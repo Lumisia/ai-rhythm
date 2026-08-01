@@ -21,6 +21,7 @@ packages = ["src/chart_worker"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = ["ffmpeg: 실제 FFmpeg 설치가 필요하다. 없으면 건너뛴다."]
 
 [tool.ruff]
 line-length = 100
