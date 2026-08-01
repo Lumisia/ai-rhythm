@@ -10,7 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # 분석 백엔드는 무겁다(torch). 핵심 패키지는 가볍게 두고 필요할 때만 켠다.
-analysis = ["beat-this>=0.1", "soundfile>=0.12"]
+analysis = ["beat-this>=0.1", "librosa>=0.10", "soundfile>=0.12"]
 
 [dependency-groups]
 dev = ["hypothesis>=6.100", "pytest>=8.2", "ruff>=0.5"]
