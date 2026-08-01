@@ -1,0 +1,1 @@
+"""Chart generation boundary adapters."""
