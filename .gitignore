@@ -1,0 +1,49 @@
+# 설계·조사 문서 (git 미포함)
+docs/
+
+# 로컬 데이터 (StoragePort 로컬 구현체)
+.data/
+out/
+reports/
+
+# 오디오·채보 산출물
+*.wav
+*.flac
+*.mp3
+*.osz
+
+# Java / Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+*.class
+hs_err_pid*
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# 비밀정보
+.env
+.env.local
+*.pem
+*-service-account.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
