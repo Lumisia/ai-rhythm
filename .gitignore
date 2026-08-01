@@ -1,5 +1,9 @@
 # 설계·조사 문서 (git 미포함)
 docs/
+.understand-anything/
+
+# git worktree 전용 경로 (산출물 청소 대상 아님 — 절대 일괄 삭제 금지)
+.worktrees/
 
 # 로컬 데이터 (StoragePort 로컬 구현체)
 .data/
