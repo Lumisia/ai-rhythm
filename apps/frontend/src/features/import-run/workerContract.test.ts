@@ -1,33 +1,15 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { basename, relative, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { loadRunDirectory } from "../../test/loadRunDirectory";
 import { importRun } from "./importRun";
 
 const fixtureRoot = resolve(process.cwd(), "src/test/fixtures/playtest-run");
 
-function fixtureFiles(directory: string): File[] {
-  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-    const path = resolve(directory, entry.name);
-    if (entry.isDirectory()) return fixtureFiles(path);
-
-    const raw = readFileSync(path);
-    const body = new ArrayBuffer(raw.byteLength);
-    new Uint8Array(body).set(raw);
-    const file = new File([body], basename(path));
-    const fixturePath = relative(fixtureRoot, path).replaceAll("\\", "/");
-    Object.defineProperty(file, "webkitRelativePath", {
-      configurable: true,
-      value: `playtest-run/${fixturePath}`,
-    });
-    return [file];
-  });
-}
-
 describe("chart worker output contract", () => {
   it("imports the deterministic worker fixture as a complete run", async () => {
-    const imported = await importRun(fixtureFiles(fixtureRoot));
+    const imported = await importRun(loadRunDirectory(fixtureRoot));
 
     expect(imported.manifest.version).toBe(1);
     expect(imported.manifest.charts).toHaveLength(12);
