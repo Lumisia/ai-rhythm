@@ -21,6 +21,7 @@ def passing_quality(**overrides) -> CandidateQuality:
         long_gap_bars=0.0,
         rating_error=0.0,
         removed_ratio=0.0,
+        audio_onset_precision=0.9,
         drum_precision=0.9,
         playability_passes=1,
         playability_violations=0,
@@ -55,17 +56,32 @@ def test_too_easy_rating_still_requests_a_retry(rating_error):
     )
 
 
-def test_missing_drum_metric_does_not_force_a_retry():
-    assert not needs_retry(passing_quality(drum_precision=None), difficulty="EXPERT")
+def test_missing_audio_onset_metric_does_not_force_a_retry():
+    assert not needs_retry(
+        passing_quality(audio_onset_precision=None), difficulty="EXPERT"
+    )
 
 
-def test_expert_drum_precision_below_seventy_percent_requests_a_retry():
-    assert needs_retry(passing_quality(drum_precision=0.6999), difficulty="EXPERT")
-    assert not needs_retry(passing_quality(drum_precision=0.7), difficulty="EXPERT")
+def test_expert_audio_onset_precision_below_seventy_percent_requests_a_retry():
+    assert needs_retry(
+        passing_quality(audio_onset_precision=0.6999), difficulty="EXPERT"
+    )
+    assert needs_retry(
+        passing_quality(audio_onset_precision=0.69996), difficulty="EXPERT"
+    )
+    assert not needs_retry(
+        passing_quality(audio_onset_precision=0.7), difficulty="EXPERT"
+    )
 
 
-def test_easy_does_not_use_drum_precision_as_a_gate():
-    assert not needs_retry(passing_quality(drum_precision=0.1), difficulty="EASY")
+def test_drum_precision_is_diagnostic_and_does_not_reject_melodic_notes():
+    assert not needs_retry(passing_quality(drum_precision=0.1), difficulty="EXPERT")
+
+
+def test_easy_does_not_use_audio_onset_precision_as_a_gate():
+    assert not needs_retry(
+        passing_quality(audio_onset_precision=0.1), difficulty="EASY"
+    )
 
 
 def test_human_reference_failure_requests_a_retry_for_every_difficulty():
@@ -85,10 +101,18 @@ def test_rank_is_lexicographic_in_the_approved_order():
         lower_removal, difficulty="NORMAL"
     )
 
-    high_drum = passing_quality(drum_precision=0.9, hold_ratio_error=0.2)
-    low_drum = passing_quality(drum_precision=0.8, hold_ratio_error=0.0)
-    assert rank_candidate(high_drum, difficulty="EXPERT") < rank_candidate(
-        low_drum, difficulty="EXPERT"
+    high_onset = passing_quality(
+        audio_onset_precision=0.9,
+        drum_precision=0.1,
+        hold_ratio_error=0.2,
+    )
+    low_onset = passing_quality(
+        audio_onset_precision=0.8,
+        drum_precision=0.9,
+        hold_ratio_error=0.0,
+    )
+    assert rank_candidate(high_onset, difficulty="EXPERT") < rank_candidate(
+        low_onset, difficulty="EXPERT"
     )
 
 

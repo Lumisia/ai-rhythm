@@ -27,7 +27,7 @@ from chart_worker.generation.candidate_selection import (
     MAX_LONG_GAP_BARS,
     MAX_RATING_ERROR,
     MAX_REMOVED_RATIO,
-    MIN_DRUM_PRECISION,
+    MIN_AUDIO_ONSET_PRECISION,
     CandidateParameters,
     CandidateQuality,
     candidate_parameters,
@@ -469,7 +469,7 @@ def _timing_payload(analysis: AnalysisStageResult, run_dir: Path) -> dict[str, o
     }
 
 
-def _drum_payload(precision: float | None) -> dict[str, object]:
+def _precision_payload(precision: float | None) -> dict[str, object]:
     if precision is None:
         return {"status": "UNAVAILABLE"}
     return {"status": "AVAILABLE", "precision": precision}
@@ -498,10 +498,10 @@ def _candidate_failure_reasons(
         reasons.append("human reference accuracy gate failed")
     if (
         difficulty in ("HARD", "EXPERT")
-        and quality.drum_precision is not None
-        and quality.drum_precision < MIN_DRUM_PRECISION
+        and quality.audio_onset_precision is not None
+        and quality.audio_onset_precision < MIN_AUDIO_ONSET_PRECISION
     ):
-        reasons.append("drum onset precision is below 0.70")
+        reasons.append("audio onset precision is below 0.70")
     return reasons
 
 
@@ -566,7 +566,8 @@ def _quality_payload(
         "actualRating": actual_rating,
         "signedRatingError": signed_rating_error,
         "absoluteRatingError": abs(signed_rating_error),
-        "drumOnsetPrecision": _drum_payload(quality.drum_precision),
+        "audioOnsetPrecision": _precision_payload(quality.audio_onset_precision),
+        "drumOnsetPrecision": _precision_payload(quality.drum_precision),
         "longGapBars": quality.long_gap_bars,
         "holdRatio": {
             "actual": actual_hold_ratio,
@@ -581,7 +582,10 @@ def _quality_payload(
             "long_gap_bars": quality.long_gap_bars,
             "rating_error": quality.rating_error,
             "removed_ratio": quality.removed_ratio,
-            "drum_precision": _drum_payload(quality.drum_precision),
+            "audio_onset_precision": _precision_payload(
+                quality.audio_onset_precision
+            ),
+            "drum_precision": _precision_payload(quality.drum_precision),
             "playability_passes": quality.playability_passes,
             "playability_violations": quality.playability_violations,
             "hold_ratio_error": quality.hold_ratio_error,
@@ -761,6 +765,7 @@ def _generation_report(
                 "removedCount": result.reports.difficulty.removed_count,
                 "playabilityRecoveredCount": result.reports.playability.recovered_count,
                 "playabilityDeletedCount": result.reports.playability.deleted_count,
+                "audioOnsetPrecision": selected_payload["audioOnsetPrecision"],
                 "drumOnsetPrecision": selected_payload["drumOnsetPrecision"],
                 "longGapBars": selected_payload["longGapBars"],
                 "holdRatio": selected_payload["holdRatio"],

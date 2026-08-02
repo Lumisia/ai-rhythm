@@ -151,6 +151,14 @@ def test_fake_pipeline_writes_playtest_manifest(tmp_path: Path):
         assert chart["candidates"][0]["drumOnsetPrecision"] == {
             "status": "UNAVAILABLE"
         }
+        assert chart["candidates"][0]["audioOnsetPrecision"]["status"] == "AVAILABLE"
+        assert chart["audioOnsetPrecision"] == chart["candidates"][0][
+            "audioOnsetPrecision"
+        ]
+        assert (
+            chart["candidates"][0]["failure_metrics"]["audio_onset_precision"]
+            == chart["audioOnsetPrecision"]
+        )
         assert chart["candidates"][0]["playabilityViolationCount"] == 0
         assert (
             chart["candidates"][0]["failure_metrics"]["playability_violations"]
@@ -475,6 +483,7 @@ def test_mapperatorinator_compares_unguided_at_same_star_even_when_guided_passes
             long_gap_bars=0.0,
             rating_error=0.0,
             removed_ratio=0.0,
+            audio_onset_precision=0.9,
             drum_precision=None,
             playability_passes=1,
             reference_pass=None,
@@ -552,6 +561,7 @@ def test_mapperatorinator_failed_guided_candidate_adds_one_bounded_star_retry(
             long_gap_bars=0.0,
             rating_error=0.3501 if variant.difficulty == "NORMAL" else 0.0,
             removed_ratio=0.0,
+            audio_onset_precision=0.9,
             drum_precision=None,
             playability_passes=1,
             reference_pass=None,

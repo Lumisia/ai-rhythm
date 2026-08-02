@@ -4,8 +4,9 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from chart_worker.analysis.onset import annotate_notes
-from chart_worker.analysis.timing import TimingSource, bpm_events_of
+from chart_worker.analysis.timing import TimingSource, bpm_events_of, match_times
 from chart_worker.generation.candidate_selection import (
+    AUDIO_ONSET_WINDOW_MS,
     CandidateQuality,
     longest_active_bar_gap,
 )
@@ -183,6 +184,15 @@ def candidate_quality_of(
             result.document.metrics.project_rating - result.reports.difficulty.target_rating
         ),
         removed_ratio=removed_ratio,
+        audio_onset_precision=(
+            match_times(
+                tuple(note.time_ms for note in result.document.notes),
+                analysis.onsets.onset_ms,
+                window_ms=AUDIO_ONSET_WINDOW_MS,
+            ).precision
+            if analysis.onsets.onset_ms
+            else None
+        ),
         drum_precision=(
             result.reports.alignment.drum_precision if stems.drum_onsets else None
         ),

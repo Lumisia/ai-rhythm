@@ -15,7 +15,8 @@ RETRY_SEED_STEP = 10_000
 MAX_LONG_GAP_BARS = 2.0
 MAX_RATING_ERROR = 0.35
 MAX_REMOVED_RATIO = 0.45
-MIN_DRUM_PRECISION = 0.70
+MIN_AUDIO_ONSET_PRECISION = 0.70
+AUDIO_ONSET_WINDOW_MS = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,7 @@ class CandidateQuality:
     long_gap_bars: float
     rating_error: float
     removed_ratio: float
+    audio_onset_precision: float | None
     drum_precision: float | None
     playability_passes: int
     playability_violations: int
@@ -98,20 +100,21 @@ def needs_retry(quality: CandidateQuality, *, difficulty: str) -> bool:
         or quality.playability_violations > 0
         or quality.reference_pass is False
     )
-    drum_failure = (
+    onset_failure = (
         difficulty in ("HARD", "EXPERT")
-        and quality.drum_precision is not None
-        and quality.drum_precision < MIN_DRUM_PRECISION
+        and quality.audio_onset_precision is not None
+        and quality.audio_onset_precision < MIN_AUDIO_ONSET_PRECISION
     )
-    return structural_failure or drum_failure
+    return structural_failure or onset_failure
 
 
 def rank_candidate(quality: CandidateQuality, *, difficulty: str) -> tuple[float, ...]:
     """Build the approved lexicographic quality key; lower is better."""
     _require_difficulty(difficulty)
-    drum_rank = (
-        -quality.drum_precision
-        if difficulty in ("HARD", "EXPERT") and quality.drum_precision is not None
+    onset_rank = (
+        -quality.audio_onset_precision
+        if difficulty in ("HARD", "EXPERT")
+        and quality.audio_onset_precision is not None
         else 0.0
     )
     return (
@@ -119,7 +122,7 @@ def rank_candidate(quality: CandidateQuality, *, difficulty: str) -> tuple[float
         quality.long_gap_bars,
         abs(quality.rating_error),
         quality.removed_ratio,
-        drum_rank,
+        onset_rank,
         quality.hold_ratio_error,
     )
 

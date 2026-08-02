@@ -11,7 +11,7 @@ from chart_worker.analysis.timing import TimingPoint, TimingSource
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.hashing import sha256_file
-from chart_worker.schema.chart import ChartDocument
+from chart_worker.schema.chart import ChartDocument, ChartNote
 from chart_worker.schema.note import NoteEvent
 from chart_worker.schema.playtest_run import AudioFileRef
 from chart_worker.stages import s4_postprocess
@@ -270,6 +270,7 @@ def test_candidate_quality_extracts_reference_and_unavailable_drums(tmp_path: Pa
     assert quality.rating_error == (
         result.document.metrics.project_rating - result.reports.difficulty.target_rating
     )
+    assert quality.audio_onset_precision == 1.0
     assert quality.drum_precision is None
     assert quality.playability_passes == result.reports.playability.passes
     assert quality.playability_violations == 0
@@ -318,6 +319,71 @@ def test_candidate_quality_counts_violations_remaining_after_the_final_pass(tmp_
 
     assert quality.playability_passes == 8
     assert quality.playability_violations == 1
+
+
+def test_candidate_audio_onset_precision_uses_unique_rows_and_the_exact_ratio(tmp_path: Path):
+    analysis, generated, stems, _ = _inputs(tmp_path)
+    analysis = dataclasses.replace(
+        analysis,
+        onsets=dataclasses.replace(analysis.onsets, onset_ms=(500, 1_000)),
+    )
+    result = run_postprocess_variant(
+        analysis,
+        generated,
+        stems,
+        tmp_path,
+        worker_version="test",
+        write_output=False,
+    )
+    result = dataclasses.replace(
+        result,
+        document=result.document.model_copy(
+            update={
+                "notes": [
+                    ChartNote(id=1, lane=0, time_ms=500, kind="TAP"),
+                    ChartNote(id=2, lane=1, time_ms=500, kind="TAP"),
+                    ChartNote(id=3, lane=2, time_ms=1_000, kind="TAP"),
+                    ChartNote(id=4, lane=3, time_ms=1_060, kind="TAP"),
+                ]
+            }
+        ),
+    )
+
+    quality = candidate_quality_of(
+        analysis,
+        generated,
+        result,
+        stems,
+        reference_pass=None,
+    )
+
+    assert quality.audio_onset_precision == 2 / 3
+
+
+def test_candidate_audio_onset_precision_is_unavailable_without_onsets(tmp_path: Path):
+    analysis, generated, stems, _ = _inputs(tmp_path)
+    analysis = dataclasses.replace(
+        analysis,
+        onsets=dataclasses.replace(analysis.onsets, onset_ms=()),
+    )
+    result = run_postprocess_variant(
+        analysis,
+        generated,
+        stems,
+        tmp_path,
+        worker_version="test",
+        write_output=False,
+    )
+
+    quality = candidate_quality_of(
+        analysis,
+        generated,
+        result,
+        stems,
+        reference_pass=None,
+    )
+
+    assert quality.audio_onset_precision is None
 
 
 def test_zero_raw_notes_are_always_a_failed_candidate(tmp_path: Path):
