@@ -93,6 +93,21 @@ def test_rejects_candidates_when_phase_matching_covers_too_little_of_a_grid():
     assert caught.value.context["coverage"] == 0.6
 
 
+def test_rejects_candidates_when_all_short_grid_beats_match_but_long_grid_is_sparse():
+    beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE, beats=(0, 500, 1_000))
+    super_timing = _candidate(
+        TimingSource.MAPPERATORINATOR_SUPER,
+        beats=tuple(range(0, 50_000, 500)),
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        select_timing_candidate(beat_this, super_timing)
+
+    assert caught.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert caught.value.context["matchedBeatCount"] == 3
+    assert caught.value.context["coverage"] == 0.03
+
+
 def test_selects_the_only_candidate_that_passes_the_p95_gate():
     beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE, p95_abs_ms=31.0)
     super_timing = _candidate(TimingSource.MAPPERATORINATOR_SUPER, p95_abs_ms=30.0)

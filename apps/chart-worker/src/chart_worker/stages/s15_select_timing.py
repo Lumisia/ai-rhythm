@@ -12,8 +12,8 @@ _F1_TIE_TOLERANCE = 1e-12
 
 
 def _has_sufficient_phase_coverage(*, matched_count: int, left_count: int, right_count: int) -> bool:
-    """Require three matches and 80% coverage of the shorter projected-beat grid."""
-    compared_count = min(left_count, right_count)
+    """Require three matches and 80% coverage of both projected-beat grids."""
+    compared_count = max(left_count, right_count)
     return (
         compared_count > 0
         and matched_count >= _MIN_PHASE_MATCHES
@@ -31,7 +31,7 @@ def candidate_phase_difference_ms(left: TimingCandidate, right: TimingCandidate)
     left_count = len(set(left.projected_beat_ms))
     right_count = len(set(right.projected_beat_ms))
     matched_count = len(matches.matched_pairs)
-    compared_count = min(left_count, right_count)
+    compared_count = max(left_count, right_count)
     coverage = matched_count / compared_count if compared_count else 0.0
     if not _has_sufficient_phase_coverage(
         matched_count=matched_count,
