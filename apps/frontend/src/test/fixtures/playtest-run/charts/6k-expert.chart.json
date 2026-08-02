@@ -28,22 +28,22 @@
       "id": 1,
       "lane": 3,
       "timeMs": 0,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 2,
       "lane": 3,
       "timeMs": 750,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 3,
       "lane": 4,
       "timeMs": 1000,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 4,
@@ -196,12 +196,12 @@
       "id": 25,
       "lane": 4,
       "timeMs": 5833,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 26,
-      "lane": 3,
+      "lane": 2,
       "timeMs": 6000,
       "type": "TAP",
       "durationMs": null
@@ -210,8 +210,8 @@
       "id": 27,
       "lane": 3,
       "timeMs": 6250,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 28,
@@ -231,8 +231,8 @@
       "id": 30,
       "lane": 1,
       "timeMs": 6917,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 31,
@@ -252,15 +252,15 @@
       "id": 33,
       "lane": 3,
       "timeMs": 7667,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 34,
       "lane": 1,
       "timeMs": 7833,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 35,
@@ -273,15 +273,15 @@
   "autoPlayOnsets": [],
   "metrics": {
     "noteCount": 35,
-    "holdCount": 0,
+    "holdCount": 8,
     "avgNps": 4.375,
     "p95Nps": 8.0,
     "peakNps": 9.0,
     "chordRatio": 0.0,
     "maxJack": 3,
-    "projectRating": 3.63,
+    "projectRating": 3.76,
     "projectTier": "HARD",
-    "patternEntropy": 2.4995,
+    "patternEntropy": 2.9404,
     "drumCoverage": 0.0,
     "drumPrecision": 0.0,
     "meanAbsErrMs": 0.0,

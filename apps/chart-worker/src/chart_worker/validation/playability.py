@@ -320,9 +320,7 @@ def _victim(notes: Chart, violation: PlayabilityViolation) -> NoteEvent | None:
 
 def _victims(notes: Chart, violation: PlayabilityViolation) -> tuple[NoteEvent, ...]:
     if violation.code is ViolationCode.PATTERN_FORBIDDEN and violation.detail.startswith("DENIM"):
-        window = [
-            note for note in notes if violation.time_ms <= note.time_ms <= violation.end_ms
-        ]
+        window = [note for note in notes if violation.time_ms <= note.time_ms <= violation.end_ms]
         return tuple(window[DENIM_MIN_NOTES - 1 :: DENIM_MIN_NOTES])
     if violation.code is ViolationCode.PATTERN_FORBIDDEN and violation.detail.startswith(
         ("HANDSTREAM", "CHORDSTREAM")

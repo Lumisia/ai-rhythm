@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from chart_worker.schema.note import coerce_int
-from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
+from chart_worker.schema.types import DIFFICULTIES, KEY_MODES, TARGET_HOLD_RATIO
 
 GAMEMODE_MANIA = 3
 PRECISION = "fp16"
@@ -32,12 +32,9 @@ solver 는 내리는 방향으로만 동작한다. 없는 시각에 노트를 �
 불변 위반이므로, 솎을 재료가 처음부터 남아 있어야 한다.
 """
 
-HOLD_NOTE_RATIO: dict[str, float] = {
-    "EASY": 0.10,
-    "NORMAL": 0.15,
-    "HARD": 0.20,
-    "EXPERT": 0.25,
-}
+HOLD_NOTE_RATIO = TARGET_HOLD_RATIO
+"""생성이 요청하는 롱노트 비율. 난이도 solver 가 내리는 바닥과 같은 값이라
+schema.types 에 둔다."""
 
 # style/clean 은 존재하지 않는 태그다. 아래는 전부 실존 mania 태그다.
 DESCRIPTORS: dict[str, tuple[str, ...]] = {

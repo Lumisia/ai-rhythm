@@ -11,6 +11,7 @@ from chart_worker.postprocess.difficulty_solver import (
 )
 from chart_worker.rating.project_rating import TARGET_RATING, measure_rating
 from chart_worker.schema.note import NoteEvent
+from chart_worker.schema.types import TARGET_HOLD_RATIO
 
 BEAT_MS = 500.0
 DURATION_MS = 60_000
@@ -302,3 +303,57 @@ def test_hold_conversion_survives_an_exhausted_removal_budget():
     result = _solve(notes, difficulty="EASY", budget=0.05)
     assert result.removed_ratio <= 0.05 + 1e-9
     assert result.converted_count > 0
+
+
+# --- 롱노트 바닥 --------------------------------------------------------------
+
+
+def _hold_ratio_of(notes):
+    return sum(1 for note in notes if note.kind == "HOLD") / len(notes)
+
+
+@pytest.mark.parametrize("difficulty", ["EASY", "NORMAL", "HARD", "EXPERT"])
+def test_hold_conversion_never_wipes_out_every_hold(difficulty):
+    """삭제 예산에서 뺐다고 상한까지 없애면 롱노트가 전멸한다.
+
+    목표에 못 닿는 채보에서 라운드가 계속 돌면 HOLD_TO_TAP 이 끝까지
+    변환한다. 등급 기여는 0.60*hold_ratio 뿐이라 다 없애도 얼마 못 내리면서
+    노트 종류 하나를 통째로 지운다.
+    """
+    notes = _dense_chart(count=600, step=60, hold_every=2)
+    result = _solve(notes, difficulty=difficulty)
+    assert not result.reached_target, "이 채보는 목표에 못 닿아야 회귀가 드러난다"
+    assert sum(1 for note in result.notes if note.kind == "HOLD") > 0
+
+
+def test_conversion_stops_at_the_difficulty_hold_floor():
+    notes = _dense_chart(count=600, step=60, hold_every=2)
+    before = _hold_ratio_of(notes)
+    result = _solve(notes, difficulty="HARD")
+    assert before > TARGET_HOLD_RATIO["HARD"]
+    assert _hold_ratio_of(result.notes) >= TARGET_HOLD_RATIO["HARD"] - 1e-9
+
+
+def test_a_chart_already_under_the_floor_is_not_converted_further():
+    notes = [
+        NoteEvent(
+            time_ms=index * 100,
+            lane=index % 4,
+            kind="HOLD" if index % 20 == 0 else "TAP",
+            duration_ms=90 if index % 20 == 0 else None,
+            onset_strength=0.5,
+        )
+        for index in range(600)
+    ]
+    assert _hold_ratio_of(notes) < TARGET_HOLD_RATIO["EASY"]
+    result = _solve(notes, difficulty="EASY")
+    assert result.operations[Operation.HOLD_TO_TAP.value] == 0
+
+
+def test_the_floor_tracks_holds_lost_to_deletion():
+    """삭제 연산도 롱노트를 가져간다. 변환 횟수만 세면 실제와 어긋난다."""
+    notes = _dense_chart(count=600, step=60, hold_every=2)
+    result = _solve(notes, difficulty="NORMAL")
+    counted = len(notes) - result.removed_count
+    assert len(result.notes) == counted
+    assert _hold_ratio_of(result.notes) >= TARGET_HOLD_RATIO["NORMAL"] - 1e-9

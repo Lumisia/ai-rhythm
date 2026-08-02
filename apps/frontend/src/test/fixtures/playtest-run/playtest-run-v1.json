@@ -33,7 +33,7 @@
     },
     {
       "path": "charts/4k-expert.chart.json",
-      "sha256": "f1512cc858373cb36af9ded6bfd2da856feedd6c21187a06b2c4ada3d926429c",
+      "sha256": "ad89cb023445d93d4eaefe8b76fcd74a5351759930a4d9a27dc28a5d2aa565bb",
       "keyMode": 4,
       "difficulty": "EXPERT"
     },
@@ -57,7 +57,7 @@
     },
     {
       "path": "charts/6k-expert.chart.json",
-      "sha256": "55d6d3da4f4bb809aaa367800450c3075aaab88d687f88b7667bcda3a66799ac",
+      "sha256": "6c3a40d07122b57b67cdcc9f1b7359d6f4357474aee88b0ecbc9c16b603b2259",
       "keyMode": 6,
       "difficulty": "EXPERT"
     },
@@ -81,7 +81,7 @@
     },
     {
       "path": "charts/7k-expert.chart.json",
-      "sha256": "31ce99c77d2a1c17f806e8005a3dbfba1f50fc03039af0a6f194b9c2ab2228df",
+      "sha256": "92aaf76324a5c06c85dbbbd04fad346b058d7caa89418b9396f7ebafc300336c",
       "keyMode": 7,
       "difficulty": "EXPERT"
     }

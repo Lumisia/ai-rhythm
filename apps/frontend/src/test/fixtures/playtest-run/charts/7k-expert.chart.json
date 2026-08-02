@@ -29,15 +29,15 @@
       "id": 1,
       "lane": 6,
       "timeMs": 0,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 2,
       "lane": 2,
       "timeMs": 750,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 3,
@@ -78,8 +78,8 @@
       "id": 8,
       "lane": 1,
       "timeMs": 2750,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 9,
@@ -99,8 +99,8 @@
       "id": 11,
       "lane": 4,
       "timeMs": 3417,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 12,
@@ -148,8 +148,8 @@
       "id": 18,
       "lane": 4,
       "timeMs": 4167,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 19,
@@ -225,8 +225,8 @@
       "id": 29,
       "lane": 2,
       "timeMs": 6917,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 30,
@@ -267,20 +267,20 @@
   "autoPlayOnsets": [],
   "metrics": {
     "noteCount": 34,
-    "holdCount": 0,
+    "holdCount": 6,
     "avgNps": 4.25,
     "p95Nps": 8.0,
     "peakNps": 9.0,
     "chordRatio": 0.0,
     "maxJack": 2,
-    "projectRating": 3.46,
+    "projectRating": 3.57,
     "projectTier": "HARD",
-    "patternEntropy": 2.5087,
+    "patternEntropy": 3.0037,
     "drumCoverage": 0.0,
     "drumPrecision": 0.0,
     "meanAbsErrMs": 0.0,
     "sideNoteRatio": 0.2941,
-    "sideHoldRatio": 0.0,
+    "sideHoldRatio": 0.1,
     "movedNoteRatio": 0.1458
   },
   "generator": {

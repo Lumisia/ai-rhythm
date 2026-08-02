@@ -7,6 +7,19 @@ Difficulty = Literal["EASY", "NORMAL", "HARD", "EXPERT"]
 KEY_MODES: tuple[int, ...] = (4, 6, 7)
 DIFFICULTIES: tuple[str, ...] = ("EASY", "NORMAL", "HARD", "EXPERT")
 
+TARGET_HOLD_RATIO: dict[str, float] = {
+    "EASY": 0.10,
+    "NORMAL": 0.15,
+    "HARD": 0.20,
+    "EXPERT": 0.25,
+}
+"""난이도별 롱노트 비율 목표.
+
+생성은 이 비율을 요청하고, 난이도 solver 는 이 아래로 내리지 않는다. 양쪽이
+같은 숫자를 봐야 해서 여기 둔다 — postprocess 는 generation 을 import 하지
+않는다.
+"""
+
 
 class LaneSemantic(StrEnum):
     MAIN_1 = "MAIN_1"

@@ -75,8 +75,8 @@
       "id": 8,
       "lane": 0,
       "timeMs": 2917,
-      "type": "TAP",
-      "durationMs": null
+      "type": "HOLD",
+      "durationMs": 83
     },
     {
       "id": 9,
@@ -271,15 +271,15 @@
   "autoPlayOnsets": [],
   "metrics": {
     "noteCount": 35,
-    "holdCount": 5,
+    "holdCount": 6,
     "avgNps": 4.375,
     "p95Nps": 8.0,
     "peakNps": 9.0,
     "chordRatio": 0.0,
     "maxJack": 2,
-    "projectRating": 3.56,
+    "projectRating": 3.58,
     "projectTier": "HARD",
-    "patternEntropy": 3.2411,
+    "patternEntropy": 3.2539,
     "drumCoverage": 0.0,
     "drumPrecision": 0.0,
     "meanAbsErrMs": 0.0,

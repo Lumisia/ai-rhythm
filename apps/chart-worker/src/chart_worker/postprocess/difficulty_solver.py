@@ -15,7 +15,7 @@ from enum import StrEnum
 from chart_worker.postprocess.patterns import rows_of
 from chart_worker.rating.project_rating import TARGET_RATING, RatingMetrics, measure_rating
 from chart_worker.schema.note import Chart, NoteEvent
-from chart_worker.schema.types import DIFFICULTIES
+from chart_worker.schema.types import DIFFICULTIES, TARGET_HOLD_RATIO
 
 REMOVAL_BUDGET = 0.35
 """솎을 수 있는 노트 비율 상한. 초안이다.
@@ -153,6 +153,17 @@ def _hold_candidates(notes: Chart) -> Iterator[NoteEvent]:
     yield from (note for note in notes if note.kind == "HOLD")
 
 
+def _hold_ratio(notes: Chart) -> float:
+    """지금 채보의 롱노트 비율.
+
+    삭제 연산도 롱노트를 가져가므로 변환 횟수만 세면 실제와 어긋난다.
+    매번 실측한다.
+    """
+    if not notes:
+        return 0.0
+    return sum(1 for note in notes if note.kind == "HOLD") / len(notes)
+
+
 _CANDIDATE_SOURCES = {
     Operation.CHORD_BREAK: _chord_break_candidates,
     Operation.WEAK_ONSET: _weak_onset_candidates,
@@ -208,6 +219,7 @@ def solve_difficulty(
             operations=counts,
         )
 
+    hold_floor = TARGET_HOLD_RATIO[difficulty]
     # 연산을 하나씩 소진하면 앞선 연산이 예산을 다 먹어 뒤가 굶는다. 잭
     # 축약은 max_jack 항을 줄이는 유일한 수단인데 그게 한 번도 안 돌 수
     # 있다. 라운드마다 모든 연산에 차례를 준다.
@@ -222,11 +234,19 @@ def solve_difficulty(
             removes = operation is not Operation.HOLD_TO_TAP
             if removes and removed >= allowance:
                 continue
+            # 삭제 예산에서 뺐다고 상한까지 없애면 목표에 못 닿는 채보에서
+            # 롱노트가 전멸한다. 등급 기여는 0.60*hold_ratio 뿐이라 다 없애도
+            # 얼마 못 내리면서 노트 종류 하나를 통째로 지운다. 난이도별 목표
+            # 비율이 바닥이다.
+            if not removes and _hold_ratio(current) <= hold_floor:
+                continue
             queue = _ranked_candidates(current, operation, beat_ms=beat_ms)
             for note in queue[:REMEASURE_EVERY]:
                 if removes and removed >= allowance:
                     break
                 if operation is Operation.HOLD_TO_TAP:
+                    if _hold_ratio(current) <= hold_floor:
+                        break
                     index = next((i for i, n in enumerate(current) if n is note), None)
                     if index is None:
                         continue

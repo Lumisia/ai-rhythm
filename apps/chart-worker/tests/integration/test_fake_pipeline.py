@@ -23,9 +23,7 @@ FIXTURE_ROOT = (
 def _write_tone_wav(path: Path) -> None:
     sample_rate_hz = 48_000
     frames = np.arange(sample_rate_hz * 8, dtype=np.float64)
-    tone = (0.08 * np.sin(2.0 * np.pi * 220.0 * frames / sample_rate_hz) * 32_767).astype(
-        "<i2"
-    )
+    tone = (0.08 * np.sin(2.0 * np.pi * 220.0 * frames / sample_rate_hz) * 32_767).astype("<i2")
     stereo = np.column_stack((tone, tone))
     with wave.open(str(path), "wb") as output:
         output.setnchannels(2)
