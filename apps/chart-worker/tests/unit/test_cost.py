@@ -257,3 +257,19 @@ def test_best_lane_is_none_when_every_main_lane_is_taken():
 
 def test_infeasible_is_infinite():
     assert math.isinf(INFEASIBLE)
+
+
+def test_a_held_lane_is_unavailable_but_is_not_a_chord():
+    """앞선 사이드 롱노트가 지금 치는 반대쪽 사이드와 동시타로 오인되면
+    lane_rules 가 통과시킨 배치를 비용함수가 위반으로 매긴다."""
+    held = _context(difficulty="NORMAL", held_lanes=frozenset({SIDE_L}))
+    chord = _context(difficulty="NORMAL", occupied_lanes=frozenset({SIDE_L}))
+    note = _note(lane=SIDE_R)
+    assert _term(note, SIDE_R, held, "w8_rule_violation") == 0.0
+    assert _term(note, SIDE_R, chord, "w8_rule_violation") > 0.0
+    assert math.isinf(placement_cost(note, SIDE_L, held).total)
+
+
+def test_held_lanes_are_not_candidates():
+    context = _context(held_lanes=frozenset({MAIN_1, MAIN_2}))
+    assert set(candidate_lanes(_note(), context)) == {MAIN_3, MAIN_4}

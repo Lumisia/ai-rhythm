@@ -64,6 +64,7 @@ def _build_context(
     difficulty: str,
     last_time_by_lane: dict[int, int],
     occupied: set[int],
+    held: set[int],
     previous_lane: int | None,
     hand_window: deque[Hand | None],
     shape_window: deque[tuple[int, ...]],
@@ -77,6 +78,7 @@ def _build_context(
         difficulty=difficulty,
         last_time_by_lane=dict(last_time_by_lane),
         occupied_lanes=frozenset(occupied),
+        held_lanes=frozenset(held),
         previous_lane=previous_lane,
         hand_counts=(left, right),
         recent_shapes=tuple(shape_window),
@@ -131,7 +133,8 @@ def _one_pass(
                 key_mode=key_mode,
                 difficulty=difficulty,
                 last_time_by_lane=last_time_by_lane,
-                occupied=occupied | held,
+                occupied=occupied,
+                held=held,
                 previous_lane=previous_lane,
                 hand_window=hand_window,
                 shape_window=shape_window,
@@ -321,11 +324,29 @@ def _moved_notes(notes: Chart) -> int:
     return sum(1 for note in notes if note.lane != note.origin_lane)
 
 
+def _violation_endpoints(
+    notes: Chart, violation: Violation
+) -> list[NoteEvent]:
+    """잭 위반에 얽힌 두 노트. 뒤 노트와 그 앞의 같은 레인 노트다."""
+    lane = violation.lanes[0]
+    later = next(
+        (n for n in notes if n.time_ms == violation.time_ms and n.lane == lane), None
+    )
+    earlier = max(
+        (n for n in notes if n.lane == lane and n.time_ms < violation.time_ms),
+        key=lambda n: n.time_ms,
+        default=None,
+    )
+    return [note for note in (later, earlier) if note is not None]
+
+
 def _drop_unfixable(notes: Chart, *, key_mode: int, difficulty: str) -> tuple[Chart, int]:
     """이동으로 못 고친 잭 위반을 최소한으로 지운다.
 
-    위반 하나에 노트가 둘 얽혀 있다. 양쪽을 다 지우면 한 번만 지워도 될
-    자리에서 강한 타격까지 잃는다. 약한 쪽 하나를 지우고 다시 검사한다.
+    위반 하나에 노트가 둘 얽혀 있고, 연타가 셋 이상이면 가운데 노트가 앞뒤
+    두 위반에 **동시에** 얽힌다. 위반을 하나씩 보고 약한 쪽을 지우면 그
+    가운데 노트를 놓쳐 두 번 지우게 된다. 가장 많은 위반에 걸린 노트를
+    먼저 지우고, 같으면 약한 쪽을 지운다.
     """
     remaining = list(notes)
     deleted = 0
@@ -339,20 +360,20 @@ def _drop_unfixable(notes: Chart, *, key_mode: int, difficulty: str) -> tuple[Ch
         ]
         if not violations:
             return remaining, deleted
-        violation = violations[0]
-        lane = violation.lanes[0]
-        later = next(
-            (n for n in remaining if n.time_ms == violation.time_ms and n.lane == lane), None
-        )
-        earlier = max(
-            (n for n in remaining if n.lane == lane and n.time_ms < violation.time_ms),
-            key=lambda n: n.time_ms,
-            default=None,
-        )
-        pair = [note for note in (later, earlier) if note is not None]
-        if not pair:
+
+        blame: dict[int, int] = {}
+        involved: dict[int, NoteEvent] = {}
+        for violation in violations:
+            for note in _violation_endpoints(remaining, violation):
+                blame[id(note)] = blame.get(id(note), 0) + 1
+                involved[id(note)] = note
+        if not involved:
             return remaining, deleted
-        victim = min(pair, key=lambda n: (n.onset_strength or 0.0, -n.time_ms))
+
+        victim = max(
+            involved.values(),
+            key=lambda n: (blame[id(n)], -(n.onset_strength or 0.0), -n.time_ms),
+        )
         remaining = [note for note in remaining if note is not victim]
         deleted += 1
 

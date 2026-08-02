@@ -47,6 +47,20 @@ def _hydra_list(values: tuple[str, ...]) -> str:
     return "[" + ",".join(values) + "]"
 
 
+def _absolute(path: Path) -> Path:
+    """실행 위치에 흔들리지 않는 경로로 만든다.
+
+    inference.py 를 체크아웃 안에서 돌리므로 cwd 가 우리 작업 디렉터리가
+    아니다. 상대 경로를 그대로 넘기면 Mapperatorinator 홈 아래로 해석되어
+    `storage/game.flac` 이 `<home>/storage/game.flac` 이 된다.
+
+    구분자가 없는 이름은 건드리지 않는다. PATH 에서 찾는 실행 파일이다.
+    """
+    if path.parent == Path():
+        return path
+    return path.resolve()
+
+
 def build_command(
     config: WorkerConfig,
     request: GenerationRequest,
@@ -62,12 +76,12 @@ def build_command(
         raise ValueError("mapperatorinator_python and mapperatorinator_home must be configured")
 
     argv = [
-        str(config.mapperatorinator_python),
+        str(_absolute(config.mapperatorinator_python)),
         INFERENCE_SCRIPT,
         "-cn",
         CONFIG_NAME,
-        f"audio_path={request.audio_path}",
-        f"output_path={output_dir}",
+        f"audio_path={_absolute(request.audio_path)}",
+        f"output_path={_absolute(output_dir)}",
         f"gamemode={GAMEMODE_MANIA}",
         f"keycount={request.key_mode}",
         f"difficulty={request.requested_star}",
@@ -85,7 +99,7 @@ def build_command(
         argv.append(f"seed={request.seed}")
     if request.timing_osu_path is not None:
         # 참조 .osu 없이 in_context=[TIMING] 을 켜면 줄 타이밍이 없다.
-        argv.append(f"beatmap_path={request.timing_osu_path}")
+        argv.append(f"beatmap_path={_absolute(request.timing_osu_path)}")
         argv.append("in_context=[TIMING]")
     return argv
 

@@ -272,3 +272,31 @@ def test_an_expert_side_chord_is_left_alone():
     lanes = {n.lane for n in result.notes if n.time_ms == 1000}
     assert lanes == {SIDE_L, SIDE_R}
     assert result.moved_count == 0
+
+
+def test_an_active_hold_is_not_a_chord_with_the_current_row():
+    """진행 중인 롱노트를 같은 행 화음으로 세면 lane_rules 와 답이 갈린다."""
+    notes = [
+        NoteEvent(time_ms=0, lane=SIDE_L, kind="HOLD", duration_ms=2000),
+        _tap(1000, SIDE_R),
+    ]
+    notes += [_tap(3000 + i * 400, MAIN_1 + i % 4) for i in range(60)]
+    for difficulty in ("NORMAL", "HARD", "EXPERT"):
+        assert check_lane_rules(notes, key_mode=7, difficulty=difficulty) == []
+        result = _convert(notes, difficulty=difficulty)
+        tap = next(n for n in result.notes if n.time_ms == 1000)
+        assert (tap.lane, result.moved_count) == (SIDE_R, 0), difficulty
+
+
+@pytest.mark.parametrize(
+    "strengths", [(0.1, 0.9, 0.2), (0.9, 0.1, 0.8), (0.5, 0.5, 0.5)]
+)
+def test_a_shared_endpoint_is_deleted_once(strengths):
+    """연타가 셋이면 가운데 노트가 앞뒤 두 위반에 동시에 얽힌다."""
+    notes = [
+        _tap(time_ms, SIDE_L, onset_strength=strength)
+        for time_ms, strength in zip((0, 100, 300), strengths)
+    ]
+    result = _convert(notes, difficulty="HARD", budget=0.0)
+    assert result.deleted_count == 1
+    assert [n.time_ms for n in result.notes] == [0, 300]

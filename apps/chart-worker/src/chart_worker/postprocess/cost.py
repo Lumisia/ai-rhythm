@@ -81,7 +81,19 @@ class PlacementContext:
     """이 노트보다 앞선 각 레인의 마지막 노트 시각."""
 
     occupied_lanes: frozenset[int] = frozenset()
-    """같은 시각에 이미 찬 레인."""
+    """같은 시각에 이미 찬 레인. 이 노트와 **화음을 이룬다**."""
+
+    held_lanes: frozenset[int] = frozenset()
+    """진행 중인 롱노트가 물고 있는 레인.
+
+    누를 수 없다는 점은 occupied 와 같지만 **화음이 아니다.** 하나로 합치면
+    앞선 사이드 롱노트가 지금 치는 반대쪽 사이드와 동시타로 오인되어,
+    lane_rules 가 위반이 아니라고 한 배치를 비용함수가 위반으로 매긴다.
+    """
+
+    @property
+    def unavailable_lanes(self) -> frozenset[int]:
+        return self.occupied_lanes | self.held_lanes
 
     previous_lane: int | None = None
     """바로 앞 시각의 노트 레인. 여러 개면 가장 가까운 것."""
@@ -233,8 +245,8 @@ def placement_cost(
     """노트를 이 레인에 둘 때의 비용."""
     if not 0 <= lane < context.key_mode:
         raise ValueError(f"lane {lane} is outside {context.key_mode}K")
-    if lane in context.occupied_lanes:
-        # 같은 시각 같은 레인에 두 노트를 둘 수 없다.
+    if lane in context.unavailable_lanes:
+        # 같은 시각 같은 레인, 그리고 진행 중인 롱노트 위에는 둘 수 없다.
         return CostBreakdown(INFEASIBLE, {"occupied": INFEASIBLE})
 
     terms = {
@@ -270,7 +282,7 @@ def candidate_lanes(
     lanes = [
         lane
         for lane in range(context.key_mode)
-        if lane not in context.occupied_lanes
+        if lane not in context.unavailable_lanes
         and (preference == "ANY" or finger_of(semantics[lane]) is FingerClass.MAIN)
     ]
     return sorted(lanes, key=lambda lane: (abs(lane - note.origin_lane), lane))

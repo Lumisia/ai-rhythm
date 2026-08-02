@@ -387,3 +387,21 @@ def test_fake_is_deterministic_across_processes(timing_osu):
         for _ in range(3)
     }
     assert len(runs) == 1
+
+
+def test_every_path_argument_is_absolute(config, timing_osu, tmp_path):
+    """cwd 가 Mapperatorinator 홈이라 상대 경로는 그 아래로 해석된다."""
+    request = _request(Path("work/timing.osu"), audio_path=Path("storage/game.flac"))
+    argv = build_command(config, request, Path("out/4-normal"))
+    for key in ("audio_path", "output_path", "beatmap_path"):
+        value = _pairs(argv)[key]
+        assert Path(value).is_absolute(), f"{key}={value}"
+    assert Path(argv[0]).is_absolute()
+
+
+def test_a_bare_interpreter_name_is_left_for_path_lookup():
+    bare = WorkerConfig(
+        mapperatorinator_python=Path("python"), mapperatorinator_home=Path("C:/mapp")
+    )
+    argv = build_command(bare, _request(Path("t.osu")), Path("out"))
+    assert argv[0] == "python"
