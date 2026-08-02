@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -92,6 +94,21 @@ class TimingCandidate:
     p95_abs_ms: float
     status: TimingStatus
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceChart:
+    key_mode: int
+    difficulty: str
+    sections: dict[str, tuple[int, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceQuality:
+    macro_f1_20ms: float
+    phase_abs_ms: float
+    p95_abs_ms: float
+    passes: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +255,123 @@ def match_times(
         tuple(sorted(pairs)),
         predicted_count=len(set(predicted_ms)),
         reference_count=len(set(reference_ms)),
+    )
+
+
+def _require_object(value: object, *, name: str) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be an object")
+    return value
+
+
+def _require_exact_fields(value: dict[str, object], expected: set[str], *, name: str) -> None:
+    if set(value) != expected:
+        raise ValueError(f"{name} must contain exactly {sorted(expected)}")
+
+
+def _require_int(value: object, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004 - schema contract
+    return value
+
+
+def load_reference_onsets(path: Path) -> dict[tuple[int, str], ReferenceChart]:
+    """Load the versioned human-reference onset contract without coercion."""
+    root = _require_object(json.loads(path.read_text(encoding="utf-8")), name="reference")
+    _require_exact_fields(root, {"version", "charts"}, name="reference")
+    if _require_int(root["version"], name="version") != 1:
+        raise ValueError("unsupported reference onset version")
+    charts_value = root["charts"]
+    if not isinstance(charts_value, list):
+        raise ValueError("charts must be an array")  # noqa: TRY004 - schema contract
+
+    loaded: dict[tuple[int, str], ReferenceChart] = {}
+    for chart_index, chart_value in enumerate(charts_value):
+        chart = _require_object(chart_value, name=f"charts[{chart_index}]")
+        _require_exact_fields(
+            chart,
+            {"keyMode", "difficulty", "sections"},
+            name=f"charts[{chart_index}]",
+        )
+        key_mode = _require_int(chart["keyMode"], name="keyMode")
+        if key_mode not in (4, 6, 7):
+            raise ValueError("keyMode must be 4, 6, or 7")
+        difficulty = chart["difficulty"]
+        if difficulty not in ("EASY", "NORMAL", "HARD", "EXPERT"):
+            raise ValueError("difficulty must be EASY, NORMAL, HARD, or EXPERT")
+        combo = (key_mode, difficulty)
+        if combo in loaded:
+            raise ValueError(f"duplicate chart reference for {key_mode}K {difficulty}")
+
+        sections_value = chart["sections"]
+        if not isinstance(sections_value, list):
+            raise ValueError("sections must be an array")  # noqa: TRY004 - schema contract
+        sections: dict[str, tuple[int, ...]] = {}
+        for section_index, section_value in enumerate(sections_value):
+            section = _require_object(
+                section_value,
+                name=f"charts[{chart_index}].sections[{section_index}]",
+            )
+            _require_exact_fields(
+                section,
+                {"id", "onsetMs"},
+                name=f"charts[{chart_index}].sections[{section_index}]",
+            )
+            section_id = section["id"]
+            if not isinstance(section_id, str) or not section_id:
+                raise ValueError("section id must be a non-empty string")
+            if section_id in sections:
+                raise ValueError(f"duplicate section id: {section_id}")
+            onset_value = section["onsetMs"]
+            if not isinstance(onset_value, list):
+                raise ValueError("onsetMs must be an array")  # noqa: TRY004 - schema contract
+            if not onset_value:
+                raise ValueError("reference section must not be empty")
+            onsets = tuple(_require_int(onset, name="onsetMs") for onset in onset_value)
+            if any(onset < 0 for onset in onsets):
+                raise ValueError("onsetMs must be non-negative")
+            if list(onsets) != sorted(onsets):
+                raise ValueError("onsetMs must be sorted")
+            sections[section_id] = onsets
+        if not sections:
+            raise ValueError("reference chart must contain at least one section")
+        loaded[combo] = ReferenceChart(key_mode, difficulty, sections)
+    return loaded
+
+
+def evaluate_reference(
+    reference: ReferenceChart | None,
+    predicted: tuple[int, ...],
+) -> ReferenceQuality | None:
+    """Compare unique final note starts with human labels, section by section."""
+    if reference is None:
+        return None
+
+    predicted_unique = tuple(sorted(set(predicted)))
+    section_f1: list[float] = []
+    all_pairs: list[tuple[int, int]] = []
+    for reference_ms in reference.sections.values():
+        first_ms, last_ms = reference_ms[0], reference_ms[-1]
+        section_predicted = tuple(
+            time_ms for time_ms in predicted_unique if first_ms <= time_ms <= last_ms
+        )
+        metrics = match_times(section_predicted, reference_ms, window_ms=20)
+        section_f1.append(metrics.f1)
+        all_pairs.extend(metrics.matched_pairs)
+
+    signed_errors = np.asarray(
+        [predicted_ms - reference_ms for predicted_ms, reference_ms in all_pairs],
+        dtype=np.float64,
+    )
+    absolute_errors = np.abs(signed_errors)
+    phase_abs_ms = abs(float(np.median(signed_errors))) if signed_errors.size else 0.0
+    p95_abs_ms = float(np.percentile(absolute_errors, 95)) if absolute_errors.size else 0.0
+    macro_f1 = float(np.mean(section_f1))
+    return ReferenceQuality(
+        macro_f1_20ms=macro_f1,
+        phase_abs_ms=phase_abs_ms,
+        p95_abs_ms=p95_abs_ms,
+        passes=macro_f1 >= 0.70 and phase_abs_ms <= 15.0 and p95_abs_ms <= 30.0,
     )
 
 

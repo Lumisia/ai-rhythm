@@ -1,17 +1,137 @@
+import json
+
 import numpy as np
 import pytest
 
 from chart_worker.analysis.beat import build_beat_grid
 from chart_worker.analysis.timing import (
     MatchMetrics,
+    ReferenceChart,
     TimingPoint,
     _bps_are_mergeable,
     _exceeds_error_limits,
     _sse_improvement_is_sufficient,
+    evaluate_reference,
     fit_piecewise_timing,
+    load_reference_onsets,
     match_times,
     project_beats,
 )
+
+
+def _write_reference(tmp_path, payload):
+    path = tmp_path / "reference-onsets-v1.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _valid_reference_payload():
+    return {
+        "version": 1,
+        "charts": [
+            {
+                "keyMode": 4,
+                "difficulty": "NORMAL",
+                "sections": [
+                    {"id": "verse", "onsetMs": [100, 200, 300]},
+                    {"id": "chorus", "onsetMs": [1000, 1100, 1200]},
+                ],
+            }
+        ],
+    }
+
+
+def test_reference_gate_uses_unweighted_section_macro_f1_and_ignores_notes_outside_sections(
+    tmp_path,
+):
+    references = load_reference_onsets(_write_reference(tmp_path, _valid_reference_payload()))
+
+    quality = evaluate_reference(
+        references[(4, "NORMAL")],
+        (0, 100, 200, 1000, 1100, 2000),
+    )
+
+    assert quality is not None
+    assert quality.macro_f1_20ms == pytest.approx(0.8)
+    assert quality.phase_abs_ms == 0.0
+    assert quality.p95_abs_ms == 0.0
+    assert quality.passes is True
+
+
+def test_reference_phase_is_absolute_signed_median_and_does_not_treat_jitter_as_offset():
+    reference = ReferenceChart(
+        key_mode=4,
+        difficulty="NORMAL",
+        sections={"verse": (100, 200, 300, 400)},
+    )
+
+    quality = evaluate_reference(reference, (120, 180, 320, 380))
+
+    assert quality is not None
+    assert quality.macro_f1_20ms == 1.0
+    assert quality.phase_abs_ms == 0.0
+    assert quality.p95_abs_ms == 20.0
+    assert quality.passes is True
+
+
+def test_reference_phase_rejects_a_constant_offset_above_fifteen_ms():
+    reference = ReferenceChart(
+        key_mode=4,
+        difficulty="NORMAL",
+        sections={"verse": (100, 200, 300, 400, 500)},
+    )
+
+    quality = evaluate_reference(reference, (120, 220, 320, 420, 480))
+
+    assert quality is not None
+    assert quality.macro_f1_20ms == 1.0
+    assert quality.phase_abs_ms == 20.0
+    assert quality.p95_abs_ms == 20.0
+    assert quality.passes is False
+
+
+def test_missing_reference_is_reported_as_unavailable():
+    assert evaluate_reference(None, (100, 200)) is None
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda payload: payload.update(version=2), "version"),
+        (
+            lambda payload: payload["charts"].append(dict(payload["charts"][0])),
+            "duplicate chart",
+        ),
+        (
+            lambda payload: payload["charts"][0]["sections"].append(
+                {"id": "verse", "onsetMs": [1300]}
+            ),
+            "duplicate section",
+        ),
+        (
+            lambda payload: payload["charts"][0]["sections"][0].update(onsetMs=[]),
+            "empty",
+        ),
+        (
+            lambda payload: payload["charts"][0]["sections"][0].update(
+                onsetMs=[100, -1, 300]
+            ),
+            "non-negative",
+        ),
+        (
+            lambda payload: payload["charts"][0]["sections"][0].update(
+                onsetMs=[100, 300, 200]
+            ),
+            "sorted",
+        ),
+    ],
+)
+def test_reference_loader_rejects_invalid_contracts(tmp_path, mutate, message):
+    payload = _valid_reference_payload()
+    mutate(payload)
+
+    with pytest.raises(ValueError, match=message):
+        load_reference_onsets(_write_reference(tmp_path, payload))
 
 
 def test_piecewise_fit_splits_a_real_tempo_change_at_a_downbeat():

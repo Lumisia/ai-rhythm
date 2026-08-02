@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -60,3 +61,59 @@ def test_bench_cli_is_exposed():
     result = runner.invoke(app, ["bench", "--help"])
     assert result.exit_code == 0
     assert "--generator" in result.output
+
+
+def test_generate_cli_passes_human_reference_onsets_to_pipeline(monkeypatch, tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    reference = tmp_path / "reference.json"
+    reference.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def succeed(options):
+        captured["options"] = options
+        return SimpleNamespace(manifest_path=tmp_path / "manifest.json")
+
+    monkeypatch.setattr("chart_worker.cli.run_pipeline", succeed)
+    result = runner.invoke(
+        app,
+        [
+            "generate",
+            str(source),
+            "--out",
+            str(tmp_path / "run"),
+            "--reference-onsets",
+            str(reference),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["options"].reference_onsets_path == reference
+
+
+def test_bench_cli_passes_human_reference_onsets_to_pipeline(monkeypatch, tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    reference = tmp_path / "reference.json"
+    reference.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def succeed(options):
+        captured["options"] = options
+        return SimpleNamespace(report_path=tmp_path / "benchmark-report.json")
+
+    monkeypatch.setattr("chart_worker.cli.run_benchmark", succeed)
+    result = runner.invoke(
+        app,
+        [
+            "bench",
+            str(source),
+            "--out",
+            str(tmp_path / "run"),
+            "--reference-onsets",
+            str(reference),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["options"].reference_onsets_path == reference

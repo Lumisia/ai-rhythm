@@ -5,12 +5,20 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from shutil import copyfile
 from time import perf_counter_ns
 from typing import Literal
 from uuid import UUID, uuid4
 
 from chart_worker.analysis.snapshot import save_analysis_snapshot
+from chart_worker.analysis.timing import (
+    ReferenceChart,
+    ReferenceQuality,
+    evaluate_reference,
+    load_reference_onsets,
+)
 from chart_worker.config import WorkerConfig, load_config
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
 from chart_worker.schema.playtest_run import (
@@ -111,10 +119,13 @@ class PipelineOptions:
     seed: int = 0
     worker_version: str = "local"
     overwrite: bool = False
+    reference_onsets_path: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", Path(self.source))
         object.__setattr__(self, "output_dir", Path(self.output_dir))
+        if self.reference_onsets_path is not None:
+            object.__setattr__(self, "reference_onsets_path", Path(self.reference_onsets_path))
         if not self.title.strip():
             raise ValueError("title must not be empty")
         if self.generator not in ("fake", "mapperatorinator"):
@@ -160,11 +171,40 @@ def _elapsed_ms(start_ns: int) -> int:
     return max(0, round((perf_counter_ns() - start_ns) / 1_000_000))
 
 
+def _load_and_copy_references(
+    source: Path | None,
+    run_dir: Path,
+) -> dict[tuple[int, str], ReferenceChart]:
+    if source is None:
+        return {}
+    resolved_source = source.resolve()
+    if not resolved_source.is_file():
+        raise ValueError(f"reference onset file does not exist: {source}")
+    references = load_reference_onsets(resolved_source)
+    destination = (run_dir / "analysis" / "reference-onsets-v1.json").resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if resolved_source != destination:
+        copyfile(resolved_source, destination)
+    return references
+
+
+def _reference_payload(quality: ReferenceQuality | None) -> dict[str, object]:
+    if quality is None:
+        return {"status": "UNAVAILABLE"}
+    return {
+        "status": "PASS" if quality.passes else "FAIL",
+        "macroF1At20Ms": quality.macro_f1_20ms,
+        "phaseAbsMs": quality.phase_abs_ms,
+        "p95AbsMs": quality.p95_abs_ms,
+    }
+
+
 def _generation_report(
     options: PipelineOptions,
     run_id: UUID,
     elapsed: dict[str, int],
     charts: tuple[PostprocessedVariant, ...],
+    reference_quality: dict[tuple[int, str], ReferenceQuality | None],
 ) -> dict[str, object]:
     return {
         "runId": str(run_id),
@@ -182,6 +222,11 @@ def _generation_report(
                 "removedCount": result.reports.difficulty.removed_count,
                 "playabilityRecoveredCount": result.reports.playability.recovered_count,
                 "playabilityDeletedCount": result.reports.playability.deleted_count,
+                "referenceAccuracy": _reference_payload(
+                    reference_quality[
+                        (result.document.key_mode, result.document.difficulty)
+                    ]
+                ),
             }
             for result in charts
         ],
@@ -195,6 +240,7 @@ def run_pipeline(
 ) -> PipelineResult:
     dependencies = dependencies or PipelineDependencies()
     run_dir = _prepare_run_dir(options)
+    references = _load_and_copy_references(options.reference_onsets_path, run_dir)
     run_id = dependencies.new_run_id()
     elapsed: dict[str, int] = {}
 
@@ -235,16 +281,49 @@ def run_pipeline(
     )
     elapsed["postprocess"] = _elapsed_ms(started)
 
+    reference_quality = {
+        (chart.document.key_mode, chart.document.difficulty): evaluate_reference(
+            references.get((chart.document.key_mode, chart.document.difficulty)),
+            tuple(sorted({note.time_ms for note in chart.document.notes})),
+        )
+        for chart in charts
+    }
+    generated_by_combo = {
+        (variant.key_mode, variant.difficulty): variant for variant in generated
+    }
+    chart_by_combo = {
+        (chart.document.key_mode, chart.document.difficulty): chart for chart in charts
+    }
+
     report_path = run_dir / "generation-report.json"
     report_path.write_text(
         json.dumps(
-            _generation_report(options, run_id, elapsed, charts),
+            _generation_report(options, run_id, elapsed, charts, reference_quality),
             ensure_ascii=False,
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
+    failed_references = [
+        {
+            "key_mode": key_mode,
+            "difficulty": difficulty,
+            "seed": generated_by_combo[(key_mode, difficulty)].generated.seed,
+            "timing_source": analysis.timing_candidate.source.value,
+            "failure_metrics": _reference_payload(quality),
+            "raw_osu_path": str(generated_by_combo[(key_mode, difficulty)].raw_osu_path),
+            "chart_path": str(chart_by_combo[(key_mode, difficulty)].path),
+        }
+        for (key_mode, difficulty), quality in reference_quality.items()
+        if quality is not None and not quality.passes
+    ]
+    if failed_references:
+        raise WorkerError(
+            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+            "the first chart candidate failed human reference accuracy",
+            context={"candidates": failed_references},
+        )
     manifest = PlaytestRunManifest(
         run_id=run_id,
         title=options.title,

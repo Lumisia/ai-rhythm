@@ -50,6 +50,16 @@ def generate(
         typer.Option("--keysounds/--no-keysounds"),
     ] = False,
     overwrite: Annotated[bool, typer.Option("--overwrite")] = False,
+    reference_onsets: Annotated[
+        Path | None,
+        typer.Option(
+            "--reference-onsets",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
 ) -> None:
     """SOURCE에서 로컬 플레이테스트용 12개 채보를 생성한다."""
     try:
@@ -62,6 +72,7 @@ def generate(
                 keysounds=keysounds,
                 seed=seed,
                 overwrite=overwrite,
+                reference_onsets_path=reference_onsets,
             )
         )
     except WorkerError as error:
@@ -121,6 +132,16 @@ def bench(
         bool,
         typer.Option("--keysounds/--no-keysounds"),
     ] = False,
+    reference_onsets: Annotated[
+        Path | None,
+        typer.Option(
+            "--reference-onsets",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
 ) -> None:
     """12개 채보를 생성하고 benchmark-report.json을 기록한다."""
     try:
@@ -132,6 +153,7 @@ def bench(
                 generator=generator.value,
                 keysounds=keysounds,
                 seed=seed,
+                reference_onsets_path=reference_onsets,
             )
         )
     except WorkerError as error:
