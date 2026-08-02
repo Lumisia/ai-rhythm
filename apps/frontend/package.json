@@ -1,0 +1,31 @@
+{
+  "name": "@ai-rhythm/local-playtester",
+  "version": "0.1.0",
+  "private": true,
+  "description": "로컬 chart-v1 수동 플레이 및 리뷰 도구",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "type": "module",
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "phaser": "^4.2.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.1.2",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "^29.1.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+}

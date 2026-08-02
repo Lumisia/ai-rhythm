@@ -1,0 +1,344 @@
+:root {
+  color: #dce3e8;
+  background: #11151d;
+  font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --ink: #dce3e8;
+  --muted: #8e98a6;
+  --smoked-navy: #151923;
+  --meter-slate: #252b38;
+  --timing-amber: #e2b75b;
+  --signal-mint: #78cbb8;
+  --fault-coral: #e27268;
+  --hairline: #38404e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: #11151d;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+a {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--signal-mint);
+  outline-offset: 4px;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 100vh;
+  overflow: hidden;
+  background-color: var(--smoked-navy);
+}
+
+.top-rail,
+.bottom-rail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 66px;
+  padding: 0 clamp(22px, 4vw, 64px);
+  border-color: var(--hairline);
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+}
+
+.top-rail {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.bottom-rail {
+  min-height: 48px;
+  border-top: 1px solid var(--hairline);
+}
+
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.wordmark-mark {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid var(--timing-amber);
+  color: var(--timing-amber);
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.system-state {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.state-lamp {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--signal-mint);
+  box-shadow: 0 0 0 3px rgba(120, 203, 184, 0.12);
+}
+
+.entry-panel {
+  display: grid;
+  grid-template-columns: minmax(56px, 0.4fr) minmax(420px, 1.45fr) minmax(270px, 0.75fr);
+  gap: clamp(28px, 5vw, 80px);
+  width: min(1240px, calc(100% - 48px));
+  margin: auto;
+  padding: clamp(44px, 8vh, 92px) 0;
+}
+
+.beat-spine {
+  display: grid;
+  grid-template-rows: auto repeat(13, 1fr) auto;
+  align-items: center;
+  min-height: 430px;
+  padding: 2px 0;
+  border-left: 1px solid var(--hairline);
+}
+
+.beat-tick {
+  display: block;
+  width: 14px;
+  height: 1px;
+  background: var(--hairline);
+}
+
+.beat-tick-major {
+  width: 32px;
+  background: var(--timing-amber);
+}
+
+.beat-index {
+  margin-left: 10px;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0.08em;
+}
+
+.entry-copy {
+  align-self: center;
+}
+
+.eyebrow,
+.panel-label {
+  margin: 0 0 22px;
+  color: var(--timing-amber);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.14em;
+}
+
+h1 {
+  max-width: 680px;
+  margin: 0;
+  color: var(--ink);
+  font-family: "Bahnschrift SemiCondensed", "Arial Narrow", sans-serif;
+  font-size: clamp(3.5rem, 7.4vw, 7.25rem);
+  font-weight: 600;
+  letter-spacing: -0.055em;
+  line-height: 0.9;
+  text-wrap: balance;
+}
+
+.lede {
+  max-width: 610px;
+  margin: 32px 0 36px;
+  color: #aeb7c1;
+  font-size: clamp(0.98rem, 1.5vw, 1.13rem);
+  line-height: 1.75;
+  word-break: keep-all;
+}
+
+.folder-button {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 18px;
+  align-items: center;
+  width: min(100%, 470px);
+  min-height: 66px;
+  padding: 0 22px;
+  border: 1px solid var(--timing-amber);
+  border-radius: 0;
+  color: #171a21;
+  background: var(--timing-amber);
+  cursor: pointer;
+  font-family: "Bahnschrift SemiCondensed", "Arial Narrow", sans-serif;
+  font-size: 1.08rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-align: left;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.folder-button:hover {
+  color: var(--timing-amber);
+  background: transparent;
+}
+
+.button-key {
+  padding-right: 18px;
+  border-right: 1px solid currentColor;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+}
+
+.button-arrow {
+  font-size: 1.3rem;
+}
+
+.privacy-note {
+  margin: 13px 0 0;
+  color: #6f7987;
+  font-size: 0.74rem;
+}
+
+.workflow-panel {
+  align-self: center;
+  padding: 28px;
+  border: 1px solid var(--hairline);
+  background: #191e29;
+}
+
+.workflow-panel ol {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.workflow-panel li {
+  display: grid;
+  grid-template-columns: 42px 1fr;
+  gap: 12px;
+  padding: 20px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.workflow-panel li:last-child {
+  border-bottom: 1px solid var(--hairline);
+}
+
+.step-index {
+  color: var(--signal-mint);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.7rem;
+}
+
+.workflow-panel strong,
+.workflow-panel small {
+  display: block;
+}
+
+.workflow-panel strong {
+  font-family: "Bahnschrift SemiCondensed", "Arial Narrow", sans-serif;
+  font-size: 1rem;
+  font-weight: 500;
+}
+
+.workflow-panel small {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.format-strip {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 24px;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.58rem;
+}
+
+.format-strip strong {
+  color: var(--ink);
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: 400;
+}
+
+.build-number {
+  color: var(--timing-amber);
+}
+
+@media (max-width: 850px) {
+  .entry-panel {
+    grid-template-columns: 32px 1fr;
+  }
+
+  .workflow-panel {
+    grid-column: 2;
+  }
+
+  .bottom-rail span:nth-child(2) {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  .top-rail,
+  .bottom-rail {
+    padding-inline: 18px;
+  }
+
+  .system-state,
+  .bottom-rail span:first-child {
+    display: none;
+  }
+
+  .entry-panel {
+    display: block;
+    width: min(100% - 36px, 520px);
+    padding: 52px 0;
+  }
+
+  .beat-spine {
+    display: none;
+  }
+
+  h1 {
+    font-size: clamp(3.4rem, 19vw, 5.3rem);
+  }
+
+  .workflow-panel {
+    margin-top: 48px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
