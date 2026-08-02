@@ -226,10 +226,25 @@ def test_reference_failure_retries_only_that_combination_and_selects_a_passing_s
         encoding="utf-8",
     )
 
-    class EmptyFirstNormalCandidate:
+    class MisalignedStructurallyBetterCandidates:
         def __call__(self, request, workdir):
             generated = FakeGenerator()(request, workdir)
             if request.key_mode == 4 and request.difficulty == "NORMAL" and request.seed == 1:
+                return GeneratedChart(
+                    notes=[
+                        dataclasses.replace(note, time_ms=note.time_ms + 100)
+                        for note in generated.notes
+                    ],
+                    key_mode=generated.key_mode,
+                    osu_text="",
+                    generator_name=generated.generator_name,
+                    seed=generated.seed,
+                )
+            if (
+                request.key_mode == 4
+                and request.difficulty == "NORMAL"
+                and request.seed == 20_001
+            ):
                 return GeneratedChart(
                     notes=[],
                     key_mode=generated.key_mode,
@@ -241,7 +256,7 @@ def test_reference_failure_retries_only_that_combination_and_selects_a_passing_s
 
     dependencies = dataclasses.replace(
         fake_dependencies(),
-        select_generator=lambda name, config: EmptyFirstNormalCandidate(),
+        select_generator=lambda name, config: MisalignedStructurallyBetterCandidates(),
     )
     output_dir = tmp_path / "run"
     result = run_pipeline(
@@ -257,8 +272,7 @@ def test_reference_failure_retries_only_that_combination_and_selects_a_passing_s
     normal_chart = ChartDocument.model_validate_json(
         (output_dir / "charts" / "4k-normal.chart.json").read_text(encoding="utf-8")
     )
-    assert normal_chart.generator.seed in (10_001, 20_001)
-    assert normal_chart.generator.seed != 1
+    assert normal_chart.generator.seed == 10_001
     assert (output_dir / "raw" / "4k-normal.osu").is_file()
     assert sorted((output_dir / "raw" / "candidates").glob("*/attempt-2")) == [
         output_dir / "raw" / "candidates" / "4k-normal" / "attempt-2"
@@ -267,6 +281,13 @@ def test_reference_failure_retries_only_that_combination_and_selects_a_passing_s
         result.manifest_path.read_text(encoding="utf-8")
     )
     assert all(Path(chart.path).parts[0] == "charts" for chart in manifest.charts)
+    report_charts = json.loads((output_dir / "generation-report.json").read_text())["charts"]
+    normal_report = next(
+        chart
+        for chart in report_charts
+        if chart["keyMode"] == 4 and chart["difficulty"] == "NORMAL"
+    )
+    assert normal_report["referenceAccuracy"]["status"] == "PASS"
 
 
 def test_fake_pipeline_never_enables_mapperatorinator_super_timing(tmp_path: Path):

@@ -346,6 +346,26 @@ def _requires_retry(
     return needs_retry(quality, difficulty=difficulty)
 
 
+def _select_pipeline_candidate(
+    evaluations: list[_CandidateEvaluation],
+    *,
+    difficulty: str,
+    generator: GeneratorName,
+) -> int:
+    eligible = list(range(len(evaluations)))
+    if generator == "fake":
+        eligible = [
+            index
+            for index in eligible
+            if evaluations[index].quality.reference_pass is not False
+        ]
+    selected_within_eligible = select_candidate_index(
+        tuple(evaluations[index].quality for index in eligible),
+        difficulty=difficulty,
+    )
+    return eligible[selected_within_eligible]
+
+
 def _generation_report(
     options: PipelineOptions,
     run_id: UUID,
@@ -515,9 +535,10 @@ def run_pipeline(
                 },
             )
 
-        selected_index = select_candidate_index(
-            tuple(evaluation.quality for evaluation in evaluations),
+        selected_index = _select_pipeline_candidate(
+            evaluations,
             difficulty=difficulty,
+            generator=options.generator,
         )
         selected = evaluations[selected_index]
         canonical_chart = dependencies.postprocess_variant(
