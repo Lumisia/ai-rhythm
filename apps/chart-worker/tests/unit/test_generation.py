@@ -10,7 +10,9 @@ from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator, synthesize_chart
 from chart_worker.generation.mapperatorinator import (
     MapperatorinatorGenerator,
+    MapperatorinatorTimingGenerator,
     build_command,
+    build_super_timing_command,
     find_generated_osu,
     inference_env,
 )
@@ -189,6 +191,26 @@ def test_command_pins_precision_over_the_config_default(config, timing_osu, tmp_
     assert _pairs(argv)["precision"] == PRECISION
 
 
+def test_super_timing_command_uses_twenty_pass_mode_without_a_reference_map(config, tmp_path):
+    """Super timing must ask V32 for timing only, not reuse Beat This timing."""
+    pairs = _pairs(build_super_timing_command(config, Path("game.flac"), tmp_path))
+
+    assert pairs["super_timing"] == "true"
+    assert pairs["output_type"] == "[TIMING]"
+    assert pairs["in_context"] == "[NONE]"
+    assert pairs["gamemode"] == "3"
+    assert pairs["precision"] == PRECISION
+    assert pairs["export_osz"] == "false"
+    assert "beatmap_path" not in pairs
+
+
+def test_super_timing_command_uses_absolute_audio_and_output_paths(config):
+    pairs = _pairs(build_super_timing_command(config, Path("storage/game.flac"), Path("out/timing")))
+
+    assert Path(pairs["audio_path"]).is_absolute()
+    assert Path(pairs["output_path"]).is_absolute()
+
+
 def test_command_selects_mania_and_the_requested_keycount(config, timing_osu, tmp_path):
     argv = build_command(config, _request(timing_osu, key_mode=7), tmp_path)
     pairs = _pairs(argv)
@@ -270,6 +292,26 @@ def test_generator_rejects_a_preexisting_osu(config, timing_osu, tmp_path):
     with pytest.raises(WorkerError, match="already contains") as caught:
         generator(_request(timing_osu), workdir)
     assert caught.value.code is ErrorCode.CHART_GENERATION_FAILED
+
+
+def test_super_timing_generator_returns_timing_osu_text_without_mania_parsing(config, tmp_path):
+    timing_only_osu = "osu file format v14\n\n[TimingPoints]\n120,731.707317,4,2,0,60,1,0\n"
+
+    result = MapperatorinatorTimingGenerator(
+        config=config, run=_fake_run(osu_text=timing_only_osu)
+    )(Path("game.flac"), tmp_path / "work")
+
+    assert result == timing_only_osu
+
+
+def test_super_timing_generator_maps_subprocess_failure(config, tmp_path):
+    generator = MapperatorinatorTimingGenerator(config=config, run=_fake_run(fail=True))
+
+    with pytest.raises(WorkerError) as caught:
+        generator(Path("game.flac"), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.CHART_GENERATION_FAILED
+    assert "cuda oom" in caught.value.context["stderr"]
 
 
 # --- subprocess 어댑터 -------------------------------------------------------

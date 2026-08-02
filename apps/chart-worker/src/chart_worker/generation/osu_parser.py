@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+from chart_worker.analysis.timing import TimingPoint
 from chart_worker.schema.note import Chart, NoteEvent
 from chart_worker.schema.types import KEY_MODES
 
@@ -45,6 +46,32 @@ def _key_value(lines: list[str]) -> dict[str, str]:
             key, _, value = line.partition(":")
             result[key.strip()] = value.strip()
     return result
+
+
+def parse_osu_timing(text: str) -> tuple[TimingPoint, ...]:
+    """Read uninherited timing points without requiring a playable mania map."""
+    points: list[TimingPoint] = []
+    for line in _sections(text).get("TimingPoints", []):
+        parts = line.split(",")
+        if len(parts) < 7 or parts[6].strip() != "1":
+            continue
+        try:
+            time_ms = round(float(parts[0]))
+            beat_length_ms = float(parts[1])
+            meter = int(float(parts[2]))
+        except ValueError as error:
+            raise ValueError(f"malformed TimingPoint: {line!r}") from error
+        if beat_length_ms <= 0 or meter <= 0:
+            raise ValueError(f"malformed TimingPoint: {line!r}")
+        points.append(
+            TimingPoint(
+                time_ms=time_ms,
+                bpm=60_000.0 / beat_length_ms,
+                meter=meter,
+                start_beat_index=None,
+            )
+        )
+    return tuple(sorted(points, key=lambda point: point.time_ms))
 
 
 def parse_osu_mania(text: str) -> OsuBeatmap:

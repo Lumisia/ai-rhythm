@@ -29,6 +29,8 @@ def test_every_error_code_has_a_disposition():
         (ErrorCode.CHART_OSU_PARSE_FAILED, Disposition.FINAL),
         (ErrorCode.CHART_VALIDATION_FAILED, Disposition.FINAL),
         (ErrorCode.CHART_TIMING_INVARIANT_VIOLATED, Disposition.FINAL_ALERT),
+        (ErrorCode.CHART_TIMING_CANDIDATE_FAILED, Disposition.RETRYABLE),
+        (ErrorCode.CHART_TIMING_REVIEW_REQUIRED, Disposition.FINAL_ALERT),
         (ErrorCode.ASSET_HASH_MISMATCH, Disposition.FINAL_ALERT),
         (ErrorCode.CHART_TARGET_RATING_UNREACHABLE, Disposition.WARN),
         (ErrorCode.LEASE_EXPIRED, Disposition.RETRYABLE),

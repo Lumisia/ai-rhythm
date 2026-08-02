@@ -116,6 +116,31 @@ def build_command(
     return argv
 
 
+def build_super_timing_command(
+    config: WorkerConfig,
+    audio_path: Path,
+    output_dir: Path,
+) -> list[str]:
+    """Build the V32 timing-only inference command without a reference map."""
+    if config.mapperatorinator_python is None or config.mapperatorinator_home is None:
+        raise ValueError("mapperatorinator_python and mapperatorinator_home must be configured")
+
+    return [
+        str(_absolute(config.mapperatorinator_python)),
+        INFERENCE_SCRIPT,
+        "-cn",
+        CONFIG_NAME,
+        f"audio_path={_absolute(audio_path)}",
+        f"output_path={_absolute(output_dir)}",
+        f"gamemode={GAMEMODE_MANIA}",
+        f"precision={config.mapperatorinator_precision or PRECISION}",
+        "export_osz=false",
+        "output_type=[TIMING]",
+        "in_context=[NONE]",
+        "super_timing=true",
+    ]
+
+
 def _require_clean_output_dir(output_dir: Path) -> None:
     """이전 실행의 .osu 를 이번 실행 결과로 오인하지 않게 한다."""
     existing = sorted(output_dir.rglob("*.osu"))
@@ -194,3 +219,31 @@ class MapperatorinatorGenerator:
             generator_name="mapperatorinator-v32",
             seed=request.seed,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class MapperatorinatorTimingGenerator:
+    """Run V32 super timing and return its timing-only .osu response verbatim."""
+
+    config: WorkerConfig
+    run: RunCommand | None = None
+
+    def __call__(self, audio_path: Path, workdir: Path) -> str:
+        workdir.mkdir(parents=True, exist_ok=True)
+        _require_clean_output_dir(workdir)
+        run = self.run or CommandRunner(
+            shared_bin_dir=self.config.ffmpeg_shared_bin_dir,
+            timeout_sec=1800.0,
+            cwd=self.config.mapperatorinator_home,
+            env=inference_env(),
+        )
+        argv = build_super_timing_command(self.config, audio_path, workdir)
+        try:
+            run(argv)
+        except CommandError as error:
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                f"super timing inference failed: {error}",
+                context={"stderr": error.stderr[-2000:]},
+            ) from error
+        return find_generated_osu(workdir).read_text(encoding="utf-8-sig")
