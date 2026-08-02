@@ -128,6 +128,12 @@ def test_timing_osu_carries_one_uninherited_point(timing_osu):
     assert beatmap.bpm_events[0].bpm == pytest.approx(BPM, abs=0.01)
 
 
+def test_timing_osu_contains_fields_required_by_mapperatorinator_slider(timing_osu):
+    text = timing_osu.read_text(encoding="utf-8")
+    assert "Creator:ai-rhythm" in text
+    assert "HPDrainRate:5" in text
+
+
 def test_timing_osu_starts_at_the_first_downbeat():
     grid = build_beat_grid(np.arange(16) * 0.5 + 1.0, (np.arange(16) * 0.5 + 1.0)[::4])
     text = beat_grid_to_timing_osu(grid, audio_filename="a.flac")

@@ -15,6 +15,7 @@ def beat_grid_to_timing_osu(
     audio_filename: str,
     title: str = "timing",
     artist: str = "ai-rhythm",
+    creator: str = "ai-rhythm",
 ) -> str:
     """비트 격자를 uninherited 타이밍 포인트 하나짜리 .osu 로 만든다.
 
@@ -44,9 +45,11 @@ def beat_grid_to_timing_osu(
             "[Metadata]",
             f"Title:{title}",
             f"Artist:{artist}",
+            f"Creator:{creator}",
             "Version:timing",
             "",
             "[Difficulty]",
+            "HPDrainRate:5",
             "CircleSize:4",
             "OverallDifficulty:8",
             "",
