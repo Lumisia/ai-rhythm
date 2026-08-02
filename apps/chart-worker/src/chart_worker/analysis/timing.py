@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -118,12 +119,24 @@ def _fit_segment(beat_ms: tuple[int, ...], start: int, end: int) -> _Segment:
     )
 
 
+def _exceeds_error_limits(p95_abs_ms: float, max_abs_ms: float) -> bool:
+    return p95_abs_ms > P95_LIMIT_MS or max_abs_ms > MAX_LIMIT_MS
+
+
+def _sse_improvement_is_sufficient(unsplit_sse: float, split_sse: float) -> bool:
+    return unsplit_sse > 0 and (unsplit_sse - split_sse) / unsplit_sse >= MIN_SSE_IMPROVEMENT
+
+
+def _bps_are_mergeable(first_bpm: float, second_bpm: float) -> bool:
+    return abs(Decimal(str(second_bpm)) - Decimal(str(first_bpm))) * 200 < Decimal(str(first_bpm))
+
+
 def _split_segment(
     beat_ms: tuple[int, ...],
     downbeat_indices: tuple[int, ...],
     segment: _Segment,
 ) -> tuple[_Segment, _Segment] | None:
-    if segment.p95_abs_ms <= P95_LIMIT_MS and segment.max_abs_ms <= MAX_LIMIT_MS:
+    if not _exceeds_error_limits(segment.p95_abs_ms, segment.max_abs_ms):
         return None
 
     candidates: list[tuple[float, _Segment, _Segment]] = []
@@ -135,12 +148,11 @@ def _split_segment(
         left = _fit_segment(beat_ms, segment.start, split_index)
         right = _fit_segment(beat_ms, split_index, segment.end)
         candidates.append((left.sse + right.sse, left, right))
-    if not candidates or segment.sse == 0:
+    if not candidates:
         return None
 
     split_sse, left, right = min(candidates, key=lambda candidate: candidate[0])
-    improvement = (segment.sse - split_sse) / segment.sse
-    if improvement < MIN_SSE_IMPROVEMENT:
+    if not _sse_improvement_is_sufficient(segment.sse, split_sse):
         return None
     return left, right
 
@@ -148,7 +160,7 @@ def _split_segment(
 def _merge_adjacent(beat_ms: tuple[int, ...], segments: list[_Segment]) -> list[_Segment]:
     merged: list[_Segment] = []
     for segment in segments:
-        if merged and abs(segment.bpm - merged[-1].bpm) / merged[-1].bpm < 0.005:
+        if merged and _bps_are_mergeable(merged[-1].bpm, segment.bpm):
             previous = merged.pop()
             merged.append(_fit_segment(beat_ms, previous.start, segment.end))
         else:
