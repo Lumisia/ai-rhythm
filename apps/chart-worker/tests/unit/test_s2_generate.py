@@ -76,7 +76,9 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
     assert len(set(workdirs)) == 12
     assert all(request.timing_osu_path == analysis.timing_osu_path for request in requests)
     assert all(request.duration_ms == 2_000 for request in requests)
-    assert all(parse_osu_file(variant.raw_osu_path).key_mode == variant.key_mode for variant in variants)
+    assert all(
+        parse_osu_file(variant.raw_osu_path).key_mode == variant.key_mode for variant in variants
+    )
 
 
 def test_run_generation_preserves_generator_osu_text(tmp_path: Path):

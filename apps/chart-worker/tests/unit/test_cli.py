@@ -43,3 +43,20 @@ def test_generate_cli_writes_worker_error_as_json(monkeypatch, tmp_path: Path):
         "message": "generator stopped",
         "context": {"key_mode": 4},
     }
+
+
+def test_postprocess_cli_rejects_the_input_directory_as_output(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    result = runner.invoke(
+        app,
+        ["postprocess", str(run_dir), "--out", str(run_dir)],
+    )
+    assert result.exit_code == 2
+    assert "must be different" in result.output
+
+
+def test_bench_cli_is_exposed():
+    result = runner.invoke(app, ["bench", "--help"])
+    assert result.exit_code == 0
+    assert "--generator" in result.output

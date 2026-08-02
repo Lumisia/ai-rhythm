@@ -22,9 +22,7 @@ def run_generation(
     offset_ms = analysis.beat_grid.beat_ms[0]
 
     for index, (key_mode, difficulty) in enumerate(
-        (key_mode, difficulty)
-        for key_mode in KEY_MODES
-        for difficulty in DIFFICULTIES
+        (key_mode, difficulty) for key_mode in KEY_MODES for difficulty in DIFFICULTIES
     ):
         request = GenerationRequest(
             audio_path=analysis.normalized.path,

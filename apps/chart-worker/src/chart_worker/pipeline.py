@@ -9,6 +9,7 @@ from time import perf_counter_ns
 from typing import Literal
 from uuid import UUID, uuid4
 
+from chart_worker.analysis.snapshot import save_analysis_snapshot
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
@@ -187,6 +188,7 @@ def run_pipeline(
 
     started = perf_counter_ns()
     analysis = dependencies.analysis(options.source.resolve(), run_dir, dependencies.config)
+    save_analysis_snapshot(analysis, run_dir)
     elapsed["analysis"] = _elapsed_ms(started)
 
     started = perf_counter_ns()

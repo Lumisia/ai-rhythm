@@ -95,13 +95,11 @@ def test_postprocess_keeps_times_and_writes_a_valid_camel_case_chart(tmp_path: P
 
 def test_postprocess_ids_are_deterministic_for_the_same_build(tmp_path: Path):
     analysis, generated, stems, _ = _inputs(tmp_path)
-    first = run_postprocess(
-        analysis, (generated,), stems, tmp_path, worker_version="same-build"
-    )[0]
+    first = run_postprocess(analysis, (generated,), stems, tmp_path, worker_version="same-build")[0]
     first_id = first.document.chart_id
-    second = run_postprocess(
-        analysis, (generated,), stems, tmp_path, worker_version="same-build"
-    )[0]
+    second = run_postprocess(analysis, (generated,), stems, tmp_path, worker_version="same-build")[
+        0
+    ]
     assert second.document.chart_id == first_id
 
 
@@ -115,8 +113,8 @@ def test_postprocess_uses_only_unmatched_drum_onsets_for_autoplay(tmp_path: Path
         keysound_manifest=None,
         keysound_manifest_path=tmp_path / "keysound-manifest.json",
     )
-    result = run_postprocess(
-        analysis, (generated,), stems, tmp_path, worker_version="test-build"
-    )[0]
+    result = run_postprocess(analysis, (generated,), stems, tmp_path, worker_version="test-build")[
+        0
+    ]
     assert result.document.auto_play_onsets == [900]
     assert result.document.metrics.drum_coverage == 0.5

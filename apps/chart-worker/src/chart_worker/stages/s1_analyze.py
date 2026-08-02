@@ -2,7 +2,6 @@
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 from chart_worker.analysis.audio_io import AudioSignal, load_audio
 from chart_worker.analysis.beat import BeatBackend, analyze_beats, beat_this_backend
