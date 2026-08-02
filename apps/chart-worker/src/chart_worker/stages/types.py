@@ -8,6 +8,8 @@ from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
+from chart_worker.schema.keysound import KeysoundManifest
+from chart_worker.schema.playtest_run import AudioFileRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,3 +28,13 @@ class GeneratedVariant:
     requested_star: float
     raw_osu_path: Path
     generated: GeneratedChart
+
+
+@dataclass(frozen=True, slots=True)
+class StemStageResult:
+    game_ref: AudioFileRef
+    no_drums_ref: AudioFileRef | None
+    keys_ref: AudioFileRef | None
+    drum_onsets: tuple[int, ...]
+    keysound_manifest: KeysoundManifest | None
+    keysound_manifest_path: Path | None
