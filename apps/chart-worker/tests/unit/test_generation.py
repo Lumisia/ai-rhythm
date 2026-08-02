@@ -21,7 +21,7 @@ from chart_worker.generation.params import (
     REQUESTED_STAR,
     GenerationRequest,
 )
-from chart_worker.generation.timing_osu import beat_grid_to_timing_osu
+from chart_worker.generation.timing_osu import beat_grid_to_timing_osu, timing_points_to_osu
 from chart_worker.rating.project_rating import TARGET_RATING
 
 BPM = 120.0
@@ -119,7 +119,7 @@ def test_matching_counts_pass_with_guidance():
 # --- 타이밍 .osu -------------------------------------------------------------
 
 
-def test_timing_osu_carries_one_uninherited_point(timing_osu):
+def test_timing_osu_carries_piecewise_uninherited_points(timing_osu):
     from chart_worker.generation.osu_parser import parse_osu_file
 
     beatmap = parse_osu_file(timing_osu)
@@ -140,6 +140,32 @@ def test_timing_osu_starts_at_the_first_downbeat():
     text = beat_grid_to_timing_osu(grid, audio_filename="a.flac")
     offset = text.split("[TimingPoints]\n")[1].split(",")[0]
     assert int(offset) == grid.beat_ms[0]
+
+
+def test_timing_osu_uses_a_downbeat_when_beats_precede_the_first_downbeat():
+    beats = np.arange(20) * 0.5 + 0.12
+    grid = build_beat_grid(beats, beats[2::4])
+
+    text = beat_grid_to_timing_osu(grid, audio_filename="a.flac")
+
+    offset = text.split("[TimingPoints]\n")[1].split(",")[0]
+    assert int(offset) == grid.beat_ms[2]
+
+
+def test_timing_points_osu_keeps_each_measured_downbeat_offset():
+    from chart_worker.analysis.timing import TimingPoint
+
+    text = timing_points_to_osu(
+        (
+            TimingPoint(time_ms=120, bpm=120.0, meter=4, start_beat_index=0),
+            TimingPoint(time_ms=16_120, bpm=100.0, meter=4, start_beat_index=32),
+        ),
+        audio_filename="a.flac",
+        title="song",
+    )
+
+    timing_lines = text.split("[TimingPoints]\n")[1].split("\n\n")[0].splitlines()
+    assert timing_lines == ["120,500.000000,4,2,0,60,1,0", "16120,600.000000,4,2,0,60,1,0"]
 
 
 def test_timing_osu_needs_a_grid():

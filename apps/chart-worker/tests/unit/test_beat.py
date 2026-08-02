@@ -153,12 +153,16 @@ def test_grid_needs_two_beats():
         build_beat_grid(np.array([1.0]), np.array([]))
 
 
-def test_bpm_events_start_at_zero_with_a_single_entry():
-    grid = build_beat_grid(_beats(16), _beats(16)[::4])
+def test_bpm_events_start_at_zero_and_keep_later_tempo_changes():
+    first = np.arange(32) * 0.5
+    second = first[-1] + np.arange(1, 33) * 0.6
+    grid = build_beat_grid(np.concatenate([first, second]), np.concatenate([first, second])[::4])
     events = bpm_events_of(grid)
-    assert len(events) == 1
+    assert len(events) == 2
     assert events[0].time_ms == 0
-    assert events[0].bpm == grid.bpm
+    assert events[0].bpm == pytest.approx(120.0, abs=0.05)
+    assert events[1].time_ms == grid.beat_ms[32]
+    assert events[1].bpm == pytest.approx(100.0, abs=0.05)
 
 
 def test_analyze_beats_passes_mono_audio_to_the_backend():

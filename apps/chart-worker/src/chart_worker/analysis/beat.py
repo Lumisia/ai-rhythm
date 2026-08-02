@@ -166,7 +166,10 @@ def bpm_events_of(grid: BeatGrid) -> list[BpmEvent]:
     없다. 추정으로 박으면 없는 변화를 만들어낸다. 드리프트는 BeatGrid 에
     기록해 두고 구간 분할은 미룬다.
     """
-    return [BpmEvent(time_ms=0, bpm=grid.bpm)]
+    from chart_worker.analysis.timing import bpm_events_of as timing_bpm_events_of
+    from chart_worker.analysis.timing import fit_piecewise_timing
+
+    return timing_bpm_events_of(fit_piecewise_timing(grid))
 
 
 def analyze_beats(signal: AudioSignal, *, backend: BeatBackend) -> BeatGrid:
