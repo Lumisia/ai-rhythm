@@ -47,10 +47,35 @@ def test_candidate_phase_difference_uses_one_to_one_matched_beats():
     assert candidate_phase_difference_ms(left, right) == pytest.approx(-60.0)
 
 
-def test_phase_coverage_requires_three_matches_and_eighty_percent_of_the_shorter_grid():
+def test_candidate_phase_difference_accepts_double_tempo_octave_equivalence():
+    beat_this = _candidate(
+        TimingSource.BEAT_THIS_PIECEWISE,
+        beats=(100, 600, 1_100, 1_600, 2_100),
+    )
+    super_timing = _candidate(
+        TimingSource.MAPPERATORINATOR_SUPER,
+        beats=(110, 360, 610, 860, 1_110, 1_360, 1_610, 1_860, 2_110, 2_360),
+    )
+
+    assert candidate_phase_difference_ms(beat_this, super_timing) == pytest.approx(-10.0)
+
+
+def test_phase_coverage_requires_three_matches_and_eighty_percent_of_same_rate_grids():
     assert not _has_sufficient_phase_coverage(matched_count=2, left_count=3, right_count=3)
     assert not _has_sufficient_phase_coverage(matched_count=3, left_count=5, right_count=5)
     assert _has_sufficient_phase_coverage(matched_count=4, left_count=5, right_count=5)
+
+
+def test_phase_coverage_accepts_exact_double_tempo_coverage_boundaries():
+    assert _has_sufficient_phase_coverage(matched_count=4, left_count=5, right_count=10)
+
+
+def test_phase_coverage_rejects_sparse_double_tempo_matches():
+    assert not _has_sufficient_phase_coverage(matched_count=3, left_count=5, right_count=10)
+
+
+def test_phase_coverage_rejects_sparse_non_octave_grid_ratio():
+    assert not _has_sufficient_phase_coverage(matched_count=10, left_count=10, right_count=22)
 
 
 def test_selects_beat_this_when_super_timing_is_unavailable_or_failed():

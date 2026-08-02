@@ -23,6 +23,9 @@ from chart_worker.stages.types import AnalysisStageResult
 _PHASE_MATCH_WINDOW_MS = 250
 _MIN_PHASE_MATCHES = 3
 _MIN_PHASE_COVERAGE = 0.80
+_MIN_OCTAVE_PHASE_COVERAGE = 0.40
+_TEMPO_OCTAVE_RATIO = 2.0
+_TEMPO_OCTAVE_REL_TOLERANCE = 0.05
 _F1_TIE_TOLERANCE = 1e-12
 
 
@@ -132,12 +135,21 @@ def run_timing_selection(
 
 
 def _has_sufficient_phase_coverage(*, matched_count: int, left_count: int, right_count: int) -> bool:
-    """Require three matches and 80% coverage of both projected-beat grids."""
-    compared_count = max(left_count, right_count)
+    """Require dense same-rate coverage or a bounded double-tempo equivalence."""
+    shorter_count = min(left_count, right_count)
+    longer_count = max(left_count, right_count)
+    if shorter_count <= 0 or matched_count < _MIN_PHASE_MATCHES:
+        return False
+    if matched_count / longer_count >= _MIN_PHASE_COVERAGE:
+        return True
     return (
-        compared_count > 0
-        and matched_count >= _MIN_PHASE_MATCHES
-        and matched_count / compared_count >= _MIN_PHASE_COVERAGE
+        math.isclose(
+            longer_count / shorter_count,
+            _TEMPO_OCTAVE_RATIO,
+            rel_tol=_TEMPO_OCTAVE_REL_TOLERANCE,
+        )
+        and matched_count / shorter_count >= _MIN_PHASE_COVERAGE
+        and matched_count / longer_count >= _MIN_OCTAVE_PHASE_COVERAGE
     )
 
 
