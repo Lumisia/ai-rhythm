@@ -89,6 +89,7 @@ def run_postprocess_variant(
         difficulty=variant.difficulty,
         duration_ms=analysis.normalized.duration_ms,
         beat_ms=beat_ms,
+        raise_on_remaining=write_output,
     )
     alignment = align_notes(playability.notes, stems.drum_onsets)
     metrics = build_chart_metrics(

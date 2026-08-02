@@ -118,6 +118,21 @@ def test_validate_raises_worker_error_when_recovery_is_disabled():
     assert caught.value.code is ErrorCode.CHART_VALIDATION_FAILED
 
 
+def test_validate_can_return_remaining_violations_for_candidate_diagnostics():
+    result = validate_and_recover(
+        [NoteEvent(500, 0), NoteEvent(500, 1), NoteEvent(500, 2)],
+        key_mode=4,
+        difficulty="EASY",
+        duration_ms=1_000,
+        beat_ms=500.0,
+        max_passes=0,
+        raise_on_remaining=False,
+    )
+
+    assert result.passes == 0
+    assert result.violations
+
+
 def test_recovery_handles_more_independent_violations_than_passes():
     notes = [
         NoteEvent(time_ms, lane, onset_strength=0.9 - lane * 0.1)

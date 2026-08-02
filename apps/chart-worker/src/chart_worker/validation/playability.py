@@ -357,6 +357,7 @@ def validate_and_recover(
     duration_ms: int,
     beat_ms: float,
     max_passes: int = MAX_RECOVERY_PASSES,
+    raise_on_remaining: bool = True,
 ) -> PlayabilityResult:
     _require_inputs(key_mode, difficulty, duration_ms, beat_ms)
     if max_passes < 0:
@@ -413,6 +414,8 @@ def validate_and_recover(
     )
     if not remaining:
         return PlayabilityResult(current, recovered, deleted, max_passes, ())
+    if not raise_on_remaining:
+        return PlayabilityResult(current, recovered, deleted, max_passes, tuple(remaining))
     raise WorkerError(
         ErrorCode.CHART_VALIDATION_FAILED,
         f"{len(remaining)} playability violations remain after {max_passes} passes",

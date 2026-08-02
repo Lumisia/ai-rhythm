@@ -14,12 +14,14 @@ from chart_worker.hashing import sha256_file
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.schema.note import NoteEvent
 from chart_worker.schema.playtest_run import AudioFileRef
+from chart_worker.stages import s4_postprocess
 from chart_worker.stages.s4_postprocess import (
     candidate_quality_of,
     run_postprocess,
     run_postprocess_variant,
 )
 from chart_worker.stages.types import AnalysisStageResult, GeneratedVariant, StemStageResult
+from chart_worker.validation.playability import PlayabilityResult
 from tests.support import timing_candidate
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -183,6 +185,38 @@ def test_candidate_evaluation_writes_only_attempt_artifact_until_selected(tmp_pa
     assert canonical.read_text(encoding="utf-8") == "winner"
     assert evaluated.path == generated.raw_osu_path.parent / "chart.json"
     assert evaluated.path.is_file()
+
+
+def test_candidate_diagnostics_are_non_strict_but_canonical_output_is_strict(
+    tmp_path: Path, monkeypatch
+):
+    analysis, generated, stems, _ = _inputs(tmp_path)
+    strict_values = []
+
+    def fake_validate(notes, **kwargs):
+        strict_values.append(kwargs["raise_on_remaining"])
+        return PlayabilityResult(notes, 0, 0, 1, ())
+
+    monkeypatch.setattr(s4_postprocess, "validate_and_recover", fake_validate)
+
+    run_postprocess_variant(
+        analysis,
+        generated,
+        stems,
+        tmp_path,
+        worker_version="test",
+        write_output=False,
+    )
+    run_postprocess_variant(
+        analysis,
+        generated,
+        stems,
+        tmp_path,
+        worker_version="test",
+        write_output=True,
+    )
+
+    assert strict_values == [False, True]
 
 
 def test_selected_candidate_is_the_only_variant_written_to_canonical_chart(tmp_path: Path):
