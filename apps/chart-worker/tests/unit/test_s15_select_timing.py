@@ -3,6 +3,7 @@ import pytest
 from chart_worker.analysis.timing import TimingCandidate, TimingPoint, TimingSource, TimingStatus
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.stages.s15_select_timing import (
+    _has_sufficient_phase_coverage,
     candidate_phase_difference_ms,
     select_timing_candidate,
 )
@@ -40,6 +41,12 @@ def test_candidate_phase_difference_uses_one_to_one_matched_beats():
     assert candidate_phase_difference_ms(left, right) == pytest.approx(-60.0)
 
 
+def test_phase_coverage_requires_three_matches_and_eighty_percent_of_the_shorter_grid():
+    assert not _has_sufficient_phase_coverage(matched_count=2, left_count=3, right_count=3)
+    assert not _has_sufficient_phase_coverage(matched_count=3, left_count=5, right_count=5)
+    assert _has_sufficient_phase_coverage(matched_count=4, left_count=5, right_count=5)
+
+
 def test_selects_beat_this_when_super_timing_is_unavailable_or_failed():
     beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE)
     failed = _candidate(TimingSource.MAPPERATORINATOR_SUPER, status=TimingStatus.FAIL)
@@ -57,6 +64,33 @@ def test_rejects_timing_candidates_that_disagree_by_more_than_fifty_ms():
 
     assert caught.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
     assert caught.value.context == {"phaseDifferenceMs": -51.0}
+
+
+def test_rejects_candidates_when_phase_matching_finds_no_common_beats():
+    """A 300ms phase shift at 60 BPM must not be mistaken for a zero offset."""
+    beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE, beats=(0, 1_000, 2_000))
+    super_timing = _candidate(TimingSource.MAPPERATORINATOR_SUPER, beats=(300, 1_300, 2_300))
+
+    with pytest.raises(WorkerError) as caught:
+        select_timing_candidate(beat_this, super_timing)
+
+    assert caught.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert caught.value.context["matchedBeatCount"] == 0
+
+
+def test_rejects_candidates_when_phase_matching_covers_too_little_of_a_grid():
+    beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE, beats=(0, 500, 1_000, 1_500, 2_000))
+    super_timing = _candidate(
+        TimingSource.MAPPERATORINATOR_SUPER,
+        beats=(0, 500, 1_000, 2_800, 3_300),
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        select_timing_candidate(beat_this, super_timing)
+
+    assert caught.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert caught.value.context["matchedBeatCount"] == 3
+    assert caught.value.context["coverage"] == 0.6
 
 
 def test_selects_the_only_candidate_that_passes_the_p95_gate():
@@ -83,6 +117,15 @@ def test_prefers_fewer_points_when_passing_f1_scores_are_within_two_percent():
     )
 
     assert select_timing_candidate(beat_this, super_timing) is super_timing
+
+
+def test_prefers_fewer_points_at_the_inclusive_two_percent_f1_boundary():
+    beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE, point_count=1, f1_20ms=0.90)
+    super_timing = _candidate(
+        TimingSource.MAPPERATORINATOR_SUPER, point_count=2, f1_20ms=0.92
+    )
+
+    assert select_timing_candidate(beat_this, super_timing) is beat_this
 
 
 def test_prefers_higher_f1_when_passing_scores_are_more_than_two_percent_apart():
