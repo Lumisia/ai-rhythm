@@ -148,9 +148,7 @@ def _one_pass(
                 if choice is None:
                     choice = best_lane(note, context, weights=weights, preference="ANY")
                 staying = (
-                    float("inf")
-                    if blocked
-                    else placement_cost(note, lane, context, weights).total
+                    float("inf") if blocked else placement_cost(note, lane, context, weights).total
                 )
                 # 레인 충돌은 예산과 무관하게 반드시 풀어야 한다.
                 # 같은 시각 같은 레인, 진행 중인 롱노트 위는 칠 수 없다.
@@ -208,9 +206,7 @@ def _relieve_side_holds(
     for violation in violations:
         hold_lane = violation.lanes[0]
         hold = next(
-            note
-            for note in notes
-            if note.time_ms == violation.time_ms and note.lane == hold_lane
+            note for note in notes if note.time_ms == violation.time_ms and note.lane == hold_lane
         )
         hand = hand_of(semantics[hold_lane])
         if hand is not None:
@@ -223,7 +219,7 @@ def _relieve_side_holds(
     moved = 0
     result: list[NoteEvent] = []
     # 약한 노트부터 옮긴다. 강한 타격은 모델이 고른 자리에 남긴다.
-    order = sorted(range(len(notes)), key=lambda i: (notes[i].onset_strength or 0.0))
+    order = sorted(range(len(notes)), key=lambda i: notes[i].onset_strength or 0.0)
     relocated: dict[int, int] = {}
     for position in order:
         note = notes[position]
@@ -248,9 +244,7 @@ def _relieve_side_holds(
         moved += 1
 
     result = [
-        dataclasses.replace(note, lane=relocated[position])
-        if position in relocated
-        else note
+        dataclasses.replace(note, lane=relocated[position]) if position in relocated else note
         for position, note in enumerate(notes)
     ]
     return sorted(result, key=lambda n: (n.time_ms, n.lane)), moved
@@ -324,14 +318,10 @@ def _moved_notes(notes: Chart) -> int:
     return sum(1 for note in notes if note.lane != note.origin_lane)
 
 
-def _violation_endpoints(
-    notes: Chart, violation: Violation
-) -> list[NoteEvent]:
+def _violation_endpoints(notes: Chart, violation: Violation) -> list[NoteEvent]:
     """잭 위반에 얽힌 두 노트. 뒤 노트와 그 앞의 같은 레인 노트다."""
     lane = violation.lanes[0]
-    later = next(
-        (n for n in notes if n.time_ms == violation.time_ms and n.lane == lane), None
-    )
+    later = next((n for n in notes if n.time_ms == violation.time_ms and n.lane == lane), None)
     earlier = max(
         (n for n in notes if n.lane == lane and n.time_ms < violation.time_ms),
         key=lambda n: n.time_ms,
@@ -353,9 +343,7 @@ def _drop_unfixable(notes: Chart, *, key_mode: int, difficulty: str) -> tuple[Ch
     while True:
         violations = [
             violation
-            for violation in check_lane_rules(
-                remaining, key_mode=key_mode, difficulty=difficulty
-            )
+            for violation in check_lane_rules(remaining, key_mode=key_mode, difficulty=difficulty)
             if violation.rule is Rule.S1_JACK_INTERVAL
         ]
         if not violations:

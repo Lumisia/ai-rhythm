@@ -142,12 +142,12 @@ def test_both_sides_at_once_is_split_at_easy():
 
 def test_center_with_both_sides_is_broken_up_below_expert():
     notes = _chart_with_side_jack(jack=0) + [
-        _tap(1000, CENTER), _tap(1000, SIDE_L), _tap(1000, SIDE_R)
+        _tap(1000, CENTER),
+        _tap(1000, SIDE_L),
+        _tap(1000, SIDE_R),
     ]
     result = _convert(notes, difficulty="HARD")
-    assert not [
-        v for v in result.remaining_violations if v.rule is Rule.C3_CENTER_WITH_BOTH_SIDES
-    ]
+    assert not [v for v in result.remaining_violations if v.rule is Rule.C3_CENTER_WITH_BOTH_SIDES]
 
 
 def test_side_hold_density_is_relieved_by_moving_to_the_other_hand():
@@ -288,9 +288,7 @@ def test_an_active_hold_is_not_a_chord_with_the_current_row():
         assert (tap.lane, result.moved_count) == (SIDE_R, 0), difficulty
 
 
-@pytest.mark.parametrize(
-    "strengths", [(0.1, 0.9, 0.2), (0.9, 0.1, 0.8), (0.5, 0.5, 0.5)]
-)
+@pytest.mark.parametrize("strengths", [(0.1, 0.9, 0.2), (0.9, 0.1, 0.8), (0.5, 0.5, 0.5)])
 def test_a_shared_endpoint_is_deleted_once(strengths):
     """연타가 셋이면 가운데 노트가 앞뒤 두 위반에 동시에 얽힌다."""
     notes = [

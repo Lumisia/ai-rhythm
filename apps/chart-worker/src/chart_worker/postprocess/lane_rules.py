@@ -128,9 +128,7 @@ def _require_difficulty(difficulty: str) -> None:
         raise ValueError(f"unsupported difficulty: {difficulty}")
 
 
-def check_jack_intervals(
-    notes: Chart, *, key_mode: int, difficulty: str
-) -> list[Violation]:
+def check_jack_intervals(notes: Chart, *, key_mode: int, difficulty: str) -> list[Violation]:
     """S1 — 같은 레인 연타가 손가락 한계보다 빠른지 본다.
 
     잭에만 적용된다. 다른 레인 노트와는 무관하므로 밀도 제한이 아니다.
@@ -161,9 +159,7 @@ def check_jack_intervals(
     return found
 
 
-def check_side_hold_density(
-    notes: Chart, *, key_mode: int, difficulty: str
-) -> list[Violation]:
+def check_side_hold_density(notes: Chart, *, key_mode: int, difficulty: str) -> list[Violation]:
     """S3 — 사이드 HOLD 를 잡은 손이 같은 시간에 얼마나 치는지 본다."""
     _require_difficulty(difficulty)
     semantics = lane_semantics(key_mode)
@@ -210,8 +206,7 @@ def check_both_sides(notes: Chart, *, key_mode: int, difficulty: str) -> list[Vi
         side_lanes = {
             semantics[note.lane]
             for note in row.notes
-            if semantics[note.lane]
-            in (LaneSemantic.SIDE_LEFT, LaneSemantic.SIDE_RIGHT)
+            if semantics[note.lane] in (LaneSemantic.SIDE_LEFT, LaneSemantic.SIDE_RIGHT)
         }
         if len(side_lanes) < 2:
             continue
@@ -243,9 +238,7 @@ def _is_accent(row) -> bool:
     )
 
 
-def check_center_combinations(
-    notes: Chart, *, key_mode: int, difficulty: str
-) -> list[Violation]:
+def check_center_combinations(notes: Chart, *, key_mode: int, difficulty: str) -> list[Violation]:
     """C3 — Space 와 양쪽 사이드가 겹치는 순간을 본다."""
     _require_difficulty(difficulty)
     semantics = lane_semantics(key_mode)

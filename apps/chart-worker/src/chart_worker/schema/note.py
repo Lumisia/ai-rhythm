@@ -35,9 +35,7 @@ class NoteEvent:
         object.__setattr__(self, "lane", coerce_int(self.lane, "lane"))
         object.__setattr__(self, "origin_lane", coerce_int(self.origin_lane, "origin_lane"))
         if self.duration_ms is not None:
-            object.__setattr__(
-                self, "duration_ms", coerce_int(self.duration_ms, "duration_ms")
-            )
+            object.__setattr__(self, "duration_ms", coerce_int(self.duration_ms, "duration_ms"))
         if self.time_ms < 0:
             raise ValueError("time_ms must be non-negative")
         if self.lane < 0:

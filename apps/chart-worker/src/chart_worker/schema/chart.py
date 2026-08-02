@@ -19,7 +19,7 @@ Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 BpmSource = Literal["BEAT_THIS", "MAPPERATORINATOR", "MANUAL"]
 
 
-class _CamelModel(BaseModel):
+class CamelModel(BaseModel):
     """JSON 은 camelCase, 파이썬은 snake_case 를 쓰는 공통 설정.
 
     extra="forbid" 는 오타 난 키를 조용히 버리지 않게 한다.
@@ -34,12 +34,12 @@ class _CamelModel(BaseModel):
     )
 
 
-class BpmEvent(_CamelModel):
+class BpmEvent(CamelModel):
     time_ms: int = Field(ge=0)
     bpm: float = Field(gt=0)
 
 
-class ChartNote(_CamelModel):
+class ChartNote(CamelModel):
     """직렬화된 노트.
 
     JSON 키는 `type` 이지만 파이썬 이름은 `NoteEvent.kind` 와 맞춘다.
@@ -65,7 +65,7 @@ class ChartNote(_CamelModel):
         return self.time_ms + (self.duration_ms or 0)
 
 
-class ChartMetrics(_CamelModel):
+class ChartMetrics(CamelModel):
     """곡 선택 화면과 분석이 함께 쓰는 측정값.
 
     후처리 파생 필드에 기본값을 주지 않는다. 0.0 을 기본값으로 두면
@@ -90,7 +90,7 @@ class ChartMetrics(_CamelModel):
     moved_note_ratio: float = Field(ge=0, le=1)
 
 
-class GeneratorInfo(_CamelModel):
+class GeneratorInfo(CamelModel):
     name: str = Field(min_length=1)
     version: str = Field(min_length=1)
     analysis_version: str = Field(min_length=1)
@@ -113,7 +113,7 @@ def notes_to_chart_notes(notes: Chart) -> list[ChartNote]:
     ]
 
 
-class ChartDocument(_CamelModel):
+class ChartDocument(CamelModel):
     schema_version: Literal[1] = SCHEMA_VERSION
     chart_id: UUID
     song_version_id: UUID
@@ -153,6 +153,7 @@ class ChartDocument(_CamelModel):
 
     def _check_notes(self) -> None:
         seen_ids: set[int] = set()
+        seen_keys: set[tuple[int, int]] = set()
         previous_key: tuple[int, int] | None = None
         hold_end_by_lane: dict[int, int] = {}
         for note in self.notes:
@@ -162,6 +163,9 @@ class ChartDocument(_CamelModel):
                 raise ValueError(f"duplicate note id {note.id}")
             seen_ids.add(note.id)
             key = (note.time_ms, note.lane)
+            if key in seen_keys:
+                raise ValueError(f"duplicate note at timeMs {note.time_ms}, lane {note.lane}")
+            seen_keys.add(key)
             if previous_key is not None and key < previous_key:
                 raise ValueError("notes must be sorted by (timeMs, lane)")
             previous_key = key

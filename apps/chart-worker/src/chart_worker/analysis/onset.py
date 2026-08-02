@@ -36,7 +36,9 @@ DOWNBEAT_WINDOW_MS = 50
 """Phase3 의 키음 어택 스냅 창과 같은 값. 창을 두 개 두면 판정이 갈린다."""
 
 
-def normalize_envelope(values: np.ndarray, *, percentile: float = NORMALIZATION_PERCENTILE) -> np.ndarray:
+def normalize_envelope(
+    values: np.ndarray, *, percentile: float = NORMALIZATION_PERCENTILE
+) -> np.ndarray:
     """분위수로 나누고 1.0 에서 자른다.
 
     원값은 곡마다 스케일이 다르다. solver 는 한 곡 안에서 비교하므로

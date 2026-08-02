@@ -61,9 +61,7 @@ def test_backoff_matches_attempt_limit():
 
 
 def test_error_carries_code_and_context():
-    error = WorkerError(
-        ErrorCode.AUDIO_TOO_LONG, "190s", context={"duration_ms": 190_000}
-    )
+    error = WorkerError(ErrorCode.AUDIO_TOO_LONG, "190s", context={"duration_ms": 190_000})
     assert error.code is ErrorCode.AUDIO_TOO_LONG
     assert error.context == {"duration_ms": 190_000}
     assert error.disposition is Disposition.FINAL

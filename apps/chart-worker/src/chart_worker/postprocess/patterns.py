@@ -167,9 +167,7 @@ def detect_chords(rows: list[Row]) -> list[PatternInstance]:
         if row.size < 2:
             continue
         kind = kinds.get(row.size, PatternKind.QUAD)
-        found.append(
-            PatternInstance(kind, row.time_ms, row.time_ms, row.lanes, row.size)
-        )
+        found.append(PatternInstance(kind, row.time_ms, row.time_ms, row.lanes, row.size))
     return found
 
 
@@ -387,16 +385,13 @@ def detect_trills(rows: list[Row], *, key_mode: int, beat_ms: float) -> list[Pat
                 continue
             end = index + 2
             while (
-                end < len(singles)
-                and singles[end].lanes[0] == (first, second)[end % 2 - index % 2]
+                end < len(singles) and singles[end].lanes[0] == (first, second)[end % 2 - index % 2]
             ):
                 end += 1
             length = end - index
             if length >= TRILL_MIN_NOTES:
                 same_hand = _hand_of(first, key_mode) == _hand_of(second, key_mode)
-                kind = (
-                    PatternKind.TRILL_ONE_HANDED if same_hand else PatternKind.TRILL_TWO_HANDED
-                )
+                kind = PatternKind.TRILL_ONE_HANDED if same_hand else PatternKind.TRILL_TWO_HANDED
                 found.append(
                     PatternInstance(
                         kind,
@@ -418,9 +413,11 @@ def detect_jumptrill(rows: list[Row]) -> list[PatternInstance]:
     index = 0
     while index + 2 < len(rows):
         window = rows[index : index + 3]
-        if all(row.size == 2 for row in window) and not (
-            set(window[0].lanes) & set(window[1].lanes)
-        ) and set(window[0].lanes) == set(window[2].lanes):
+        if (
+            all(row.size == 2 for row in window)
+            and not (set(window[0].lanes) & set(window[1].lanes))
+            and set(window[0].lanes) == set(window[2].lanes)
+        ):
             found.append(
                 PatternInstance(
                     PatternKind.JUMPTRILL,
@@ -571,9 +568,7 @@ def pattern_entropy(histogram: dict[PatternKind, int]) -> float:
         return 0.0
     return round(
         -sum(
-            (count / total) * math.log2(count / total)
-            for count in histogram.values()
-            if count > 0
+            (count / total) * math.log2(count / total) for count in histogram.values() if count > 0
         ),
         4,
     )

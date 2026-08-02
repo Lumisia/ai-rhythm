@@ -108,9 +108,7 @@ def test_another_lane_between_breaks_the_jack():
 
 
 def test_anchor_is_a_half_beat_lane_with_others_interleaved():
-    notes = _taps(
-        [(0, 0), (125, 1), (250, 0), (375, 2), (500, 0), (625, 1), (750, 0), (875, 3)]
-    )
+    notes = _taps([(0, 0), (125, 1), (250, 0), (375, 2), (500, 0), (625, 1), (750, 0), (875, 3)])
     assert PatternKind.ANCHOR in _kinds(notes)
 
 
@@ -304,7 +302,9 @@ def test_a_varied_chart_scores_higher_than_a_repetitive_one():
     varied = _taps(
         [(0, 0), (0, 1), (125, 2), (250, 3), (375, 2), (500, 1), (625, 0), (750, 1), (875, 2)]
     )
-    low = pattern_entropy(pattern_histogram(detect_patterns(repetitive, key_mode=4, beat_ms=BEAT_MS)))
+    low = pattern_entropy(
+        pattern_histogram(detect_patterns(repetitive, key_mode=4, beat_ms=BEAT_MS))
+    )
     high = pattern_entropy(pattern_histogram(detect_patterns(varied, key_mode=4, beat_ms=BEAT_MS)))
     assert high > low
 

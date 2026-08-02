@@ -105,7 +105,9 @@ def test_annotation_produces_a_usable_chart(struck_signal, backend):
     analysis = analyze_onsets(struck_signal, backend=backend)
     beats = np.arange(8) * 0.5
     grid = build_beat_grid(beats, beats[::4])
-    notes = [NoteEvent(time_ms=round(at * 1000), lane=index % 4) for index, at in enumerate(HIT_SEC)]
+    notes = [
+        NoteEvent(time_ms=round(at * 1000), lane=index % 4) for index, at in enumerate(HIT_SEC)
+    ]
 
     annotated = annotate_notes(notes, onsets=analysis, grid=grid)
     assert [note.time_ms for note in annotated] == [note.time_ms for note in notes]

@@ -88,9 +88,7 @@ def test_strength_is_sampled_at_the_note_time():
     assert analysis.strength_at(round(FRAME_MS * BAND_PEAK_FRAMES[1])) == 1.0
 
 
-@pytest.mark.parametrize(
-    ("frame", "expected"), list(zip(BAND_PEAK_FRAMES, ("LOW", "MID", "HIGH")))
-)
+@pytest.mark.parametrize(("frame", "expected"), list(zip(BAND_PEAK_FRAMES, ("LOW", "MID", "HIGH"))))
 def test_band_is_the_strongest_row(frame, expected):
     assert _analysis().band_at(round(FRAME_MS * frame)) == expected
 

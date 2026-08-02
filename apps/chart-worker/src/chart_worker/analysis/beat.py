@@ -143,9 +143,7 @@ def build_beat_grid(beat_sec: np.ndarray, downbeat_sec: np.ndarray) -> BeatGrid:
     interval = robust_interval_sec(raw)
     clean = dedupe_beats(raw, min_gap_sec=DEDUPE_RATIO * interval)
     bpm, residual = fit_bpm(clean)
-    downbeat_indices = snap_downbeats(
-        clean, downbeat_sec, tolerance_sec=DEDUPE_RATIO * interval
-    )
+    downbeat_indices = snap_downbeats(clean, downbeat_sec, tolerance_sec=DEDUPE_RATIO * interval)
     return BeatGrid(
         # tolist() 는 numpy 스칼라가 아니라 파이썬 int 를 준다.
         beat_ms=tuple(np.round(clean * 1000).astype(np.int64).tolist()),

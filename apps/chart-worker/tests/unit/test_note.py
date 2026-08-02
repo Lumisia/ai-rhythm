@@ -76,7 +76,10 @@ def test_numpy_origin_lane_sentinel_still_defaults_to_lane():
     [
         ({"time_ms": np.float64(1200.0), "lane": 0}, "time_ms"),
         ({"time_ms": 0, "lane": np.float32(1.0)}, "lane"),
-        ({"time_ms": 0, "lane": 0, "kind": "HOLD", "duration_ms": np.float64(400.0)}, "duration_ms"),
+        (
+            {"time_ms": 0, "lane": 0, "kind": "HOLD", "duration_ms": np.float64(400.0)},
+            "duration_ms",
+        ),
         ({"time_ms": np.bool_(True), "lane": 0}, "time_ms"),
     ],
 )

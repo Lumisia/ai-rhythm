@@ -5,6 +5,7 @@ from chart_worker.postprocess.difficulty_solver import (
     RATING_TOLERANCE,
     REMOVAL_BUDGET,
     Operation,
+    _jack_trim_candidates,
     musical_cost,
     solve_difficulty,
 )
@@ -166,6 +167,14 @@ def test_the_removal_budget_caps_the_damage():
     assert result.notes
 
 
+def test_custom_removal_budget_reports_exhaustion():
+    notes = _dense_chart(count=400, step=60)
+    result = _solve(notes, difficulty="EASY", budget=0.05)
+    assert not result.reached_target
+    assert result.removed_count == int(len(notes) * 0.05)
+    assert result.budget_exhausted
+
+
 def test_the_result_metrics_match_the_returned_chart():
     notes = _dense_chart()
     result = _solve(notes)
@@ -269,6 +278,19 @@ def test_no_operation_class_is_starved_by_an_earlier_one():
     fired = {name for name, count in result.operations.items() if count}
     assert Operation.JACK_TRIM.value in fired
     assert Operation.HOLD_TO_TAP.value in fired
+
+
+def test_jack_trim_ignores_non_consecutive_lane_repeats():
+    notes = [
+        NoteEvent(time_ms=time_ms, lane=lane)
+        for time_ms, lane in ((0, 0), (100, 1), (200, 0), (300, 1), (400, 0))
+    ]
+    assert list(_jack_trim_candidates(notes)) == []
+
+
+def test_jack_trim_keeps_only_the_first_two_consecutive_rows():
+    notes = [NoteEvent(time_ms=index * 100, lane=0) for index in range(4)]
+    assert [note.time_ms for note in _jack_trim_candidates(notes)] == [200, 300]
 
 
 def test_hold_conversion_survives_an_exhausted_removal_budget():

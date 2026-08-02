@@ -177,9 +177,7 @@ def test_rejects_note_outside_key_mode():
 
 
 def test_rejects_unsorted_notes():
-    notes = notes_to_chart_notes(
-        [NoteEvent(time_ms=0, lane=0), NoteEvent(time_ms=500, lane=1)]
-    )
+    notes = notes_to_chart_notes([NoteEvent(time_ms=0, lane=0), NoteEvent(time_ms=500, lane=1)])
     with pytest.raises(ValidationError, match="sorted"):
         _document(
             notes=list(reversed(notes)),
@@ -191,6 +189,12 @@ def test_rejects_duplicate_note_ids():
     note = ChartNote(id=1, lane=0, time_ms=0, type="TAP")
     with pytest.raises(ValidationError, match="duplicate note id"):
         _document(notes=[note, note], metrics=_metrics(note_count=2, hold_count=0))
+
+
+def test_rejects_two_notes_in_the_same_lane_at_the_same_time():
+    notes = notes_to_chart_notes([NoteEvent(time_ms=0, lane=0), NoteEvent(time_ms=0, lane=0)])
+    with pytest.raises(ValidationError, match="duplicate note"):
+        _document(notes=notes, metrics=_metrics(note_count=2, hold_count=0))
 
 
 def test_rejects_overlapping_holds_in_one_lane():

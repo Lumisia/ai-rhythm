@@ -104,6 +104,17 @@ def build_command(
     return argv
 
 
+def _require_clean_output_dir(output_dir: Path) -> None:
+    """이전 실행의 .osu 를 이번 실행 결과로 오인하지 않게 한다."""
+    existing = sorted(output_dir.rglob("*.osu"))
+    if existing:
+        raise WorkerError(
+            ErrorCode.CHART_GENERATION_FAILED,
+            "output directory already contains .osu files",
+            context={"files": [str(path) for path in existing]},
+        )
+
+
 def find_generated_osu(output_dir: Path) -> Path:
     """생성된 .osu 를 찾는다. 정확히 하나여야 한다."""
     produced = sorted(output_dir.rglob("*.osu"))
@@ -131,6 +142,7 @@ class MapperatorinatorGenerator:
 
     def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
         workdir.mkdir(parents=True, exist_ok=True)
+        _require_clean_output_dir(workdir)
         run = self.run or CommandRunner(
             shared_bin_dir=self.config.ffmpeg_shared_bin_dir,
             timeout_sec=1800.0,

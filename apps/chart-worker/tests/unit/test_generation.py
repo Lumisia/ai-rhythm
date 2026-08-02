@@ -182,7 +182,8 @@ def test_descriptors_are_written_as_hydra_lists(config, timing_osu, tmp_path):
 
 def test_seed_is_omitted_when_unset(config, timing_osu, tmp_path):
     assert not [
-        item for item in build_command(config, _request(timing_osu), tmp_path)
+        item
+        for item in build_command(config, _request(timing_osu), tmp_path)
         if item.startswith("seed=")
     ]
     seeded = build_command(config, _request(timing_osu, seed=7), tmp_path)
@@ -221,6 +222,21 @@ def test_several_osu_files_are_a_generation_failure(tmp_path):
     (tmp_path / "b.osu").write_text("y")
     with pytest.raises(WorkerError, match="exactly one"):
         find_generated_osu(tmp_path)
+
+
+def test_generator_rejects_a_preexisting_osu(config, timing_osu, tmp_path):
+    """이전 실행 파일 하나를 이번 실행의 결과로 오인하면 안 된다."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "old.osu").write_text(MINI_OSU, encoding="utf-8")
+
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=lambda argv: CommandResult(argv, 0, "", ""),
+    )
+    with pytest.raises(WorkerError, match="already contains") as caught:
+        generator(_request(timing_osu), workdir)
+    assert caught.value.code is ErrorCode.CHART_GENERATION_FAILED
 
 
 # --- subprocess 어댑터 -------------------------------------------------------

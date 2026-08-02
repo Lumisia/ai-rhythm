@@ -11,7 +11,6 @@ import dataclasses
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import StrEnum
-from itertools import pairwise
 
 from chart_worker.postprocess.patterns import rows_of
 from chart_worker.rating.project_rating import TARGET_RATING, RatingMetrics, measure_rating
@@ -66,6 +65,7 @@ class SolveResult:
     metrics: RatingMetrics
     target_rating: float
     removed_count: int
+    removal_allowance: int
     converted_count: int
     removed_ratio: float
     operations: dict[str, int]
@@ -76,7 +76,7 @@ class SolveResult:
 
     @property
     def budget_exhausted(self) -> bool:
-        return self.removed_ratio >= REMOVAL_BUDGET
+        return not self.reached_target and self.removed_count >= self.removal_allowance
 
 
 def musical_cost(note: NoteEvent, *, isolation: float) -> float:
@@ -136,16 +136,16 @@ def _subdivision_candidates(notes: Chart) -> Iterator[NoteEvent]:
 
 def _jack_trim_candidates(notes: Chart) -> Iterator[NoteEvent]:
     """같은 레인 연속의 초과분. 오래된 것부터 남기고 뒤를 자른다."""
-    by_lane: dict[int, list[NoteEvent]] = {}
-    for note in sorted(notes, key=lambda n: n.time_ms):
-        by_lane.setdefault(note.lane, []).append(note)
-    for lane_notes in by_lane.values():
-        run = [lane_notes[0]]
-        for previous, note in pairwise(lane_notes):
-            del previous
+    runs: dict[int, list[NoteEvent]] = {}
+    for row in rows_of(notes):
+        lanes_in_row = {note.lane for note in row.notes}
+        for lane in list(runs):
+            if lane not in lanes_in_row:
+                runs[lane] = []
+        for note in row.notes:
+            run = runs.setdefault(note.lane, [])
             run.append(note)
-        for index, note in enumerate(run):
-            if index >= MAX_JACK_RUN:
+            if len(run) > MAX_JACK_RUN:
                 yield note
 
 
@@ -162,15 +162,11 @@ _CANDIDATE_SOURCES = {
 }
 
 
-def _ranked_candidates(
-    notes: Chart, operation: Operation, *, beat_ms: float
-) -> list[NoteEvent]:
+def _ranked_candidates(notes: Chart, operation: Operation, *, beat_ms: float) -> list[NoteEvent]:
     """이 연산이 건드릴 노트를 음악 비용이 낮은 순으로."""
     isolation = _isolation_by_note(notes, beat_ms=beat_ms)
     candidates = list(_CANDIDATE_SOURCES[operation](notes))
-    return sorted(
-        candidates, key=lambda n: musical_cost(n, isolation=isolation.get(id(n), 1.0))
-    )
+    return sorted(candidates, key=lambda n: musical_cost(n, isolation=isolation.get(id(n), 1.0)))
 
 
 def solve_difficulty(
@@ -199,10 +195,19 @@ def solve_difficulty(
     metrics = measure_rating(current, duration_ms)
     counts = dict.fromkeys((op.value for op in Operation), 0)
     removed = converted = 0
-    if not current:
-        return SolveResult(current, metrics, target, 0, 0, 0.0, counts)
-
     allowance = int(len(notes) * budget)
+    if not current:
+        return SolveResult(
+            notes=current,
+            metrics=metrics,
+            target_rating=target,
+            removed_count=0,
+            removal_allowance=allowance,
+            converted_count=0,
+            removed_ratio=0.0,
+            operations=counts,
+        )
+
     # 연산을 하나씩 소진하면 앞선 연산이 예산을 다 먹어 뒤가 굶는다. 잭
     # 축약은 max_jack 항을 줄이는 유일한 수단인데 그게 한 번도 안 돌 수
     # 있다. 라운드마다 모든 연산에 차례를 준다.
@@ -242,6 +247,7 @@ def solve_difficulty(
         metrics=metrics,
         target_rating=target,
         removed_count=removed,
+        removal_allowance=allowance,
         converted_count=converted,
         removed_ratio=round(removed / len(notes), 4),
         operations=counts,

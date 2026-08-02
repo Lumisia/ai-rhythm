@@ -220,12 +220,19 @@ def _rule_violation(note: NoteEvent, lane: int, context: PlacementContext) -> fl
         )
         if opposite in others and not _both_sides_allowed(note, context):
             violations += 1.0
-    if semantic is LaneSemantic.CENTER and {
-        LaneSemantic.SIDE_LEFT,
-        LaneSemantic.SIDE_RIGHT,
-    } <= others:
+    if (
+        semantic is LaneSemantic.CENTER
+        and {
+            LaneSemantic.SIDE_LEFT,
+            LaneSemantic.SIDE_RIGHT,
+        }
+        <= others
+    ):
         mains = sum(1 for kind in others if finger_of(kind) is FingerClass.MAIN)
-        if mains > MAX_MAIN_WITH_CENTER_AND_BOTH_SIDES or context.difficulty != CENTER_WITH_BOTH_SIDES_FROM:
+        if (
+            mains > MAX_MAIN_WITH_CENTER_AND_BOTH_SIDES
+            or context.difficulty != CENTER_WITH_BOTH_SIDES_FROM
+        ):
             violations += 1.0
     return violations
 

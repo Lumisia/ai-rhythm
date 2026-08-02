@@ -254,8 +254,16 @@ def test_normalizing_onto_the_source_is_refused(config, paths):
 @pytest.mark.parametrize(
     ("error", "expected", "retryable"),
     [
-        (CommandError(["ffprobe"], "executable not found"), ErrorCode.AUDIO_NORMALIZATION_FAILED, True),
-        (CommandError(["ffprobe"], "timed out after 600s"), ErrorCode.AUDIO_NORMALIZATION_FAILED, True),
+        (
+            CommandError(["ffprobe"], "executable not found"),
+            ErrorCode.AUDIO_NORMALIZATION_FAILED,
+            True,
+        ),
+        (
+            CommandError(["ffprobe"], "timed out after 600s"),
+            ErrorCode.AUDIO_NORMALIZATION_FAILED,
+            True,
+        ),
         (CommandError(["ffprobe"], "exited with 1", returncode=1), ErrorCode.AUDIO_INVALID, False),
     ],
 )

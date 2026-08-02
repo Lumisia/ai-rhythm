@@ -26,8 +26,7 @@ TARGET = Path("out.flac")
 def test_silence_trim_filter_uses_documented_values():
     chain = commands.silence_trim_filter()
     assert chain == (
-        "silenceremove=start_periods=1:start_duration=0"
-        ":start_threshold=-60dB:detection=rms"
+        "silenceremove=start_periods=1:start_duration=0:start_threshold=-60dB:detection=rms"
     )
 
 
@@ -40,9 +39,7 @@ def test_both_passes_share_the_same_trim_arguments():
     """측정과 인코딩의 트림이 다르면 측정값이 실제 신호를 설명하지 못한다."""
     trim = commands.silence_trim_filter()
     measure = _filter_chain(commands.measure_command(FFMPEG, SOURCE))
-    normalize = _filter_chain(
-        commands.normalize_command(FFMPEG, SOURCE, TARGET, gain_db=-3.0)
-    )
+    normalize = _filter_chain(commands.normalize_command(FFMPEG, SOURCE, TARGET, gain_db=-3.0))
     assert measure.startswith(f"{trim},")
     assert normalize.startswith(f"{trim},")
 
