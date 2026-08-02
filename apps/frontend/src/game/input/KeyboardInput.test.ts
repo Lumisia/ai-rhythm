@@ -10,21 +10,38 @@ describe("bindingsFor", () => {
   it("maps the seven-key layout by physical KeyboardEvent.code", () => {
     expect(bindingsFor(7)).toEqual(
       new Map([
-        ["ShiftLeft", 0],
-        ["KeyA", 1],
-        ["KeyS", 2],
+        ["KeyA", 0],
+        ["KeyS", 1],
+        ["KeyD", 2],
         ["Space", 3],
-        ["Semicolon", 4],
-        ["Quote", 5],
-        ["ShiftRight", 6],
+        ["KeyL", 4],
+        ["Semicolon", 5],
+        ["Quote", 6],
       ]),
     );
+  });
+
+  it("keeps every lane on the home row so no finger leaves position", () => {
+    // Shift 로 바깥 레인을 잡으면 새끼손가락이 홈에서 떨어져 헷갈린다.
+    for (const keyMode of [4, 6, 7] as const) {
+      const codes = [...bindingsFor(keyMode).keys()];
+      expect(codes).not.toContain("ShiftLeft");
+      expect(codes).not.toContain("ShiftRight");
+    }
+  });
+
+  it("puts seven-key on six-key plus a centre thumb", () => {
+    const six = [...bindingsFor(6).keys()];
+    const seven = [...bindingsFor(7).keys()];
+    expect(seven.filter((code) => code !== "Space")).toEqual(six);
+    expect(bindingsFor(7).get("Space")).toBe(3);
   });
 });
 
 describe("keyLabelsFor", () => {
   it("returns one printable label per lane in lane order", () => {
-    expect(keyLabelsFor(7)).toEqual(["⇧", "A", "S", "␣", ";", "'", "⇧"]);
+    expect(keyLabelsFor(7)).toEqual(["A", "S", "D", "␣", "L", ";", "'"]);
+    expect(keyLabelsFor(6)).toEqual(["A", "S", "D", "L", ";", "'"]);
     expect(keyLabelsFor(4)).toEqual(["A", "S", ";", "'"]);
   });
 
@@ -119,8 +136,8 @@ describe("KeyboardInput", () => {
     target.dispatchEvent(down);
     target.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyA" }));
     // 판정이 안 붙는 입력도 알려야 키 바인딩이 틀린 건지 노트가 없는 건지 안다.
-    expect(onLaneDown).toHaveBeenCalledWith(1, 1000);
-    expect(onLaneUp).toHaveBeenCalledWith(1, expect.any(Number));
+    expect(onLaneDown).toHaveBeenCalledWith(0, 1000);
+    expect(onLaneUp).toHaveBeenCalledWith(0, expect.any(Number));
   });
 
   it("does not report a lane twice while the key is held", () => {
@@ -135,6 +152,6 @@ describe("KeyboardInput", () => {
     target.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyA" }));
     target.dispatchEvent(new KeyboardEvent("keydown", { code: "Space" }));
     target.dispatchEvent(new Event("blur"));
-    expect(onLaneUp.mock.calls.map(([lane]) => lane).sort()).toEqual([1, 3]);
+    expect(onLaneUp.mock.calls.map(([lane]) => lane).sort()).toEqual([0, 3]);
   });
 });

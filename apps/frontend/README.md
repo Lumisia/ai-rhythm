@@ -49,8 +49,10 @@ npm run validate:run -- "C:\Git\ai-rhythm\.data\playtests\koe-no-yukue-v3"
 | 키 모드 | 배열 |
 | --- | --- |
 | 4K | `A` `S` `;` `'` |
-| 6K | `왼Shift` `A` `S` `;` `'` `오른Shift` |
-| 7K | `왼Shift` `A` `S` `Space` `;` `'` `오른Shift` |
+| 6K | `A` `S` `D` `L` `;` `'` |
+| 7K | `A` `S` `D` `Space` `L` `;` `'` |
+
+7K는 6K에 가운데 엄지만 더한 것이다. 모두 홈 포지션 안이라 손가락이 자리를 떠나지 않는다.
 
 `ESC`로 일시정지한다. 플레이 중 숫자 키로 문제 구간을 기록하며, 기록되면 우측 상단에 이름이 잠깐 뜬다.
 
