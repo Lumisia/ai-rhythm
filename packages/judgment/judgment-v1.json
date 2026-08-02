@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "presets": {
+    "lenient": {
+      "PERFECT": 80,
+      "GREAT": 120,
+      "GOOD": 160,
+      "BAD": 200
+    },
+    "normal": {
+      "PERFECT": 45,
+      "GREAT": 90,
+      "GOOD": 130,
+      "BAD": 170
+    },
+    "strict": {
+      "PERFECT": 22,
+      "GREAT": 45,
+      "GOOD": 90,
+      "BAD": 135
+    }
+  },
+  "default": "lenient",
+  "holdReleaseScale": 1.5,
+  "missAfterMs": 200
+}
