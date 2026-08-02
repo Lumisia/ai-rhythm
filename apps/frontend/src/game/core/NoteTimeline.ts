@@ -24,9 +24,18 @@ function upperBound(notes: readonly ChartNote[], timeMs: number): number {
 
 export class NoteTimeline {
   readonly #notes: readonly ChartNote[];
+  readonly #maximumHoldDurationMs: number;
 
   constructor(notes: readonly ChartNote[]) {
     this.#notes = [...notes].sort((left, right) => left.timeMs - right.timeMs || left.id - right.id);
+    this.#maximumHoldDurationMs = this.#notes.reduce(
+      (maximum, note) => Math.max(maximum, note.type === "HOLD" ? (note.durationMs ?? 0) : 0),
+      0,
+    );
+  }
+
+  get maximumHoldDurationMs(): number {
+    return this.#maximumHoldDurationMs;
   }
 
   visibleBetween(startMs: number, endMs: number): readonly ChartNote[] {

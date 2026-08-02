@@ -25,4 +25,12 @@ describe("NoteTimeline", () => {
     const timeline = new NoteTimeline([note(1, 100)]);
     expect(timeline.visibleBetween(200, 100)).toEqual([]);
   });
+
+  it("exposes the longest hold for renderer lookback", () => {
+    const timeline = new NoteTimeline([
+      note(1, 100),
+      { id: 2, lane: 0, timeMs: 200, type: "HOLD", durationMs: 750 },
+    ]);
+    expect(timeline.maximumHoldDurationMs).toBe(750);
+  });
 });
