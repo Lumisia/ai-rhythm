@@ -37,6 +37,16 @@ class CommandError(Exception):
         self.returncode = returncode
         self.stderr = stderr
 
+    @property
+    def is_infrastructure(self) -> bool:
+        """프로세스가 아예 돌지 못했다.
+
+        실행 파일이 없거나 시간이 초과한 것은 **입력 문제가 아니다.**
+        입력을 최종 거부(FINAL)로 처리하면 환경 문제로 멀쩡한 작업이
+        영영 재시도되지 않는다.
+        """
+        return self.returncode is None
+
 
 def build_env(
     shared_bin_dir: Path | None,
@@ -66,7 +76,11 @@ class CommandRunner:
     shared_bin_dir: Path | None = None
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     check: bool = True
-    env: dict[str, str] = field(default_factory=dict, compare=False)
+    cwd: Path | None = None
+    """작업 디렉터리. Hydra 처럼 실행 위치에서 설정을 찾는 도구에 필요하다."""
+
+    env: Mapping[str, str] | None = field(default=None, compare=False)
+    """PATH 를 덧붙일 바탕 환경. None 이면 os.environ 을 쓴다."""
 
     def __call__(self, argv: list[str]) -> CommandResult:
         return run_command(
@@ -74,6 +88,8 @@ class CommandRunner:
             shared_bin_dir=self.shared_bin_dir,
             timeout_sec=self.timeout_sec,
             check=self.check,
+            cwd=self.cwd,
+            env=self.env,
         )
 
 
@@ -83,6 +99,8 @@ def run_command(
     shared_bin_dir: Path | None = None,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     check: bool = True,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     """프로세스를 실행하고 stdout·stderr 를 문자열로 돌려준다.
 
@@ -96,12 +114,13 @@ def run_command(
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=build_env(shared_bin_dir),
+            env=build_env(shared_bin_dir, env),
+            cwd=None if cwd is None else str(cwd),
             timeout=timeout_sec,
             check=False,
         )
-    except FileNotFoundError:
-        raise CommandError(argv, "executable not found") from None
+    except (FileNotFoundError, NotADirectoryError):
+        raise CommandError(argv, "executable or working directory not found") from None
     except subprocess.TimeoutExpired:
         raise CommandError(argv, f"timed out after {timeout_sec:g}s") from None
 

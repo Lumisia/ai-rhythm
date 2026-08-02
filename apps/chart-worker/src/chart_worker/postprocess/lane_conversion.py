@@ -17,8 +17,8 @@ from chart_worker.postprocess.cost import (
     best_lane,
     placement_cost,
 )
-from chart_worker.postprocess.lane_rules import FingerClass as Finger
 from chart_worker.postprocess.lane_rules import (
+    ACCENT_STRENGTH,
     Hand,
     Rule,
     Violation,
@@ -26,6 +26,7 @@ from chart_worker.postprocess.lane_rules import (
     finger_of,
     hand_of,
 )
+from chart_worker.postprocess.lane_rules import FingerClass as Finger
 from chart_worker.schema.note import Chart, NoteEvent
 from chart_worker.schema.types import lane_semantics
 
@@ -66,6 +67,8 @@ def _build_context(
     previous_lane: int | None,
     hand_window: deque[Hand | None],
     shape_window: deque[tuple[int, ...]],
+    row_is_downbeat: bool = False,
+    row_is_accent: bool = False,
 ) -> PlacementContext:
     left = sum(1 for hand in hand_window if hand is Hand.LEFT)
     right = sum(1 for hand in hand_window if hand is Hand.RIGHT)
@@ -77,6 +80,8 @@ def _build_context(
         previous_lane=previous_lane,
         hand_counts=(left, right),
         recent_shapes=tuple(shape_window),
+        row_is_downbeat=row_is_downbeat,
+        row_is_accent=row_is_accent,
     )
 
 
@@ -102,12 +107,22 @@ def _one_pass(
     previous_lane: int | None = None
     moved = 0
 
+    # 롱노트가 물고 있는 레인은 그 끝까지 비어 있지 않다. 시작 시각만 보면
+    # 새 노트를 진행 중인 롱노트 위로 옮겨 칠 수 없는 채보가 된다.
+    busy_until: dict[int, int] = {}
+
     index = 0
     while index < len(ordered):
         time_ms = ordered[index].time_ms
         row = [note for note in ordered[index:] if note.time_ms == time_ms]
         index += len(row)
 
+        held = {lane for lane, until in busy_until.items() if time_ms < until}
+        row_downbeat = any(note.is_downbeat for note in row)
+        row_accent = row_downbeat or any(
+            note.onset_strength is not None and note.onset_strength >= ACCENT_STRENGTH
+            for note in row
+        )
         occupied: set[int] = set()
         row_result: list[NoteEvent] = []
         for note in sorted(row, key=lambda n: -(n.onset_strength or 0.0)):
@@ -116,28 +131,35 @@ def _one_pass(
                 key_mode=key_mode,
                 difficulty=difficulty,
                 last_time_by_lane=last_time_by_lane,
-                occupied=occupied,
+                occupied=occupied | held,
                 previous_lane=previous_lane,
                 hand_window=hand_window,
                 shape_window=shape_window,
+                row_is_downbeat=row_downbeat,
+                row_is_accent=row_accent,
             )
             lane = note.lane
-            if lane in occupied or _breaks_a_rule(note, lane, context, weights):
+            blocked = lane in occupied or lane in held
+            if blocked or _breaks_a_rule(note, lane, context, weights):
                 choice = best_lane(note, context, weights=weights)
                 if choice is None:
                     choice = best_lane(note, context, weights=weights, preference="ANY")
                 staying = (
-                    placement_cost(note, lane, context, weights).total
-                    if lane not in occupied
-                    else float("inf")
+                    float("inf")
+                    if blocked
+                    else placement_cost(note, lane, context, weights).total
                 )
-                if choice is not None and choice[0] != lane and choice[1].total < staying:
-                    if moved < move_allowance:
-                        lane = choice[0]
-                        moved += 1
-                    elif lane in occupied:
-                        # 같은 레인 겹침은 예산과 무관하게 반드시 풀어야 한다.
-                        lane = choice[0]
+                # 레인 충돌은 예산과 무관하게 반드시 풀어야 한다.
+                # 같은 시각 같은 레인, 진행 중인 롱노트 위는 칠 수 없다.
+                affordable = moved < move_allowance or blocked
+                if (
+                    choice is not None
+                    and choice[0] != lane
+                    and choice[1].total < staying
+                    and affordable
+                ):
+                    lane = choice[0]
+                    moved += 1
             occupied.add(lane)
             placed_note = note if lane == note.lane else dataclasses.replace(note, lane=lane)
             row_result.append(placed_note)
@@ -145,6 +167,8 @@ def _one_pass(
 
         for placed_note in row_result:
             last_time_by_lane[placed_note.lane] = time_ms
+            if placed_note.kind == "HOLD":
+                busy_until[placed_note.lane] = time_ms + (placed_note.duration_ms or 0)
         shape_window.append(tuple(sorted(occupied)))
         previous_lane = min(occupied, key=lambda l: abs(l - (previous_lane or l)))
         placed.extend(row_result)
@@ -255,30 +279,28 @@ def convert_lanes(
 
     for _ in range(max_passes):
         passes += 1
-        current, step_moves = _one_pass(
+        current, _ = _one_pass(
             current,
             key_mode=key_mode,
             difficulty=difficulty,
             weights=weights,
-            move_allowance=max(0, allowance - moved),
+            move_allowance=max(0, allowance - _moved_notes(current)),
         )
-        moved += step_moves
-        current, hold_moves = _relieve_side_holds(
+        current, _ = _relieve_side_holds(
             current,
             key_mode=key_mode,
             difficulty=difficulty,
             weights=weights,
-            move_allowance=max(0, allowance - moved),
+            move_allowance=max(0, allowance - _moved_notes(current)),
         )
-        moved += hold_moves
         if not check_lane_rules(current, key_mode=key_mode, difficulty=difficulty):
             break
 
-    remaining = check_lane_rules(current, key_mode=key_mode, difficulty=difficulty)
-    current, deleted = _drop_unfixable(current, remaining, key_mode=key_mode)
+    current, deleted = _drop_unfixable(current, key_mode=key_mode, difficulty=difficulty)
     remaining = check_lane_rules(current, key_mode=key_mode, difficulty=difficulty)
 
     _require_timing_invariant(original_times, current)
+    moved = _moved_notes(current)
     return ConversionResult(
         notes=current,
         moved_count=moved,
@@ -289,26 +311,50 @@ def convert_lanes(
     )
 
 
-def _drop_unfixable(
-    notes: Chart, violations: list[Violation], *, key_mode: int
-) -> tuple[Chart, int]:
-    """이동으로 못 고친 위반 노트를 지운다. onset_strength 낮은 것부터."""
-    if not violations:
-        return notes, 0
-    targets = {
-        (violation.time_ms, lane)
-        for violation in violations
-        if violation.rule is Rule.S1_JACK_INTERVAL
-        for lane in violation.lanes
-    }
-    if not targets:
-        return notes, 0
-    doomed = sorted(
-        (note for note in notes if (note.time_ms, note.lane) in targets),
-        key=lambda n: (n.onset_strength or 0.0),
-    )
-    removed = {id(note) for note in doomed}
-    return [note for note in notes if id(note) not in removed], len(doomed)
+def _moved_notes(notes: Chart) -> int:
+    """원배치에서 벗어난 노트 수.
+
+    연산 횟수를 세면 같은 노트를 여러 패스에서 옮길 때 중복 집계되어
+    moved_note_ratio 가 부풀고 예산이 일찍 소진된다. 다시 제자리로 돌아온
+    노트는 옮긴 것이 아니다.
+    """
+    return sum(1 for note in notes if note.lane != note.origin_lane)
+
+
+def _drop_unfixable(notes: Chart, *, key_mode: int, difficulty: str) -> tuple[Chart, int]:
+    """이동으로 못 고친 잭 위반을 최소한으로 지운다.
+
+    위반 하나에 노트가 둘 얽혀 있다. 양쪽을 다 지우면 한 번만 지워도 될
+    자리에서 강한 타격까지 잃는다. 약한 쪽 하나를 지우고 다시 검사한다.
+    """
+    remaining = list(notes)
+    deleted = 0
+    while True:
+        violations = [
+            violation
+            for violation in check_lane_rules(
+                remaining, key_mode=key_mode, difficulty=difficulty
+            )
+            if violation.rule is Rule.S1_JACK_INTERVAL
+        ]
+        if not violations:
+            return remaining, deleted
+        violation = violations[0]
+        lane = violation.lanes[0]
+        later = next(
+            (n for n in remaining if n.time_ms == violation.time_ms and n.lane == lane), None
+        )
+        earlier = max(
+            (n for n in remaining if n.lane == lane and n.time_ms < violation.time_ms),
+            key=lambda n: n.time_ms,
+            default=None,
+        )
+        pair = [note for note in (later, earlier) if note is not None]
+        if not pair:
+            return remaining, deleted
+        victim = min(pair, key=lambda n: (n.onset_strength or 0.0, -n.time_ms))
+        remaining = [note for note in remaining if note is not victim]
+        deleted += 1
 
 
 def _require_timing_invariant(original_times: list[int], notes: Chart) -> None:

@@ -120,6 +120,9 @@ class MapperatorinatorGenerator:
         run = self.run or CommandRunner(
             shared_bin_dir=self.config.ffmpeg_shared_bin_dir,
             timeout_sec=1800.0,
+            # inference.py 는 상대 경로이고 Hydra 는 실행 위치에서 configs/ 를
+            # 찾는다. 체크아웃 밖에서 돌리면 스크립트도 설정도 못 찾는다.
+            cwd=self.config.mapperatorinator_home,
         )
         argv = build_command(self.config, request, workdir)
         try:

@@ -307,3 +307,35 @@ def test_a_varied_chart_scores_higher_than_a_repetitive_one():
     low = pattern_entropy(pattern_histogram(detect_patterns(repetitive, key_mode=4, beat_ms=BEAT_MS)))
     high = pattern_entropy(pattern_histogram(detect_patterns(varied, key_mode=4, beat_ms=BEAT_MS)))
     assert high > low
+
+
+# --- 검수 회귀 --------------------------------------------------------------
+
+
+def test_a_ten_second_gap_is_not_a_trill():
+    """화음 행만 걸러내면 멀리 떨어진 두 노트가 붙어버린다."""
+    notes = _taps([(0, 0), (10_000, 1), (20_000, 0)])
+    kinds = _kinds(notes)
+    assert PatternKind.TRILL_ONE_HANDED not in kinds
+    assert PatternKind.TRILL_TWO_HANDED not in kinds
+
+
+def test_a_chord_breaks_the_trill_flow():
+    notes = _taps([(0, 0), (125, 1), (250, 2), (250, 3), (375, 0), (500, 1)])
+    kinds = _kinds(notes)
+    assert PatternKind.TRILL_ONE_HANDED not in kinds
+    assert PatternKind.TRILL_TWO_HANDED not in kinds
+
+
+def test_a_far_apart_climb_is_not_stairs():
+    assert PatternKind.STAIRS not in _kinds(_taps([(0, 0), (30_000, 1), (60_000, 2)]))
+
+
+def test_a_chord_breaks_the_stairs_flow():
+    notes = _taps([(0, 0), (125, 1), (250, 2), (250, 3), (375, 3)])
+    assert PatternKind.STAIRS not in _kinds(notes)
+
+
+def test_a_gap_inside_the_beat_keeps_the_trill():
+    notes = _taps([(0, 0), (125, 1), (250, 0), (375, 1)])
+    assert PatternKind.TRILL_ONE_HANDED in _kinds(notes)

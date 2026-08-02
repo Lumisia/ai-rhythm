@@ -39,6 +39,14 @@ INTERVAL_TOLERANCE = 0.25
 SHIELD_GAP_DIVISOR = 2.0
 INVERSE_GAP_MS = 30
 
+MAX_RUN_GAP_BEATS = 1.0
+"""연속 패턴이 이어지는 최대 간격.
+
+트릴·계단·데님은 **끊기지 않는 흐름**이다. 화음 행을 걸러내고 남은
+단노트만 이으면 10초 떨어진 두 노트나 화음이 관통한 구간도 하나로
+붙어버린다. 행 인접성과 간격을 함께 봐야 한다.
+"""
+
 
 class PatternKind(StrEnum):
     JUMP = "JUMP"
@@ -109,6 +117,28 @@ def rows_of(notes: Chart) -> list[Row]:
         Row(time_ms=time_ms, notes=tuple(sorted(grouped[time_ms], key=lambda n: n.lane)))
         for time_ms in sorted(grouped)
     ]
+
+
+def _single_note_runs(rows: list[Row], *, beat_ms: float) -> list[list[Row]]:
+    """화음에 끊기지 않고 간격도 벌어지지 않은 단노트 구간들."""
+    limit = beat_ms * MAX_RUN_GAP_BEATS
+    runs: list[list[Row]] = []
+    current: list[Row] = []
+    for row in rows:
+        if row.size != 1:
+            # 화음이 끼면 흐름이 끊긴다.
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+            continue
+        if current and row.time_ms - current[-1].time_ms > limit:
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+        current.append(row)
+    if len(current) > 1:
+        runs.append(current)
+    return runs
 
 
 def _hand_of(lane: int, key_mode: int) -> int:
@@ -311,24 +341,24 @@ def _is_roll(run: list[Row], key_mode: int) -> bool:
     return steps in ({1}, {-1}) or steps <= {1, 1 - key_mode} or steps <= {-1, key_mode - 1}
 
 
-def detect_stairs(rows: list[Row]) -> list[PatternInstance]:
+def detect_stairs(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     """레인이 한 칸씩 같은 방향으로 움직이는 단노트 연속."""
-    singles = [row for row in rows if row.size == 1]
     found = []
-    run = [singles[0]] if singles else []
-    direction = 0
-    for previous, row in pairwise(singles):
-        step = row.lanes[0] - previous.lanes[0]
-        if step in (1, -1) and (direction == 0 or step == direction):
-            direction = step
-            run.append(row)
-            continue
+    for singles in _single_note_runs(rows, beat_ms=beat_ms):
+        run = [singles[0]]
+        direction = 0
+        for previous, row in pairwise(singles):
+            step = row.lanes[0] - previous.lanes[0]
+            if step in (1, -1) and (direction == 0 or step == direction):
+                direction = step
+                run.append(row)
+                continue
+            if len(run) >= STAIRS_MIN_NOTES:
+                found.append(_stairs_instance(run))
+            run = [previous, row] if step in (1, -1) else [row]
+            direction = step if step in (1, -1) else 0
         if len(run) >= STAIRS_MIN_NOTES:
             found.append(_stairs_instance(run))
-        run = [previous, row] if step in (1, -1) else [row]
-        direction = step if step in (1, -1) else 0
-    if len(run) >= STAIRS_MIN_NOTES:
-        found.append(_stairs_instance(run))
     return found
 
 
@@ -345,33 +375,40 @@ def _stairs_instance(run: list[Row]) -> PatternInstance:
 # --- 트릴 -------------------------------------------------------------------
 
 
-def detect_trills(rows: list[Row], *, key_mode: int) -> list[PatternInstance]:
+def detect_trills(rows: list[Row], *, key_mode: int, beat_ms: float) -> list[PatternInstance]:
     """두 레인을 오가는 단노트 교대."""
-    singles = [row for row in rows if row.size == 1]
     found = []
-    index = 0
-    while index + TRILL_MIN_NOTES <= len(singles):
-        first, second = singles[index].lanes[0], singles[index + 1].lanes[0]
-        if first == second:
-            index += 1
-            continue
-        end = index + 2
-        while end < len(singles) and singles[end].lanes[0] == (first, second)[end % 2 - index % 2]:
-            end += 1
-        length = end - index
-        if length >= TRILL_MIN_NOTES:
-            same_hand = _hand_of(first, key_mode) == _hand_of(second, key_mode)
-            kind = (
-                PatternKind.TRILL_ONE_HANDED if same_hand else PatternKind.TRILL_TWO_HANDED
-            )
-            found.append(
-                PatternInstance(
-                    kind, singles[index].time_ms, singles[end - 1].time_ms, (first, second), length
+    for singles in _single_note_runs(rows, beat_ms=beat_ms):
+        index = 0
+        while index + TRILL_MIN_NOTES <= len(singles):
+            first, second = singles[index].lanes[0], singles[index + 1].lanes[0]
+            if first == second:
+                index += 1
+                continue
+            end = index + 2
+            while (
+                end < len(singles)
+                and singles[end].lanes[0] == (first, second)[end % 2 - index % 2]
+            ):
+                end += 1
+            length = end - index
+            if length >= TRILL_MIN_NOTES:
+                same_hand = _hand_of(first, key_mode) == _hand_of(second, key_mode)
+                kind = (
+                    PatternKind.TRILL_ONE_HANDED if same_hand else PatternKind.TRILL_TWO_HANDED
                 )
-            )
-            index = end - 1
-        else:
-            index += 1
+                found.append(
+                    PatternInstance(
+                        kind,
+                        singles[index].time_ms,
+                        singles[end - 1].time_ms,
+                        (first, second),
+                        length,
+                    )
+                )
+                index = end - 1
+            else:
+                index += 1
     return found
 
 
@@ -399,20 +436,20 @@ def detect_jumptrill(rows: list[Row]) -> list[PatternInstance]:
     return found
 
 
-def detect_denim(rows: list[Row]) -> list[PatternInstance]:
+def detect_denim(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     """홀수 레인과 짝수 레인이 번갈아 나오는 긴 단노트 연속."""
-    singles = [row for row in rows if row.size == 1]
     found = []
-    run: list[Row] = []
-    for row in singles:
-        if run and row.lanes[0] % 2 == run[-1].lanes[0] % 2:
-            if len(run) >= DENIM_MIN_NOTES and len({r.lanes[0] for r in run}) > 2:
-                found.append(_denim_instance(run))
-            run = [row]
-            continue
-        run.append(row)
-    if len(run) >= DENIM_MIN_NOTES and len({r.lanes[0] for r in run}) > 2:
-        found.append(_denim_instance(run))
+    for singles in _single_note_runs(rows, beat_ms=beat_ms):
+        run: list[Row] = []
+        for row in singles:
+            if run and row.lanes[0] % 2 == run[-1].lanes[0] % 2:
+                if len(run) >= DENIM_MIN_NOTES and len({r.lanes[0] for r in run}) > 2:
+                    found.append(_denim_instance(run))
+                run = [row]
+                continue
+            run.append(row)
+        if len(run) >= DENIM_MIN_NOTES and len({r.lanes[0] for r in run}) > 2:
+            found.append(_denim_instance(run))
     return found
 
 
@@ -510,10 +547,10 @@ def detect_patterns(notes: Chart, *, key_mode: int, beat_ms: float) -> list[Patt
         *detect_anchor(rows, beat_ms=beat_ms),
         *detect_chordjack(rows),
         *detect_streams(rows, beat_ms=beat_ms, key_mode=key_mode),
-        *detect_stairs(rows),
-        *detect_trills(rows, key_mode=key_mode),
+        *detect_stairs(rows, beat_ms=beat_ms),
+        *detect_trills(rows, key_mode=key_mode, beat_ms=beat_ms),
         *detect_jumptrill(rows),
-        *detect_denim(rows),
+        *detect_denim(rows, beat_ms=beat_ms),
         *detect_hold_patterns(notes, beat_ms=beat_ms),
     ]
     return sorted(found, key=lambda instance: (instance.start_ms, instance.kind))

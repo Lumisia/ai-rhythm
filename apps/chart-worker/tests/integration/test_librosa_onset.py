@@ -18,7 +18,7 @@ from chart_worker.analysis.onset import (
 )
 from chart_worker.schema.note import NoteEvent
 
-pytestmark = pytest.mark.beat_this
+pytestmark = pytest.mark.librosa
 
 pytest.importorskip("librosa", reason="analysis extra is not installed")
 

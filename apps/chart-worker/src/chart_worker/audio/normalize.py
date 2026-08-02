@@ -36,13 +36,31 @@ class NormalizedAudio:
     limited_by: str
 
 
+def _same_file(source: Path, target: Path) -> bool:
+    """같은 파일을 가리키는지 본다. 심볼릭 링크와 상대 경로도 본다."""
+    try:
+        if source.exists() and target.exists() and source.samefile(target):
+            return True
+    except OSError:
+        pass
+    return source.resolve() == target.resolve()
+
+
 def _probe(run: RunCommand, ffprobe_bin: Path, path: Path) -> AudioProbe:
     argv = commands.probe_command(ffprobe_bin, path)
     try:
         result = run(argv)
     except CommandError as error:
+        # ffprobe 가 파일을 거부한 것과 ffprobe 자체가 못 돈 것은 다르다.
+        # 후자를 AUDIO_INVALID(FINAL)로 처리하면 실행 파일 경로가 잘못됐거나
+        # 시간이 초과했을 때 멀쩡한 작업이 영영 재시도되지 않는다.
+        code = (
+            ErrorCode.AUDIO_NORMALIZATION_FAILED
+            if error.is_infrastructure
+            else ErrorCode.AUDIO_INVALID
+        )
         raise WorkerError(
-            ErrorCode.AUDIO_INVALID,
+            code,
             f"ffprobe failed: {error}",
             context={"path": str(path), "stderr": error.stderr[-2000:]},
         ) from error
@@ -87,6 +105,9 @@ def normalize_audio(
     run: RunCommand | None = None,
 ) -> NormalizedAudio:
     """원본 오디오를 audio-profile-v1 FLAC 으로 굳힌다."""
+    if _same_file(source, target):
+        # 실패 경로가 target 을 지운다. 같은 경로면 그게 원본이다.
+        raise ValueError(f"source and target are the same file: {source}")
     if run is None:
         run = CommandRunner(shared_bin_dir=config.ffmpeg_shared_bin_dir)
 
@@ -132,7 +153,12 @@ def normalize_audio(
         ) from error
 
     # 명령행에 프로파일을 박아도 확인은 별개다.
-    result_probe = _probe(run, ffprobe_bin, target)
+    try:
+        result_probe = _probe(run, ffprobe_bin, target)
+    except WorkerError:
+        # 검증하지 못한 산출물을 남기면 다음 실행이 유효한 것으로 오인한다.
+        target.unlink(missing_ok=True)
+        raise
     _require_profile(target, result_probe)
     if result_probe.duration_ms > profile.MAX_DURATION_MS:
         raise _too_long(target, result_probe.duration_ms, profile.MAX_DURATION_MS, remove=True)

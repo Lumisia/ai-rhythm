@@ -58,7 +58,7 @@ def test_check_false_returns_the_failing_result():
 
 
 def test_raises_when_the_executable_is_missing():
-    with pytest.raises(CommandError, match="executable not found"):
+    with pytest.raises(CommandError, match="executable or working directory not found"):
         run_command(["definitely-not-a-real-binary-xyz"])
 
 

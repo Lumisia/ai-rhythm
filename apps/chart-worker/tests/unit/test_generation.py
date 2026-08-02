@@ -347,3 +347,43 @@ def test_fixture_keycount_must_match(timing_osu, tmp_path):
     fixture.write_text(MINI_OSU, encoding="utf-8")
     with pytest.raises(WorkerError, match="fixture is 4K"):
         FakeGenerator(fixture_path=fixture)(_request(timing_osu, key_mode=7), tmp_path)
+
+
+# --- 검수 회귀 --------------------------------------------------------------
+
+
+def test_the_command_runs_inside_the_mapperatorinator_checkout(config, timing_osu, tmp_path):
+    """inference.py 는 상대 경로이고 Hydra 는 실행 위치에서 configs/ 를 찾는다."""
+    seen = {}
+
+    def run(argv):
+        seen["argv"] = argv
+        (tmp_path / "work").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "work" / "out.osu").write_text(MINI_OSU, encoding="utf-8")
+        return CommandResult(argv, 0, "", "")
+
+    generator = MapperatorinatorGenerator(config=config, run=run)
+    generator(_request(timing_osu), tmp_path / "work")
+    assert seen["argv"][1] == "inference.py"
+
+
+def test_fake_is_deterministic_across_processes(timing_osu):
+    """문자열이 낀 튜플의 hash() 는 PYTHONHASHSEED 로 소금이 쳐진다."""
+    import subprocess
+    import sys
+
+    script = (
+        "from pathlib import Path;"
+        "from chart_worker.generation.params import GenerationRequest;"
+        "from chart_worker.generation.fake import synthesize_chart;"
+        f"r=GenerationRequest(audio_path=Path('a.flac'),key_mode=4,difficulty='NORMAL',"
+        f"duration_ms={DURATION_MS},timing_osu_path=Path(r'{timing_osu}'),seed=42);"
+        "print([n.lane for n in synthesize_chart(r)])"
+    )
+    runs = {
+        subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, check=True
+        ).stdout
+        for _ in range(3)
+    }
+    assert len(runs) == 1

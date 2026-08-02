@@ -171,9 +171,12 @@ class ChartDocument(_CamelModel):
                 raise ValueError("note timeMs must be less than durationMs")
             if note.end_ms > self.duration_ms:
                 raise ValueError("HOLD end time must not exceed durationMs")
+            # 진행 중인 롱노트 위에는 무엇도 놓을 수 없다. HOLD 끼리만
+            # 검사하면 그 안으로 들어간 TAP 이 검증을 통과해 칠 수 없는
+            # 채보가 배포된다.
+            if note.time_ms < hold_end_by_lane.get(note.lane, -1):
+                raise ValueError(f"note overlaps a HOLD in lane {note.lane}")
             if note.kind == "HOLD":
-                if note.time_ms < hold_end_by_lane.get(note.lane, -1):
-                    raise ValueError(f"HOLD notes overlap in lane {note.lane}")
                 hold_end_by_lane[note.lane] = note.end_ms
 
     def _check_bpm_events(self) -> None:

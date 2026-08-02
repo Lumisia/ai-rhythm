@@ -50,7 +50,10 @@ def synthesize_chart(request: GenerationRequest) -> Chart:
         )
     offset_ms, beat_ms = _timing_of(request)
     step_ms = beat_ms / NOTES_PER_BEAT[request.difficulty]
-    rng = random.Random((request.seed or 0, request.key_mode, request.difficulty).__hash__())
+    # 문자열이 낀 튜플의 hash() 는 PYTHONHASHSEED 로 소금이 쳐져 프로세스마다
+    # 다르다. 골든 테스트가 재현되려면 시드가 프로세스에 무관해야 한다.
+    # random.Random(str) 은 sha512 로 변환하므로 안정적이다.
+    rng = random.Random(f"{request.seed or 0}:{request.key_mode}:{request.difficulty}")
 
     notes: list[NoteEvent] = []
     lane_free_at = dict.fromkeys(range(request.key_mode), -1)

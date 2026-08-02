@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from typing import Literal
 
 from chart_worker.postprocess.lane_rules import (
+    ACCENT_STRENGTH,
+    BOTH_SIDES,
+    CENTER_WITH_BOTH_SIDES_FROM,
+    MAX_MAIN_WITH_CENTER_AND_BOTH_SIDES,
+    BothSidesPolicy,
     FingerClass,
     Hand,
     finger_of,
@@ -87,6 +92,11 @@ class PlacementContext:
     recent_shapes: tuple[tuple[int, ...], ...] = ()
     """최근 행들의 레인 모양. w6 이 쓴다."""
 
+    row_is_downbeat: bool = False
+    row_is_accent: bool = False
+    """S4 는 행 전체의 악센트를 본다. 후보 노트 하나만 보면 같은 행의 다른
+    노트가 들고 있는 다운비트를 놓친다."""
+
     @property
     def semantics(self) -> list[LaneSemantic]:
         return lane_semantics(self.key_mode)
@@ -161,27 +171,49 @@ def _band_mismatch(note: NoteEvent, lane: int, context: PlacementContext) -> flo
     return 0.0 if hand is wanted else 1.0
 
 
+def _both_sides_allowed(note: NoteEvent, context: PlacementContext) -> bool:
+    """S4 정책. lane_rules 의 판정과 같은 답을 내야 한다.
+
+    난이도를 보지 않으면 EXPERT 에서 합법인 사이드 화음까지 옮기고
+    이동 예산을 깎아먹는다.
+    """
+    policy = BOTH_SIDES[context.difficulty]
+    if policy is BothSidesPolicy.FREE:
+        return True
+    downbeat = context.row_is_downbeat or note.is_downbeat
+    if policy is BothSidesPolicy.DOWNBEAT_ONLY:
+        return downbeat
+    if policy is BothSidesPolicy.ACCENT_ONLY:
+        strong = note.onset_strength is not None and note.onset_strength >= ACCENT_STRENGTH
+        return downbeat or context.row_is_accent or strong
+    return False
+
+
 def _rule_violation(note: NoteEvent, lane: int, context: PlacementContext) -> float:
     """S1 위반 여부. S4·C3 는 같은 시각 구성에서 나온다."""
     violations = 0.0
-    if _same_lane_repeat(note, lane, context) > 0 and context.last_time_by_lane.get(lane) is not None:
+    last = context.last_time_by_lane.get(lane)
+    if last is not None:
         limit = jack_interval_ms(context.semantics[lane], context.difficulty)
-        if note.time_ms - context.last_time_by_lane[lane] < limit:
+        if note.time_ms - last < limit:
             violations += 1.0
 
     semantic = context.semantics[lane]
+    others = {context.semantics[other] for other in context.occupied_lanes}
     if finger_of(semantic) is FingerClass.SIDE:
-        others = {context.semantics[other] for other in context.occupied_lanes}
         opposite = (
             LaneSemantic.SIDE_RIGHT
             if semantic is LaneSemantic.SIDE_LEFT
             else LaneSemantic.SIDE_LEFT
         )
-        if opposite in others:
+        if opposite in others and not _both_sides_allowed(note, context):
             violations += 1.0
-    if semantic is LaneSemantic.CENTER:
-        others = {context.semantics[other] for other in context.occupied_lanes}
-        if {LaneSemantic.SIDE_LEFT, LaneSemantic.SIDE_RIGHT} <= others:
+    if semantic is LaneSemantic.CENTER and {
+        LaneSemantic.SIDE_LEFT,
+        LaneSemantic.SIDE_RIGHT,
+    } <= others:
+        mains = sum(1 for kind in others if finger_of(kind) is FingerClass.MAIN)
+        if mains > MAX_MAIN_WITH_CENTER_AND_BOTH_SIDES or context.difficulty != CENTER_WITH_BOTH_SIDES_FROM:
             violations += 1.0
     return violations
 

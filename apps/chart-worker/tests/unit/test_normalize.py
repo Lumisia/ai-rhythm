@@ -238,3 +238,44 @@ def test_output_that_misses_the_profile_is_rejected_and_removed(config, paths, t
         normalize_audio(source, target, config=config, run=FakeFfmpeg(target_json=target_json))
     assert caught.value.code is ErrorCode.AUDIO_NORMALIZATION_FAILED
     assert not target.exists()
+
+
+# --- 검수 회귀 --------------------------------------------------------------
+
+
+def test_normalizing_onto_the_source_is_refused(config, paths):
+    """실패 경로가 target 을 지운다. 같은 경로면 그게 원본이다."""
+    source, _ = paths
+    with pytest.raises(ValueError, match="same file"):
+        normalize_audio(source, source, config=config, run=FakeFfmpeg())
+    assert source.exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected", "retryable"),
+    [
+        (CommandError(["ffprobe"], "executable not found"), ErrorCode.AUDIO_NORMALIZATION_FAILED, True),
+        (CommandError(["ffprobe"], "timed out after 600s"), ErrorCode.AUDIO_NORMALIZATION_FAILED, True),
+        (CommandError(["ffprobe"], "exited with 1", returncode=1), ErrorCode.AUDIO_INVALID, False),
+    ],
+)
+def test_ffprobe_that_could_not_run_stays_retryable(config, paths, error, expected, retryable):
+    """환경 문제를 FINAL 로 처리하면 멀쩡한 작업이 영영 재시도되지 않는다."""
+    source, target = paths
+
+    def run(argv):
+        raise error
+
+    with pytest.raises(WorkerError) as caught:
+        normalize_audio(source, target, config=config, run=run)
+    assert caught.value.code is expected
+    assert caught.value.retryable is retryable
+
+
+def test_a_target_that_cannot_be_probed_is_removed(config, paths):
+    """검증하지 못한 산출물을 남기면 다음 실행이 유효한 것으로 오인한다."""
+    source, target = paths
+    fake = FakeFfmpeg(fail_on="probe_target")
+    with pytest.raises(WorkerError):
+        normalize_audio(source, target, config=config, run=fake)
+    assert not target.exists()

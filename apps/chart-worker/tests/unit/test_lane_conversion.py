@@ -224,3 +224,51 @@ def test_no_two_notes_share_a_lane_at_the_same_time():
     result = _convert(notes, difficulty="EASY")
     keys = [(n.time_ms, n.lane) for n in result.notes]
     assert len(keys) == len(set(keys))
+
+
+# --- 검수 회귀 --------------------------------------------------------------
+
+
+def test_a_moved_note_never_lands_inside_an_active_hold():
+    """롱노트가 물고 있는 레인은 그 끝까지 비어 있지 않다."""
+    notes = [NoteEvent(time_ms=0, lane=MAIN_1, kind="HOLD", duration_ms=1000)]
+    notes += _side_jack(4, 125)
+    notes += [_tap(2000 + i * 400, MAIN_2 + i % 3) for i in range(60)]
+    result = _convert(notes)
+    hold = next(n for n in result.notes if n.kind == "HOLD")
+    end = hold.time_ms + hold.duration_ms
+    inside = [
+        n
+        for n in result.notes
+        if n.kind == "TAP" and n.lane == hold.lane and hold.time_ms < n.time_ms < end
+    ]
+    assert inside == []
+
+
+def test_deletion_removes_one_note_per_violation_not_both_ends():
+    """양쪽을 다 지우면 한 번만 지워도 될 자리에서 강한 타격까지 잃는다."""
+    notes = [
+        _tap(0, SIDE_L, onset_strength=0.9),
+        _tap(100, SIDE_L, onset_strength=0.1),
+        _tap(300, SIDE_L, onset_strength=0.8),
+    ]
+    result = _convert(notes, difficulty="HARD", budget=0.0)
+    assert result.deleted_count == 1
+    assert [n.time_ms for n in result.notes] == [0, 300]
+
+
+@pytest.mark.parametrize("gap", [60, 80, 100])
+@pytest.mark.parametrize("count", [30, 60, 120])
+def test_move_count_is_distinct_notes_not_operations(gap, count):
+    """연산을 세면 여러 패스에서 같은 노트가 중복 집계된다."""
+    result = _convert(_side_jack(count, gap), difficulty="EASY")
+    assert result.moved_count == sum(1 for n in result.notes if n.lane != n.origin_lane)
+
+
+def test_an_expert_side_chord_is_left_alone():
+    """EXPERT 의 양쪽 사이드 동시는 합법이다. 옮기면 예산만 깎는다."""
+    notes = _chart_with_side_jack(jack=0) + [_tap(1000, SIDE_L), _tap(1000, SIDE_R)]
+    result = _convert(notes, difficulty="EXPERT")
+    lanes = {n.lane for n in result.notes if n.time_ms == 1000}
+    assert lanes == {SIDE_L, SIDE_R}
+    assert result.moved_count == 0
