@@ -107,6 +107,18 @@ def test_another_lane_between_breaks_the_jack():
     assert PatternKind.MINIJACK not in _kinds(notes)
 
 
+def test_same_lane_after_more_than_a_beat_is_not_a_jack():
+    notes = _taps([(0, 0), (1_000, 0)])
+    assert PatternKind.MINIJACK not in _kinds(notes)
+
+
+def test_chords_more_than_a_beat_apart_do_not_form_sequence_patterns():
+    notes = _taps([(0, 0), (0, 1), (0, 2), (1_000, 0), (1_000, 1), (1_000, 2)])
+    kinds = _kinds(notes)
+    assert PatternKind.CHORDJACK not in kinds
+    assert PatternKind.HANDSTREAM not in kinds
+
+
 def test_anchor_is_a_half_beat_lane_with_others_interleaved():
     notes = _taps([(0, 0), (125, 1), (250, 0), (375, 2), (500, 0), (625, 1), (750, 0), (875, 3)])
     assert PatternKind.ANCHOR in _kinds(notes)

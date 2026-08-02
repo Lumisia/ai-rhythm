@@ -20,7 +20,7 @@ MAX_HAND_SHARE = {"EASY": 0.75, "NORMAL": 0.80, "HARD": 0.85, "EXPERT": 0.90}
 HAND_WINDOW_MS = 2_000
 MIN_NOTES_FOR_HAND_SHARE = 6
 MIN_HOLD_MS = 60
-MAX_RECOVERY_PASSES = 3
+MAX_RECOVERY_PASSES = 8
 
 
 class ViolationCode(StrEnum):
@@ -78,7 +78,7 @@ def _pattern_violation(
     )
 
 
-def _jack_violations(notes: Chart, difficulty: str) -> list[PlayabilityViolation]:
+def _jack_violations(notes: Chart, difficulty: str, beat_ms: float) -> list[PlayabilityViolation]:
     limit = MAX_JACK_RUN[difficulty]
     active: dict[int, list[int]] = {}
     found = []
@@ -89,6 +89,8 @@ def _jack_violations(notes: Chart, difficulty: str) -> list[PlayabilityViolation
                 active[lane] = []
         for lane in lanes:
             run = active.setdefault(lane, [])
+            if run and row.time_ms - run[-1] > beat_ms:
+                run.clear()
             run.append(row.time_ms)
             if len(run) == limit + 1:
                 found.append(
@@ -221,7 +223,7 @@ def find_violations(
             )
 
     found.extend(_hand_violations(structurally_valid, key_mode, difficulty))
-    found.extend(_jack_violations(structurally_valid, difficulty))
+    found.extend(_jack_violations(structurally_valid, difficulty, beat_ms))
     found.extend(
         PlayabilityViolation(
             ViolationCode.LANE_RULE,
@@ -311,6 +313,21 @@ def _victim(notes: Chart, violation: PlayabilityViolation) -> NoteEvent | None:
     return min(candidates, key=_preservation_key)
 
 
+def _victims(notes: Chart, violation: PlayabilityViolation) -> tuple[NoteEvent, ...]:
+    if violation.code is ViolationCode.PATTERN_FORBIDDEN and violation.detail.startswith(
+        ("HANDSTREAM", "CHORDSTREAM")
+    ):
+        window = [note for note in notes if violation.time_ms <= note.time_ms <= violation.end_ms]
+        selected = []
+        for row in rows_of(window):
+            excess = max(0, row.size - 2)
+            selected.extend(sorted(row.notes, key=_preservation_key)[:excess])
+        if selected:
+            return tuple(selected)
+    victim = _victim(notes, violation)
+    return () if victim is None else (victim,)
+
+
 def _require_invariants(before: Chart, after: Chart) -> None:
     if not check_timing_invariant(before, after):
         raise WorkerError(
@@ -368,11 +385,15 @@ def validate_and_recover(
                 (),
             )
 
-        victim = _victim(current, violations[0])
-        if victim is None:
+        victims = {
+            id(victim): victim
+            for violation in violations
+            for victim in _victims(current, violation)
+        }
+        if not victims:
             break
-        current = [note for note in current if note is not victim]
-        deleted += 1
+        current = [note for note in current if id(note) not in victims]
+        deleted += len(victims)
         _require_invariants(before, current)
 
     remaining = find_violations(
@@ -392,7 +413,9 @@ def validate_and_recover(
                 {
                     "code": violation.code.value,
                     "time_ms": violation.time_ms,
+                    "end_ms": violation.end_ms,
                     "lanes": violation.lanes,
+                    "detail": violation.detail,
                 }
                 for violation in remaining[:20]
             ]

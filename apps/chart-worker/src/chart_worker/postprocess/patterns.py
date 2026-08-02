@@ -193,14 +193,15 @@ def detect_grace(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
 # --- 잭 ---------------------------------------------------------------------
 
 
-def _lane_runs(rows: list[Row]) -> list[tuple[int, list[int]]]:
+def _lane_runs(rows: list[Row], *, beat_ms: float) -> list[tuple[int, list[int]]]:
     """레인별로, 중간에 다른 노트가 끼지 않는 연속 등장 구간."""
+    limit = beat_ms * MAX_RUN_GAP_BEATS
     runs: list[tuple[int, list[int]]] = []
     active: dict[int, list[int]] = {}
     for row in rows:
         lanes = set(row.lanes)
         for lane in list(active):
-            if lane not in lanes:
+            if lane not in lanes or row.time_ms - active[lane][-1] > limit:
                 runs.append((lane, active.pop(lane)))
         for lane in lanes:
             active.setdefault(lane, []).append(row.time_ms)
@@ -208,14 +209,14 @@ def _lane_runs(rows: list[Row]) -> list[tuple[int, list[int]]]:
     return runs
 
 
-def detect_jacks(rows: list[Row]) -> list[PatternInstance]:
+def detect_jacks(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     """같은 레인 연속. 길이로 갈린다.
 
     긴 잭은 짧은 잭을 겸한다 — 4연타는 LONGJACK 이면서 JACK 이다.
     해금표가 Jack(3+)과 Longjack 을 따로 다루므로 둘 다 낸다.
     """
     found = []
-    for lane, times in _lane_runs(rows):
+    for lane, times in _lane_runs(rows, beat_ms=beat_ms):
         length = len(times)
         if length < 2:
             continue
@@ -260,10 +261,12 @@ def detect_anchor(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     return found
 
 
-def detect_chordjack(rows: list[Row]) -> list[PatternInstance]:
+def detect_chordjack(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     """연속한 두 화음이 레인을 두 개 이상 공유한다."""
     found = []
     for first, second in pairwise(rows):
+        if second.time_ms - first.time_ms > beat_ms * MAX_RUN_GAP_BEATS:
+            continue
         if first.size < 2 or second.size < 2:
             continue
         shared = set(first.lanes) & set(second.lanes)
@@ -283,26 +286,35 @@ def detect_chordjack(rows: list[Row]) -> list[PatternInstance]:
 # --- 스트림 -----------------------------------------------------------------
 
 
-def _runs_of_even_intervals(rows: list[Row]) -> list[list[Row]]:
+def _runs_of_even_intervals(rows: list[Row], *, beat_ms: float) -> list[list[Row]]:
     """간격이 고르게 이어지는 구간으로 자른다."""
     if len(rows) < 2:
         return []
     runs: list[list[Row]] = []
-    current = [rows[0], rows[1]]
-    for previous, row in pairwise(rows[1:]):
-        if _close(row.time_ms - previous.time_ms, current[-1].time_ms - current[-2].time_ms):
+    current = [rows[0]]
+    limit = beat_ms * MAX_RUN_GAP_BEATS
+    for previous, row in pairwise(rows):
+        gap = row.time_ms - previous.time_ms
+        if gap > limit:
+            if len(current) >= 2:
+                runs.append(current)
+            current = [row]
+            continue
+        if len(current) == 1 or _close(gap, current[-1].time_ms - current[-2].time_ms):
             current.append(row)
             continue
-        runs.append(current)
+        if len(current) >= 2:
+            runs.append(current)
         current = [previous, row]
-    runs.append(current)
+    if len(current) >= 2:
+        runs.append(current)
     return runs
 
 
 def detect_streams(rows: list[Row], *, beat_ms: float, key_mode: int) -> list[PatternInstance]:
     """고른 간격의 연속. 섞인 화음 크기로 이름이 갈린다."""
     found = []
-    for run in _runs_of_even_intervals(rows):
+    for run in _runs_of_even_intervals(rows, beat_ms=beat_ms):
         if len(run) < STREAM_MIN_NOTES:
             continue
         interval = run[1].time_ms - run[0].time_ms
@@ -407,7 +419,7 @@ def detect_trills(rows: list[Row], *, key_mode: int, beat_ms: float) -> list[Pat
     return found
 
 
-def detect_jumptrill(rows: list[Row]) -> list[PatternInstance]:
+def detect_jumptrill(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     """레인이 겹치지 않는 두 화음의 교대."""
     found = []
     index = 0
@@ -415,6 +427,10 @@ def detect_jumptrill(rows: list[Row]) -> list[PatternInstance]:
         window = rows[index : index + 3]
         if (
             all(row.size == 2 for row in window)
+            and all(
+                second.time_ms - first.time_ms <= beat_ms * MAX_RUN_GAP_BEATS
+                for first, second in pairwise(window)
+            )
             and not (set(window[0].lanes) & set(window[1].lanes))
             and set(window[0].lanes) == set(window[2].lanes)
         ):
@@ -540,13 +556,13 @@ def detect_patterns(notes: Chart, *, key_mode: int, beat_ms: float) -> list[Patt
     found = [
         *detect_chords(rows),
         *detect_grace(rows, beat_ms=beat_ms),
-        *detect_jacks(rows),
+        *detect_jacks(rows, beat_ms=beat_ms),
         *detect_anchor(rows, beat_ms=beat_ms),
-        *detect_chordjack(rows),
+        *detect_chordjack(rows, beat_ms=beat_ms),
         *detect_streams(rows, beat_ms=beat_ms, key_mode=key_mode),
         *detect_stairs(rows, beat_ms=beat_ms),
         *detect_trills(rows, key_mode=key_mode, beat_ms=beat_ms),
-        *detect_jumptrill(rows),
+        *detect_jumptrill(rows, beat_ms=beat_ms),
         *detect_denim(rows, beat_ms=beat_ms),
         *detect_hold_patterns(notes, beat_ms=beat_ms),
     ]
