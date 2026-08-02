@@ -36,6 +36,8 @@ class GeneratedVariant:
     requested_star: float
     raw_osu_path: Path
     generated: GeneratedChart
+    cfg_scale: float = 1.0
+    attempt: int = 1
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,6 +19,13 @@ from chart_worker.analysis.timing import (
 )
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.candidate_selection import (
+    RETRY_SEED_STEP,
+    CandidateParameters,
+    CandidateQuality,
+    needs_retry,
+    select_candidate_index,
+)
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
 from chart_worker.schema.playtest_run import (
@@ -27,9 +34,13 @@ from chart_worker.schema.playtest_run import (
     RunChartRef,
 )
 from chart_worker.stages.s1_analyze import run_analysis
-from chart_worker.stages.s2_generate import run_generation
+from chart_worker.stages.s2_generate import run_generation, run_generation_variant
 from chart_worker.stages.s3_stems import run_stems
-from chart_worker.stages.s4_postprocess import run_postprocess
+from chart_worker.stages.s4_postprocess import (
+    candidate_quality_of,
+    run_postprocess,
+    run_postprocess_variant,
+)
 from chart_worker.stages.s15_select_timing import run_timing_selection
 from chart_worker.stages.types import (
     AnalysisStageResult,
@@ -49,6 +60,14 @@ PostprocessStage = Callable[
     [AnalysisStageResult, tuple[GeneratedVariant, ...], StemStageResult, Path, str],
     tuple[PostprocessedVariant, ...],
 ]
+GenerationVariantStage = Callable[
+    [AnalysisStageResult, Path, ChartGenerator, int, str, int, CandidateParameters],
+    GeneratedVariant,
+]
+PostprocessVariantStage = Callable[
+    [AnalysisStageResult, GeneratedVariant, StemStageResult, Path, str, bool],
+    PostprocessedVariant,
+]
 
 
 def _analysis_stage(source: Path, run_dir: Path, config: WorkerConfig) -> AnalysisStageResult:
@@ -64,6 +83,26 @@ def _generation_stage(
     return run_generation(analysis, run_dir, generator=generator, seed=seed)
 
 
+def _generation_variant_stage(
+    analysis: AnalysisStageResult,
+    run_dir: Path,
+    generator: ChartGenerator,
+    key_mode: int,
+    difficulty: str,
+    attempt: int,
+    parameters: CandidateParameters,
+) -> GeneratedVariant:
+    return run_generation_variant(
+        analysis,
+        run_dir,
+        generator=generator,
+        key_mode=key_mode,
+        difficulty=difficulty,
+        attempt=attempt,
+        parameters=parameters,
+    )
+
+
 def _timing_stage(
     analysis: AnalysisStageResult,
     run_dir: Path,
@@ -75,6 +114,12 @@ def _timing_stage(
 
 def _stem_stage(analysis: AnalysisStageResult, run_dir: Path, enabled: bool) -> StemStageResult:
     return run_stems(analysis, run_dir, enabled=enabled)
+
+
+def _select_generator(name: GeneratorName, config: WorkerConfig) -> ChartGenerator:
+    if name == "fake":
+        return FakeGenerator()
+    return MapperatorinatorGenerator(config)
 
 
 def _postprocess_stage(
@@ -93,6 +138,24 @@ def _postprocess_stage(
     )
 
 
+def _postprocess_variant_stage(
+    analysis: AnalysisStageResult,
+    generated: GeneratedVariant,
+    stems: StemStageResult,
+    run_dir: Path,
+    worker_version: str,
+    write_output: bool,
+) -> PostprocessedVariant:
+    return run_postprocess_variant(
+        analysis,
+        generated,
+        stems,
+        run_dir,
+        worker_version=worker_version,
+        write_output=write_output,
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -102,9 +165,12 @@ class PipelineDependencies:
     config: WorkerConfig = field(default_factory=load_config)
     analysis: AnalysisStage = _analysis_stage
     timing: TimingStage = _timing_stage
+    select_generator: Callable[[GeneratorName, WorkerConfig], ChartGenerator] = _select_generator
     generation: GenerationStage = _generation_stage
+    generation_variant: GenerationVariantStage = _generation_variant_stage
     stems: StemStage = _stem_stage
     postprocess: PostprocessStage = _postprocess_stage
+    postprocess_variant: PostprocessVariantStage = _postprocess_variant_stage
     now: Callable[[], datetime] = _utc_now
     new_run_id: Callable[[], UUID] = uuid4
 
@@ -142,6 +208,14 @@ class PipelineResult:
     elapsed_ms_by_stage: dict[str, int]
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateEvaluation:
+    variant: GeneratedVariant
+    result: PostprocessedVariant
+    quality: CandidateQuality
+    reference_quality: ReferenceQuality | None
+
+
 def _prepare_run_dir(options: PipelineOptions) -> Path:
     if not options.source.is_file():
         raise ValueError(f"source does not exist or is not a file: {options.source}")
@@ -159,12 +233,6 @@ def _relative(path: Path, run_dir: Path) -> str:
         return path.resolve().relative_to(run_dir).as_posix()
     except ValueError:
         raise ValueError(f"pipeline asset is outside the output directory: {path}") from None
-
-
-def _select_generator(name: GeneratorName, config: WorkerConfig) -> ChartGenerator:
-    if name == "fake":
-        return FakeGenerator()
-    return MapperatorinatorGenerator(config)
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -197,6 +265,85 @@ def _reference_payload(quality: ReferenceQuality | None) -> dict[str, object]:
         "phaseAbsMs": quality.phase_abs_ms,
         "p95AbsMs": quality.p95_abs_ms,
     }
+
+
+def _quality_payload(
+    evaluation: _CandidateEvaluation,
+    *,
+    analysis: AnalysisStageResult,
+) -> dict[str, object]:
+    variant = evaluation.variant
+    quality = evaluation.quality
+    return {
+        "attempt": variant.attempt,
+        "seed": variant.generated.seed,
+        "parameters": {
+            "requested_star": variant.requested_star,
+            "cfg_scale": variant.cfg_scale,
+        },
+        "timing_source": analysis.timing_candidate.source.value,
+        "failure_metrics": {
+            "long_gap_bars": quality.long_gap_bars,
+            "rating_error": quality.rating_error,
+            "removed_ratio": quality.removed_ratio,
+            "drum_precision": quality.drum_precision,
+            "playability_passes": quality.playability_passes,
+            "hold_ratio_error": quality.hold_ratio_error,
+            "reference_pass": quality.reference_pass,
+            "reference_accuracy": _reference_payload(evaluation.reference_quality),
+        },
+        "raw_osu_path": str(variant.raw_osu_path),
+        "chart_path": str(evaluation.result.path),
+    }
+
+
+def _write_exhausted_report(
+    *,
+    options: PipelineOptions,
+    run_id: UUID,
+    elapsed: dict[str, int],
+    charts: tuple[PostprocessedVariant, ...],
+    reference_quality: dict[tuple[int, str], ReferenceQuality | None],
+    key_mode: int,
+    difficulty: str,
+    candidates: list[dict[str, object]],
+    run_dir: Path,
+) -> Path:
+    payload = _generation_report(options, run_id, elapsed, charts, reference_quality)
+    payload["failedCombination"] = {
+        "keyMode": key_mode,
+        "difficulty": difficulty,
+        "candidates": candidates,
+    }
+    report_path = run_dir / "generation-report.json"
+    report_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def _canonical_raw_path(variant: GeneratedVariant, run_dir: Path) -> Path:
+    destination = run_dir / "raw" / (
+        f"{variant.key_mode}k-{variant.difficulty.lower()}.osu"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    copyfile(variant.raw_osu_path, destination)
+    return destination
+
+
+def _requires_retry(
+    quality: CandidateQuality,
+    *,
+    difficulty: str,
+    generator: GeneratorName,
+) -> bool:
+    # FakeGenerator validates orchestration and serialization, not musical
+    # quality. Its two-second fixture cannot meaningfully satisfy rating or
+    # deletion gates; human labels remain a real observable contract.
+    if generator == "fake":
+        return quality.reference_pass is False
+    return needs_retry(quality, difficulty=difficulty)
 
 
 def _generation_report(
@@ -259,10 +406,11 @@ def run_pipeline(
     elapsed["timing"] = _elapsed_ms(started)
 
     started = perf_counter_ns()
+    generator = dependencies.select_generator(options.generator, dependencies.config)
     generated = dependencies.generation(
         analysis,
         run_dir,
-        _select_generator(options.generator, dependencies.config),
+        generator,
         options.seed,
     )
     elapsed["generation"] = _elapsed_ms(started)
@@ -272,28 +420,121 @@ def run_pipeline(
     elapsed["stems"] = _elapsed_ms(started)
 
     started = perf_counter_ns()
-    charts = dependencies.postprocess(
-        analysis,
-        generated,
-        stems,
-        run_dir,
-        options.worker_version,
-    )
-    elapsed["postprocess"] = _elapsed_ms(started)
+    selected_charts: list[PostprocessedVariant] = []
+    selected_reference_quality: dict[tuple[int, str], ReferenceQuality | None] = {}
+    canonical_raw_paths: list[Path] = []
+    for combination_index, initial_variant in enumerate(generated):
+        key_mode = initial_variant.key_mode
+        difficulty = initial_variant.difficulty
+        reference = references.get((key_mode, difficulty))
 
-    reference_quality = {
-        (chart.document.key_mode, chart.document.difficulty): evaluate_reference(
-            references.get((chart.document.key_mode, chart.document.difficulty)),
-            tuple(sorted({note.time_ms for note in chart.document.notes})),
+        def evaluate(
+            variant: GeneratedVariant,
+            reference_chart: ReferenceChart | None,
+        ) -> _CandidateEvaluation:
+            result = dependencies.postprocess_variant(
+                analysis,
+                variant,
+                stems,
+                run_dir,
+                options.worker_version,
+                False,
+            )
+            reference_result = evaluate_reference(
+                reference_chart,
+                tuple(sorted({note.time_ms for note in result.document.notes})),
+            )
+            quality = candidate_quality_of(
+                analysis,
+                variant,
+                result,
+                stems,
+                reference_pass=(
+                    reference_result.passes if reference_result is not None else None
+                ),
+            )
+            return _CandidateEvaluation(variant, result, quality, reference_result)
+
+        evaluations = [evaluate(initial_variant, reference)]
+        if _requires_retry(
+            evaluations[0].quality,
+            difficulty=difficulty,
+            generator=options.generator,
+        ):
+            for attempt in (2, 3):
+                retry_variant = dependencies.generation_variant(
+                    analysis,
+                    run_dir,
+                    generator,
+                    key_mode,
+                    difficulty,
+                    attempt,
+                    CandidateParameters(
+                        seed=(
+                            options.seed
+                            + combination_index
+                            + (attempt - 1) * RETRY_SEED_STEP
+                        ),
+                        requested_star=initial_variant.requested_star,
+                        cfg_scale=initial_variant.cfg_scale,
+                    ),
+                )
+                evaluations.append(evaluate(retry_variant, reference))
+
+        if all(
+            _requires_retry(
+                evaluation.quality,
+                difficulty=difficulty,
+                generator=options.generator,
+            )
+            for evaluation in evaluations
+        ):
+            candidate_payloads = [
+                _quality_payload(evaluation, analysis=analysis)
+                for evaluation in evaluations
+            ]
+            elapsed["postprocess"] = _elapsed_ms(started)
+            _write_exhausted_report(
+                options=options,
+                run_id=run_id,
+                elapsed=elapsed,
+                charts=tuple(selected_charts),
+                reference_quality=selected_reference_quality,
+                key_mode=key_mode,
+                difficulty=difficulty,
+                candidates=candidate_payloads,
+                run_dir=run_dir,
+            )
+            raise WorkerError(
+                ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+                "all three chart candidates failed quality gates",
+                context={
+                    "key_mode": key_mode,
+                    "difficulty": difficulty,
+                    "candidates": candidate_payloads,
+                },
+            )
+
+        selected_index = select_candidate_index(
+            tuple(evaluation.quality for evaluation in evaluations),
+            difficulty=difficulty,
         )
-        for chart in charts
-    }
-    generated_by_combo = {
-        (variant.key_mode, variant.difficulty): variant for variant in generated
-    }
-    chart_by_combo = {
-        (chart.document.key_mode, chart.document.difficulty): chart for chart in charts
-    }
+        selected = evaluations[selected_index]
+        canonical_chart = dependencies.postprocess_variant(
+            analysis,
+            selected.variant,
+            stems,
+            run_dir,
+            options.worker_version,
+            True,
+        )
+        selected_charts.append(canonical_chart)
+        selected_reference_quality[(key_mode, difficulty)] = selected.reference_quality
+        canonical_raw_paths.append(_canonical_raw_path(selected.variant, run_dir))
+
+    charts = tuple(selected_charts)
+    reference_quality = selected_reference_quality
+    elapsed["postprocess"] = _elapsed_ms(started)
 
     report_path = run_dir / "generation-report.json"
     report_path.write_text(
@@ -305,25 +546,6 @@ def run_pipeline(
         + "\n",
         encoding="utf-8",
     )
-    failed_references = [
-        {
-            "key_mode": key_mode,
-            "difficulty": difficulty,
-            "seed": generated_by_combo[(key_mode, difficulty)].generated.seed,
-            "timing_source": analysis.timing_candidate.source.value,
-            "failure_metrics": _reference_payload(quality),
-            "raw_osu_path": str(generated_by_combo[(key_mode, difficulty)].raw_osu_path),
-            "chart_path": str(chart_by_combo[(key_mode, difficulty)].path),
-        }
-        for (key_mode, difficulty), quality in reference_quality.items()
-        if quality is not None and not quality.passes
-    ]
-    if failed_references:
-        raise WorkerError(
-            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-            "the first chart candidate failed human reference accuracy",
-            context={"candidates": failed_references},
-        )
     manifest = PlaytestRunManifest(
         run_id=run_id,
         title=options.title,
@@ -360,6 +582,6 @@ def run_pipeline(
         output_dir=run_dir,
         manifest_path=manifest_path,
         chart_paths=tuple(chart.path for chart in charts),
-        raw_osu_paths=tuple(variant.raw_osu_path for variant in generated),
+        raw_osu_paths=tuple(canonical_raw_paths),
         elapsed_ms_by_stage=elapsed,
     )

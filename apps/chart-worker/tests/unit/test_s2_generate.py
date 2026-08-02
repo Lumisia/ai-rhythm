@@ -6,10 +6,11 @@ from chart_worker.analysis.audio_io import AudioSignal
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
+from chart_worker.generation.candidate_selection import CandidateParameters
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import parse_osu_file
 from chart_worker.schema.note import NoteEvent
-from chart_worker.stages.s2_generate import run_generation
+from chart_worker.stages.s2_generate import run_generation, run_generation_variant
 from chart_worker.stages.types import AnalysisStageResult
 from tests.support import timing_candidate
 
@@ -76,7 +77,19 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
     requests = [request for request, _ in generator.calls]
     workdirs = [workdir for _, workdir in generator.calls]
     assert len({request.seed for request in requests}) == 12
+    assert [
+        (request.key_mode, request.difficulty, request.seed) for request in requests
+    ] == [
+        (key_mode, difficulty, 17 + index)
+        for index, (key_mode, difficulty) in enumerate(
+            (key_mode, difficulty)
+            for key_mode in (4, 6, 7)
+            for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+        )
+    ]
     assert len(set(workdirs)) == 12
+    assert all("candidates" in workdir.parts for workdir in workdirs)
+    assert all("attempt-1" in workdir.parts for workdir in workdirs)
     assert all(request.timing_osu_path == analysis.timing_osu_path for request in requests)
     assert all(request.duration_ms == 2_000 for request in requests)
     assert all(
@@ -105,3 +118,34 @@ def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
     generator = OriginalGenerator()
     variants = run_generation(analysis, tmp_path, generator=generator, seed=1)
     assert variants[0].raw_osu_path.read_text(encoding="utf-8") == generator.texts[0]
+
+
+def test_generation_attempts_use_unique_raw_and_work_directories(tmp_path: Path):
+    analysis = _analysis(tmp_path)
+    generator = RecordingGenerator()
+
+    first = run_generation_variant(
+        analysis,
+        tmp_path,
+        generator=generator,
+        key_mode=4,
+        difficulty="NORMAL",
+        attempt=1,
+        parameters=CandidateParameters(seed=19, requested_star=3.0, cfg_scale=1.0),
+    )
+    second = run_generation_variant(
+        analysis,
+        tmp_path,
+        generator=generator,
+        key_mode=4,
+        difficulty="NORMAL",
+        attempt=2,
+        parameters=CandidateParameters(seed=10_019, requested_star=3.0, cfg_scale=1.0),
+    )
+
+    assert first.raw_osu_path != second.raw_osu_path
+    assert first.raw_osu_path.parent.name == "attempt-1"
+    assert second.raw_osu_path.parent.name == "attempt-2"
+    assert generator.calls[0][1] != generator.calls[1][1]
+    assert first.raw_osu_path.is_file()
+    assert second.raw_osu_path.is_file()
