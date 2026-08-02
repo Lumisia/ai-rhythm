@@ -135,6 +135,12 @@ export class JudgmentEngine {
     return events.sort((left, right) => left.noteTimeMs - right.noteTimeMs || left.noteId - right.noteId);
   }
 
+  reset(): void {
+    for (const runtimeNote of this.#runtimeNotes) {
+      runtimeNote.state = "PENDING";
+    }
+  }
+
   #nearest(
     lane: number,
     timeMs: number,

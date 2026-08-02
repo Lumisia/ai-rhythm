@@ -22,6 +22,7 @@ export interface RhythmSceneSession {
   scrollSpeed: number | (() => number);
   keysoundScheduler?: KeysoundScheduler;
   songPlayer?: Pick<SongPlayer, "dispose">;
+  loop?: { startMs: number; endMs: number; restart: () => void };
   onJudgment?: (event: JudgmentEvent) => void;
   onPause?: () => void;
   onComplete?: (score: ScoreSnapshot) => void;
@@ -56,6 +57,10 @@ export class RhythmScene extends Phaser.Scene {
 
   update(): void {
     const songTimeMs = this.#session.clock.songTimeMs();
+    if (this.#session.loop && songTimeMs >= this.#session.loop.endMs) {
+      this.#session.loop.restart();
+      return;
+    }
     for (const event of this.#session.engine.advance(songTimeMs)) {
       this.#acceptJudgment(event);
     }
@@ -66,7 +71,7 @@ export class RhythmScene extends Phaser.Scene {
         : this.#session.scrollSpeed;
     this.#renderer?.update(songTimeMs, scrollSpeed);
 
-    if (!this.#finished && songTimeMs > this.#session.chart.durationMs + 500) {
+    if (!this.#session.loop && !this.#finished && songTimeMs > this.#session.chart.durationMs + 500) {
       this.#finished = true;
       this.#session.onComplete?.(this.#session.score.snapshot());
     }

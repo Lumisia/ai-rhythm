@@ -74,4 +74,12 @@ describe("JudgmentEngine", () => {
     ]);
     expect(engine.keyUp(0, 1801)).toBeNull();
   });
+
+  it("resets judgments for a practice-loop replay", () => {
+    const engine = makeEngine([tap(1, 0, 1000)]);
+    expect(engine.keyDown(0, 1000)?.noteId).toBe(1);
+    expect(engine.keyDown(0, 1000)).toBeNull();
+    engine.reset();
+    expect(engine.keyDown(0, 1000)?.noteId).toBe(1);
+  });
 });
