@@ -6,7 +6,11 @@ dependencies = [
   "numpy>=1.26",
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
+  "typer>=0.12",
 ]
+
+[project.scripts]
+chart-worker = "chart_worker.cli:app"
 
 [project.optional-dependencies]
 # 분석 백엔드는 무겁다(torch). 핵심 패키지는 가볍게 두고 필요할 때만 켠다.
