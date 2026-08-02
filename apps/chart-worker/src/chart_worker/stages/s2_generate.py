@@ -2,10 +2,13 @@
 
 from pathlib import Path
 
-from chart_worker.generation.candidate_selection import CandidateParameters
+from chart_worker.generation.candidate_selection import (
+    CandidateParameters,
+    candidate_parameters,
+)
 from chart_worker.generation.mapperatorinator import ChartGenerator
 from chart_worker.generation.osu_writer import notes_to_osu_mania
-from chart_worker.generation.params import REQUESTED_STAR, GenerationRequest
+from chart_worker.generation.params import GenerationRequest
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.types import AnalysisStageResult, GeneratedVariant
 
@@ -84,11 +87,7 @@ def run_generation(
                 key_mode=key_mode,
                 difficulty=difficulty,
                 attempt=1,
-                parameters=CandidateParameters(
-                    seed=seed + index,
-                    requested_star=REQUESTED_STAR[difficulty],
-                    cfg_scale=1.0,
-                ),
+                parameters=candidate_parameters(seed, index, 1, None),
             )
         )
     return tuple(variants)

@@ -83,7 +83,9 @@ class GenerationRequest:
 
         if not self.descriptors:
             object.__setattr__(self, "descriptors", DESCRIPTORS[self.difficulty])
-        if not self.negative_descriptors:
+        if self.cfg_scale <= 1.0:
+            object.__setattr__(self, "negative_descriptors", ())
+        elif not self.negative_descriptors:
             object.__setattr__(self, "negative_descriptors", NEGATIVE_DESCRIPTORS[self.difficulty])
         if self.requested_star <= 0:
             object.__setattr__(self, "requested_star", REQUESTED_STAR[self.difficulty])

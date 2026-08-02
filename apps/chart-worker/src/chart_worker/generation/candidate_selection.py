@@ -6,7 +6,8 @@ import numpy as np
 
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing import TimingCandidate
-from chart_worker.schema.types import DIFFICULTIES
+from chart_worker.generation.params import REQUESTED_STAR
+from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
 MAX_CANDIDATE_ATTEMPTS = 3
 RETRY_SEED_STEP = 10_000
@@ -34,6 +35,8 @@ class CandidateQuality:
     playability_passes: int
     hold_ratio_error: float
     reference_pass: bool | None
+    requested_star: float | None = None
+    cfg_scale: float | None = None
 
 
 def _require_difficulty(difficulty: str) -> None:
@@ -41,12 +44,53 @@ def _require_difficulty(difficulty: str) -> None:
         raise ValueError(f"unsupported difficulty: {difficulty}")
 
 
+def requested_star_candidates(difficulty: str) -> tuple[float, float, float]:
+    """Return the bounded half-star schedule for one difficulty."""
+    _require_difficulty(difficulty)
+    current = REQUESTED_STAR[difficulty]
+    return (current, current - 0.5, current - 1.0)
+
+
+def candidate_parameters(
+    base_seed: int,
+    combination_index: int,
+    attempt: int,
+    previous: CandidateQuality | None,
+) -> CandidateParameters:
+    """Choose one of three deterministic seed, star, and CFG combinations."""
+    if not 0 <= combination_index < len(KEY_MODES) * len(DIFFICULTIES):
+        raise ValueError(f"combination_index out of range: {combination_index}")
+    if not 1 <= attempt <= MAX_CANDIDATE_ATTEMPTS:
+        raise ValueError(f"attempt must be within 1..{MAX_CANDIDATE_ATTEMPTS}")
+    if attempt > 1 and previous is None:
+        raise ValueError("previous quality is required for retry attempts")
+
+    difficulty = DIFFICULTIES[combination_index % len(DIFFICULTIES)]
+    star_candidates = requested_star_candidates(difficulty)
+    requested_star = star_candidates[0]
+    if previous is not None:
+        previous_star = (
+            previous.requested_star
+            if previous.requested_star is not None
+            else star_candidates[0]
+        )
+        requested_star = previous_star
+        if previous.rating_error > MAX_RATING_ERROR:
+            requested_star = max(star_candidates[-1], previous_star - 0.5)
+
+    return CandidateParameters(
+        seed=base_seed + combination_index + (attempt - 1) * RETRY_SEED_STEP,
+        requested_star=requested_star,
+        cfg_scale=1.25 if attempt == 1 else 1.0,
+    )
+
+
 def needs_retry(quality: CandidateQuality, *, difficulty: str) -> bool:
     """Return whether another seed may repair this candidate's quality."""
     _require_difficulty(difficulty)
     structural_failure = (
         quality.long_gap_bars > MAX_LONG_GAP_BARS
-        or quality.rating_error >= MAX_RATING_ERROR
+        or abs(quality.rating_error) >= MAX_RATING_ERROR
         or quality.removed_ratio > MAX_REMOVED_RATIO
         or quality.playability_passes >= MAX_PLAYABILITY_PASSES
         or quality.reference_pass is False

@@ -20,9 +20,9 @@ from chart_worker.analysis.timing import (
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.candidate_selection import (
-    RETRY_SEED_STEP,
     CandidateParameters,
     CandidateQuality,
+    candidate_parameters,
     needs_retry,
     select_candidate_index,
 )
@@ -489,14 +489,11 @@ def run_pipeline(
                     key_mode,
                     difficulty,
                     attempt,
-                    CandidateParameters(
-                        seed=(
-                            options.seed
-                            + combination_index
-                            + (attempt - 1) * RETRY_SEED_STEP
-                        ),
-                        requested_star=initial_variant.requested_star,
-                        cfg_scale=initial_variant.cfg_scale,
+                    candidate_parameters(
+                        options.seed,
+                        combination_index,
+                        attempt,
+                        evaluations[-1].quality,
                     ),
                 )
                 evaluations.append(evaluate(retry_variant, reference))

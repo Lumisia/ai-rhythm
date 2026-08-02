@@ -178,7 +178,7 @@ def candidate_quality_of(
             duration_ms=analysis.normalized.duration_ms,
             note_times=tuple(note.time_ms for note in result.document.notes),
         ),
-        rating_error=abs(
+        rating_error=(
             result.document.metrics.project_rating - result.reports.difficulty.target_rating
         ),
         removed_ratio=removed_ratio,
@@ -190,4 +190,6 @@ def candidate_quality_of(
             hold_ratio - TARGET_HOLD_RATIO[variant.difficulty]
         ),
         reference_pass=reference_pass,
+        requested_star=variant.requested_star,
+        cfg_scale=variant.cfg_scale,
     )

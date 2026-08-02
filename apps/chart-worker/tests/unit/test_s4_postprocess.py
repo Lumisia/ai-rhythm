@@ -229,13 +229,15 @@ def test_candidate_quality_extracts_reference_and_unavailable_drums(tmp_path: Pa
     )
 
     assert quality.removed_ratio == 0.0
-    assert quality.rating_error == abs(
+    assert quality.rating_error == (
         result.document.metrics.project_rating - result.reports.difficulty.target_rating
     )
     assert quality.drum_precision is None
     assert quality.playability_passes == result.reports.playability.passes
     assert quality.hold_ratio_error == 0.15
     assert quality.reference_pass is True
+    assert quality.requested_star == generated.requested_star
+    assert quality.cfg_scale == generated.cfg_scale
 
 
 def test_zero_raw_notes_are_always_a_failed_candidate(tmp_path: Path):

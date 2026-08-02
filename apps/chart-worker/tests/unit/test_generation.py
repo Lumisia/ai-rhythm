@@ -91,8 +91,14 @@ def test_defaults_are_filled_from_the_difficulty_tables():
     request = _request()
     assert request.requested_star == REQUESTED_STAR["NORMAL"]
     assert request.descriptors == DESCRIPTORS["NORMAL"]
-    assert request.negative_descriptors == NEGATIVE_DESCRIPTORS["NORMAL"]
+    assert request.negative_descriptors == ()
     assert request.hold_note_ratio > 0
+
+
+def test_guided_candidate_uses_real_negative_descriptors():
+    request = _request(cfg_scale=1.25)
+    assert request.cfg_scale == 1.25
+    assert request.negative_descriptors == NEGATIVE_DESCRIPTORS["NORMAL"]
 
 
 def test_no_descriptor_is_the_nonexistent_clean_tag():
@@ -229,10 +235,21 @@ def test_timing_context_needs_a_reference_beatmap(config, timing_osu, tmp_path):
 
 
 def test_descriptors_are_written_as_hydra_lists(config, timing_osu, tmp_path):
-    argv = build_command(config, _request(timing_osu, difficulty="HARD"), tmp_path)
+    argv = build_command(
+        config,
+        _request(timing_osu, difficulty="HARD", cfg_scale=1.25),
+        tmp_path,
+    )
     pairs = _pairs(argv)
     assert pairs["descriptors"] == "[style/jumpstream,style/handstream,style/LN coordination]"
     assert pairs["negative_descriptors"].startswith("[style/dump,")
+
+
+def test_unguided_candidate_omits_negative_descriptors_from_hydra(
+    config, timing_osu, tmp_path
+):
+    pairs = _pairs(build_command(config, _request(timing_osu, cfg_scale=1.0), tmp_path))
+    assert pairs["negative_descriptors"] == "[]"
 
 
 def test_seed_is_omitted_when_unset(config, timing_osu, tmp_path):

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import chart_worker.pipeline as pipeline_module
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import GeneratedChart
@@ -177,10 +178,11 @@ def test_reference_failure_writes_report_then_exhausts_the_first_candidate(tmp_p
     candidates = caught.value.context["candidates"]
     assert [candidate["attempt"] for candidate in candidates] == [1, 2, 3]
     assert [candidate["seed"] for candidate in candidates] == [1, 10_001, 20_001]
-    assert all(
-        candidate["parameters"] == {"requested_star": 3.0, "cfg_scale": 1.0}
-        for candidate in candidates
-    )
+    assert [candidate["parameters"] for candidate in candidates] == [
+        {"requested_star": 3.0, "cfg_scale": 1.25},
+        {"requested_star": 3.0, "cfg_scale": 1.0},
+        {"requested_star": 3.0, "cfg_scale": 1.0},
+    ]
     assert all(candidate["timing_source"] == "BEAT_THIS_PIECEWISE" for candidate in candidates)
     assert all(candidate["failure_metrics"]["reference_accuracy"]["status"] == "FAIL" for candidate in candidates)
     assert all(Path(candidate["raw_osu_path"]).is_file() for candidate in candidates)
@@ -197,6 +199,54 @@ def test_reference_failure_writes_report_then_exhausts_the_first_candidate(tmp_p
     assert report["failedCombination"]["difficulty"] == "NORMAL"
     assert len(report["failedCombination"]["candidates"]) == 3
     assert not (output_dir / "playtest-run-v1.json").exists()
+
+
+def test_pipeline_retry_parameters_follow_each_too_hard_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    reference = tmp_path / "labels.json"
+    reference.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "charts": [
+                    {
+                        "keyMode": 4,
+                        "difficulty": "NORMAL",
+                        "sections": [{"id": "song", "onsetMs": [100, 300]}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    real_quality_of = pipeline_module.candidate_quality_of
+
+    def always_too_hard(*args, **kwargs):
+        quality = real_quality_of(*args, **kwargs)
+        return dataclasses.replace(quality, rating_error=0.3501)
+
+    monkeypatch.setattr(pipeline_module, "candidate_quality_of", always_too_hard)
+
+    with pytest.raises(WorkerError) as caught:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                reference_onsets_path=reference,
+            ),
+            dependencies=fake_dependencies(),
+        )
+
+    candidates = caught.value.context["candidates"]
+    assert [candidate["parameters"] for candidate in candidates] == [
+        {"requested_star": 3.0, "cfg_scale": 1.25},
+        {"requested_star": 2.5, "cfg_scale": 1.0},
+        {"requested_star": 2.0, "cfg_scale": 1.0},
+    ]
 
 
 def test_reference_failure_retries_only_that_combination_and_selects_a_passing_seed(

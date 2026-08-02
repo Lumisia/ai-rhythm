@@ -5,7 +5,9 @@ import pytest
 
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing import TimingCandidate, TimingPoint, TimingSource, TimingStatus
+from chart_worker.generation import candidate_selection
 from chart_worker.generation.candidate_selection import (
+    CandidateParameters,
     CandidateQuality,
     longest_active_bar_gap,
     needs_retry,
@@ -42,6 +44,13 @@ def passing_quality(**overrides) -> CandidateQuality:
 )
 def test_structural_retry_boundaries(changes, expected):
     assert needs_retry(passing_quality(**changes), difficulty="NORMAL") is expected
+
+
+@pytest.mark.parametrize("rating_error", [-0.35, -0.3501])
+def test_too_easy_rating_still_requests_a_retry(rating_error):
+    assert needs_retry(
+        passing_quality(rating_error=rating_error), difficulty="NORMAL"
+    )
 
 
 def test_missing_drum_metric_does_not_force_a_retry():
@@ -84,6 +93,89 @@ def test_rank_is_lexicographic_in_the_approved_order():
 def test_candidate_selection_breaks_exact_ties_by_original_attempt_order():
     qualities = (passing_quality(), passing_quality(), passing_quality())
     assert select_candidate_index(qualities, difficulty="NORMAL") == 0
+
+
+def test_requested_star_candidates_are_three_half_star_steps():
+    assert candidate_selection.requested_star_candidates("NORMAL") == (3.0, 2.5, 2.0)
+
+
+def test_requested_star_candidates_reject_an_unsupported_difficulty():
+    with pytest.raises(ValueError, match="unsupported difficulty"):
+        candidate_selection.requested_star_candidates("NOMAL")
+
+
+def test_first_candidate_uses_configured_star_guidance_and_base_seed():
+    # Combination index 1 is NORMAL in the stable 4K EASY/NORMAL/... order.
+    # The exact literal catches both an off-by-one seed and a stale 1.0 CFG.
+    assert candidate_selection.candidate_parameters(7, 1, 1, None) == CandidateParameters(
+        seed=8, requested_star=3.0, cfg_scale=1.25
+    )
+
+
+def test_each_too_hard_retry_lowers_the_previous_request_by_half_a_star():
+    first = passing_quality(
+        rating_error=0.3501,
+        requested_star=3.0,
+        cfg_scale=1.25,
+    )
+    second_parameters = candidate_selection.candidate_parameters(7, 1, 2, first)
+    assert second_parameters.seed == 10_008
+    assert second_parameters.requested_star == 2.5
+    assert second_parameters.cfg_scale == 1.0
+
+    second = passing_quality(
+        rating_error=0.36,
+        requested_star=second_parameters.requested_star,
+        cfg_scale=second_parameters.cfg_scale,
+    )
+    third_parameters = candidate_selection.candidate_parameters(7, 1, 3, second)
+    assert third_parameters.seed == 20_008
+    assert third_parameters.requested_star == 2.0
+    assert third_parameters.cfg_scale == 1.0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rating_error": -0.3501},
+        {"rating_error": 0.35},
+        {"long_gap_bars": 2.1},
+    ],
+)
+def test_retry_keeps_star_unless_previous_candidate_is_more_than_point_35_too_hard(
+    overrides,
+):
+    quality = passing_quality(
+        **overrides,
+        requested_star=3.0,
+        cfg_scale=1.25,
+    )
+    parameters = candidate_selection.candidate_parameters(7, 1, 2, quality)
+    assert parameters.requested_star == 3.0
+    assert parameters.cfg_scale == 1.0
+
+
+def test_candidate_schedule_rejects_a_fourth_attempt():
+    with pytest.raises(ValueError, match="attempt"):
+        candidate_selection.candidate_parameters(
+            7, 1, 4, passing_quality(requested_star=3.0)
+        )
+
+
+def test_unguided_candidate_wins_when_guided_structural_tuple_is_worse():
+    guided = passing_quality(
+        long_gap_bars=2.1,
+        rating_error=0.2,
+        removed_ratio=0.2,
+        cfg_scale=1.25,
+    )
+    unguided = passing_quality(
+        long_gap_bars=0.0,
+        rating_error=0.1,
+        removed_ratio=0.1,
+        cfg_scale=1.0,
+    )
+    assert select_candidate_index((guided, unguided), difficulty="NORMAL") == 1
 
 
 def test_active_bar_gap_counts_variable_length_bars_not_elapsed_constant_bars():

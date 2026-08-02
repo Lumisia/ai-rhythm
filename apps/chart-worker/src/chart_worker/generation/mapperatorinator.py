@@ -102,7 +102,7 @@ def build_command(
         f"cfg_scale={request.cfg_scale}",
         f"mania_column_temperature={MANIA_COLUMN_TEMPERATURE}",
         f"descriptors={_hydra_list(request.descriptors)}",
-        f"negative_descriptors={_hydra_list(request.negative_descriptors)}",
+        f"negative_descriptors={_hydra_list(request.negative_descriptors if request.cfg_scale > 1.0 else ())}",
         f"precision={config.mapperatorinator_precision or PRECISION}",
         "export_osz=false",
         "resnap_events=true",
