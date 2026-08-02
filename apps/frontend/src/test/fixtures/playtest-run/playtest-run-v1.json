@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "runId": "00000000-0000-0000-0000-000000000007",
+  "title": "contract fixture",
+  "generatedAt": "2026-08-02T00:00:00Z",
+  "workerVersion": "fixture",
+  "audio": {
+    "game": {
+      "path": "audio/game.flac",
+      "sha256": "a158ce71bec83f09bf5f730df5c13c16a51d0605278628273dc0b6e8caf64945"
+    },
+    "noDrums": null,
+    "keys": null
+  },
+  "charts": [
+    {
+      "path": "charts/4k-easy.chart.json",
+      "sha256": "42f2bfc7acc63291744165624d017a4feafff510b648bdc7562d6a75319d14a9",
+      "keyMode": 4,
+      "difficulty": "EASY"
+    },
+    {
+      "path": "charts/4k-normal.chart.json",
+      "sha256": "60db2d8f367c9cd710807e8c0181d5033328afbd7113bdeeeec2b11acafd745b",
+      "keyMode": 4,
+      "difficulty": "NORMAL"
+    },
+    {
+      "path": "charts/4k-hard.chart.json",
+      "sha256": "308c8fbd0d079620bc36dc49e4fef69bb3fb0b515d809060a9202353a5c39a4f",
+      "keyMode": 4,
+      "difficulty": "HARD"
+    },
+    {
+      "path": "charts/4k-expert.chart.json",
+      "sha256": "f1512cc858373cb36af9ded6bfd2da856feedd6c21187a06b2c4ada3d926429c",
+      "keyMode": 4,
+      "difficulty": "EXPERT"
+    },
+    {
+      "path": "charts/6k-easy.chart.json",
+      "sha256": "29827f262d5d1dcd0ea0b28c2769ab42c08d9586d4e7b8894f53bc44e39232aa",
+      "keyMode": 6,
+      "difficulty": "EASY"
+    },
+    {
+      "path": "charts/6k-normal.chart.json",
+      "sha256": "e69b7f097d30172dd1b3585f8d57cb591a68a74c8394c8910206f126231ebf5e",
+      "keyMode": 6,
+      "difficulty": "NORMAL"
+    },
+    {
+      "path": "charts/6k-hard.chart.json",
+      "sha256": "fcf18e2c433c75518d008a2cd085e76e04ad89ebc3e9077d451bd55e300463dc",
+      "keyMode": 6,
+      "difficulty": "HARD"
+    },
+    {
+      "path": "charts/6k-expert.chart.json",
+      "sha256": "55d6d3da4f4bb809aaa367800450c3075aaab88d687f88b7667bcda3a66799ac",
+      "keyMode": 6,
+      "difficulty": "EXPERT"
+    },
+    {
+      "path": "charts/7k-easy.chart.json",
+      "sha256": "83b584129cabe75b82b151e1e91d4dd0829bddb6ad7689b5a0995fb4d9cd7d4a",
+      "keyMode": 7,
+      "difficulty": "EASY"
+    },
+    {
+      "path": "charts/7k-normal.chart.json",
+      "sha256": "470238f2a209c7c92516f5fb6b273b0d7ad434492ba97d235983950c12ef737c",
+      "keyMode": 7,
+      "difficulty": "NORMAL"
+    },
+    {
+      "path": "charts/7k-hard.chart.json",
+      "sha256": "6fda1c624a3e00f5112e0aa3cda4ecb4c5cb1588c3fab0e245b56bfdd1f332d1",
+      "keyMode": 7,
+      "difficulty": "HARD"
+    },
+    {
+      "path": "charts/7k-expert.chart.json",
+      "sha256": "31ce99c77d2a1c17f806e8005a3dbfba1f50fc03039af0a6f194b9c2ab2228df",
+      "keyMode": 7,
+      "difficulty": "EXPERT"
+    }
+  ],
+  "keysoundManifestPath": null,
+  "generationReportPath": "generation-report.json"
+}

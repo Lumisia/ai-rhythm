@@ -1,0 +1,293 @@
+{
+  "schemaVersion": 1,
+  "chartId": "a23acfa9-425c-5c66-88fc-9df61ec0c50c",
+  "songVersionId": "fdac79c6-e0f4-5cc6-8177-24e66925b513",
+  "gameAudioAssetId": "b3394f95-cdcc-5c32-8d4d-fbcb16de093c",
+  "audioSha256": "a158ce71bec83f09bf5f730df5c13c16a51d0605278628273dc0b6e8caf64945",
+  "keyMode": 7,
+  "difficulty": "EXPERT",
+  "laneSemantics": [
+    "SIDE_LEFT",
+    "MAIN_1",
+    "MAIN_2",
+    "CENTER",
+    "MAIN_3",
+    "MAIN_4",
+    "SIDE_RIGHT"
+  ],
+  "offsetMs": 0,
+  "durationMs": 8000,
+  "bpmEvents": [
+    {
+      "timeMs": 0,
+      "bpm": 120.0
+    }
+  ],
+  "bpmSource": "BEAT_THIS",
+  "notes": [
+    {
+      "id": 1,
+      "lane": 6,
+      "timeMs": 0,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 2,
+      "lane": 2,
+      "timeMs": 750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 3,
+      "lane": 4,
+      "timeMs": 1000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 4,
+      "lane": 0,
+      "timeMs": 1250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 5,
+      "lane": 6,
+      "timeMs": 1500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 6,
+      "lane": 0,
+      "timeMs": 2000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 7,
+      "lane": 5,
+      "timeMs": 2500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 8,
+      "lane": 1,
+      "timeMs": 2750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 9,
+      "lane": 5,
+      "timeMs": 3000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 10,
+      "lane": 0,
+      "timeMs": 3250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 11,
+      "lane": 4,
+      "timeMs": 3417,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 12,
+      "lane": 1,
+      "timeMs": 3500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 13,
+      "lane": 4,
+      "timeMs": 3583,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 14,
+      "lane": 6,
+      "timeMs": 3667,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 15,
+      "lane": 4,
+      "timeMs": 3750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 16,
+      "lane": 2,
+      "timeMs": 3833,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 17,
+      "lane": 4,
+      "timeMs": 4000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 18,
+      "lane": 4,
+      "timeMs": 4167,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 19,
+      "lane": 1,
+      "timeMs": 4417,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 20,
+      "lane": 5,
+      "timeMs": 4667,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 21,
+      "lane": 1,
+      "timeMs": 4917,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 22,
+      "lane": 2,
+      "timeMs": 5167,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 23,
+      "lane": 3,
+      "timeMs": 5417,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 24,
+      "lane": 0,
+      "timeMs": 5667,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 25,
+      "lane": 0,
+      "timeMs": 6000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 26,
+      "lane": 6,
+      "timeMs": 6250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 27,
+      "lane": 2,
+      "timeMs": 6500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 28,
+      "lane": 5,
+      "timeMs": 6667,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 29,
+      "lane": 2,
+      "timeMs": 6917,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 30,
+      "lane": 4,
+      "timeMs": 7167,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 31,
+      "lane": 6,
+      "timeMs": 7333,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 32,
+      "lane": 1,
+      "timeMs": 7500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 33,
+      "lane": 2,
+      "timeMs": 7750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 34,
+      "lane": 2,
+      "timeMs": 7917,
+      "type": "TAP",
+      "durationMs": null
+    }
+  ],
+  "autoPlayOnsets": [],
+  "metrics": {
+    "noteCount": 34,
+    "holdCount": 0,
+    "avgNps": 4.25,
+    "p95Nps": 8.0,
+    "peakNps": 9.0,
+    "chordRatio": 0.0,
+    "maxJack": 2,
+    "projectRating": 3.46,
+    "projectTier": "HARD",
+    "patternEntropy": 2.5087,
+    "drumCoverage": 0.0,
+    "drumPrecision": 0.0,
+    "meanAbsErrMs": 0.0,
+    "sideNoteRatio": 0.2941,
+    "sideHoldRatio": 0.0,
+    "movedNoteRatio": 0.1458
+  },
+  "generator": {
+    "name": "fake-synthetic",
+    "version": "fake-synthetic",
+    "analysisVersion": "beat-this-final0+librosa",
+    "postprocessVersion": "fixture",
+    "seed": 18
+  }
+}

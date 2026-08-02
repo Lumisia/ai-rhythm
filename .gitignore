@@ -13,6 +13,7 @@ reports/
 # 오디오·채보 산출물
 *.wav
 *.flac
+!apps/frontend/src/test/fixtures/playtest-run/audio/game.flac
 *.mp3
 *.osz
 

@@ -9,7 +9,12 @@ from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.postprocess.lane_conversion import convert_lanes
 from chart_worker.postprocess.lane_rules import check_lane_rules, hand_of
 from chart_worker.postprocess.pattern_policy import Allow, allowance_of, quota_excesses
-from chart_worker.postprocess.patterns import PatternInstance, detect_patterns, rows_of
+from chart_worker.postprocess.patterns import (
+    DENIM_MIN_NOTES,
+    PatternInstance,
+    detect_patterns,
+    rows_of,
+)
 from chart_worker.schema.note import Chart, NoteEvent
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES, lane_semantics
 from chart_worker.validation.invariants import check_hold_only_shrinks, check_timing_invariant
@@ -314,6 +319,11 @@ def _victim(notes: Chart, violation: PlayabilityViolation) -> NoteEvent | None:
 
 
 def _victims(notes: Chart, violation: PlayabilityViolation) -> tuple[NoteEvent, ...]:
+    if violation.code is ViolationCode.PATTERN_FORBIDDEN and violation.detail.startswith("DENIM"):
+        window = [
+            note for note in notes if violation.time_ms <= note.time_ms <= violation.end_ms
+        ]
+        return tuple(window[DENIM_MIN_NOTES - 1 :: DENIM_MIN_NOTES])
     if violation.code is ViolationCode.PATTERN_FORBIDDEN and violation.detail.startswith(
         ("HANDSTREAM", "CHORDSTREAM")
     ):

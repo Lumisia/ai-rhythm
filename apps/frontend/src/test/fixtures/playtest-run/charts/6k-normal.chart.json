@@ -1,0 +1,229 @@
+{
+  "schemaVersion": 1,
+  "chartId": "d21512f3-d973-5eac-8a9c-33c8f254c87d",
+  "songVersionId": "fdac79c6-e0f4-5cc6-8177-24e66925b513",
+  "gameAudioAssetId": "b3394f95-cdcc-5c32-8d4d-fbcb16de093c",
+  "audioSha256": "a158ce71bec83f09bf5f730df5c13c16a51d0605278628273dc0b6e8caf64945",
+  "keyMode": 6,
+  "difficulty": "NORMAL",
+  "laneSemantics": [
+    "SIDE_LEFT",
+    "MAIN_1",
+    "MAIN_2",
+    "MAIN_3",
+    "MAIN_4",
+    "SIDE_RIGHT"
+  ],
+  "offsetMs": 0,
+  "durationMs": 8000,
+  "bpmEvents": [
+    {
+      "timeMs": 0,
+      "bpm": 120.0
+    }
+  ],
+  "bpmSource": "BEAT_THIS",
+  "notes": [
+    {
+      "id": 1,
+      "lane": 3,
+      "timeMs": 0,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 2,
+      "lane": 0,
+      "timeMs": 250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 3,
+      "lane": 5,
+      "timeMs": 500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 4,
+      "lane": 0,
+      "timeMs": 750,
+      "type": "HOLD",
+      "durationMs": 250
+    },
+    {
+      "id": 5,
+      "lane": 3,
+      "timeMs": 1000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 6,
+      "lane": 1,
+      "timeMs": 1250,
+      "type": "HOLD",
+      "durationMs": 250
+    },
+    {
+      "id": 7,
+      "lane": 0,
+      "timeMs": 1500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 8,
+      "lane": 0,
+      "timeMs": 2000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 9,
+      "lane": 3,
+      "timeMs": 2500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 10,
+      "lane": 1,
+      "timeMs": 2750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 11,
+      "lane": 4,
+      "timeMs": 3000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 12,
+      "lane": 2,
+      "timeMs": 3500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 13,
+      "lane": 0,
+      "timeMs": 3750,
+      "type": "HOLD",
+      "durationMs": 250
+    },
+    {
+      "id": 14,
+      "lane": 3,
+      "timeMs": 4000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 15,
+      "lane": 2,
+      "timeMs": 4250,
+      "type": "HOLD",
+      "durationMs": 250
+    },
+    {
+      "id": 16,
+      "lane": 1,
+      "timeMs": 4500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 17,
+      "lane": 3,
+      "timeMs": 4750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 18,
+      "lane": 4,
+      "timeMs": 5000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 19,
+      "lane": 5,
+      "timeMs": 5250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 20,
+      "lane": 3,
+      "timeMs": 5750,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 21,
+      "lane": 4,
+      "timeMs": 6250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 22,
+      "lane": 1,
+      "timeMs": 6500,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 23,
+      "lane": 4,
+      "timeMs": 7000,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 24,
+      "lane": 3,
+      "timeMs": 7250,
+      "type": "TAP",
+      "durationMs": null
+    },
+    {
+      "id": 25,
+      "lane": 3,
+      "timeMs": 7500,
+      "type": "TAP",
+      "durationMs": null
+    }
+  ],
+  "autoPlayOnsets": [],
+  "metrics": {
+    "noteCount": 25,
+    "holdCount": 4,
+    "avgNps": 3.125,
+    "p95Nps": 4.0,
+    "peakNps": 4.0,
+    "chordRatio": 0.0,
+    "maxJack": 2,
+    "projectRating": 1.93,
+    "projectTier": "EASY",
+    "patternEntropy": 2.2516,
+    "drumCoverage": 0.0,
+    "drumPrecision": 0.0,
+    "meanAbsErrMs": 0.0,
+    "sideNoteRatio": 0.28,
+    "sideHoldRatio": 0.2857,
+    "movedNoteRatio": 0.0938
+  },
+  "generator": {
+    "name": "fake-synthetic",
+    "version": "fake-synthetic",
+    "analysisVersion": "beat-this-final0+librosa",
+    "postprocessVersion": "fixture",
+    "seed": 12
+  }
+}

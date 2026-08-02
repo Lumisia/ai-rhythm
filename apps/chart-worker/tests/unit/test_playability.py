@@ -187,3 +187,20 @@ def test_recovery_reduces_every_handstream_row_in_one_bounded_run():
     )
     assert result.violations == ()
     assert all(len(row) <= 2 for row in _notes_at_each_time(result.notes).values())
+
+
+def test_recovery_splits_a_long_forbidden_denim_in_one_bounded_run():
+    lanes = (2, 3, 4, 1)
+    notes = [NoteEvent(index * 250, lanes[index % len(lanes)]) for index in range(22)]
+
+    result = validate_and_recover(
+        notes,
+        key_mode=7,
+        difficulty="HARD",
+        duration_ms=8_000,
+        beat_ms=500.0,
+        max_passes=1,
+    )
+
+    assert result.violations == ()
+    assert result.deleted_count == 3
