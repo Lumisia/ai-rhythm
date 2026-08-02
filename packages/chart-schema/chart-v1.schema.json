@@ -1,0 +1,363 @@
+{
+  "$defs": {
+    "BpmEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "timeMs": {
+          "minimum": 0,
+          "title": "Timems",
+          "type": "integer"
+        },
+        "bpm": {
+          "exclusiveMinimum": 0,
+          "title": "Bpm",
+          "type": "number"
+        }
+      },
+      "required": [
+        "timeMs",
+        "bpm"
+      ],
+      "title": "BpmEvent",
+      "type": "object"
+    },
+    "ChartMetrics": {
+      "additionalProperties": false,
+      "description": "곡 선택 화면과 분석이 함께 쓰는 측정값.\n\n후처리 파생 필드에 기본값을 주지 않는다. 0.0 을 기본값으로 두면\n\"아직 계산하지 않음\"과 \"계산했더니 0\"을 구분할 수 없다.",
+      "properties": {
+        "noteCount": {
+          "minimum": 0,
+          "title": "Notecount",
+          "type": "integer"
+        },
+        "holdCount": {
+          "minimum": 0,
+          "title": "Holdcount",
+          "type": "integer"
+        },
+        "avgNps": {
+          "minimum": 0,
+          "title": "Avgnps",
+          "type": "number"
+        },
+        "p95Nps": {
+          "minimum": 0,
+          "title": "P95Nps",
+          "type": "number"
+        },
+        "peakNps": {
+          "minimum": 0,
+          "title": "Peaknps",
+          "type": "number"
+        },
+        "chordRatio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Chordratio",
+          "type": "number"
+        },
+        "maxJack": {
+          "minimum": 0,
+          "title": "Maxjack",
+          "type": "integer"
+        },
+        "projectRating": {
+          "minimum": 0,
+          "title": "Projectrating",
+          "type": "number"
+        },
+        "projectTier": {
+          "enum": [
+            "EASY",
+            "NORMAL",
+            "HARD",
+            "EXPERT"
+          ],
+          "title": "Projecttier",
+          "type": "string"
+        },
+        "patternEntropy": {
+          "minimum": 0,
+          "title": "Patternentropy",
+          "type": "number"
+        },
+        "drumCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Drumcoverage",
+          "type": "number"
+        },
+        "drumPrecision": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Drumprecision",
+          "type": "number"
+        },
+        "meanAbsErrMs": {
+          "minimum": 0,
+          "title": "Meanabserrms",
+          "type": "number"
+        },
+        "sideNoteRatio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Sidenoteratio",
+          "type": "number"
+        },
+        "sideHoldRatio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Sideholdratio",
+          "type": "number"
+        },
+        "movedNoteRatio": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Movednoteratio",
+          "type": "number"
+        }
+      },
+      "required": [
+        "noteCount",
+        "holdCount",
+        "avgNps",
+        "p95Nps",
+        "peakNps",
+        "chordRatio",
+        "maxJack",
+        "projectRating",
+        "projectTier",
+        "patternEntropy",
+        "drumCoverage",
+        "drumPrecision",
+        "meanAbsErrMs",
+        "sideNoteRatio",
+        "sideHoldRatio",
+        "movedNoteRatio"
+      ],
+      "title": "ChartMetrics",
+      "type": "object"
+    },
+    "ChartNote": {
+      "additionalProperties": false,
+      "description": "직렬화된 노트.\n\nJSON 키는 `type` 이지만 파이썬 이름은 `NoteEvent.kind` 와 맞춘다.\n필드명을 `type` 으로 두면 내장 이름을 가린다.",
+      "properties": {
+        "id": {
+          "minimum": 1,
+          "title": "Id",
+          "type": "integer"
+        },
+        "lane": {
+          "minimum": 0,
+          "title": "Lane",
+          "type": "integer"
+        },
+        "timeMs": {
+          "minimum": 0,
+          "title": "Timems",
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "TAP",
+            "HOLD"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "durationMs": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Durationms"
+        }
+      },
+      "required": [
+        "id",
+        "lane",
+        "timeMs",
+        "type"
+      ],
+      "title": "ChartNote",
+      "type": "object"
+    },
+    "GeneratorInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        },
+        "analysisVersion": {
+          "minLength": 1,
+          "title": "Analysisversion",
+          "type": "string"
+        },
+        "postprocessVersion": {
+          "minLength": 1,
+          "title": "Postprocessversion",
+          "type": "string"
+        },
+        "seed": {
+          "title": "Seed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "analysisVersion",
+        "postprocessVersion",
+        "seed"
+      ],
+      "title": "GeneratorInfo",
+      "type": "object"
+    },
+    "LaneSemantic": {
+      "enum": [
+        "MAIN_1",
+        "MAIN_2",
+        "MAIN_3",
+        "MAIN_4",
+        "CENTER",
+        "SIDE_LEFT",
+        "SIDE_RIGHT"
+      ],
+      "title": "LaneSemantic",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 1,
+      "default": 1,
+      "title": "Schemaversion",
+      "type": "integer"
+    },
+    "chartId": {
+      "format": "uuid",
+      "title": "Chartid",
+      "type": "string"
+    },
+    "songVersionId": {
+      "format": "uuid",
+      "title": "Songversionid",
+      "type": "string"
+    },
+    "gameAudioAssetId": {
+      "format": "uuid",
+      "title": "Gameaudioassetid",
+      "type": "string"
+    },
+    "audioSha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Audiosha256",
+      "type": "string"
+    },
+    "keyMode": {
+      "enum": [
+        4,
+        6,
+        7
+      ],
+      "title": "Keymode",
+      "type": "integer"
+    },
+    "difficulty": {
+      "enum": [
+        "EASY",
+        "NORMAL",
+        "HARD",
+        "EXPERT"
+      ],
+      "title": "Difficulty",
+      "type": "string"
+    },
+    "laneSemantics": {
+      "items": {
+        "$ref": "#/$defs/LaneSemantic"
+      },
+      "title": "Lanesemantics",
+      "type": "array"
+    },
+    "offsetMs": {
+      "title": "Offsetms",
+      "type": "integer"
+    },
+    "durationMs": {
+      "exclusiveMinimum": 0,
+      "title": "Durationms",
+      "type": "integer"
+    },
+    "bpmEvents": {
+      "items": {
+        "$ref": "#/$defs/BpmEvent"
+      },
+      "minItems": 1,
+      "title": "Bpmevents",
+      "type": "array"
+    },
+    "bpmSource": {
+      "enum": [
+        "BEAT_THIS",
+        "MAPPERATORINATOR",
+        "MANUAL"
+      ],
+      "title": "Bpmsource",
+      "type": "string"
+    },
+    "notes": {
+      "items": {
+        "$ref": "#/$defs/ChartNote"
+      },
+      "title": "Notes",
+      "type": "array"
+    },
+    "autoPlayOnsets": {
+      "items": {
+        "type": "integer"
+      },
+      "title": "Autoplayonsets",
+      "type": "array"
+    },
+    "metrics": {
+      "$ref": "#/$defs/ChartMetrics"
+    },
+    "generator": {
+      "$ref": "#/$defs/GeneratorInfo"
+    }
+  },
+  "required": [
+    "chartId",
+    "songVersionId",
+    "gameAudioAssetId",
+    "audioSha256",
+    "keyMode",
+    "difficulty",
+    "laneSemantics",
+    "offsetMs",
+    "durationMs",
+    "bpmEvents",
+    "bpmSource",
+    "notes",
+    "autoPlayOnsets",
+    "metrics",
+    "generator"
+  ],
+  "title": "ChartDocument",
+  "type": "object"
+}

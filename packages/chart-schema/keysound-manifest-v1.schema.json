@@ -1,0 +1,59 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 1,
+      "default": 1,
+      "title": "Schemaversion",
+      "type": "integer"
+    },
+    "songVersionId": {
+      "format": "uuid",
+      "title": "Songversionid",
+      "type": "string"
+    },
+    "bgmAssetId": {
+      "format": "uuid",
+      "title": "Bgmassetid",
+      "type": "string"
+    },
+    "keysAssetId": {
+      "format": "uuid",
+      "title": "Keysassetid",
+      "type": "string"
+    },
+    "sliceSec": {
+      "default": 0.3,
+      "exclusiveMinimum": 0,
+      "title": "Slicesec",
+      "type": "number"
+    },
+    "prerollSec": {
+      "default": 0.012,
+      "minimum": 0,
+      "title": "Prerollsec",
+      "type": "number"
+    },
+    "snapWindowMs": {
+      "default": 50,
+      "minimum": 0,
+      "title": "Snapwindowms",
+      "type": "integer"
+    },
+    "drumOnsets": {
+      "items": {
+        "type": "integer"
+      },
+      "title": "Drumonsets",
+      "type": "array"
+    }
+  },
+  "required": [
+    "songVersionId",
+    "bgmAssetId",
+    "keysAssetId",
+    "drumOnsets"
+  ],
+  "title": "KeysoundManifest",
+  "type": "object"
+}
