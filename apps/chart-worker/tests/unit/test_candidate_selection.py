@@ -97,8 +97,8 @@ def test_candidate_selection_breaks_exact_ties_by_original_attempt_order():
     assert select_candidate_index(qualities, difficulty="NORMAL") == 0
 
 
-def test_requested_star_candidates_are_three_half_star_steps():
-    assert candidate_selection.requested_star_candidates("NORMAL") == (3.0, 2.5, 2.0)
+def test_normal_requested_star_candidates_use_the_real_song_calibration():
+    assert candidate_selection.requested_star_candidates("NORMAL") == (1.5, 1.0, 0.5)
 
 
 def test_easy_requested_star_candidates_start_at_the_calibrated_one_point_five():
@@ -114,19 +114,19 @@ def test_first_candidate_uses_configured_star_guidance_and_base_seed():
     # Combination index 1 is NORMAL in the stable 4K EASY/NORMAL/... order.
     # The exact literal catches both an off-by-one seed and a stale 1.0 CFG.
     assert candidate_selection.candidate_parameters(7, 1, 1, None) == CandidateParameters(
-        seed=8, requested_star=3.0, cfg_scale=1.25
+        seed=8, requested_star=1.5, cfg_scale=1.25
     )
 
 
 def test_second_candidate_keeps_star_for_same_condition_cfg_comparison():
     first = passing_quality(
         rating_error=0.3501,
-        requested_star=3.0,
+        requested_star=1.5,
         cfg_scale=1.25,
     )
     second_parameters = candidate_selection.candidate_parameters(7, 1, 2, first)
     assert second_parameters.seed == 10_008
-    assert second_parameters.requested_star == 3.0
+    assert second_parameters.requested_star == 1.5
     assert second_parameters.cfg_scale == 1.0
 
 
@@ -196,13 +196,13 @@ def test_third_candidate_does_not_lower_below_the_difficulty_floor():
     second = passing_quality(
         rating_error=0.36,
         removed_ratio=0.4501,
-        requested_star=2.0,
+        requested_star=0.5,
         cfg_scale=1.0,
     )
 
     parameters = candidate_selection.candidate_parameters(0, 1, 3, second)
 
-    assert parameters.requested_star == 2.0
+    assert parameters.requested_star == 0.5
 
 
 @pytest.mark.parametrize(

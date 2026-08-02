@@ -22,15 +22,15 @@ YEAR_RANGE = (2007, 2024)
 
 REQUESTED_STAR: dict[str, float] = {
     "EASY": 1.5,
-    "NORMAL": 3.0,
+    "NORMAL": 1.5,
     "HARD": 4.0,
     "EXPERT": 5.0,
 }
-"""NORMAL·HARD는 solver 목표보다 높고 EASY·EXPERT는 목표와 같다.
+"""HARD는 solver 목표보다 높고 EASY·EXPERT는 목표와 같다.
 
 solver 는 내리는 방향으로만 동작한다. 없는 시각에 노트를 만들면 타이밍
-불변 위반이므로 솎을 재료가 필요하지만, EASY는 실제 시험곡의 과도한
-삭제율을 막기 위해 1.5★에서 시작한다.
+불변 위반이므로 솎을 재료가 필요하다. EASY와 NORMAL은 실제 시험곡에서
+요청보다 높은 별점이 생성되고 삭제율이 과도해져 보정된 1.5★에서 시작한다.
 """
 
 HOLD_NOTE_RATIO = TARGET_HOLD_RATIO

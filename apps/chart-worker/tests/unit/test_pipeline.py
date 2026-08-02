@@ -384,9 +384,9 @@ def test_reference_failure_writes_report_then_exhausts_the_first_candidate(tmp_p
     assert [candidate["attempt"] for candidate in candidates] == [1, 2, 3]
     assert [candidate["seed"] for candidate in candidates] == [1, 10_001, 20_001]
     assert [candidate["parameters"] for candidate in candidates] == [
-        {"requested_star": 3.0, "cfg_scale": 1.25},
-        {"requested_star": 3.0, "cfg_scale": 1.0},
-        {"requested_star": 3.0, "cfg_scale": 1.0},
+        {"requested_star": 1.5, "cfg_scale": 1.25},
+        {"requested_star": 1.5, "cfg_scale": 1.0},
+        {"requested_star": 1.5, "cfg_scale": 1.0},
     ]
     assert all(candidate["timing_source"] == "BEAT_THIS_PIECEWISE" for candidate in candidates)
     assert all(candidate["failure_metrics"]["reference_accuracy"]["status"] == "FAIL" for candidate in candidates)
@@ -454,9 +454,9 @@ def test_pipeline_retry_parameters_follow_each_too_hard_candidate(
 
     candidates = caught.value.context["candidates"]
     assert [candidate["parameters"] for candidate in candidates] == [
-        {"requested_star": 3.0, "cfg_scale": 1.25},
-        {"requested_star": 3.0, "cfg_scale": 1.0},
-        {"requested_star": 2.5, "cfg_scale": 1.0},
+        {"requested_star": 1.5, "cfg_scale": 1.25},
+        {"requested_star": 1.5, "cfg_scale": 1.0},
+        {"requested_star": 1.0, "cfg_scale": 1.0},
     ]
 
 
@@ -500,7 +500,7 @@ def test_mapperatorinator_compares_unguided_at_same_star_even_when_guided_passes
     assert [
         (request.seed, request.requested_star, request.cfg_scale)
         for request in normal_calls
-    ] == [(1, 3.0, 1.25), (10_001, 3.0, 1.0)]
+    ] == [(1, 1.5, 1.25), (10_001, 1.5, 1.0)]
     assert len(result.raw_osu_paths) == 12
     assert all(path.is_file() for path in result.raw_osu_paths)
     assert result.manifest_path.is_file()
@@ -574,9 +574,9 @@ def test_mapperatorinator_failed_guided_candidate_adds_one_bounded_star_retry(
     assert caught.value.context["difficulty"] == "NORMAL"
     candidates = caught.value.context["candidates"]
     assert [(candidate["seed"], candidate["parameters"]) for candidate in candidates] == [
-        (1, {"requested_star": 3.0, "cfg_scale": 1.25}),
-        (10_001, {"requested_star": 3.0, "cfg_scale": 1.0}),
-        (20_001, {"requested_star": 2.5, "cfg_scale": 1.0}),
+        (1, {"requested_star": 1.5, "cfg_scale": 1.25}),
+        (10_001, {"requested_star": 1.5, "cfg_scale": 1.0}),
+        (20_001, {"requested_star": 1.0, "cfg_scale": 1.0}),
     ]
 
 

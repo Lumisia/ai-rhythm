@@ -66,15 +66,21 @@ def _request(timing_osu=None, **overrides):
 # --- 파라미터 ---------------------------------------------------------------
 
 
-def test_requested_star_is_never_below_the_solver_target():
-    """solver 는 내리는 방향으로만 동작한다. 재료가 남아 있어야 한다."""
-    for difficulty, target in TARGET_RATING.items():
-        assert REQUESTED_STAR[difficulty] >= target, difficulty
+def test_real_song_calibrated_requested_stars_are_explicit():
+    assert REQUESTED_STAR == {
+        "EASY": 1.5,
+        "NORMAL": 1.5,
+        "HARD": 4.0,
+        "EXPERT": 5.0,
+    }
 
 
-@pytest.mark.parametrize("difficulty", ["NORMAL", "HARD"])
-def test_lower_tiers_have_explicit_solver_headroom(difficulty):
-    assert REQUESTED_STAR[difficulty] > TARGET_RATING[difficulty]
+def test_normal_request_compensates_for_mapperatorinator_overgeneration():
+    assert REQUESTED_STAR["NORMAL"] < TARGET_RATING["NORMAL"]
+
+
+def test_hard_keeps_explicit_solver_headroom():
+    assert REQUESTED_STAR["HARD"] > TARGET_RATING["HARD"]
 
 
 def test_easy_request_matches_the_solver_target_after_real_candidate_calibration():
