@@ -458,6 +458,15 @@ h1 {
   margin: 0;
 }
 
+/* 라벨과 실측이 어긋난 값. 검수 대상이라는 표시지 오류는 아니다. */
+.value-fault {
+  color: var(--fault-coral);
+}
+
+.chart-card {
+  min-height: 232px;
+}
+
 .chart-card button,
 .primary-action {
   width: 100%;

@@ -1,7 +1,9 @@
-"""저장된 S1/S2 결과로 S4만 다시 실행한다."""
+"""저장된 S1/S2 결과로 S4만 다시 실행한다. 요청하면 S3 도 같이 돌린다."""
 
+import dataclasses
 import json
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,8 +22,9 @@ from chart_worker.schema.playtest_run import (
     RunAudioRefs,
     RunChartRef,
 )
+from chart_worker.stages.s3_stems import run_stems
 from chart_worker.stages.s4_postprocess import run_postprocess
-from chart_worker.stages.types import GeneratedVariant, StemStageResult
+from chart_worker.stages.types import AnalysisStageResult, GeneratedVariant, StemStageResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +32,13 @@ class PostprocessOptions:
     input_dir: Path
     output_dir: Path
     worker_version: str = "local-reprocess"
+    keysounds: bool = False
+    """입력에 스템이 없으면 여기서 만든다.
+
+    S3 는 분석 스냅샷만 있으면 되므로 스템을 얻자고 Mapperatorinator 를 다시
+    돌릴 이유가 없다. 스템 없이 S4 를 돌리면 `autoPlayOnsets` 가 비고 드럼
+    정렬 지표가 전부 0 이 되어, 키음 경로를 아예 검수할 수 없다.
+    """
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "input_dir", Path(self.input_dir).resolve())
@@ -66,6 +76,18 @@ def _copy_ref(reference: AudioFileRef, input_dir: Path, output_dir: Path) -> Aud
     return AudioFileRef(path=reference.path, sha256=sha256_file(target))
 
 
+def _relocate(analysis: AnalysisStageResult, audio_path: Path) -> AnalysisStageResult:
+    """분석이 가리키는 오디오를 출력 폴더의 사본으로 바꾼다.
+
+    S3 는 자산 경로가 실행 폴더 안에 있기를 요구한다. 스냅샷은 입력 폴더를
+    가리키므로 그대로 넘기면 거부당한다. 해시는 `_copy_ref` 가 이미 확인했다.
+    """
+    return dataclasses.replace(
+        analysis,
+        normalized=dataclasses.replace(analysis.normalized, path=audio_path),
+    )
+
+
 def _variants(manifest: PlaytestRunManifest, input_dir: Path) -> tuple[GeneratedVariant, ...]:
     variants = []
     for reference in manifest.charts:
@@ -92,7 +114,19 @@ def _variants(manifest: PlaytestRunManifest, input_dir: Path) -> tuple[Generated
     return tuple(variants)
 
 
-def run_postprocess_only(options: PostprocessOptions) -> PostprocessResult:
+def _stem_stage(analysis: AnalysisStageResult, run_dir: Path, enabled: bool) -> StemStageResult:
+    return run_stems(analysis, run_dir, enabled=enabled)
+
+
+def run_postprocess_only(
+    options: PostprocessOptions,
+    *,
+    stems_stage: Callable[[AnalysisStageResult, Path, bool], StemStageResult] = _stem_stage,
+) -> PostprocessResult:
+    """`stems_stage` 는 파이프라인과 같은 이유로 주입 가능하다.
+
+    Demucs 없이도 이 경로를 테스트할 수 있어야 한다.
+    """
     source_manifest = _prepare(options)
     analysis = load_analysis_snapshot(options.input_dir)
     game_ref = _copy_ref(source_manifest.audio.game, options.input_dir, options.output_dir)
@@ -118,6 +152,17 @@ def run_postprocess_only(options: PostprocessOptions) -> PostprocessResult:
         keysound_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_path, keysound_path)
         drum_onsets = tuple(keysound_manifest.drum_onsets)
+    elif options.keysounds:
+        stems = stems_stage(
+            _relocate(analysis, options.output_dir / game_ref.path),
+            options.output_dir,
+            True,
+        )
+        no_drums_ref = stems.no_drums_ref
+        keys_ref = stems.keys_ref
+        drum_onsets = stems.drum_onsets
+        keysound_manifest = stems.keysound_manifest
+        keysound_path = stems.keysound_manifest_path
 
     results = run_postprocess(
         analysis,

@@ -145,6 +145,33 @@ def contract_fixture_analysis(
     )
 
 
+def fake_stem_stage(analysis: AnalysisStageResult, run_dir: Path, enabled: bool):
+    """Demucs 없이 S3 를 돈다. 드럼을 상수로 채워 감산 관계만 유지한다."""
+    from chart_worker.stages.s3_stems import run_stems
+
+    def stem_backend(model_mix, sample_rate):
+        del sample_rate
+        return np.full_like(model_mix, 0.1, dtype=np.float32)
+
+    def onset_backend(mono, sample_rate):
+        del mono
+        return OnsetAnalysis(
+            sample_rate_hz=sample_rate,
+            hop_length=512,
+            strength=np.array([0.0, 1.0]),
+            band_strength=np.zeros((3, 2)),
+            onset_ms=(20, 70),
+        )
+
+    return run_stems(
+        analysis,
+        run_dir,
+        enabled=enabled,
+        stem_backend=stem_backend,
+        onset_backend=onset_backend,
+    )
+
+
 def fake_dependencies() -> PipelineDependencies:
     return PipelineDependencies(
         config=WorkerConfig(),

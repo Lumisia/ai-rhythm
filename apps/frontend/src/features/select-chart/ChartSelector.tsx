@@ -36,8 +36,28 @@ export function ChartSelector({ run, lastReviews = {}, onSelect, onReset }: Char
                     </div>
                     <dl>
                       <div><dt>NOTES</dt><dd>{chart.document.metrics.noteCount}</dd></div>
+                      <div>
+                        <dt>HOLD</dt>
+                        <dd className={chart.document.metrics.holdCount === 0 ? "value-fault" : undefined}>
+                          {chart.document.metrics.holdCount}
+                        </dd>
+                      </div>
                       <div><dt>PEAK</dt><dd>{chart.document.metrics.peakNps.toFixed(2)} NPS</dd></div>
                       <div><dt>CHORD</dt><dd>{(chart.document.metrics.chordRatio * 100).toFixed(1)}%</dd></div>
+                      {/* 라벨과 실측 티어가 어긋나면 그게 검수 대상이다. 숨기면
+                          테스터가 EASY 인 줄 알고 NORMAL 밀도를 친다. */}
+                      <div>
+                        <dt>측정</dt>
+                        <dd
+                          className={
+                            chart.document.metrics.projectTier === chart.document.difficulty
+                              ? undefined
+                              : "value-fault"
+                          }
+                        >
+                          {chart.document.metrics.projectTier}
+                        </dd>
+                      </div>
                       <div><dt>REVIEW</dt><dd>{lastReviews[chart.document.chartId] ?? "—"}</dd></div>
                     </dl>
                     <button onClick={() => onSelect(chart)} type="button">

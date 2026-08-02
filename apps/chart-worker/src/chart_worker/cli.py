@@ -83,10 +83,19 @@ def postprocess(
         typer.Argument(exists=True, file_okay=False, dir_okay=True, readable=True),
     ],
     out: Annotated[Path, typer.Option("--out", "-o")],
+    keysounds: Annotated[
+        bool,
+        typer.Option("--keysounds/--no-keysounds"),
+    ] = False,
 ) -> None:
-    """기존 실행의 분석값과 raw osu로 S4만 다시 실행한다."""
+    """기존 실행의 분석값과 raw osu로 S4를 다시 실행한다.
+
+    --keysounds를 주고 입력에 스템이 없으면 S3도 같이 돌린다.
+    """
     try:
-        result = run_postprocess_only(PostprocessOptions(input_dir=input_dir, output_dir=out))
+        result = run_postprocess_only(
+            PostprocessOptions(input_dir=input_dir, output_dir=out, keysounds=keysounds)
+        )
     except WorkerError as error:
         typer.echo(
             json.dumps(_worker_error_payload(error), ensure_ascii=False),
