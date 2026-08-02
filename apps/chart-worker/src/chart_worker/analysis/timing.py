@@ -355,9 +355,10 @@ def evaluate_reference(
         section_predicted = tuple(
             time_ms for time_ms in predicted_unique if first_ms <= time_ms <= last_ms
         )
-        metrics = match_times(section_predicted, reference_ms, window_ms=20)
-        section_f1.append(metrics.f1)
-        all_pairs.extend(metrics.matched_pairs)
+        f1_metrics = match_times(section_predicted, reference_ms, window_ms=20)
+        error_metrics = match_times(section_predicted, reference_ms, window_ms=50)
+        section_f1.append(f1_metrics.f1)
+        all_pairs.extend(error_metrics.matched_pairs)
 
     signed_errors = np.asarray(
         [predicted_ms - reference_ms for predicted_ms, reference_ms in all_pairs],

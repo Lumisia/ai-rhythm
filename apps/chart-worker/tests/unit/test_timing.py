@@ -90,6 +90,25 @@ def test_reference_phase_rejects_a_constant_offset_above_fifteen_ms():
     assert quality.passes is False
 
 
+def test_reference_p95_uses_fifty_ms_pairs_and_rejects_tail_errors_above_thirty_ms():
+    reference = ReferenceChart(
+        key_mode=4,
+        difficulty="NORMAL",
+        sections={"song": (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)},
+    )
+
+    quality = evaluate_reference(
+        reference,
+        (100, 200, 300, 400, 540, 600, 740, 800, 900, 1000),
+    )
+
+    assert quality is not None
+    assert quality.macro_f1_20ms == pytest.approx(0.8)
+    assert quality.phase_abs_ms == 0.0
+    assert quality.p95_abs_ms == 40.0
+    assert quality.passes is False
+
+
 def test_missing_reference_is_reported_as_unavailable():
     assert evaluate_reference(None, (100, 200)) is None
 
