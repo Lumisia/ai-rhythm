@@ -12,6 +12,7 @@
   "type": "module",
   "dependencies": {
     "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "phaser": "^4.2.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
