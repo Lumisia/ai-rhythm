@@ -636,7 +636,7 @@ h1 {
 }
 
 .playfield-frame {
-  min-height: 620px;
+  min-height: 700px;
   padding: 12px;
 }
 
@@ -650,11 +650,99 @@ h1 {
   letter-spacing: 0.1em;
 }
 
+.phase-paused {
+  color: var(--timing-amber);
+}
+
+.playfield-stack {
+  position: relative;
+}
+
 .playfield {
   width: 100%;
-  height: 560px;
+  height: 640px;
   border: 1px solid var(--hairline);
   background: var(--smoked-navy);
+}
+
+.pause-veil {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  margin: 0;
+  place-items: center;
+  color: var(--timing-amber);
+  background: rgba(17, 21, 29, 0.82);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+}
+
+/* 플레이 중에는 설정을 접고 플레이필드에 자리를 넘긴다. */
+.play-panel--live .play-layout {
+  grid-template-columns: minmax(216px, 260px) minmax(520px, 1fr);
+}
+
+.live-readout dl {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+}
+
+.live-readout dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.66rem;
+}
+
+.live-readout dt {
+  color: var(--muted);
+}
+
+.live-readout dd {
+  margin: 0;
+  color: var(--ink);
+}
+
+.key-hint {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--hairline);
+}
+
+.key-hint .panel-label {
+  margin-bottom: 12px;
+}
+
+.key-hint-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.key-hint kbd {
+  display: grid;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 6px;
+  place-items: center;
+  border: 1px solid var(--hairline);
+  color: var(--ink);
+  background: var(--meter-slate);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.72rem;
+}
+
+.key-hint small {
+  display: block;
+  margin-top: 11px;
+  color: var(--muted);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.58rem;
 }
 
 .result-placeholder {
@@ -882,11 +970,17 @@ h1 {
   }
 
   .playfield-frame {
-    min-height: 480px;
+    min-height: 540px;
   }
 
   .playfield {
-    height: 420px;
+    height: 480px;
+  }
+}
+
+@media (max-width: 850px) {
+  .play-panel--live .play-layout {
+    grid-template-columns: 1fr;
   }
 }
 

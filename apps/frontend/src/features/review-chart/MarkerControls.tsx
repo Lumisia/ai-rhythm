@@ -31,6 +31,12 @@ export function markerKindForSlot(slot: number): ReviewMarkerKind | null {
   return markerKinds[slot - 1] ?? null;
 }
 
+/** 플레이 화면에 띄울 마커 이름. */
+export function markerLabelForSlot(slot: number): string | null {
+  const kind = markerKindForSlot(slot);
+  return kind ? labels[kind] : null;
+}
+
 export function createReviewMarker(
   kind: ReviewMarkerKind,
   timeMs: number,

@@ -2,6 +2,9 @@
 docs/
 .understand-anything/
 
+# 로컬 개발 도구 설정
+.claude/
+
 # git worktree 전용 경로 (산출물 청소 대상 아님 — 절대 일괄 삭제 금지)
 .worktrees/
 

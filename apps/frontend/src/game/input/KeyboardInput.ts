@@ -9,6 +9,8 @@ export interface KeyboardInputOptions {
   engine: Pick<JudgmentEngine, "keyDown" | "keyUp">;
   recorder: InputRecorder;
   onJudgment?: (event: JudgmentEvent) => void;
+  onLaneDown?: (lane: number, timeMs: number) => void;
+  onLaneUp?: (lane: number, timeMs: number) => void;
 }
 
 export class KeyboardInput {
@@ -18,6 +20,8 @@ export class KeyboardInput {
   readonly #engine: Pick<JudgmentEngine, "keyDown" | "keyUp">;
   readonly #recorder: InputRecorder;
   readonly #onJudgment?: (event: JudgmentEvent) => void;
+  readonly #onLaneDown?: (lane: number, timeMs: number) => void;
+  readonly #onLaneUp?: (lane: number, timeMs: number) => void;
   readonly #heldCodes = new Set<string>();
   #attached = false;
 
@@ -28,6 +32,8 @@ export class KeyboardInput {
     this.#engine = options.engine;
     this.#recorder = options.recorder;
     this.#onJudgment = options.onJudgment;
+    this.#onLaneDown = options.onLaneDown;
+    this.#onLaneUp = options.onLaneUp;
   }
 
   attach(): void {
@@ -56,6 +62,9 @@ export class KeyboardInput {
     this.#heldCodes.add(rawEvent.code);
     const timeMs = this.#clock.performanceToSongTimeMs(rawEvent.timeStamp);
     this.#recorder.record({ action: "DOWN", lane, code: rawEvent.code, timeMs });
+    // 판정보다 먼저 알린다. 판정이 안 붙는 입력도 화면에 반응이 있어야
+    // 키 바인딩이 틀린 건지 노트가 없는 건지 구분된다.
+    this.#onLaneDown?.(lane, timeMs);
     const judgment = this.#engine.keyDown(lane, timeMs);
     if (judgment) this.#onJudgment?.(judgment);
   };
@@ -68,11 +77,16 @@ export class KeyboardInput {
     if (!this.#heldCodes.delete(rawEvent.code)) return;
     const timeMs = this.#clock.performanceToSongTimeMs(rawEvent.timeStamp);
     this.#recorder.record({ action: "UP", lane, code: rawEvent.code, timeMs });
+    this.#onLaneUp?.(lane, timeMs);
     const judgment = this.#engine.keyUp(lane, timeMs);
     if (judgment) this.#onJudgment?.(judgment);
   };
 
   readonly #handleBlur = (): void => {
+    for (const code of this.#heldCodes) {
+      const lane = this.#bindings.get(code);
+      if (lane !== undefined) this.#onLaneUp?.(lane, this.#clock.songTimeMs());
+    }
     this.#heldCodes.clear();
   };
 }

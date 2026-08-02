@@ -8,7 +8,13 @@ import { JudgmentEngine, type JudgmentEvent } from "../../game/core/JudgmentEngi
 import { ScoreCalculator, type ScoreSnapshot } from "../../game/core/ScoreCalculator";
 import type { ImportedChart, ImportedRun } from "../import-run/importRun";
 import type { RecordedInputEvent } from "../../game/core/InputRecorder";
-import { MarkerControls, createReviewMarker, markerKindForSlot } from "../review-chart/MarkerControls";
+import { keyLabelsFor } from "../../game/input/KeyBindings";
+import {
+  MarkerControls,
+  createReviewMarker,
+  markerKindForSlot,
+  markerLabelForSlot,
+} from "../review-chart/MarkerControls";
 import type { ReviewMarker, ReviewMarkerKind } from "../review-chart/review";
 import { PlaySettings, type PlaySettingsValue } from "./PlaySettings";
 
@@ -160,6 +166,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         score,
         recorder,
         scrollSpeed: () => settings.scrollSpeed,
+        judgmentPreset: settings.judgmentPreset,
         keysoundScheduler,
         songPlayer: player,
         loop: settings.loopEnabled
@@ -182,6 +189,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
           const kind = markerKindForSlot(slot);
           if (kind) addMarker(kind, timeMs);
         },
+        markerLabel: markerLabelForSlot,
         onComplete: () => queueMicrotask(finish),
       });
       resourcesRef.current = { context, player, game, score, recorder, clock, judgments };
@@ -216,34 +224,80 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
     onBack();
   };
 
+  const live = phase === "PLAYING" || phase === "PAUSED";
+  const keyLabels = keyLabelsFor(chart.document.keyMode);
+
   return (
-    <section className="workspace-panel play-panel" aria-labelledby="play-title">
+    <section
+      className={`workspace-panel play-panel${live ? " play-panel--live" : ""}`}
+      aria-labelledby="play-title"
+    >
       <header className="workspace-heading">
         <div>
           <p className="eyebrow">{chart.document.keyMode}K / {chart.document.difficulty}</p>
-          <h2 id="play-title">플레이 설정</h2>
-          <p>{run.manifest.title} · LV {chart.document.metrics.projectRating.toFixed(2)}</p>
+          <h2 id="play-title">{live ? run.manifest.title : "플레이 설정"}</h2>
+          <p>
+            {live ? `${chart.document.keyMode}K ${chart.document.difficulty}` : run.manifest.title} · LV{" "}
+            {chart.document.metrics.projectRating.toFixed(2)} · 노트 {chart.document.metrics.noteCount} · 홀드{" "}
+            {chart.document.metrics.holdCount}
+          </p>
         </div>
         <button className="text-button" onClick={leave} type="button">채보 목록으로</button>
       </header>
 
       <div className="play-layout">
         <aside className="settings-panel">
-          <PlaySettings disabled={phase !== "READY"} durationMs={chart.document.durationMs} keysoundAvailable={Boolean(run.keysoundManifest && run.audio.noDrums && run.audio.keys)} onChange={setSettings} value={settings} />
-          {phase === "READY" ? <button className="primary-action" onClick={() => void start()} type="button">오디오 준비 및 시작</button> : null}
+          {live ? (
+            <div className="live-readout">
+              <p className="panel-label">SESSION</p>
+              <dl>
+                <div><dt>입력 보정</dt><dd>{settings.calibrationMs} ms</dd></div>
+                <div><dt>스크롤</dt><dd>{settings.scrollSpeed.toFixed(1)}×</dd></div>
+                <div><dt>판정</dt><dd>{settings.judgmentPreset}</dd></div>
+                {settings.loopEnabled ? (
+                  <div><dt>구간 반복</dt><dd>{settings.loopStartMs}–{settings.loopEndMs} ms</dd></div>
+                ) : null}
+              </dl>
+            </div>
+          ) : (
+            <PlaySettings disabled={phase !== "READY"} durationMs={chart.document.durationMs} keysoundAvailable={Boolean(run.keysoundManifest && run.audio.noDrums && run.audio.keys)} onChange={setSettings} value={settings} />
+          )}
+          {phase === "READY" ? (
+            <>
+              <div className="key-hint">
+                <p className="panel-label">KEYS</p>
+                <div className="key-hint-row">
+                  {keyLabels.map((label, lane) => (
+                    <kbd key={`${label}-${lane}`}>{label}</kbd>
+                  ))}
+                </div>
+                <small>ESC 일시정지 · 숫자 1–8 문제 마커</small>
+              </div>
+              <button className="primary-action" onClick={() => void start()} type="button">오디오 준비 및 시작</button>
+            </>
+          ) : null}
           {phase === "PREPARING" ? <p className="status-line">AUDIO DECODE / SCENE BOOT</p> : null}
-          {phase === "PLAYING" || phase === "PAUSED" ? (
+          {live ? (
             <div className="transport-controls">
               <button onClick={togglePause} type="button">{phase === "PLAYING" ? "일시정지" : "계속"}</button>
               <button onClick={finish} type="button">플레이 종료</button>
             </div>
           ) : null}
           {error ? <p className="import-error" role="alert">{error}</p> : null}
-          <MarkerControls disabled={phase === "READY" || phase === "PREPARING"} markers={markers} onAdd={(kind) => addMarker(kind)} />
+          <MarkerControls disabled={!live} markers={markers} onAdd={(kind) => addMarker(kind)} />
         </aside>
         <div className="playfield-frame">
-          <div className="playfield-header"><span>BEAT SPINE</span><span>{phase}</span></div>
-          <div aria-label="리듬 플레이 화면" className="playfield" ref={playfieldRef} />
+          <div className="playfield-header">
+            <span>{live ? keyLabels.join(" ") : "PLAYFIELD"}</span>
+            <span className={phase === "PAUSED" ? "phase-paused" : undefined}>{phase}</span>
+          </div>
+          {/* Phaser 가 이 div 에 canvas 를 붙인다. 자식을 두면 서로 건드린다. */}
+          <div className="playfield-stack">
+            <div aria-label="리듬 플레이 화면" className="playfield" ref={playfieldRef} />
+            {phase === "PAUSED" ? (
+              <p className="pause-veil">일시정지 — ESC 또는 계속 버튼</p>
+            ) : null}
+          </div>
         </div>
       </div>
     </section>

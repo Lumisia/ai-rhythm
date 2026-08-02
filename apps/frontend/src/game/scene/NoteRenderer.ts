@@ -85,8 +85,19 @@ export class NoteRenderer {
       const top = Math.min(headY, tailY);
       const bottom = Math.max(headY, tailY);
       if (bottom < -this.#noteHeight || top > this.#height + this.#noteHeight) return false;
-      this.#graphics.fillStyle(lane.color, 0.56);
-      this.#graphics.fillRect(x, Math.max(-this.#noteHeight, top), width, Math.max(this.#noteHeight, bottom - top));
+      const bodyTop = Math.max(-this.#noteHeight, top);
+      const bodyHeight = Math.max(this.#noteHeight, bottom - top);
+      // 몸통은 어둡게 깔고 양옆에 밝은 선을 세운다. 단노트와 같은 채움이면
+      // 흐르는 중에 둘을 구분할 수 없다.
+      this.#graphics.fillStyle(lane.color, 0.28);
+      this.#graphics.fillRect(x, bodyTop, width, bodyHeight);
+      this.#graphics.fillStyle(lane.color, 0.85);
+      this.#graphics.fillRect(x, bodyTop, 2, bodyHeight);
+      this.#graphics.fillRect(x + width - 2, bodyTop, 2, bodyHeight);
+      // 꼬리 끝을 막아 어디서 떼야 하는지 보이게 한다.
+      if (tailY > -this.#noteHeight && tailY < this.#height + this.#noteHeight) {
+        this.#graphics.fillRect(x, tailY - 2, width, 3);
+      }
     } else if (headY < -this.#noteHeight || headY > this.#height + this.#noteHeight) {
       return false;
     }
