@@ -8,12 +8,39 @@ import soundfile as sf
 from chart_worker.analysis.audio_io import AudioSignal
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing import (
+    TimingCandidate,
+    TimingPoint,
+    TimingSource,
+    TimingStatus,
+    project_beats,
+)
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.config import WorkerConfig
 from chart_worker.generation.timing_osu import beat_grid_to_timing_osu
 from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineDependencies
 from chart_worker.stages.types import AnalysisStageResult
+
+
+def timing_candidate(
+    *,
+    points: tuple[TimingPoint, ...] | None = None,
+    duration_ms: int = 2_000,
+    source: TimingSource = TimingSource.BEAT_THIS_PIECEWISE,
+) -> TimingCandidate:
+    """Build the complete selected-timing contract shared by test fixtures."""
+    selected_points = points or (TimingPoint(0, 120.0, 4, 0),)
+    return TimingCandidate(
+        source=source,
+        points=selected_points,
+        projected_beat_ms=project_beats(selected_points, end_ms=duration_ms),
+        f1_20ms=1.0,
+        f1_50ms=1.0,
+        p95_abs_ms=0.0,
+        status=TimingStatus.PASS,
+        reasons=(),
+    )
 
 
 def fake_analysis(source: Path, run_dir: Path, config: WorkerConfig) -> AnalysisStageResult:
@@ -43,6 +70,7 @@ def fake_analysis(source: Path, run_dir: Path, config: WorkerConfig) -> Analysis
         ),
         encoding="utf-8",
     )
+    selected_timing = timing_candidate()
     return AnalysisStageResult(
         normalized=NormalizedAudio(
             path=audio_path,
@@ -68,7 +96,9 @@ def fake_analysis(source: Path, run_dir: Path, config: WorkerConfig) -> Analysis
             band_strength=np.ones((3, 200)),
             onset_ms=(500, 1_000, 1_500),
         ),
+        timing_candidate=selected_timing,
         timing_osu_path=timing_path,
+        timing_quality_report_path=run_dir / "analysis" / "timing-quality-v1.json",
     )
 
 
@@ -116,6 +146,7 @@ def contract_fixture_analysis(
     )
     onset_ms = tuple(range(500, duration_ms, 500))
     onset_frame_count = frame_count // 512 + 1
+    selected_timing = timing_candidate(duration_ms=duration_ms)
     return AnalysisStageResult(
         normalized=NormalizedAudio(
             path=audio_path,
@@ -141,7 +172,9 @@ def contract_fixture_analysis(
             band_strength=np.ones((3, onset_frame_count)),
             onset_ms=onset_ms,
         ),
+        timing_candidate=selected_timing,
         timing_osu_path=timing_path,
+        timing_quality_report_path=run_dir / "analysis" / "timing-quality-v1.json",
     )
 
 

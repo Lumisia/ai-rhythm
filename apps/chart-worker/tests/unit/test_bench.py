@@ -18,4 +18,10 @@ def test_benchmark_writes_report_for_all_charts(tmp_path: Path):
     report = BenchmarkReport.model_validate_json(result.report_path.read_text(encoding="utf-8"))
     assert report.source_name == "fixture.wav"
     assert len(report.charts) == 12
-    assert set(report.elapsed_ms_by_stage) == {"analysis", "generation", "stems", "postprocess"}
+    assert set(report.elapsed_ms_by_stage) == {
+        "analysis",
+        "timing",
+        "generation",
+        "stems",
+        "postprocess",
+    }

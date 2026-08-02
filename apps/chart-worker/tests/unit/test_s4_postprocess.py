@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import numpy as np
 from chart_worker.analysis.audio_io import AudioSignal
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing import TimingPoint, TimingSource
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.hashing import sha256_file
@@ -14,6 +16,7 @@ from chart_worker.schema.note import NoteEvent
 from chart_worker.schema.playtest_run import AudioFileRef
 from chart_worker.stages.s4_postprocess import run_postprocess
 from chart_worker.stages.types import AnalysisStageResult, GeneratedVariant, StemStageResult
+from tests.support import timing_candidate
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -47,7 +50,9 @@ def _inputs(tmp_path: Path):
             np.array([[0.0, 0.2, 0.0], [0.0, 0.8, 0.0], [0.0, 0.1, 0.0]]),
             (500,),
         ),
+        timing_candidate=timing_candidate(),
         timing_osu_path=tmp_path / "analysis" / "timing.osu",
+        timing_quality_report_path=tmp_path / "analysis" / "timing-quality-v1.json",
     )
     raw_path = tmp_path / "raw" / "4k-normal.osu"
     raw_path.parent.mkdir(parents=True)
@@ -69,6 +74,42 @@ def _inputs(tmp_path: Path):
         keysound_manifest_path=None,
     )
     return analysis, generated, stems, original_note
+
+
+def test_postprocess_exports_every_selected_bpm_event(tmp_path: Path):
+    analysis, generated, stems, _ = _inputs(tmp_path)
+    analysis = dataclasses.replace(
+        analysis,
+        timing_candidate=timing_candidate(
+            points=(
+                TimingPoint(120, 120.0, 4, 0),
+                TimingPoint(16_000, 100.0, 4, 32),
+            ),
+            duration_ms=20_000,
+        ),
+    )
+
+    result = run_postprocess(
+        analysis, (generated,), stems, tmp_path, worker_version="test"
+    )[0]
+
+    assert [event.time_ms for event in result.document.bpm_events] == [0, 16_000]
+    assert result.document.bpm_source == "BEAT_THIS"
+    assert result.document.offset_ms == 120
+
+
+def test_postprocess_labels_super_timing_as_mapperatorinator(tmp_path: Path):
+    analysis, generated, stems, _ = _inputs(tmp_path)
+    analysis = dataclasses.replace(
+        analysis,
+        timing_candidate=timing_candidate(source=TimingSource.MAPPERATORINATOR_SUPER),
+    )
+
+    result = run_postprocess(
+        analysis, (generated,), stems, tmp_path, worker_version="test"
+    )[0]
+
+    assert result.document.bpm_source == "MAPPERATORINATOR"
 
 
 def test_postprocess_keeps_times_and_writes_a_valid_camel_case_chart(tmp_path: Path):

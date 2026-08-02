@@ -22,6 +22,7 @@ from chart_worker.stages.s1_analyze import run_analysis
 from chart_worker.stages.s2_generate import run_generation
 from chart_worker.stages.s3_stems import run_stems
 from chart_worker.stages.s4_postprocess import run_postprocess
+from chart_worker.stages.s15_select_timing import run_timing_selection
 from chart_worker.stages.types import (
     AnalysisStageResult,
     GeneratedVariant,
@@ -31,6 +32,7 @@ from chart_worker.stages.types import (
 
 GeneratorName = Literal["fake", "mapperatorinator"]
 AnalysisStage = Callable[[Path, Path, WorkerConfig], AnalysisStageResult]
+TimingStage = Callable[[AnalysisStageResult, Path, WorkerConfig, bool], AnalysisStageResult]
 GenerationStage = Callable[
     [AnalysisStageResult, Path, ChartGenerator, int], tuple[GeneratedVariant, ...]
 ]
@@ -52,6 +54,15 @@ def _generation_stage(
     seed: int,
 ) -> tuple[GeneratedVariant, ...]:
     return run_generation(analysis, run_dir, generator=generator, seed=seed)
+
+
+def _timing_stage(
+    analysis: AnalysisStageResult,
+    run_dir: Path,
+    config: WorkerConfig,
+    enable_super_timing: bool,
+) -> AnalysisStageResult:
+    return run_timing_selection(analysis, run_dir, config, enable_super_timing)
 
 
 def _stem_stage(analysis: AnalysisStageResult, run_dir: Path, enabled: bool) -> StemStageResult:
@@ -82,6 +93,7 @@ def _utc_now() -> datetime:
 class PipelineDependencies:
     config: WorkerConfig = field(default_factory=load_config)
     analysis: AnalysisStage = _analysis_stage
+    timing: TimingStage = _timing_stage
     generation: GenerationStage = _generation_stage
     stems: StemStage = _stem_stage
     postprocess: PostprocessStage = _postprocess_stage
@@ -188,8 +200,17 @@ def run_pipeline(
 
     started = perf_counter_ns()
     analysis = dependencies.analysis(options.source.resolve(), run_dir, dependencies.config)
-    save_analysis_snapshot(analysis, run_dir)
     elapsed["analysis"] = _elapsed_ms(started)
+
+    started = perf_counter_ns()
+    analysis = dependencies.timing(
+        analysis,
+        run_dir,
+        dependencies.config,
+        options.generator == "mapperatorinator",
+    )
+    save_analysis_snapshot(analysis, run_dir)
+    elapsed["timing"] = _elapsed_ms(started)
 
     started = perf_counter_ns()
     generated = dependencies.generation(

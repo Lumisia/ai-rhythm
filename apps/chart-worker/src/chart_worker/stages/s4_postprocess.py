@@ -3,8 +3,8 @@
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from chart_worker.analysis.beat import bpm_events_of
 from chart_worker.analysis.onset import annotate_notes
+from chart_worker.analysis.timing import TimingSource, bpm_events_of
 from chart_worker.hashing import sha256_file
 from chart_worker.postprocess.difficulty_solver import solve_difficulty
 from chart_worker.postprocess.lane_conversion import convert_lanes
@@ -88,10 +88,14 @@ def run_postprocess(
             key_mode=variant.key_mode,
             difficulty=variant.difficulty,
             lane_semantics=lane_semantics(variant.key_mode),
-            offset_ms=analysis.beat_grid.beat_ms[0],
+            offset_ms=analysis.timing_candidate.points[0].time_ms,
             duration_ms=analysis.normalized.duration_ms,
-            bpm_events=bpm_events_of(analysis.beat_grid),
-            bpm_source="BEAT_THIS",
+            bpm_events=bpm_events_of(analysis.timing_candidate.points),
+            bpm_source=(
+                "BEAT_THIS"
+                if analysis.timing_candidate.source is TimingSource.BEAT_THIS_PIECEWISE
+                else "MAPPERATORINATOR"
+            ),
             notes=notes_to_chart_notes(playability.notes),
             auto_play_onsets=list(alignment.auto_play_onsets),
             metrics=metrics,

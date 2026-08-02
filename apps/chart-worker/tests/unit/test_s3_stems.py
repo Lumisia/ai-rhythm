@@ -5,9 +5,11 @@ import numpy as np
 from chart_worker.analysis.audio_io import AudioSignal, load_audio
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing import TimingPoint
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.stages.s3_stems import run_stems
 from chart_worker.stages.types import AnalysisStageResult
+from tests.support import timing_candidate
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -36,7 +38,12 @@ def _analysis(tmp_path: Path) -> AnalysisStageResult:
         signal=signal,
         beat_grid=BeatGrid((0, 50), (0,), 1_200.0, 4, 0.0, 2, 0, 0.0, 0.0),
         onsets=OnsetAnalysis(48_000, 512, np.ones(2), np.ones((3, 2)), (25,)),
+        timing_candidate=timing_candidate(
+            duration_ms=100,
+            points=(TimingPoint(0, 1_200.0, 4, 0),),
+        ),
         timing_osu_path=tmp_path / "analysis" / "timing.osu",
+        timing_quality_report_path=tmp_path / "analysis" / "timing-quality-v1.json",
     )
 
 

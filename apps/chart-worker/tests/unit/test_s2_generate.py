@@ -11,6 +11,7 @@ from chart_worker.generation.osu_parser import parse_osu_file
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages.s2_generate import run_generation
 from chart_worker.stages.types import AnalysisStageResult
+from tests.support import timing_candidate
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -41,7 +42,9 @@ def _analysis(tmp_path: Path) -> AnalysisStageResult:
         signal=AudioSignal(np.zeros((96_000, 2)), 48_000),
         beat_grid=BeatGrid((0, 500, 1_000, 1_500), (0, 2), 120.0, 4, 0.0, 4, 0, 0.0, 0.0),
         onsets=OnsetAnalysis(48_000, 512, np.ones(2), np.ones((3, 2)), (500,)),
+        timing_candidate=timing_candidate(),
         timing_osu_path=timing_path,
+        timing_quality_report_path=tmp_path / "analysis" / "timing-quality-v1.json",
     )
 
 

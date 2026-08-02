@@ -4,6 +4,7 @@ import numpy as np
 
 from chart_worker.analysis.audio_io import AudioSignal
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing import TimingSource
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.config import WorkerConfig
 from chart_worker.stages.s1_analyze import run_analysis
@@ -73,6 +74,9 @@ def test_run_analysis_writes_normalized_audio_and_timing_osu(tmp_path: Path):
     assert result.signal is signal
     assert result.beat_grid.bpm == 120.0
     assert result.onsets.onset_ms == (500,)
+    assert result.timing_candidate.source is TimingSource.BEAT_THIS_PIECEWISE
+    assert result.timing_candidate.points[0].time_ms == 0
+    assert result.timing_quality_report_path == tmp_path / "analysis" / "timing-quality-v1.json"
     timing = result.timing_osu_path.read_text(encoding="utf-8")
     assert timing.startswith("osu file format v14")
     assert "AudioFilename: game.flac" in timing

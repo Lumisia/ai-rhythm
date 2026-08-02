@@ -19,7 +19,8 @@ def run_generation(
     variants = []
     raw_dir = run_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    offset_ms = analysis.beat_grid.beat_ms[0]
+    offset_ms = analysis.timing_candidate.points[0].time_ms
+    bpm = analysis.timing_candidate.points[0].bpm
 
     for index, (key_mode, difficulty) in enumerate(
         (key_mode, difficulty) for key_mode in KEY_MODES for difficulty in DIFFICULTIES
@@ -37,7 +38,7 @@ def run_generation(
         osu_text = generated.osu_text or notes_to_osu_mania(
             generated.notes,
             key_mode=key_mode,
-            bpm=analysis.beat_grid.bpm,
+            bpm=bpm,
             offset_ms=offset_ms,
             audio_filename=analysis.normalized.path.name,
             title=analysis.normalized.path.stem,

@@ -9,6 +9,14 @@ import numpy as np
 from chart_worker.analysis.audio_io import load_audio
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing import (
+    TimingCandidate,
+    TimingPoint,
+    TimingSource,
+    TimingStatus,
+    match_times,
+    project_beats,
+)
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.hashing import sha256_file
 from chart_worker.stages.types import AnalysisStageResult
@@ -35,6 +43,12 @@ def save_analysis_snapshot(analysis: AnalysisStageResult, run_dir: Path) -> tupl
     )
     normalized = asdict(analysis.normalized)
     normalized["path"] = _relative(analysis.normalized.path, run_dir)
+    if not analysis.timing_osu_path.is_file():
+        raise ValueError(f"timing osu is missing: {analysis.timing_osu_path}")
+    if not analysis.timing_quality_report_path.is_file():
+        raise ValueError(
+            f"timing quality report is missing: {analysis.timing_quality_report_path}"
+        )
     metadata = {
         "version": 1,
         "normalized": normalized,
@@ -46,6 +60,19 @@ def save_analysis_snapshot(analysis: AnalysisStageResult, run_dir: Path) -> tupl
             "nFft": analysis.onsets.n_fft,
         },
         "timingOsuPath": _relative(analysis.timing_osu_path, run_dir),
+        "timingSelection": {
+            "source": analysis.timing_candidate.source.value,
+            "points": [
+                {
+                    "timeMs": point.time_ms,
+                    "bpm": point.bpm,
+                    "meter": point.meter,
+                    "startBeatIndex": point.start_beat_index,
+                }
+                for point in analysis.timing_candidate.points
+            ],
+            "qualityReportPath": _relative(analysis.timing_quality_report_path, run_dir),
+        },
         "arraysPath": _relative(arrays_path, run_dir),
     }
     metadata_path = analysis_dir / METADATA_NAME
@@ -94,10 +121,45 @@ def load_analysis_snapshot(run_dir: Path) -> AnalysisStageResult:
     timing_path = run_dir / metadata["timingOsuPath"]
     if not timing_path.is_file():
         raise ValueError(f"timing osu is missing: {timing_path}")
+    timing_selection = metadata["timingSelection"]
+    report_path = run_dir / timing_selection["qualityReportPath"]
+    if not report_path.is_file():
+        raise ValueError(f"timing quality report is missing: {report_path}")
+    points = tuple(
+        TimingPoint(
+            time_ms=int(point["timeMs"]),
+            bpm=float(point["bpm"]),
+            meter=int(point["meter"]),
+            start_beat_index=(
+                int(point["startBeatIndex"])
+                if point["startBeatIndex"] is not None
+                else None
+            ),
+        )
+        for point in timing_selection["points"]
+    )
+    if not points:
+        raise ValueError("timing selection has no timing points")
+    projected = project_beats(points, end_ms=normalized.duration_ms)
+    metrics_20 = match_times(projected, grid.beat_ms, window_ms=20)
+    metrics_50 = match_times(projected, grid.beat_ms, window_ms=50)
+    passed = metrics_50.p95_abs_ms <= 30.0
+    candidate = TimingCandidate(
+        source=TimingSource(timing_selection["source"]),
+        points=points,
+        projected_beat_ms=projected,
+        f1_20ms=metrics_20.f1,
+        f1_50ms=metrics_50.f1,
+        p95_abs_ms=metrics_50.p95_abs_ms,
+        status=TimingStatus.PASS if passed else TimingStatus.FAIL,
+        reasons=() if passed else ("p95 exceeds 30ms",),
+    )
     return AnalysisStageResult(
         normalized=normalized,
         signal=load_audio(audio_path),
         beat_grid=grid,
         onsets=onsets,
+        timing_candidate=candidate,
         timing_osu_path=timing_path,
+        timing_quality_report_path=report_path,
     )

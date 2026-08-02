@@ -79,3 +79,28 @@ def test_postprocess_leaves_keysounds_alone_unless_asked(tmp_path: Path):
     assert seen == []
     assert manifest.audio.no_drums is None
     assert manifest.keysound_manifest_path is None
+
+
+@pytest.mark.parametrize(
+    "missing_relative_path, expected_message",
+    (
+        ("analysis/timing.osu", "timing osu is missing"),
+        ("analysis/timing-quality-v1.json", "timing quality report is missing"),
+    ),
+)
+def test_postprocess_rejects_an_incomplete_selected_timing_snapshot(
+    tmp_path: Path, missing_relative_path: str, expected_message: str
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    input_dir = tmp_path / "input"
+    run_pipeline(
+        PipelineOptions(source=source, output_dir=input_dir, title="fixture", seed=7),
+        dependencies=fake_dependencies(),
+    )
+    (input_dir / missing_relative_path).unlink()
+
+    with pytest.raises(ValueError, match=expected_message):
+        run_postprocess_only(
+            PostprocessOptions(input_dir=input_dir, output_dir=tmp_path / "output")
+        )

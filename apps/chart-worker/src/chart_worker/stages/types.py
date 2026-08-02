@@ -6,6 +6,7 @@ from pathlib import Path
 from chart_worker.analysis.audio_io import AudioSignal
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing import TimingCandidate
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.postprocess.difficulty_solver import SolveResult
@@ -23,7 +24,9 @@ class AnalysisStageResult:
     signal: AudioSignal
     beat_grid: BeatGrid
     onsets: OnsetAnalysis
+    timing_candidate: TimingCandidate
     timing_osu_path: Path
+    timing_quality_report_path: Path
 
 
 @dataclass(frozen=True, slots=True)
