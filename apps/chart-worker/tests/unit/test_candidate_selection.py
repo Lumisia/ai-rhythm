@@ -23,6 +23,7 @@ def passing_quality(**overrides) -> CandidateQuality:
         removed_ratio=0.0,
         drum_precision=0.9,
         playability_passes=1,
+        playability_violations=0,
         hold_ratio_error=0.0,
         reference_pass=None,
     )
@@ -39,7 +40,8 @@ def passing_quality(**overrides) -> CandidateQuality:
         ({"removed_ratio": 0.45}, False),
         ({"removed_ratio": 0.4501}, True),
         ({"playability_passes": 7}, False),
-        ({"playability_passes": 8}, True),
+        ({"playability_passes": 8}, False),
+        ({"playability_violations": 1}, True),
     ],
 )
 def test_structural_retry_boundaries(changes, expected):

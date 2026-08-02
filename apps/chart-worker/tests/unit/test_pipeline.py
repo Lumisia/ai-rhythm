@@ -151,6 +151,11 @@ def test_fake_pipeline_writes_playtest_manifest(tmp_path: Path):
         assert chart["candidates"][0]["drumOnsetPrecision"] == {
             "status": "UNAVAILABLE"
         }
+        assert chart["candidates"][0]["playabilityViolationCount"] == 0
+        assert (
+            chart["candidates"][0]["failure_metrics"]["playability_violations"]
+            == 0
+        )
         assert chart["holdRatio"]["absoluteError"] == pytest.approx(
             abs(chart["holdRatio"]["actual"] - chart["holdRatio"]["target"])
         )

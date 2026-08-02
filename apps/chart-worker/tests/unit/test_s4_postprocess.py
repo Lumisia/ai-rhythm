@@ -21,7 +21,11 @@ from chart_worker.stages.s4_postprocess import (
     run_postprocess_variant,
 )
 from chart_worker.stages.types import AnalysisStageResult, GeneratedVariant, StemStageResult
-from chart_worker.validation.playability import PlayabilityResult
+from chart_worker.validation.playability import (
+    PlayabilityResult,
+    PlayabilityViolation,
+    ViolationCode,
+)
 from tests.support import timing_candidate
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -268,10 +272,52 @@ def test_candidate_quality_extracts_reference_and_unavailable_drums(tmp_path: Pa
     )
     assert quality.drum_precision is None
     assert quality.playability_passes == result.reports.playability.passes
+    assert quality.playability_violations == 0
     assert quality.hold_ratio_error == 0.15
     assert quality.reference_pass is True
     assert quality.requested_star == generated.requested_star
     assert quality.cfg_scale == generated.cfg_scale
+
+
+def test_candidate_quality_counts_violations_remaining_after_the_final_pass(tmp_path: Path):
+    analysis, generated, stems, _ = _inputs(tmp_path)
+    result = run_postprocess_variant(
+        analysis,
+        generated,
+        stems,
+        tmp_path,
+        worker_version="test",
+        write_output=False,
+    )
+    violation = PlayabilityViolation(
+        code=ViolationCode.JACK_RUN,
+        time_ms=500,
+        end_ms=500,
+        lanes=(0,),
+        detail="still invalid",
+    )
+    result = dataclasses.replace(
+        result,
+        reports=dataclasses.replace(
+            result.reports,
+            playability=dataclasses.replace(
+                result.reports.playability,
+                passes=8,
+                violations=(violation,),
+            ),
+        ),
+    )
+
+    quality = candidate_quality_of(
+        analysis,
+        generated,
+        result,
+        stems,
+        reference_pass=None,
+    )
+
+    assert quality.playability_passes == 8
+    assert quality.playability_violations == 1
 
 
 def test_zero_raw_notes_are_always_a_failed_candidate(tmp_path: Path):

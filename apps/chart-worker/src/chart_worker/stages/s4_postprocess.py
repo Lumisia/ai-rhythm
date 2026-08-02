@@ -187,6 +187,7 @@ def candidate_quality_of(
             result.reports.alignment.drum_precision if stems.drum_onsets else None
         ),
         playability_passes=result.reports.playability.passes,
+        playability_violations=len(result.reports.playability.violations),
         hold_ratio_error=abs(
             hold_ratio - TARGET_HOLD_RATIO[variant.difficulty]
         ),

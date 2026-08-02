@@ -25,7 +25,6 @@ from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.candidate_selection import (
     MAX_LONG_GAP_BARS,
-    MAX_PLAYABILITY_PASSES,
     MAX_RATING_ERROR,
     MAX_REMOVED_RATIO,
     MIN_DRUM_PRECISION,
@@ -493,8 +492,8 @@ def _candidate_failure_reasons(
         reasons.append("rating error is at least 0.35")
     if quality.removed_ratio > MAX_REMOVED_RATIO:
         reasons.append("total removal ratio exceeds 0.45")
-    if quality.playability_passes >= MAX_PLAYABILITY_PASSES:
-        reasons.append("playability recovery reached eight passes")
+    if quality.playability_violations > 0:
+        reasons.append("playability violations remain after recovery")
     if quality.reference_pass is False:
         reasons.append("human reference accuracy gate failed")
     if (
@@ -562,6 +561,7 @@ def _quality_payload(
         },
         "totalRemovalRatio": total_removal_ratio,
         "playabilityPasses": reports.playability.passes,
+        "playabilityViolationCount": quality.playability_violations,
         "targetRating": target_rating,
         "actualRating": actual_rating,
         "signedRatingError": signed_rating_error,
@@ -583,6 +583,7 @@ def _quality_payload(
             "removed_ratio": quality.removed_ratio,
             "drum_precision": _drum_payload(quality.drum_precision),
             "playability_passes": quality.playability_passes,
+            "playability_violations": quality.playability_violations,
             "hold_ratio_error": quality.hold_ratio_error,
             "reference_pass": quality.reference_pass,
             "reference_accuracy": _reference_payload(evaluation.reference_quality),

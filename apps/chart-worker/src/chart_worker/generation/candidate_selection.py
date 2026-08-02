@@ -16,7 +16,6 @@ MAX_LONG_GAP_BARS = 2.0
 MAX_RATING_ERROR = 0.35
 MAX_REMOVED_RATIO = 0.45
 MIN_DRUM_PRECISION = 0.70
-MAX_PLAYABILITY_PASSES = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +32,7 @@ class CandidateQuality:
     removed_ratio: float
     drum_precision: float | None
     playability_passes: int
+    playability_violations: int
     hold_ratio_error: float
     reference_pass: bool | None
     requested_star: float | None = None
@@ -95,7 +95,7 @@ def needs_retry(quality: CandidateQuality, *, difficulty: str) -> bool:
         quality.long_gap_bars > MAX_LONG_GAP_BARS
         or abs(quality.rating_error) >= MAX_RATING_ERROR
         or quality.removed_ratio > MAX_REMOVED_RATIO
-        or quality.playability_passes >= MAX_PLAYABILITY_PASSES
+        or quality.playability_violations > 0
         or quality.reference_pass is False
     )
     drum_failure = (
