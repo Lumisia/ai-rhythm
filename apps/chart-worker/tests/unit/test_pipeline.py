@@ -1,10 +1,12 @@
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import pytest
 
 import chart_worker.pipeline as pipeline_module
+from chart_worker.analysis.timing import project_beats
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import GeneratedChart
@@ -23,13 +25,50 @@ class RecordingFakeGenerator:
         return FakeGenerator()(request, workdir)
 
 
+def timing_candidate_payload(candidate):
+    return {
+        "source": candidate.source.value,
+        "points": [
+            {
+                "timeMs": point.time_ms,
+                "bpm": point.bpm,
+                "meter": point.meter,
+                "startBeatIndex": point.start_beat_index,
+            }
+            for point in candidate.points
+        ],
+        "projectedBeatMs": list(candidate.projected_beat_ms),
+        "f1At20Ms": candidate.f1_20ms,
+        "f1At50Ms": candidate.f1_50ms,
+        "p95AbsMs": candidate.p95_abs_ms,
+        "status": candidate.status.value,
+        "reasons": list(candidate.reasons),
+    }
+
+
+def write_timing_quality_report(analysis) -> None:
+    selected = timing_candidate_payload(analysis.timing_candidate)
+    analysis.timing_quality_report_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "selected": selected,
+                "warnings": [],
+                "candidates": [selected],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def mapperatorinator_dependencies(generator: RecordingFakeGenerator):
     dependencies = fake_dependencies()
 
     def timing_stage(analysis, run_dir, config, enable_super_timing):
         del run_dir, config
         assert enable_super_timing is True
-        analysis.timing_quality_report_path.write_text("{}\n", encoding="utf-8")
+        write_timing_quality_report(analysis)
         return analysis
 
     return dataclasses.replace(
@@ -80,10 +119,146 @@ def test_fake_pipeline_writes_playtest_manifest(tmp_path: Path):
     )
     assert (output_dir / metadata["timingSelection"]["qualityReportPath"]).is_file()
     report = json.loads((output_dir / "generation-report.json").read_text())
+    assert report["timing"]["selectedSource"] == "BEAT_THIS_PIECEWISE"
+    assert report["timing"]["selected"] == report["timing"]["candidates"][0]
+    assert report["timing"]["qualityReportPath"] == (
+        "analysis/timing-quality-v1.json"
+    )
+    assert report["timing"]["warnings"] == []
     assert all(
         chart["referenceAccuracy"] == {"status": "UNAVAILABLE"}
         for chart in report["charts"]
     )
+
+    for chart in report["charts"]:
+        assert chart["candidateCount"] == 1
+        assert chart["selectedAttempt"] == 1
+        assert chart["selectedSeed"] == chart["candidates"][0]["seed"]
+        assert chart["selectedParameters"] == chart["candidates"][0][
+            "generationParameters"
+        ]
+        assert chart["rawNoteCount"] >= chart["finalNoteCount"]
+        deleted = sum(chart["removals"].values())
+        expected_ratio = deleted / chart["rawNoteCount"] if chart["rawNoteCount"] else 1.0
+        assert chart["totalRemovalRatio"] == pytest.approx(expected_ratio)
+        assert chart["signedRatingError"] == pytest.approx(
+            chart["actualRating"] - chart["targetRating"]
+        )
+        assert chart["absoluteRatingError"] == pytest.approx(
+            abs(chart["signedRatingError"])
+        )
+        assert chart["drumOnsetPrecision"] == {"status": "UNAVAILABLE"}
+        assert chart["candidates"][0]["drumOnsetPrecision"] == {
+            "status": "UNAVAILABLE"
+        }
+        assert chart["holdRatio"]["absoluteError"] == pytest.approx(
+            abs(chart["holdRatio"]["actual"] - chart["holdRatio"]["target"])
+        )
+        assert chart["candidates"][0]["selection"]["status"] == "SELECTED"
+        for field in ("chartPath", "rawOsuPath"):
+            relative = Path(chart[field])
+            assert not relative.is_absolute()
+            assert (output_dir / relative).is_file()
+        selected_candidate = chart["candidates"][0]
+        assert selected_candidate["canonicalChartPath"] == chart["chartPath"]
+        assert selected_candidate["canonicalRawOsuPath"] == chart["rawOsuPath"]
+        for field in ("diagnosticRawOsuPath", "diagnosticChartPath"):
+            relative = Path(selected_candidate[field])
+            assert not relative.is_absolute()
+            assert (output_dir / relative).is_file()
+
+
+def _selected_timing_analysis(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    run_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+    analysis = dependencies.analysis(source, run_dir, dependencies.config)
+    return dependencies.timing(analysis, run_dir, dependencies.config, False), run_dir
+
+
+def test_timing_report_accepts_structured_warning_context(tmp_path: Path):
+    analysis, run_dir = _selected_timing_analysis(tmp_path)
+    report = json.loads(analysis.timing_quality_report_path.read_text(encoding="utf-8"))
+    report["warnings"] = [
+        {
+            "code": "CHART_GENERATION_FAILED",
+            "message": "super timing unavailable",
+            "context": {"stderr": "model missing"},
+        }
+    ]
+    analysis.timing_quality_report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    payload = pipeline_module._timing_payload(analysis, run_dir)
+
+    assert payload["warnings"] == report["warnings"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda report: report["candidates"][0].pop("projectedBeatMs"),
+            "candidate fields",
+        ),
+        (
+            lambda report: report["candidates"][0].__setitem__("p95AbsMs", math.nan),
+            "finite number",
+        ),
+        (
+            lambda report: report["candidates"][0].__setitem__("f1At20Ms", True),
+            "finite number",
+        ),
+        (
+            lambda report: report.__setitem__(
+                "warnings", [{"code": "BROKEN", "message": "bad", "context": []}]
+            ),
+            "warning context",
+        ),
+    ],
+)
+def test_timing_report_rejects_malformed_candidate_or_warning(
+    tmp_path: Path,
+    mutation,
+    message: str,
+):
+    analysis, run_dir = _selected_timing_analysis(tmp_path)
+    report = json.loads(analysis.timing_quality_report_path.read_text(encoding="utf-8"))
+    mutation(report)
+    analysis.timing_quality_report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        pipeline_module._timing_payload(analysis, run_dir)
+
+
+def test_timing_report_rejects_selected_metric_mismatch(tmp_path: Path):
+    analysis, run_dir = _selected_timing_analysis(tmp_path)
+    report = json.loads(analysis.timing_quality_report_path.read_text(encoding="utf-8"))
+    report["selected"]["f1At20Ms"] = 0.5
+    analysis.timing_quality_report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="selected candidate does not match analysis"):
+        pipeline_module._timing_payload(analysis, run_dir)
+
+
+def test_timing_report_accepts_negative_lead_in_point_and_projected_beat(tmp_path: Path):
+    analysis, run_dir = _selected_timing_analysis(tmp_path)
+    negative_point = dataclasses.replace(analysis.timing_candidate.points[0], time_ms=-120)
+    negative_candidate = dataclasses.replace(
+        analysis.timing_candidate,
+        points=(negative_point,),
+        projected_beat_ms=project_beats(
+            (negative_point,),
+            end_ms=analysis.normalized.duration_ms,
+        ),
+    )
+    analysis = dataclasses.replace(analysis, timing_candidate=negative_candidate)
+    write_timing_quality_report(analysis)
+
+    payload = pipeline_module._timing_payload(analysis, run_dir)
+
+    assert payload["selected"]["points"][0]["timeMs"] == -120
+    assert payload["selected"]["projectedBeatMs"][0] == -120
 
 
 def test_pipeline_copies_reference_and_reports_measured_accuracy_per_chart(tmp_path: Path):
@@ -210,8 +385,14 @@ def test_reference_failure_writes_report_then_exhausts_the_first_candidate(tmp_p
     ]
     assert all(candidate["timing_source"] == "BEAT_THIS_PIECEWISE" for candidate in candidates)
     assert all(candidate["failure_metrics"]["reference_accuracy"]["status"] == "FAIL" for candidate in candidates)
-    assert all(Path(candidate["raw_osu_path"]).is_file() for candidate in candidates)
-    assert all(Path(candidate["chart_path"]).is_file() for candidate in candidates)
+    assert all(
+        (output_dir / candidate["raw_osu_path"]).is_file()
+        for candidate in candidates
+    )
+    assert all(
+        (output_dir / candidate["chart_path"]).is_file()
+        for candidate in candidates
+    )
     assert len({candidate["raw_osu_path"] for candidate in candidates}) == 3
     assert len({candidate["chart_path"] for candidate in candidates}) == 3
     retry_dirs = sorted((output_dir / "raw" / "candidates").glob("*/attempt-2"))
@@ -318,6 +499,36 @@ def test_mapperatorinator_compares_unguided_at_same_star_even_when_guided_passes
     assert len(result.raw_osu_paths) == 12
     assert all(path.is_file() for path in result.raw_osu_paths)
     assert result.manifest_path.is_file()
+    report = json.loads((result.output_dir / "generation-report.json").read_text())
+    normal_report = next(
+        chart
+        for chart in report["charts"]
+        if chart["keyMode"] == 4 and chart["difficulty"] == "NORMAL"
+    )
+    assert normal_report["candidateCount"] == 2
+    assert [candidate["attempt"] for candidate in normal_report["candidates"]] == [1, 2]
+    assert sum(
+        candidate["selection"]["status"] == "SELECTED"
+        for candidate in normal_report["candidates"]
+    ) == 1
+    selected_candidate = next(
+        candidate
+        for candidate in normal_report["candidates"]
+        if candidate["selection"]["status"] == "SELECTED"
+    )
+    rejected_candidate = next(
+        candidate
+        for candidate in normal_report["candidates"]
+        if candidate["selection"]["status"] == "REJECTED"
+    )
+    assert selected_candidate["canonicalChartPath"] == normal_report["chartPath"]
+    assert selected_candidate["canonicalRawOsuPath"] == normal_report["rawOsuPath"]
+    assert "canonicalChartPath" not in rejected_candidate
+    assert "canonicalRawOsuPath" not in rejected_candidate
+    assert sum(
+        candidate["selection"]["status"] == "REJECTED"
+        for candidate in normal_report["candidates"]
+    ) == 1
 
 
 def test_mapperatorinator_failed_guided_candidate_adds_one_bounded_star_retry(
@@ -463,7 +674,7 @@ def test_fake_pipeline_never_enables_mapperatorinator_super_timing(tmp_path: Pat
     def timing_stage(analysis, run_dir, config, enable_super_timing):
         del run_dir, config
         assert enable_super_timing is False
-        analysis.timing_quality_report_path.write_text("{}\n", encoding="utf-8")
+        write_timing_quality_report(analysis)
         return analysis
 
     run_pipeline(

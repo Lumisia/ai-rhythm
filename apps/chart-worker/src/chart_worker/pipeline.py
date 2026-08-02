@@ -1,6 +1,7 @@
 """로컬 한 번 실행용 chart-worker 오케스트레이션."""
 
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,12 +15,20 @@ from chart_worker.analysis.snapshot import save_analysis_snapshot
 from chart_worker.analysis.timing import (
     ReferenceChart,
     ReferenceQuality,
+    TimingCandidate,
+    TimingSource,
+    TimingStatus,
     evaluate_reference,
     load_reference_onsets,
 )
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.candidate_selection import (
+    MAX_LONG_GAP_BARS,
+    MAX_PLAYABILITY_PASSES,
+    MAX_RATING_ERROR,
+    MAX_REMOVED_RATIO,
+    MIN_DRUM_PRECISION,
     CandidateParameters,
     CandidateQuality,
     candidate_parameters,
@@ -33,6 +42,7 @@ from chart_worker.schema.playtest_run import (
     RunAudioRefs,
     RunChartRef,
 )
+from chart_worker.schema.types import TARGET_HOLD_RATIO
 from chart_worker.stages.s1_analyze import run_analysis
 from chart_worker.stages.s2_generate import run_generation, run_generation_variant
 from chart_worker.stages.s3_stems import run_stems
@@ -216,6 +226,14 @@ class _CandidateEvaluation:
     reference_quality: ReferenceQuality | None
 
 
+@dataclass(frozen=True, slots=True)
+class _ChartSelection:
+    result: PostprocessedVariant
+    evaluations: tuple[_CandidateEvaluation, ...]
+    selected_index: int
+    canonical_raw_path: Path
+
+
 def _prepare_run_dir(options: PipelineOptions) -> Path:
     if not options.source.is_file():
         raise ValueError(f"source does not exist or is not a file: {options.source}")
@@ -233,6 +251,13 @@ def _relative(path: Path, run_dir: Path) -> str:
         return path.resolve().relative_to(run_dir).as_posix()
     except ValueError:
         raise ValueError(f"pipeline asset is outside the output directory: {path}") from None
+
+
+def _report_asset_path(path: Path, run_dir: Path) -> str:
+    relative = _relative(path, run_dir)
+    if not path.resolve().is_file():
+        raise ValueError(f"pipeline report asset does not exist: {path}")
+    return relative
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -267,13 +292,252 @@ def _reference_payload(quality: ReferenceQuality | None) -> dict[str, object]:
     }
 
 
+_TIMING_CANDIDATE_FIELDS = {
+    "source",
+    "points",
+    "projectedBeatMs",
+    "f1At20Ms",
+    "f1At50Ms",
+    "p95AbsMs",
+    "status",
+    "reasons",
+}
+_TIMING_POINT_FIELDS = {"timeMs", "bpm", "meter", "startBeatIndex"}
+
+
+def _timing_candidate_payload(candidate: TimingCandidate) -> dict[str, object]:
+    return {
+        "source": candidate.source.value,
+        "points": [
+            {
+                "timeMs": point.time_ms,
+                "bpm": point.bpm,
+                "meter": point.meter,
+                "startBeatIndex": point.start_beat_index,
+            }
+            for point in candidate.points
+        ],
+        "projectedBeatMs": list(candidate.projected_beat_ms),
+        "f1At20Ms": candidate.f1_20ms,
+        "f1At50Ms": candidate.f1_50ms,
+        "p95AbsMs": candidate.p95_abs_ms,
+        "status": candidate.status.value,
+        "reasons": list(candidate.reasons),
+    }
+
+
+def _require_int(value: object, *, name: str, minimum: int | None = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")  # noqa: TRY004
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _require_finite_number(
+    value: object,
+    *,
+    name: str,
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be a finite number")  # noqa: TRY004
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError(f"{name} must be a finite number")
+    if converted < minimum or (maximum is not None and converted > maximum):
+        raise ValueError(f"{name} is outside the supported range")
+    return converted
+
+
+def _validate_timing_candidate(value: object, *, name: str) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be an object")
+    if set(value) != _TIMING_CANDIDATE_FIELDS:
+        raise ValueError(f"{name} candidate fields do not match the version-1 contract")
+    if not isinstance(value["source"], str) or value["source"] not in {
+        source.value for source in TimingSource
+    }:
+        raise ValueError(f"{name} source is unsupported")
+    if not isinstance(value["status"], str) or value["status"] not in {
+        status.value for status in TimingStatus
+    }:
+        raise ValueError(f"{name} status is unsupported")
+
+    points = value["points"]
+    if not isinstance(points, list):
+        raise ValueError(f"{name} points must be an array")  # noqa: TRY004
+    for index, point in enumerate(points):
+        point_name = f"{name}.points[{index}]"
+        if not isinstance(point, dict) or set(point) != _TIMING_POINT_FIELDS:
+            raise ValueError(f"{point_name} fields do not match the version-1 contract")
+        _require_int(point["timeMs"], name=f"{point_name}.timeMs", minimum=None)
+        _require_finite_number(
+            point["bpm"],
+            name=f"{point_name}.bpm",
+            minimum=float.fromhex("0x0.0000000000001p-1022"),
+        )
+        _require_int(point["meter"], name=f"{point_name}.meter", minimum=1)
+        start_beat_index = point["startBeatIndex"]
+        if start_beat_index is not None:
+            _require_int(start_beat_index, name=f"{point_name}.startBeatIndex")
+
+    projected = value["projectedBeatMs"]
+    if not isinstance(projected, list):
+        raise ValueError(f"{name}.projectedBeatMs must be an array")  # noqa: TRY004
+    projected_values = [
+        _require_int(
+            item,
+            name=f"{name}.projectedBeatMs[{index}]",
+            minimum=None,
+        )
+        for index, item in enumerate(projected)
+    ]
+    if projected_values != sorted(set(projected_values)):
+        raise ValueError(f"{name}.projectedBeatMs must be sorted without duplicates")
+
+    _require_finite_number(
+        value["f1At20Ms"], name=f"{name}.f1At20Ms", maximum=1.0
+    )
+    _require_finite_number(
+        value["f1At50Ms"], name=f"{name}.f1At50Ms", maximum=1.0
+    )
+    _require_finite_number(value["p95AbsMs"], name=f"{name}.p95AbsMs")
+    reasons = value["reasons"]
+    if not isinstance(reasons, list) or not all(isinstance(reason, str) for reason in reasons):
+        raise ValueError(f"{name}.reasons must be an array of strings")
+    return value
+
+
+def _validate_timing_warning(value: object, *, index: int) -> dict[str, object]:
+    name = f"warnings[{index}]"
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object")  # noqa: TRY004
+    if not isinstance(value.get("code"), str) or not value["code"]:
+        raise ValueError(f"{name} code must be a non-empty string")
+    if not isinstance(value.get("message"), str):
+        raise ValueError(f"{name} message must be a string")  # noqa: TRY004
+    context = value.get("context")
+    if not isinstance(context, dict) or not all(isinstance(key, str) for key in context):
+        raise ValueError(f"{name} warning context must be an object")
+    return value
+
+
+def _timing_payload(analysis: AnalysisStageResult, run_dir: Path) -> dict[str, object]:
+    quality_report_path = _report_asset_path(analysis.timing_quality_report_path, run_dir)
+    value = json.loads(analysis.timing_quality_report_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(  # noqa: TRY004 - persisted contract validation
+            "timing quality report must be an object"
+        )
+    if set(value) != {"version", "selected", "warnings", "candidates"}:
+        raise ValueError("timing quality report fields do not match the version-1 contract")
+    if _require_int(value["version"], name="timing quality report version", minimum=1) != 1:
+        raise ValueError("unsupported timing quality report version")
+    selected = _validate_timing_candidate(value["selected"], name="selected")
+    candidates = value["candidates"]
+    warnings = value["warnings"]
+    if not isinstance(candidates, list):
+        raise ValueError(  # noqa: TRY004 - persisted contract validation
+            "timing quality report candidates must be an array"
+        )
+    if not candidates:
+        raise ValueError("timing quality report candidates must not be empty")
+    if not isinstance(warnings, list):
+        raise ValueError(  # noqa: TRY004 - persisted contract validation
+            "timing quality report warnings must be an array"
+        )
+    validated_candidates = [
+        _validate_timing_candidate(candidate, name=f"candidates[{index}]")
+        for index, candidate in enumerate(candidates)
+    ]
+    validated_warnings = [
+        _validate_timing_warning(warning, index=index)
+        for index, warning in enumerate(warnings)
+    ]
+    expected_selected = _timing_candidate_payload(analysis.timing_candidate)
+    if selected != expected_selected:
+        raise ValueError("timing quality report selected candidate does not match analysis")
+    if selected not in validated_candidates:
+        raise ValueError("timing quality report selected candidate is absent from candidates")
+    return {
+        "qualityReportPath": quality_report_path,
+        "selectedSource": selected["source"],
+        "selected": selected,
+        "candidates": validated_candidates,
+        "warnings": validated_warnings,
+    }
+
+
+def _drum_payload(precision: float | None) -> dict[str, object]:
+    if precision is None:
+        return {"status": "UNAVAILABLE"}
+    return {"status": "AVAILABLE", "precision": precision}
+
+
+def _candidate_failure_reasons(
+    quality: CandidateQuality,
+    *,
+    difficulty: str,
+    generator: GeneratorName,
+) -> list[str]:
+    reasons = []
+    if generator == "fake":
+        if quality.reference_pass is False:
+            reasons.append("human reference accuracy gate failed")
+        return reasons
+    if quality.long_gap_bars > MAX_LONG_GAP_BARS:
+        reasons.append("long gap exceeds two bars")
+    if abs(quality.rating_error) >= MAX_RATING_ERROR:
+        reasons.append("rating error is at least 0.35")
+    if quality.removed_ratio > MAX_REMOVED_RATIO:
+        reasons.append("total removal ratio exceeds 0.45")
+    if quality.playability_passes >= MAX_PLAYABILITY_PASSES:
+        reasons.append("playability recovery reached eight passes")
+    if quality.reference_pass is False:
+        reasons.append("human reference accuracy gate failed")
+    if (
+        difficulty in ("HARD", "EXPERT")
+        and quality.drum_precision is not None
+        and quality.drum_precision < MIN_DRUM_PRECISION
+    ):
+        reasons.append("drum onset precision is below 0.70")
+    return reasons
+
+
+def _hold_ratio(result: PostprocessedVariant) -> float:
+    notes = result.document.notes
+    if not notes:
+        return 0.0
+    return sum(note.kind == "HOLD" for note in notes) / len(notes)
+
+
 def _quality_payload(
     evaluation: _CandidateEvaluation,
     *,
     analysis: AnalysisStageResult,
+    run_dir: Path,
+    selection_status: str,
+    selection_reasons: list[str],
 ) -> dict[str, object]:
     variant = evaluation.variant
     quality = evaluation.quality
+    reports = evaluation.result.reports
+    raw_note_count = len(variant.generated.notes)
+    final_note_count = len(evaluation.result.document.notes)
+    lane_deleted = reports.conversion.deleted_count
+    difficulty_deleted = reports.difficulty.removed_count
+    playability_deleted = reports.playability.deleted_count
+    total_deleted = lane_deleted + difficulty_deleted + playability_deleted
+    total_removal_ratio = total_deleted / raw_note_count if raw_note_count else 1.0
+    target_rating = reports.difficulty.target_rating
+    actual_rating = evaluation.result.document.metrics.project_rating
+    signed_rating_error = actual_rating - target_rating
+    actual_hold_ratio = _hold_ratio(evaluation.result)
+    target_hold_ratio = TARGET_HOLD_RATIO[variant.difficulty]
+    raw_osu_path = _report_asset_path(variant.raw_osu_path, run_dir)
+    chart_path = _report_asset_path(evaluation.result.path, run_dir)
     return {
         "attempt": variant.attempt,
         "seed": variant.generated.seed,
@@ -281,20 +545,99 @@ def _quality_payload(
             "requested_star": variant.requested_star,
             "cfg_scale": variant.cfg_scale,
         },
+        "generationParameters": {
+            "requestedStar": variant.requested_star,
+            "cfgScale": variant.cfg_scale,
+        },
+        "selection": {
+            "status": selection_status,
+            "reasons": selection_reasons,
+        },
+        "rawNoteCount": raw_note_count,
+        "finalNoteCount": final_note_count,
+        "removals": {
+            "laneConversion": lane_deleted,
+            "difficultySolver": difficulty_deleted,
+            "playability": playability_deleted,
+        },
+        "totalRemovalRatio": total_removal_ratio,
+        "playabilityPasses": reports.playability.passes,
+        "targetRating": target_rating,
+        "actualRating": actual_rating,
+        "signedRatingError": signed_rating_error,
+        "absoluteRatingError": abs(signed_rating_error),
+        "drumOnsetPrecision": _drum_payload(quality.drum_precision),
+        "longGapBars": quality.long_gap_bars,
+        "holdRatio": {
+            "actual": actual_hold_ratio,
+            "target": target_hold_ratio,
+            "absoluteError": abs(actual_hold_ratio - target_hold_ratio),
+        },
+        "referenceAccuracy": _reference_payload(evaluation.reference_quality),
+        "diagnosticRawOsuPath": raw_osu_path,
+        "diagnosticChartPath": chart_path,
         "timing_source": analysis.timing_candidate.source.value,
         "failure_metrics": {
             "long_gap_bars": quality.long_gap_bars,
             "rating_error": quality.rating_error,
             "removed_ratio": quality.removed_ratio,
-            "drum_precision": quality.drum_precision,
+            "drum_precision": _drum_payload(quality.drum_precision),
             "playability_passes": quality.playability_passes,
             "hold_ratio_error": quality.hold_ratio_error,
             "reference_pass": quality.reference_pass,
             "reference_accuracy": _reference_payload(evaluation.reference_quality),
         },
-        "raw_osu_path": str(variant.raw_osu_path),
-        "chart_path": str(evaluation.result.path),
+        "raw_osu_path": raw_osu_path,
+        "chart_path": chart_path,
     }
+
+
+def _selection_payloads(
+    selection: _ChartSelection,
+    *,
+    analysis: AnalysisStageResult,
+    run_dir: Path,
+    generator: GeneratorName,
+) -> list[dict[str, object]]:
+    selected_attempt = selection.evaluations[selection.selected_index].variant.attempt
+    payloads = []
+    for index, evaluation in enumerate(selection.evaluations):
+        failure_reasons = _candidate_failure_reasons(
+            evaluation.quality,
+            difficulty=evaluation.variant.difficulty,
+            generator=generator,
+        )
+        if index == selection.selected_index:
+            reasons = [
+                *failure_reasons,
+                "selected by the approved lexicographic quality ranking",
+            ]
+            status = "SELECTED"
+        else:
+            reasons = [
+                *failure_reasons,
+                f"ranked below selected attempt {selected_attempt}",
+            ]
+            status = "REJECTED"
+        payloads.append(
+            _quality_payload(
+                evaluation,
+                analysis=analysis,
+                run_dir=run_dir,
+                selection_status=status,
+                selection_reasons=reasons,
+            )
+        )
+        if index == selection.selected_index:
+            payloads[-1]["canonicalChartPath"] = _report_asset_path(
+                selection.result.path,
+                run_dir,
+            )
+            payloads[-1]["canonicalRawOsuPath"] = _report_asset_path(
+                selection.canonical_raw_path,
+                run_dir,
+            )
+    return payloads
 
 
 def _write_exhausted_report(
@@ -302,14 +645,24 @@ def _write_exhausted_report(
     options: PipelineOptions,
     run_id: UUID,
     elapsed: dict[str, int],
-    charts: tuple[PostprocessedVariant, ...],
-    reference_quality: dict[tuple[int, str], ReferenceQuality | None],
+    selections: tuple[_ChartSelection, ...],
+    analysis: AnalysisStageResult,
     key_mode: int,
     difficulty: str,
     candidates: list[dict[str, object]],
     run_dir: Path,
 ) -> Path:
-    payload = _generation_report(options, run_id, elapsed, charts, reference_quality)
+    payload = _generation_report(
+        options,
+        run_id,
+        elapsed,
+        selections,
+        analysis=analysis,
+        run_dir=run_dir,
+    )
+    payload["warnings"] = [
+        f"{key_mode}K {difficulty}: all chart candidates failed quality gates"
+    ]
     payload["failedCombination"] = {
         "keyMode": key_mode,
         "difficulty": difficulty,
@@ -370,33 +723,61 @@ def _generation_report(
     options: PipelineOptions,
     run_id: UUID,
     elapsed: dict[str, int],
-    charts: tuple[PostprocessedVariant, ...],
-    reference_quality: dict[tuple[int, str], ReferenceQuality | None],
+    selections: tuple[_ChartSelection, ...],
+    *,
+    analysis: AnalysisStageResult,
+    run_dir: Path,
 ) -> dict[str, object]:
+    charts = []
+    for selection in selections:
+        result = selection.result
+        selected = selection.evaluations[selection.selected_index]
+        candidates = _selection_payloads(
+            selection,
+            analysis=analysis,
+            run_dir=run_dir,
+            generator=options.generator,
+        )
+        selected_payload = candidates[selection.selected_index]
+        charts.append(
+            {
+                "keyMode": result.document.key_mode,
+                "difficulty": result.document.difficulty,
+                "candidateCount": len(candidates),
+                "selectedAttempt": selected.variant.attempt,
+                "selectedSeed": selected.variant.generated.seed,
+                "selectedParameters": selected_payload["generationParameters"],
+                "rawNoteCount": selected_payload["rawNoteCount"],
+                "finalNoteCount": selected_payload["finalNoteCount"],
+                "removals": selected_payload["removals"],
+                "totalRemovalRatio": selected_payload["totalRemovalRatio"],
+                "playabilityPasses": selected_payload["playabilityPasses"],
+                "targetRating": selected_payload["targetRating"],
+                "actualRating": selected_payload["actualRating"],
+                "signedRatingError": selected_payload["signedRatingError"],
+                "absoluteRatingError": selected_payload["absoluteRatingError"],
+                "reachedTarget": result.reports.difficulty.reached_target,
+                "removedCount": result.reports.difficulty.removed_count,
+                "playabilityRecoveredCount": result.reports.playability.recovered_count,
+                "playabilityDeletedCount": result.reports.playability.deleted_count,
+                "drumOnsetPrecision": selected_payload["drumOnsetPrecision"],
+                "longGapBars": selected_payload["longGapBars"],
+                "holdRatio": selected_payload["holdRatio"],
+                "referenceAccuracy": selected_payload["referenceAccuracy"],
+                "chartPath": _report_asset_path(result.path, run_dir),
+                "rawOsuPath": _report_asset_path(selection.canonical_raw_path, run_dir),
+                "candidates": candidates,
+            }
+        )
     return {
         "runId": str(run_id),
         "sourceName": options.source.name,
         "generator": options.generator,
         "keysounds": options.keysounds,
         "elapsedMsByStage": elapsed,
-        "charts": [
-            {
-                "keyMode": result.document.key_mode,
-                "difficulty": result.document.difficulty,
-                "targetRating": result.reports.difficulty.target_rating,
-                "actualRating": result.document.metrics.project_rating,
-                "reachedTarget": result.reports.difficulty.reached_target,
-                "removedCount": result.reports.difficulty.removed_count,
-                "playabilityRecoveredCount": result.reports.playability.recovered_count,
-                "playabilityDeletedCount": result.reports.playability.deleted_count,
-                "referenceAccuracy": _reference_payload(
-                    reference_quality[
-                        (result.document.key_mode, result.document.difficulty)
-                    ]
-                ),
-            }
-            for result in charts
-        ],
+        "timing": _timing_payload(analysis, run_dir),
+        "warnings": [],
+        "charts": charts,
     }
 
 
@@ -441,7 +822,7 @@ def run_pipeline(
 
     started = perf_counter_ns()
     selected_charts: list[PostprocessedVariant] = []
-    selected_reference_quality: dict[tuple[int, str], ReferenceQuality | None] = {}
+    selections: list[_ChartSelection] = []
     canonical_raw_paths: list[Path] = []
     for combination_index, initial_variant in enumerate(generated):
         key_mode = initial_variant.key_mode
@@ -513,7 +894,20 @@ def run_pipeline(
             for evaluation in evaluations
         ):
             candidate_payloads = [
-                _quality_payload(evaluation, analysis=analysis)
+                _quality_payload(
+                    evaluation,
+                    analysis=analysis,
+                    run_dir=run_dir,
+                    selection_status="REJECTED",
+                    selection_reasons=[
+                        *_candidate_failure_reasons(
+                            evaluation.quality,
+                            difficulty=evaluation.variant.difficulty,
+                            generator=options.generator,
+                        ),
+                        "all candidates failed quality gates",
+                    ],
+                )
                 for evaluation in evaluations
             ]
             elapsed["postprocess"] = _elapsed_ms(started)
@@ -521,8 +915,8 @@ def run_pipeline(
                 options=options,
                 run_id=run_id,
                 elapsed=elapsed,
-                charts=tuple(selected_charts),
-                reference_quality=selected_reference_quality,
+                selections=tuple(selections),
+                analysis=analysis,
                 key_mode=key_mode,
                 difficulty=difficulty,
                 candidates=candidate_payloads,
@@ -553,17 +947,31 @@ def run_pipeline(
             True,
         )
         selected_charts.append(canonical_chart)
-        selected_reference_quality[(key_mode, difficulty)] = selected.reference_quality
-        canonical_raw_paths.append(_canonical_raw_path(selected.variant, run_dir))
+        canonical_raw_path = _canonical_raw_path(selected.variant, run_dir)
+        canonical_raw_paths.append(canonical_raw_path)
+        selections.append(
+            _ChartSelection(
+                result=canonical_chart,
+                evaluations=tuple(evaluations),
+                selected_index=selected_index,
+                canonical_raw_path=canonical_raw_path,
+            )
+        )
 
     charts = tuple(selected_charts)
-    reference_quality = selected_reference_quality
     elapsed["postprocess"] = _elapsed_ms(started)
 
     report_path = run_dir / "generation-report.json"
     report_path.write_text(
         json.dumps(
-            _generation_report(options, run_id, elapsed, charts, reference_quality),
+            _generation_report(
+                options,
+                run_id,
+                elapsed,
+                tuple(selections),
+                analysis=analysis,
+                run_dir=run_dir,
+            ),
             ensure_ascii=False,
             indent=2,
         )
