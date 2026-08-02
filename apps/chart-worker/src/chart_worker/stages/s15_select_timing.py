@@ -74,12 +74,25 @@ def run_timing_selection(
 ) -> AnalysisStageResult:
     """Select one timing candidate and materialize its shared pipeline artifacts."""
     super_timing = None
+    warnings: list[dict[str, object]] = []
     if enable_super_timing:
-        text = MapperatorinatorTimingGenerator(config)(
-            analysis.normalized.path,
-            run_dir / "analysis" / "super-timing-work",
-        )
-        super_timing = _evaluate_super_timing(parse_osu_timing(text), analysis)
+        try:
+            text = MapperatorinatorTimingGenerator(config)(
+                analysis.normalized.path,
+                run_dir / "analysis" / "super-timing-work",
+            )
+        except WorkerError as error:
+            if error.code is not ErrorCode.CHART_GENERATION_FAILED:
+                raise
+            warnings.append(
+                {
+                    "code": error.code.value,
+                    "message": str(error),
+                    "context": error.context,
+                }
+            )
+        else:
+            super_timing = _evaluate_super_timing(parse_osu_timing(text), analysis)
 
     selected = select_timing_candidate(analysis.timing_candidate, super_timing)
     timing_path = run_dir / "analysis" / "timing.osu"
@@ -97,6 +110,7 @@ def run_timing_selection(
             {
                 "version": 1,
                 "selected": _candidate_payload(selected),
+                "warnings": warnings,
                 "candidates": [
                     _candidate_payload(candidate)
                     for candidate in (analysis.timing_candidate, super_timing)
@@ -162,8 +176,10 @@ def select_timing_candidate(
     super_timing: TimingCandidate | None,
 ) -> TimingCandidate:
     """Select a timing candidate, preserving review-required disagreements."""
-    if super_timing is None or super_timing.status is TimingStatus.FAIL:
-        return beat_this
+    if super_timing is None:
+        if beat_this.status is TimingStatus.PASS and beat_this.p95_abs_ms <= 30.0:
+            return beat_this
+        raise WorkerError(ErrorCode.CHART_TIMING_CANDIDATE_FAILED, "no timing candidate passed")
 
     phase = candidate_phase_difference_ms(beat_this, super_timing)
     if abs(phase) > 50.0:
@@ -176,7 +192,7 @@ def select_timing_candidate(
     passing = [
         candidate
         for candidate in (beat_this, super_timing)
-        if candidate.p95_abs_ms <= 30.0
+        if candidate.status is TimingStatus.PASS and candidate.p95_abs_ms <= 30.0
     ]
     if not passing:
         raise WorkerError(ErrorCode.CHART_TIMING_CANDIDATE_FAILED, "no timing candidate passed")

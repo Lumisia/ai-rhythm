@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 import pytest
 
+from chart_worker.analysis.snapshot import load_analysis_snapshot
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.reprocess import PostprocessOptions, run_postprocess_only
 from chart_worker.schema.playtest_run import PlaytestRunManifest
@@ -104,3 +106,81 @@ def test_postprocess_rejects_an_incomplete_selected_timing_snapshot(
         run_postprocess_only(
             PostprocessOptions(input_dir=input_dir, output_dir=tmp_path / "output")
         )
+
+
+def _write_snapshot_path(metadata, field: str, value: str) -> None:
+    if field == "normalized.path":
+        metadata["normalized"]["path"] = value
+    elif field == "timingSelection.qualityReportPath":
+        metadata["timingSelection"]["qualityReportPath"] = value
+    else:
+        metadata[field] = value
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "normalized.path",
+        "arraysPath",
+        "timingOsuPath",
+        "timingSelection.qualityReportPath",
+    ),
+)
+def test_snapshot_rejects_absolute_asset_paths(tmp_path: Path, field: str):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    input_dir = tmp_path / "input"
+    run_pipeline(
+        PipelineOptions(source=source, output_dir=input_dir, title="fixture"),
+        dependencies=fake_dependencies(),
+    )
+    metadata_path = input_dir / "analysis" / "analysis-v1.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    _write_snapshot_path(metadata, field, str((tmp_path / "outside.bin").resolve()))
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must be relative"):
+        load_analysis_snapshot(input_dir)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "normalized.path",
+        "arraysPath",
+        "timingOsuPath",
+        "timingSelection.qualityReportPath",
+    ),
+)
+def test_snapshot_rejects_asset_path_traversal(tmp_path: Path, field: str):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    input_dir = tmp_path / "input"
+    run_pipeline(
+        PipelineOptions(source=source, output_dir=input_dir, title="fixture"),
+        dependencies=fake_dependencies(),
+    )
+    metadata_path = input_dir / "analysis" / "analysis-v1.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    _write_snapshot_path(metadata, field, "../outside.bin")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="escapes run directory"):
+        load_analysis_snapshot(input_dir)
+
+
+def test_snapshot_without_timing_selection_has_clear_legacy_error(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    input_dir = tmp_path / "input"
+    run_pipeline(
+        PipelineOptions(source=source, output_dir=input_dir, title="fixture"),
+        dependencies=fake_dependencies(),
+    )
+    metadata_path = input_dir / "analysis" / "analysis-v1.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del metadata["timingSelection"]
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="predates timing selection"):
+        load_analysis_snapshot(input_dir)

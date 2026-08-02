@@ -32,6 +32,22 @@ def _relative(path: Path, run_dir: Path) -> str:
         raise ValueError(f"analysis asset is outside the run directory: {path}") from None
 
 
+def _snapshot_asset_path(run_dir: Path, raw_path: object, *, field: str) -> Path:
+    """Resolve a metadata path while keeping every snapshot asset inside its run."""
+    if not isinstance(raw_path, str):
+        raise TypeError(f"{field} must be a relative path string")
+    relative = Path(raw_path)
+    if relative.is_absolute():
+        raise ValueError(f"{field} must be relative")
+    root = run_dir.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise ValueError(f"{field} escapes run directory") from None
+    return resolved
+
+
 def save_analysis_snapshot(analysis: AnalysisStageResult, run_dir: Path) -> tuple[Path, Path]:
     analysis_dir = run_dir / "analysis"
     analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -88,9 +104,15 @@ def load_analysis_snapshot(run_dir: Path) -> AnalysisStageResult:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("version") != 1:
         raise ValueError(f"unsupported analysis snapshot version: {metadata.get('version')}")
+    if "timingSelection" not in metadata:
+        raise ValueError("analysis snapshot predates timing selection")
 
     normalized_data = dict(metadata["normalized"])
-    audio_path = run_dir / normalized_data.pop("path")
+    audio_path = _snapshot_asset_path(
+        run_dir,
+        normalized_data.pop("path"),
+        field="normalized.path",
+    )
     normalized = NormalizedAudio(path=audio_path, **normalized_data)
     actual_sha = sha256_file(audio_path)
     if actual_sha != normalized.sha256:
@@ -103,7 +125,7 @@ def load_analysis_snapshot(run_dir: Path) -> AnalysisStageResult:
     beat_data["downbeat_indices"] = tuple(beat_data["downbeat_indices"])
     grid = BeatGrid(**beat_data)
 
-    arrays_path = run_dir / metadata["arraysPath"]
+    arrays_path = _snapshot_asset_path(run_dir, metadata["arraysPath"], field="arraysPath")
     with np.load(arrays_path, allow_pickle=False) as arrays:
         strength = np.array(arrays["strength"], dtype=np.float64, copy=True)
         band_strength = np.array(arrays["band_strength"], dtype=np.float64, copy=True)
@@ -118,11 +140,19 @@ def load_analysis_snapshot(run_dir: Path) -> AnalysisStageResult:
         onset_ms=tuple(int(value) for value in onset_data["onsetMs"]),
         n_fft=int(onset_data["nFft"]),
     )
-    timing_path = run_dir / metadata["timingOsuPath"]
+    timing_path = _snapshot_asset_path(
+        run_dir,
+        metadata["timingOsuPath"],
+        field="timingOsuPath",
+    )
     if not timing_path.is_file():
         raise ValueError(f"timing osu is missing: {timing_path}")
     timing_selection = metadata["timingSelection"]
-    report_path = run_dir / timing_selection["qualityReportPath"]
+    report_path = _snapshot_asset_path(
+        run_dir,
+        timing_selection["qualityReportPath"],
+        field="timingSelection.qualityReportPath",
+    )
     if not report_path.is_file():
         raise ValueError(f"timing quality report is missing: {report_path}")
     points = tuple(

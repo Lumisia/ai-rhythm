@@ -1,12 +1,18 @@
+import json
+
 import pytest
 
 from chart_worker.analysis.timing import TimingCandidate, TimingPoint, TimingSource, TimingStatus
+from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.stages import s15_select_timing
 from chart_worker.stages.s15_select_timing import (
     _has_sufficient_phase_coverage,
     candidate_phase_difference_ms,
+    run_timing_selection,
     select_timing_candidate,
 )
+from tests.support import fake_analysis
 
 
 def _candidate(
@@ -53,6 +59,98 @@ def test_selects_beat_this_when_super_timing_is_unavailable_or_failed():
 
     assert select_timing_candidate(beat_this, None) is beat_this
     assert select_timing_candidate(beat_this, failed) is beat_this
+
+
+def test_rejects_failed_beat_this_when_super_timing_is_unavailable():
+    beat_this = _candidate(
+        TimingSource.BEAT_THIS_PIECEWISE,
+        status=TimingStatus.FAIL,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        select_timing_candidate(beat_this, None)
+
+    assert caught.value.code is ErrorCode.CHART_TIMING_CANDIDATE_FAILED
+
+
+def test_generated_failed_super_timing_still_runs_phase_disagreement_gate():
+    beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE)
+    failed = _candidate(
+        TimingSource.MAPPERATORINATOR_SUPER,
+        beats=(151, 651, 1151),
+        status=TimingStatus.FAIL,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        select_timing_candidate(beat_this, failed)
+
+    assert caught.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+
+
+def test_generated_failed_super_timing_falls_back_after_phase_gate():
+    beat_this = _candidate(TimingSource.BEAT_THIS_PIECEWISE)
+    failed = _candidate(
+        TimingSource.MAPPERATORINATOR_SUPER,
+        beats=(110, 610, 1110),
+        status=TimingStatus.FAIL,
+    )
+
+    assert select_timing_candidate(beat_this, failed) is beat_this
+
+
+def test_super_timing_execution_failure_falls_back_and_persists_warning(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    analysis = fake_analysis(source, tmp_path, WorkerConfig())
+
+    class FailingTimingGenerator:
+        def __call__(self, audio_path, workdir):
+            del audio_path, workdir
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                "GPU unavailable",
+                context={"device": "cuda"},
+            )
+
+    monkeypatch.setattr(
+        s15_select_timing,
+        "MapperatorinatorTimingGenerator",
+        lambda config: FailingTimingGenerator(),
+    )
+
+    result = run_timing_selection(analysis, tmp_path, WorkerConfig(), True)
+    report = json.loads(result.timing_quality_report_path.read_text(encoding="utf-8"))
+
+    assert result.timing_candidate.source is TimingSource.BEAT_THIS_PIECEWISE
+    assert report["warnings"] == [
+        {
+            "code": "CHART_GENERATION_FAILED",
+            "message": "CHART_GENERATION_FAILED: GPU unavailable",
+            "context": {"device": "cuda"},
+        }
+    ]
+
+
+def test_super_timing_does_not_swallow_programming_errors(tmp_path, monkeypatch):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    analysis = fake_analysis(source, tmp_path, WorkerConfig())
+
+    class BrokenTimingGenerator:
+        def __call__(self, audio_path, workdir):
+            del audio_path, workdir
+            raise RuntimeError("bug")
+
+    monkeypatch.setattr(
+        s15_select_timing,
+        "MapperatorinatorTimingGenerator",
+        lambda config: BrokenTimingGenerator(),
+    )
+
+    with pytest.raises(RuntimeError, match="bug"):
+        run_timing_selection(analysis, tmp_path, WorkerConfig(), True)
 
 
 def test_rejects_timing_candidates_that_disagree_by_more_than_fifty_ms():
