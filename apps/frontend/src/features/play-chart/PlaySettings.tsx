@@ -1,5 +1,8 @@
 import type { JudgmentPreset } from "../../game/core/types";
 
+/** 배속 1.0 에서 노트가 화면을 흐르는 시간. 640px 플레이필드 기준값이다. */
+const APPROACH_MS_AT_1X = 907;
+
 export interface PlaySettingsValue {
   calibrationMs: number;
   scrollSpeed: number;
@@ -32,8 +35,9 @@ export function PlaySettings({ value, durationMs, keysoundAvailable, disabled, o
       </label>
       <label>
         <span>스크롤 속도</span>
-        <input max={6} min={0.6} onChange={(event) => update("scrollSpeed", event.currentTarget.valueAsNumber)} step={0.1} type="range" value={value.scrollSpeed} />
-        <small>{value.scrollSpeed.toFixed(1)}×</small>
+        <input max={4} min={0.6} onChange={(event) => update("scrollSpeed", event.currentTarget.valueAsNumber)} step={0.1} type="range" value={value.scrollSpeed} />
+        {/* 배속보다 "노트가 몇 ms 흐르는가"가 실제로 읽는 값이다. */}
+        <small>{Math.round(APPROACH_MS_AT_1X / value.scrollSpeed)}ms</small>
       </label>
       <label>
         <span>판정 프리셋</span>

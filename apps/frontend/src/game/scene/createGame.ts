@@ -10,7 +10,7 @@ export function createGame(container: HTMLElement, session: RhythmSceneSession):
     parent: container,
     width,
     height,
-    backgroundColor: "#151923",
+    backgroundColor: "#0d1016",
     banner: false,
     input: false,
     audio: { noAudio: true },

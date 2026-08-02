@@ -5,7 +5,7 @@ import type { KeysoundScheduler } from "../audio/KeysoundScheduler";
 import type { SongPlayer } from "../audio/SongPlayer";
 import { InputRecorder } from "../core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../core/JudgmentEngine";
-import { layoutLanes, type LaneGeometry } from "../core/LaneLayout";
+import { layoutStage, type StageGeometry } from "../core/LaneLayout";
 import { NoteTimeline } from "../core/NoteTimeline";
 import { ScoreCalculator, type ScoreSnapshot } from "../core/ScoreCalculator";
 import { loadJudgmentConfig } from "../core/judgment-config";
@@ -14,8 +14,10 @@ import { bindingsFor, keyLabelsFor } from "../input/KeyBindings";
 import { KeyboardInput } from "../input/KeyboardInput";
 import { HudRenderer } from "./HudRenderer";
 import { NoteRenderer } from "./NoteRenderer";
+import { JUDGE_LINE_RATIO, StageRenderer } from "./StageRenderer";
 
 const DEFAULT_BEAT_MS = 500;
+const LANE_FLASH_MS = 130;
 
 export interface RhythmSceneSession {
   chart: ChartDocument;
@@ -38,11 +40,13 @@ export interface RhythmSceneSession {
 
 export class RhythmScene extends Phaser.Scene {
   readonly #session: RhythmSceneSession;
-  #laneGraphics: Phaser.GameObjects.Graphics | null = null;
+  #stage: StageRenderer | null = null;
   #renderer: NoteRenderer | null = null;
   #hud: HudRenderer | null = null;
   #keyboardInput: KeyboardInput | null = null;
   #finished = false;
+  readonly #held = new Set<number>();
+  readonly #flashAtMs = new Map<number, number>();
 
   constructor(session: RhythmSceneSession) {
     super({ key: "rhythm-playtest" });
@@ -57,8 +61,11 @@ export class RhythmScene extends Phaser.Scene {
       engine: this.#session.engine,
       recorder: this.#session.recorder,
       onJudgment: (event) => this.#acceptJudgment(event),
-      onLaneDown: (lane, timeMs) => this.#hud?.pressLane(lane, timeMs),
-      onLaneUp: (lane) => this.#hud?.releaseLane(lane),
+      onLaneDown: (lane, timeMs) => {
+        this.#held.add(lane);
+        this.#flashAtMs.set(lane, timeMs);
+      },
+      onLaneUp: (lane) => this.#held.delete(lane),
     });
     this.#keyboardInput.attach();
     window.addEventListener("keydown", this.#handleControlKey);
@@ -81,6 +88,7 @@ export class RhythmScene extends Phaser.Scene {
         ? this.#session.scrollSpeed()
         : this.#session.scrollSpeed;
     this.#renderer?.update(songTimeMs, scrollSpeed);
+    this.#stage?.setPressed(this.#held, this.#flashAtMs, songTimeMs, LANE_FLASH_MS);
     this.#hud?.update(songTimeMs);
 
     if (!this.#session.loop && !this.#finished && songTimeMs > this.#session.chart.durationMs + 500) {
@@ -120,35 +128,44 @@ export class RhythmScene extends Phaser.Scene {
   #layoutPlayfield(): void {
     const width = this.scale.width;
     const height = this.scale.height;
-    // 판정선 아래를 넓게 남긴다. 타이밍 스코프가 그 자리에 들어간다.
-    const judgeLineY = height * 0.74;
-    const lanes = layoutLanes(width, this.#session.chart.laneSemantics);
-    this.#drawLanes(lanes, height, judgeLineY);
+    const judgeLineY = Math.round(height * JUDGE_LINE_RATIO);
+    const stage = layoutStage(width, this.#session.chart.laneSemantics);
+
+    if (!this.#stage) {
+      this.#stage = new StageRenderer(
+        this,
+        stage,
+        width,
+        height,
+        judgeLineY,
+        keyLabelsFor(this.#session.chart.keyMode),
+      );
+    } else {
+      this.#stage.resize(stage, width, height, judgeLineY);
+    }
     if (!this.#renderer) {
       this.#renderer = new NoteRenderer(
         this,
         new NoteTimeline(this.#session.chart.notes),
-        lanes,
+        stage.lanes,
         { width, height, judgeLineY },
       );
     } else {
-      this.#renderer.resize(width, height, judgeLineY, lanes);
+      this.#renderer.resize(width, height, judgeLineY, stage.lanes);
     }
+    const geometry = { width, height, judgeLineY, stage };
     if (!this.#hud) {
-      this.#hud = new HudRenderer(this, lanes, {
-        width,
-        height,
-        judgeLineY,
+      this.#hud = new HudRenderer(this, {
+        ...geometry,
         windows: this.#judgmentWindows(),
         durationMs: this.#session.chart.durationMs,
         noteCount: this.#session.chart.notes.length,
         firstNoteTimeMs: this.#firstNoteTimeMs(),
         beatMs: this.#beatMs(),
-        keyLabels: keyLabelsFor(this.#session.chart.keyMode),
         snapshot: () => this.#session.score.snapshot(),
       });
     } else {
-      this.#hud.resize(lanes, { width, height, judgeLineY });
+      this.#hud.resize(geometry);
     }
   }
 
@@ -167,26 +184,6 @@ export class RhythmScene extends Phaser.Scene {
     return bpm && bpm > 0 ? 60_000 / bpm : DEFAULT_BEAT_MS;
   }
 
-  #drawLanes(lanes: readonly LaneGeometry[], height: number, judgeLineY: number): void {
-    this.#laneGraphics?.destroy();
-    const graphics = this.add.graphics().setDepth(0);
-    for (const lane of lanes) {
-      graphics.fillStyle(lane.backgroundColor, 1);
-      graphics.fillRect(lane.x, 0, lane.width, judgeLineY);
-      graphics.lineStyle(1, 0x38404e, 0.9);
-      graphics.lineBetween(lane.x, 0, lane.x, judgeLineY);
-      // 판정선 위에 리셉터를 깔아 노트가 어디로 들어오는지 못박는다.
-      graphics.fillStyle(lane.color, 0.1);
-      graphics.fillRect(lane.x + 1, judgeLineY - 16, lane.width - 2, 16);
-    }
-    // 판정선 아래는 계기 영역이다. 레인을 끊어 눈이 섞이지 않게 한다.
-    graphics.fillStyle(0x151923, 1);
-    graphics.fillRect(0, judgeLineY, this.scale.width, height - judgeLineY);
-    graphics.lineStyle(3, 0xe2b75b, 1);
-    graphics.lineBetween(0, judgeLineY, this.scale.width, judgeLineY);
-    this.#laneGraphics = graphics;
-  }
-
   #shutdown(): void {
     window.removeEventListener("keydown", this.#handleControlKey);
     this.scale.off(Phaser.Scale.Events.RESIZE, this.#layoutPlayfield, this);
@@ -196,8 +193,8 @@ export class RhythmScene extends Phaser.Scene {
     this.#renderer = null;
     this.#hud?.destroy();
     this.#hud = null;
-    this.#laneGraphics?.destroy();
-    this.#laneGraphics = null;
+    this.#stage?.destroy();
+    this.#stage = null;
     this.#session.keysoundScheduler?.dispose();
     this.#session.songPlayer?.dispose();
   }

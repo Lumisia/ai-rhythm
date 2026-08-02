@@ -1,7 +1,7 @@
 import Phaser from "phaser";
 
 import type { JudgmentEvent } from "../core/JudgmentEngine";
-import type { LaneGeometry } from "../core/LaneLayout";
+import type { StageGeometry } from "../core/LaneLayout";
 import type { ScoreSnapshot } from "../core/ScoreCalculator";
 import type { JudgmentName, JudgmentWindows } from "../core/types";
 
@@ -25,13 +25,13 @@ const JUDGMENT_COLOR: Record<JudgmentName, number> = {
 const MONO = '"Cascadia Mono", Consolas, monospace';
 const DISPLAY = '"Bahnschrift SemiCondensed", "Arial Narrow", sans-serif';
 
-const JUDGMENT_HOLD_MS = 520;
+const JUDGMENT_HOLD_MS = 460;
 const MARKER_HOLD_MS = 1400;
-const SCOPE_TRAIL_MS = 2200;
-const SCOPE_TRAIL_MAX = 160;
-const LANE_FLASH_MS = 130;
+const SCOPE_TRAIL_MS = 2400;
+const SCOPE_TRAIL_MAX = 200;
 const COMBO_MIN = 5;
 const COUNTDOWN_LEAD_MS = 3200;
+const GUTTER_PADDING = 18;
 
 interface ScopeMark {
   errMs: number;
@@ -42,6 +42,7 @@ export interface HudGeometry {
   width: number;
   height: number;
   judgeLineY: number;
+  stage: StageGeometry;
 }
 
 export interface HudRendererOptions extends HudGeometry {
@@ -50,16 +51,18 @@ export interface HudRendererOptions extends HudGeometry {
   noteCount: number;
   firstNoteTimeMs: number;
   beatMs: number;
-  keyLabels: readonly string[];
   snapshot: () => ScoreSnapshot;
 }
 
 /** 플레이 중 계기 판독부.
  *
- * 게임 UI 가 아니라 측정 계기다. 이 도구는 채보를 검수하려고 쓴다. 그래서
- * 화려한 연출 대신 읽을 수 있는 수치를 놓는다. 타이밍 오차 스코프가
- * 주인공이다 — 입력 보정값을 맞출 수 있는 유일한 물건이고, 그게 없으면
- * "채보 오프셋이 틀렸나 내가 못 친 건가"를 구분할 수 없다.
+ * 무대가 좁아지면서 좌우에 여백이 생겼다. 수치는 거기 둔다 — 무대 위에
+ * 겹치면 노트를 가린다. 무대 안에는 판정·콤보처럼 시선이 이미 가 있는
+ * 자리에서 읽어야 하는 것만 올린다.
+ *
+ * 타이밍 오차 스코프가 주인공이다. 리셉터 바로 아래에 무대 폭으로 눕힌다 —
+ * VSRG 들이 hit error bar 를 두는 자리다. 입력 보정을 맞출 수 있는 유일한
+ * 물건이고, 없으면 "채보 오프셋이 틀렸나 내가 못 친 건가"를 구분할 수 없다.
  */
 export class HudRenderer {
   readonly #scene: Phaser.Scene;
@@ -67,28 +70,27 @@ export class HudRenderer {
   readonly #judgmentText: Phaser.GameObjects.Text;
   readonly #errorText: Phaser.GameObjects.Text;
   readonly #comboText: Phaser.GameObjects.Text;
-  readonly #statText: Phaser.GameObjects.Text;
+  readonly #accuracyText: Phaser.GameObjects.Text;
+  readonly #accuracyLabel: Phaser.GameObjects.Text;
+  readonly #leftText: Phaser.GameObjects.Text;
+  readonly #countsText: Phaser.GameObjects.Text;
   readonly #scopeText: Phaser.GameObjects.Text;
   readonly #markerText: Phaser.GameObjects.Text;
   readonly #countdownText: Phaser.GameObjects.Text;
-  readonly #keyTexts: Phaser.GameObjects.Text[] = [];
 
   readonly #windows: JudgmentWindows;
   readonly #durationMs: number;
   readonly #noteCount: number;
   readonly #firstNoteTimeMs: number;
   readonly #beatMs: number;
-  readonly #keyLabels: readonly string[];
   readonly #snapshot: () => ScoreSnapshot;
 
-  #lanes: readonly LaneGeometry[];
+  #stage: StageGeometry;
   #width: number;
   #height: number;
   #judgeLineY: number;
 
   readonly #scopeMarks: ScopeMark[] = [];
-  readonly #laneFlashAtMs = new Map<number, number>();
-  readonly #laneHeld = new Set<number>();
   readonly #markerTimes: number[] = [];
   #lastJudgment: {
     judgment: JudgmentName;
@@ -99,13 +101,9 @@ export class HudRenderer {
   #markerShownAtMs = -Infinity;
   #statSignature = "";
 
-  constructor(
-    scene: Phaser.Scene,
-    lanes: readonly LaneGeometry[],
-    options: HudRendererOptions,
-  ) {
+  constructor(scene: Phaser.Scene, options: HudRendererOptions) {
     this.#scene = scene;
-    this.#lanes = lanes;
+    this.#stage = options.stage;
     this.#width = options.width;
     this.#height = options.height;
     this.#judgeLineY = options.judgeLineY;
@@ -114,29 +112,20 @@ export class HudRenderer {
     this.#noteCount = options.noteCount;
     this.#firstNoteTimeMs = options.firstNoteTimeMs;
     this.#beatMs = options.beatMs;
-    this.#keyLabels = options.keyLabels;
     this.#snapshot = options.snapshot;
 
     this.#graphics = scene.add.graphics().setDepth(20);
-    this.#statText = this.#text(MONO, 11, MUTED).setDepth(24);
-    this.#judgmentText = this.#text(DISPLAY, 30, INK).setDepth(24).setOrigin(0.5, 1);
-    this.#errorText = this.#text(MONO, 12, MUTED).setDepth(24).setOrigin(0.5, 0);
-    this.#comboText = this.#text(DISPLAY, 46, INK).setDepth(23).setOrigin(0.5, 1);
+    this.#accuracyText = this.#text(DISPLAY, 30, INK).setDepth(24);
+    this.#accuracyLabel = this.#text(MONO, 9, MUTED).setDepth(24);
+    this.#leftText = this.#text(MONO, 11, MUTED).setDepth(24);
+    this.#countsText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(1, 0);
+    this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(0.5, 0.5);
+    this.#errorText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(0.5, 0);
+    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(23).setOrigin(0.5, 0.5);
     this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(24).setOrigin(0.5, 0);
     this.#markerText = this.#text(MONO, 11, CORAL).setDepth(24).setOrigin(1, 0);
-    this.#countdownText = this.#text(DISPLAY, 78, AMBER).setDepth(25).setOrigin(0.5, 0.5);
-    this.#buildKeyLabels();
+    this.#countdownText = this.#text(DISPLAY, 84, AMBER).setDepth(25).setOrigin(0.5, 0.5);
     this.#layout();
-  }
-
-  /** 키를 눌렀다. 판정과 무관하게 레인이 반응해야 입력이 먹은 걸 안다. */
-  pressLane(lane: number, atMs: number): void {
-    this.#laneFlashAtMs.set(lane, atMs);
-    this.#laneHeld.add(lane);
-  }
-
-  releaseLane(lane: number): void {
-    this.#laneHeld.delete(lane);
   }
 
   acceptJudgment(event: JudgmentEvent, songTimeMs: number): void {
@@ -162,7 +151,6 @@ export class HudRenderer {
 
   update(songTimeMs: number): void {
     this.#graphics.clear();
-    this.#drawLaneFeedback(songTimeMs);
     this.#drawProgressRail(songTimeMs);
     this.#drawScope(songTimeMs);
     this.#drawJudgment(songTimeMs);
@@ -174,8 +162,8 @@ export class HudRenderer {
     );
   }
 
-  resize(lanes: readonly LaneGeometry[], geometry: HudGeometry): void {
-    this.#lanes = lanes;
+  resize(geometry: HudGeometry): void {
+    this.#stage = geometry.stage;
     this.#width = geometry.width;
     this.#height = geometry.height;
     this.#judgeLineY = geometry.judgeLineY;
@@ -185,14 +173,16 @@ export class HudRenderer {
   destroy(): void {
     this.#graphics.destroy();
     for (const text of [
-      this.#statText,
+      this.#accuracyText,
+      this.#accuracyLabel,
+      this.#leftText,
+      this.#countsText,
       this.#judgmentText,
       this.#errorText,
       this.#comboText,
       this.#scopeText,
       this.#markerText,
       this.#countdownText,
-      ...this.#keyTexts,
     ]) {
       text.destroy();
     }
@@ -201,11 +191,13 @@ export class HudRenderer {
   // --- 배치 -----------------------------------------------------------------
 
   get #scopeY(): number {
-    return this.#judgeLineY + (this.#height - this.#judgeLineY) * 0.46;
+    // 판정선 아래 첫 줄은 키 라벨 자리다. 스코프는 그 아래.
+    return this.#judgeLineY + 44;
   }
 
   get #scopeHalfWidth(): number {
-    return Math.min(this.#width * 0.34, 260);
+    // 무대 폭에 맞춘다. 좁으면 떠 보이고, 넓으면 무대 밖으로 새어 나간다.
+    return this.#stage.width / 2;
   }
 
   #text(fontFamily: string, fontSize: number, color: number): Phaser.GameObjects.Text {
@@ -216,131 +208,115 @@ export class HudRenderer {
     });
   }
 
-  #buildKeyLabels(): void {
-    for (const label of this.#keyLabels) {
-      this.#keyTexts.push(
-        this.#scene.add
-          .text(0, 0, label, {
-            fontFamily: MONO,
-            fontSize: "11px",
-            color: Phaser.Display.Color.IntegerToColor(MUTED).rgba,
-          })
-          .setDepth(24)
-          .setOrigin(0.5, 0),
-      );
-    }
-  }
-
   #layout(): void {
-    const centerX = this.#width / 2;
-    this.#statText.setPosition(12, 10);
-    this.#markerText.setPosition(this.#width - 12, 10);
-    this.#judgmentText.setPosition(centerX, this.#judgeLineY - 26);
-    this.#errorText.setPosition(centerX, this.#judgeLineY - 22);
-    this.#comboText.setPosition(centerX, this.#judgeLineY - 74);
-    this.#scopeText.setPosition(centerX, this.#scopeY + 16);
-    this.#countdownText.setPosition(centerX, this.#judgeLineY * 0.52);
-    this.#keyTexts.forEach((text, lane) => {
-      const geometry = this.#lanes[lane];
-      if (!geometry) return void text.setVisible(false);
-      text.setVisible(true).setPosition(geometry.x + geometry.width / 2, this.#judgeLineY + 7);
-    });
+    const centerX = this.#stage.left + this.#stage.width / 2;
+    const leftGutter = Math.max(GUTTER_PADDING, this.#stage.left - 150);
+    const rightEdge = Math.min(this.#width - GUTTER_PADDING, this.#stage.right + 150);
+
+    this.#accuracyLabel.setPosition(leftGutter, 22);
+    this.#accuracyText.setPosition(leftGutter, 34);
+    this.#leftText.setPosition(leftGutter, 78);
+    this.#countsText.setPosition(rightEdge, 34);
+    this.#markerText.setPosition(rightEdge, 14);
+
+    this.#comboText.setPosition(centerX, this.#judgeLineY - 190);
+    this.#judgmentText.setPosition(centerX, this.#judgeLineY - 116);
+    this.#errorText.setPosition(centerX, this.#judgeLineY - 100);
+    this.#scopeText.setPosition(centerX, this.#scopeY + 26);
+    this.#countdownText.setPosition(centerX, this.#judgeLineY * 0.5);
   }
 
   // --- 그리기 ---------------------------------------------------------------
 
-  /** 눌린 레인을 밝힌다. 바인딩이 틀렸는지 판정이 없는 건지 구분해준다. */
-  #drawLaneFeedback(songTimeMs: number): void {
-    for (const lane of this.#lanes) {
-      const pressedAtMs = this.#laneFlashAtMs.get(lane.index);
-      const held = this.#laneHeld.has(lane.index);
-      const age = pressedAtMs === undefined ? Infinity : songTimeMs - pressedAtMs;
-      const flash = age < LANE_FLASH_MS ? 1 - age / LANE_FLASH_MS : 0;
-      const strength = held ? Math.max(0.34, flash) : flash;
-      if (strength <= 0) continue;
-      this.#graphics.fillStyle(lane.color, 0.16 * strength);
-      this.#graphics.fillRect(lane.x, 0, lane.width, this.#judgeLineY);
-      this.#graphics.fillStyle(lane.color, 0.72 * strength);
-      this.#graphics.fillRect(lane.x, this.#judgeLineY - 3, lane.width, 3);
-    }
-  }
-
-  /** 곡 진행과 찍어둔 문제 마커. 어디쯤에서 기록했는지 눈으로 잡는다. */
+  /** 곡 진행과 찍어둔 문제 마커.
+   *
+   * 무대 폭에 앰버 가로선으로 두면 판정선과 헷갈린다. 무대 바깥 왼쪽에
+   * 세로로 세워서 형태부터 다르게 한다.
+   */
   #drawProgressRail(songTimeMs: number): void {
-    const y = this.#height - 5;
+    const x = Math.max(6, this.#stage.left - 26);
+    const top = 24;
+    const height = this.#height - top - 24;
     this.#graphics.fillStyle(SLATE, 1);
-    this.#graphics.fillRect(0, y, this.#width, 3);
+    this.#graphics.fillRect(x, top, 3, height);
     const ratio = Phaser.Math.Clamp(songTimeMs / this.#durationMs, 0, 1);
-    this.#graphics.fillStyle(AMBER, 1);
-    this.#graphics.fillRect(0, y, this.#width * ratio, 3);
+    this.#graphics.fillStyle(MUTED, 0.9);
+    this.#graphics.fillRect(x, top, 3, height * ratio);
+    this.#graphics.fillStyle(INK, 1);
+    this.#graphics.fillRect(x - 2, top + height * ratio - 1, 7, 2);
     this.#graphics.fillStyle(CORAL, 1);
     for (const markerTimeMs of this.#markerTimes) {
-      const x = this.#width * Phaser.Math.Clamp(markerTimeMs / this.#durationMs, 0, 1);
-      this.#graphics.fillRect(x - 1, y - 4, 2, 11);
+      const y = top + height * Phaser.Math.Clamp(markerTimeMs / this.#durationMs, 0, 1);
+      this.#graphics.fillRect(x - 4, y - 1, 11, 2);
     }
   }
 
-  /** 타이밍 오차 스코프. 이 화면의 주인공이다.
+  /** 타이밍 오차 스코프. 리셉터 바로 아래, VSRG 의 hit error bar 자리다.
    *
    * 가운데가 0ms. 최근 타격이 오차 위치에 점으로 남고 서서히 지워진다.
    * 점 무리가 한쪽으로 쏠려 있으면 입력 보정값을 그만큼 옮기면 된다.
    */
   #drawScope(songTimeMs: number): void {
-    const centerX = this.#width / 2;
+    const centerX = this.#stage.left + this.#stage.width / 2;
     const y = this.#scopeY;
     const half = this.#scopeHalfWidth;
     const perMs = half / this.#windows.BAD;
 
-    for (const [name, color] of [
-      ["BAD", HAIRLINE],
-      ["GOOD", HAIRLINE],
-      ["GREAT", MUTED],
-      ["PERFECT", MINT],
+    this.#graphics.fillStyle(SLATE, 0.55);
+    this.#graphics.fillRect(centerX - half, y - 9, half * 2, 18);
+    for (const [name, color, alpha] of [
+      ["GOOD", HAIRLINE, 0.9],
+      ["GREAT", MUTED, 0.55],
+      ["PERFECT", MINT, 0.8],
     ] as const) {
       const offset = this.#windows[name] * perMs;
-      const height = name === "PERFECT" ? 13 : 9;
-      this.#graphics.fillStyle(color, name === "PERFECT" ? 0.75 : 0.5);
-      this.#graphics.fillRect(centerX - offset, y - height / 2, 1, height);
-      this.#graphics.fillRect(centerX + offset, y - height / 2, 1, height);
+      this.#graphics.fillStyle(color, alpha);
+      this.#graphics.fillRect(centerX - offset, y - 8, 1, 16);
+      this.#graphics.fillRect(centerX + offset, y - 8, 1, 16);
     }
-
-    this.#graphics.fillStyle(HAIRLINE, 0.8);
-    this.#graphics.fillRect(centerX - half, y, half * 2, 1);
     this.#graphics.fillStyle(AMBER, 1);
-    this.#graphics.fillRect(centerX - 1, y - 10, 2, 21);
+    this.#graphics.fillRect(centerX - 1, y - 12, 2, 24);
 
     let visible = 0;
     for (const mark of this.#scopeMarks) {
       const age = songTimeMs - mark.atMs;
       if (age < 0 || age > SCOPE_TRAIL_MS) continue;
       visible += 1;
-      const x = centerX + Phaser.Math.Clamp(mark.errMs, -this.#windows.BAD, this.#windows.BAD) * perMs;
-      this.#graphics.fillStyle(INK, 0.85 * (1 - age / SCOPE_TRAIL_MS));
-      this.#graphics.fillRect(x - 1, y - 6, 2, 12);
+      const clamped = Phaser.Math.Clamp(mark.errMs, -this.#windows.BAD, this.#windows.BAD);
+      this.#graphics.fillStyle(INK, 0.9 * (1 - age / SCOPE_TRAIL_MS));
+      this.#graphics.fillRect(centerX + clamped * perMs - 1, y - 8, 2, 16);
     }
 
     const snapshot = this.#snapshot();
     if (snapshot.timingSampleCount > 0) {
-      const meanX =
-        centerX +
-        Phaser.Math.Clamp(snapshot.meanErrMs, -this.#windows.BAD, this.#windows.BAD) * perMs;
+      const clamped = Phaser.Math.Clamp(
+        snapshot.meanErrMs,
+        -this.#windows.BAD,
+        this.#windows.BAD,
+      );
+      const meanX = centerX + clamped * perMs;
+      // 바 아래로 세운다. 위로 세우면 평균이 0 근처일 때 가운데 레인의
+      // 키 라벨을 가린다 — 평균은 대개 0 근처다.
       this.#graphics.fillStyle(MINT, 1);
-      this.#graphics.fillTriangle(meanX, y - 15, meanX - 5, y - 24, meanX + 5, y - 24);
+      this.#graphics.fillTriangle(meanX, y + 12, meanX - 5, y + 21, meanX + 5, y + 21);
       const sign = snapshot.meanErrMs >= 0 ? "+" : "−";
       const drift = Math.abs(snapshot.meanErrMs).toFixed(1);
-      this.#scopeText
-        .setText(
-          `EARLY ◄ MEAN ${sign}${drift}ms ► LATE    보정 ${(-snapshot.meanErrMs).toFixed(0)}ms 권장`,
-        )
-        .setVisible(true);
+      this.#scopeText.setText(
+        `◄ EARLY   평균 ${sign}${drift}ms   LATE ►    보정 ${(-snapshot.meanErrMs).toFixed(0)}ms 권장`,
+      );
+      this.#scopeText.setVisible(true);
     } else {
-      this.#scopeText.setText("EARLY ◄  타이밍 오차  ► LATE").setVisible(visible === 0);
+      this.#scopeText.setText("◄ EARLY    타이밍 오차    LATE ►").setVisible(visible === 0);
     }
   }
 
   #drawJudgment(songTimeMs: number): void {
     const last = this.#lastJudgment;
-    if (!last) return void this.#judgmentText.setVisible(false).setAlpha(0);
+    if (!last) {
+      this.#judgmentText.setVisible(false);
+      this.#errorText.setVisible(false);
+      return;
+    }
     const age = songTimeMs - last.atMs;
     if (age < 0 || age > JUDGMENT_HOLD_MS) {
       this.#judgmentText.setVisible(false);
@@ -363,14 +339,14 @@ export class HudRenderer {
     const sign = last.errMs >= 0 ? "+" : "−";
     this.#errorText
       .setVisible(true)
-      .setAlpha(alpha * 0.8)
+      .setAlpha(alpha * 0.85)
       .setText(`${sign}${Math.abs(last.errMs).toFixed(0)}ms ${last.errMs >= 0 ? "LATE" : "EARLY"}`);
   }
 
   #drawCombo(): void {
     const { combo } = this.#snapshot();
     if (combo < COMBO_MIN) return void this.#comboText.setVisible(false);
-    this.#comboText.setVisible(true).setAlpha(0.5).setText(String(combo));
+    this.#comboText.setVisible(true).setAlpha(0.45).setText(String(combo));
   }
 
   #drawStats(songTimeMs: number): void {
@@ -381,14 +357,23 @@ export class HudRenderer {
     if (signature === this.#statSignature) return;
     this.#statSignature = signature;
     const counts = snapshot.counts;
-    this.#statText.setText(
+    this.#accuracyLabel.setText("ACCURACY");
+    this.#accuracyText.setText(`${accuracy}%`);
+    this.#leftText.setText(
       [
-        `ACC ${accuracy}%`,
         `${clock(songTimeMs)} / ${clock(this.#durationMs)}`,
-        `NOTES ${judged}/${this.#noteCount}`,
-        `MAX ${snapshot.maxCombo}`,
-        `P${counts.PERFECT} G${counts.GREAT} ${counts.GOOD}/${counts.BAD} M${counts.MISS}`,
-      ].join("   "),
+        `NOTES  ${judged} / ${this.#noteCount}`,
+        `MAX    ${snapshot.maxCombo}`,
+      ].join("\n"),
+    );
+    this.#countsText.setText(
+      [
+        `PERFECT ${counts.PERFECT}`,
+        `GREAT   ${counts.GREAT}`,
+        `GOOD    ${counts.GOOD}`,
+        `BAD     ${counts.BAD}`,
+        `MISS    ${counts.MISS}`,
+      ].join("\n"),
     );
   }
 

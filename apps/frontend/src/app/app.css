@@ -645,7 +645,7 @@ h1 {
 }
 
 .playfield-frame {
-  min-height: 700px;
+  min-height: 764px;
   padding: 12px;
 }
 
@@ -669,9 +669,11 @@ h1 {
 
 .playfield {
   width: 100%;
-  height: 640px;
+  /* 무대는 고정 폭이라 세로가 곧 읽을 수 있는 활주로다. 짧으면 배속을
+     낮춰도 노트가 몰려 보인다. */
+  height: 706px;
   border: 1px solid var(--hairline);
-  background: var(--smoked-navy);
+  background: #0d1016;
 }
 
 .pause-veil {
