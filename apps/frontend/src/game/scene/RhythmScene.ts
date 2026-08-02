@@ -25,6 +25,7 @@ export interface RhythmSceneSession {
   loop?: { startMs: number; endMs: number; restart: () => void };
   onJudgment?: (event: JudgmentEvent) => void;
   onPause?: () => void;
+  onMarkerSlot?: (slot: number, timeMs: number) => void;
   onComplete?: (score: ScoreSnapshot) => void;
 }
 
@@ -86,9 +87,20 @@ export class RhythmScene extends Phaser.Scene {
   }
 
   readonly #handleControlKey = (event: KeyboardEvent): void => {
-    if (event.code !== "Escape" || event.repeat) return;
-    event.preventDefault();
-    this.#session.onPause?.();
+    if (event.repeat) return;
+    if (event.code === "Escape") {
+      event.preventDefault();
+      this.#session.onPause?.();
+      return;
+    }
+    const markerMatch = /^Digit([1-8])$/.exec(event.code);
+    if (markerMatch) {
+      event.preventDefault();
+      this.#session.onMarkerSlot?.(
+        Number(markerMatch[1]),
+        this.#session.clock.songTimeMs(),
+      );
+    }
   };
 
   #layoutPlayfield(): void {

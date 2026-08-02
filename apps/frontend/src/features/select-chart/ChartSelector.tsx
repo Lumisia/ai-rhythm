@@ -2,13 +2,14 @@ import type { ImportedChart, ImportedRun } from "../import-run/importRun";
 
 interface ChartSelectorProps {
   run: ImportedRun;
+  lastReviews?: Readonly<Record<string, string>>;
   onSelect: (chart: ImportedChart) => void;
   onReset: () => void;
 }
 
 const keyModes = [4, 6, 7] as const;
 
-export function ChartSelector({ run, onSelect, onReset }: ChartSelectorProps) {
+export function ChartSelector({ run, lastReviews = {}, onSelect, onReset }: ChartSelectorProps) {
   return (
     <section className="workspace-panel selector-panel" aria-labelledby="selector-title">
       <header className="workspace-heading">
@@ -37,6 +38,7 @@ export function ChartSelector({ run, onSelect, onReset }: ChartSelectorProps) {
                       <div><dt>NOTES</dt><dd>{chart.document.metrics.noteCount}</dd></div>
                       <div><dt>PEAK</dt><dd>{chart.document.metrics.peakNps.toFixed(2)} NPS</dd></div>
                       <div><dt>CHORD</dt><dd>{(chart.document.metrics.chordRatio * 100).toFixed(1)}%</dd></div>
+                      <div><dt>REVIEW</dt><dd>{lastReviews[chart.document.chartId] ?? "—"}</dd></div>
                     </dl>
                     <button onClick={() => onSelect(chart)} type="button">
                       {keyMode}K {chart.document.difficulty} 플레이

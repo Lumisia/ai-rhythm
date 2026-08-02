@@ -576,6 +576,65 @@ h1 {
   margin-top: 25px;
 }
 
+.marker-controls {
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--hairline);
+}
+
+.marker-heading {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+}
+
+.marker-heading span {
+  color: var(--fault-coral);
+}
+
+.marker-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.marker-grid button {
+  display: grid;
+  grid-template-columns: 24px 1fr;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  padding: 4px 7px;
+  border: 1px solid var(--hairline);
+  border-radius: 0;
+  color: var(--ink);
+  background: var(--meter-slate);
+  cursor: pointer;
+  font-size: 0.7rem;
+  text-align: left;
+}
+
+.marker-grid button:hover:not(:disabled) {
+  border-color: var(--fault-coral);
+}
+
+.marker-grid button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.marker-grid kbd {
+  display: grid;
+  height: 22px;
+  place-items: center;
+  border: 1px solid var(--fault-coral);
+  color: var(--fault-coral);
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
 .playfield-frame {
   min-height: 620px;
   padding: 12px;
@@ -627,6 +686,114 @@ h1 {
   color: var(--ink);
   font-family: "Bahnschrift SemiCondensed", "Arial Narrow", sans-serif;
   font-size: 1.8rem;
+}
+
+.review-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.review-block,
+.subjective-review {
+  padding: 22px;
+  border: 1px solid var(--hairline);
+  background: #191e29;
+}
+
+.review-block h3,
+.subjective-review h3 {
+  margin: 0 0 18px;
+  color: var(--timing-amber);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+}
+
+.stat-list {
+  margin: 0;
+}
+
+.stat-list div,
+.failure-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 9px 0;
+  border-top: 1px solid var(--hairline);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.68rem;
+}
+
+.stat-list dt,
+.failure-list span {
+  color: var(--muted);
+}
+
+.stat-list dd {
+  margin: 0;
+}
+
+.failure-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.failure-list strong {
+  color: var(--fault-coral);
+  font-weight: 500;
+}
+
+.empty-state {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.subjective-review {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 14px;
+}
+
+.subjective-review h3,
+.subjective-review .comment-field,
+.subjective-review .primary-action {
+  grid-column: 1 / -1;
+}
+
+.subjective-review label {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.subjective-review select,
+.subjective-review textarea {
+  width: 100%;
+  border: 1px solid var(--hairline);
+  border-radius: 0;
+  color: var(--ink);
+  background: var(--meter-slate);
+  font: inherit;
+}
+
+.subjective-review select {
+  height: 42px;
+  padding: 0 10px;
+}
+
+.subjective-review textarea {
+  padding: 12px;
+  resize: vertical;
+}
+
+.subjective-review .primary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
 }
 
 @media (max-width: 850px) {
@@ -703,7 +870,9 @@ h1 {
   }
 
   .chart-grid,
-  .result-strip {
+  .result-strip,
+  .review-grid,
+  .subjective-review {
     grid-template-columns: 1fr;
   }
 

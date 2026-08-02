@@ -4,6 +4,8 @@ import { ImportRunPanel } from "../features/import-run/ImportRunPanel";
 import { importRun, type ImportedChart, type ImportedRun } from "../features/import-run/importRun";
 import { PlayChartPanel, type PlaySessionResult } from "../features/play-chart/PlayChartPanel";
 import { ChartSelector } from "../features/select-chart/ChartSelector";
+import { ReviewResult } from "../features/review-chart/ReviewResult";
+import type { PlaytestReview } from "../features/review-chart/review";
 
 type Importer = (files: File[]) => Promise<ImportedRun>;
 
@@ -15,6 +17,7 @@ export function LocalPlaytestPage({ importer = importRun }: LocalPlaytestPagePro
   const [run, setRun] = useState<ImportedRun | null>(null);
   const [selectedChart, setSelectedChart] = useState<ImportedChart | null>(null);
   const [result, setResult] = useState<PlaySessionResult | null>(null);
+  const [lastReviews, setLastReviews] = useState<Record<string, string>>({});
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,20 +36,25 @@ export function LocalPlaytestPage({ importer = importRun }: LocalPlaytestPagePro
   if (!run) return <ImportRunPanel error={error} importing={importing} onFiles={(files) => void handleFiles(files)} />;
   if (result && selectedChart) {
     return (
-      <section className="workspace-panel result-placeholder" aria-labelledby="result-title">
-        <p className="eyebrow">SESSION CAPTURED</p>
-        <h2 id="result-title">플레이 결과</h2>
-        <div className="result-strip">
-          <span>MAX COMBO <strong>{result.score.maxCombo}</strong></span>
-          <span>MISS <strong>{result.score.counts.MISS}</strong></span>
-          <span>MEAN ABS <strong>{result.score.meanAbsoluteErrMs.toFixed(1)} ms</strong></span>
-        </div>
-        <button className="primary-action" onClick={() => { setResult(null); setSelectedChart(null); }} type="button">채보 목록으로</button>
-      </section>
+      <ReviewResult
+        onBack={() => { setResult(null); setSelectedChart(null); }}
+        onSaved={(review: PlaytestReview) => setLastReviews((current) => ({ ...current, [review.chartId]: review.verdict }))}
+        session={{
+          runId: run.manifest.runId,
+          title: run.manifest.title,
+          chartId: selectedChart.document.chartId,
+          chartSha256: selectedChart.ref.sha256,
+          audioSha256: run.manifest.audio.game.sha256,
+          keyMode: selectedChart.document.keyMode,
+          difficulty: selectedChart.document.difficulty,
+          durationMs: selectedChart.document.durationMs,
+          result,
+        }}
+      />
     );
   }
   if (selectedChart) {
     return <PlayChartPanel chart={selectedChart} onBack={() => setSelectedChart(null)} onComplete={setResult} run={run} />;
   }
-  return <ChartSelector onReset={() => { setRun(null); setError(null); }} onSelect={setSelectedChart} run={run} />;
+  return <ChartSelector lastReviews={lastReviews} onReset={() => { setRun(null); setError(null); setLastReviews({}); }} onSelect={setSelectedChart} run={run} />;
 }

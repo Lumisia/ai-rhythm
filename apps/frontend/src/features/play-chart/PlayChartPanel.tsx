@@ -7,11 +7,16 @@ import { InputRecorder } from "../../game/core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../../game/core/JudgmentEngine";
 import { ScoreCalculator, type ScoreSnapshot } from "../../game/core/ScoreCalculator";
 import type { ImportedChart, ImportedRun } from "../import-run/importRun";
+import type { RecordedInputEvent } from "../../game/core/InputRecorder";
+import { MarkerControls, createReviewMarker, markerKindForSlot } from "../review-chart/MarkerControls";
+import type { ReviewMarker, ReviewMarkerKind } from "../review-chart/review";
 import { PlaySettings, type PlaySettingsValue } from "./PlaySettings";
 
 export interface PlaySessionResult {
   score: ScoreSnapshot;
   judgments: JudgmentEvent[];
+  inputs: readonly Readonly<RecordedInputEvent>[];
+  markers: ReviewMarker[];
   settings: PlaySettingsValue;
 }
 
@@ -27,6 +32,8 @@ interface RuntimeResources {
   player: SongPlayer;
   game: { destroy(removeCanvas?: boolean): void };
   score: ScoreCalculator;
+  recorder: InputRecorder;
+  clock: GameClock;
   judgments: JudgmentEvent[];
 }
 
@@ -42,6 +49,8 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
   });
   const [phase, setPhase] = useState<"READY" | "PREPARING" | "PLAYING" | "PAUSED">("READY");
   const [error, setError] = useState<string | null>(null);
+  const [markers, setMarkers] = useState<ReviewMarker[]>([]);
+  const markersRef = useRef<ReviewMarker[]>([]);
   const playfieldRef = useRef<HTMLDivElement>(null);
   const resourcesRef = useRef<RuntimeResources | null>(null);
   const mountedRef = useRef(false);
@@ -70,11 +79,21 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
     const result = {
       score: resources.score.snapshot(),
       judgments: [...resources.judgments],
+      inputs: resources.recorder.snapshot(),
+      markers: [...markersRef.current],
       settings: { ...settings },
     };
     cleanup();
     onComplete(result);
   }, [cleanup, onComplete, settings]);
+
+  const addMarker = useCallback((kind: ReviewMarkerKind, timeMs?: number) => {
+    const currentTimeMs = timeMs ?? resourcesRef.current?.clock.songTimeMs();
+    if (currentTimeMs === undefined) return;
+    const marker = createReviewMarker(kind, currentTimeMs, chart.document.durationMs);
+    markersRef.current = [...markersRef.current, marker];
+    setMarkers(markersRef.current);
+  }, [chart.document.durationMs]);
 
   const start = async () => {
     if (!playfieldRef.current || resourcesRef.current || startingRef.current) return;
@@ -159,9 +178,13 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
           player?.pause();
           setPhase("PAUSED");
         },
+        onMarkerSlot: (slot, timeMs) => {
+          const kind = markerKindForSlot(slot);
+          if (kind) addMarker(kind, timeMs);
+        },
         onComplete: () => queueMicrotask(finish),
       });
-      resourcesRef.current = { context, player, game, score, judgments };
+      resourcesRef.current = { context, player, game, score, recorder, clock, judgments };
       player.play(rangeStart);
       setPhase("PLAYING");
     } catch (caught) {
@@ -216,6 +239,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
             </div>
           ) : null}
           {error ? <p className="import-error" role="alert">{error}</p> : null}
+          <MarkerControls disabled={phase === "READY" || phase === "PREPARING"} markers={markers} onAdd={(kind) => addMarker(kind)} />
         </aside>
         <div className="playfield-frame">
           <div className="playfield-header"><span>BEAT SPINE</span><span>{phase}</span></div>
