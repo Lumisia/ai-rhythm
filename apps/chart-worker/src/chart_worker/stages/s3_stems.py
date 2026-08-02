@@ -81,12 +81,13 @@ def run_stems(
         keys_signal,
         backend=onset_backend or librosa_backend(),
     )
+    drum_onsets = tuple(sorted(set(drum_analysis.onset_ms)))
     audio_sha = analysis.normalized.sha256
     manifest = KeysoundManifest(
         song_version_id=uuid5(NAMESPACE_URL, f"{audio_sha}:song-version"),
         bgm_asset_id=uuid5(NAMESPACE_URL, f"{audio_sha}:bgm"),
         keys_asset_id=uuid5(NAMESPACE_URL, f"{audio_sha}:keys"),
-        drum_onsets=list(drum_analysis.onset_ms),
+        drum_onsets=list(drum_onsets),
     )
     manifest_path = run_dir / "keysound-manifest.json"
     manifest_path.write_text(
@@ -103,7 +104,7 @@ def run_stems(
             path=_relative(keys_path, run_dir),
             sha256=sha256_file(keys_path),
         ),
-        drum_onsets=tuple(drum_analysis.onset_ms),
+        drum_onsets=drum_onsets,
         keysound_manifest=manifest,
         keysound_manifest_path=manifest_path,
     )

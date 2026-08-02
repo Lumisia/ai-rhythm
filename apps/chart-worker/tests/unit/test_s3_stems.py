@@ -65,7 +65,7 @@ def test_enabled_stems_writes_two_lossless_files_and_drum_onsets(tmp_path: Path)
             hop_length=512,
             strength=np.array([0.0, 1.0]),
             band_strength=np.zeros((3, 2)),
-            onset_ms=(20, 70),
+            onset_ms=(70, 20, 70),
         )
 
     result = run_stems(
