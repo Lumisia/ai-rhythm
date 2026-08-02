@@ -112,7 +112,7 @@ def test_first_candidate_uses_configured_star_guidance_and_base_seed():
     )
 
 
-def test_each_too_hard_retry_lowers_the_previous_request_by_half_a_star():
+def test_second_candidate_keeps_star_for_same_condition_cfg_comparison():
     first = passing_quality(
         rating_error=0.3501,
         requested_star=3.0,
@@ -120,17 +120,19 @@ def test_each_too_hard_retry_lowers_the_previous_request_by_half_a_star():
     )
     second_parameters = candidate_selection.candidate_parameters(7, 1, 2, first)
     assert second_parameters.seed == 10_008
-    assert second_parameters.requested_star == 2.5
+    assert second_parameters.requested_star == 3.0
     assert second_parameters.cfg_scale == 1.0
 
+
+def test_third_candidate_lowers_the_unguided_request_by_half_a_star_when_too_hard():
     second = passing_quality(
         rating_error=0.36,
-        requested_star=second_parameters.requested_star,
-        cfg_scale=second_parameters.cfg_scale,
+        requested_star=3.0,
+        cfg_scale=1.0,
     )
     third_parameters = candidate_selection.candidate_parameters(7, 1, 3, second)
     assert third_parameters.seed == 20_008
-    assert third_parameters.requested_star == 2.0
+    assert third_parameters.requested_star == 2.5
     assert third_parameters.cfg_scale == 1.0
 
 
@@ -164,15 +166,15 @@ def test_candidate_schedule_rejects_a_fourth_attempt():
 
 def test_unguided_candidate_wins_when_guided_structural_tuple_is_worse():
     guided = passing_quality(
-        long_gap_bars=2.1,
-        rating_error=0.2,
-        removed_ratio=0.2,
+        long_gap_bars=1.9,
+        rating_error=0.01,
+        removed_ratio=0.01,
         cfg_scale=1.25,
     )
     unguided = passing_quality(
         long_gap_bars=0.0,
-        rating_error=0.1,
-        removed_ratio=0.1,
+        rating_error=0.2,
+        removed_ratio=0.2,
         cfg_scale=1.0,
     )
     assert select_candidate_index((guided, unguided), difficulty="NORMAL") == 1

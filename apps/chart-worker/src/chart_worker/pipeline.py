@@ -476,27 +476,33 @@ def run_pipeline(
             return _CandidateEvaluation(variant, result, quality, reference_result)
 
         evaluations = [evaluate(initial_variant, reference)]
-        if _requires_retry(
+        initial_requires_retry = _requires_retry(
             evaluations[0].quality,
             difficulty=difficulty,
             generator=options.generator,
-        ):
-            for attempt in (2, 3):
-                retry_variant = dependencies.generation_variant(
-                    analysis,
-                    run_dir,
-                    generator,
-                    key_mode,
-                    difficulty,
+        )
+        retry_attempts: tuple[int, ...] = ()
+        if options.generator == "mapperatorinator":
+            retry_attempts = (2, 3) if initial_requires_retry else (2,)
+        elif initial_requires_retry:
+            retry_attempts = (2, 3)
+
+        for attempt in retry_attempts:
+            retry_variant = dependencies.generation_variant(
+                analysis,
+                run_dir,
+                generator,
+                key_mode,
+                difficulty,
+                attempt,
+                candidate_parameters(
+                    options.seed,
+                    combination_index,
                     attempt,
-                    candidate_parameters(
-                        options.seed,
-                        combination_index,
-                        attempt,
-                        evaluations[-1].quality,
-                    ),
-                )
-                evaluations.append(evaluate(retry_variant, reference))
+                    evaluations[-1].quality,
+                ),
+            )
+            evaluations.append(evaluate(retry_variant, reference))
 
         if all(
             _requires_retry(

@@ -75,7 +75,7 @@ def candidate_parameters(
             else star_candidates[0]
         )
         requested_star = previous_star
-        if previous.rating_error > MAX_RATING_ERROR:
+        if attempt == 3 and previous.rating_error > MAX_RATING_ERROR:
             requested_star = max(star_candidates[-1], previous_star - 0.5)
 
     return CandidateParameters(
@@ -113,6 +113,7 @@ def rank_candidate(quality: CandidateQuality, *, difficulty: str) -> tuple[float
     )
     return (
         float(needs_retry(quality, difficulty=difficulty)),
+        quality.long_gap_bars,
         abs(quality.rating_error),
         quality.removed_ratio,
         drum_rank,

@@ -14,6 +14,31 @@ from chart_worker.schema.playtest_run import PlaytestRunManifest
 from tests.support import fake_dependencies
 
 
+class RecordingFakeGenerator:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, request, workdir):
+        self.calls.append(request)
+        return FakeGenerator()(request, workdir)
+
+
+def mapperatorinator_dependencies(generator: RecordingFakeGenerator):
+    dependencies = fake_dependencies()
+
+    def timing_stage(analysis, run_dir, config, enable_super_timing):
+        del run_dir, config
+        assert enable_super_timing is True
+        analysis.timing_quality_report_path.write_text("{}\n", encoding="utf-8")
+        return analysis
+
+    return dataclasses.replace(
+        dependencies,
+        timing=timing_stage,
+        select_generator=lambda name, config: generator,
+    )
+
+
 def test_fake_pipeline_writes_playtest_manifest(tmp_path: Path):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
@@ -244,8 +269,98 @@ def test_pipeline_retry_parameters_follow_each_too_hard_candidate(
     candidates = caught.value.context["candidates"]
     assert [candidate["parameters"] for candidate in candidates] == [
         {"requested_star": 3.0, "cfg_scale": 1.25},
+        {"requested_star": 3.0, "cfg_scale": 1.0},
         {"requested_star": 2.5, "cfg_scale": 1.0},
-        {"requested_star": 2.0, "cfg_scale": 1.0},
+    ]
+
+
+def test_mapperatorinator_compares_unguided_at_same_star_even_when_guided_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    generator = RecordingFakeGenerator()
+    real_quality_of = pipeline_module.candidate_quality_of
+
+    def passing_quality(*args, **kwargs):
+        quality = real_quality_of(*args, **kwargs)
+        return dataclasses.replace(
+            quality,
+            long_gap_bars=0.0,
+            rating_error=0.0,
+            removed_ratio=0.0,
+            drum_precision=None,
+            playability_passes=1,
+            reference_pass=None,
+        )
+
+    monkeypatch.setattr(pipeline_module, "candidate_quality_of", passing_quality)
+
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="mapperatorinator",
+        ),
+        dependencies=mapperatorinator_dependencies(generator),
+    )
+
+    normal_calls = [
+        request
+        for request in generator.calls
+        if request.key_mode == 4 and request.difficulty == "NORMAL"
+    ]
+    assert [
+        (request.seed, request.requested_star, request.cfg_scale)
+        for request in normal_calls
+    ] == [(1, 3.0, 1.25), (10_001, 3.0, 1.0)]
+    assert len(result.raw_osu_paths) == 12
+    assert all(path.is_file() for path in result.raw_osu_paths)
+    assert result.manifest_path.is_file()
+
+
+def test_mapperatorinator_failed_guided_candidate_adds_one_bounded_star_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    generator = RecordingFakeGenerator()
+    real_quality_of = pipeline_module.candidate_quality_of
+
+    def normal_is_too_hard(*args, **kwargs):
+        quality = real_quality_of(*args, **kwargs)
+        variant = args[1]
+        return dataclasses.replace(
+            quality,
+            long_gap_bars=0.0,
+            rating_error=0.3501 if variant.difficulty == "NORMAL" else 0.0,
+            removed_ratio=0.0,
+            drum_precision=None,
+            playability_passes=1,
+            reference_pass=None,
+        )
+
+    monkeypatch.setattr(pipeline_module, "candidate_quality_of", normal_is_too_hard)
+
+    with pytest.raises(WorkerError) as caught:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="mapperatorinator",
+            ),
+            dependencies=mapperatorinator_dependencies(generator),
+        )
+
+    assert caught.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert caught.value.context["difficulty"] == "NORMAL"
+    candidates = caught.value.context["candidates"]
+    assert [(candidate["seed"], candidate["parameters"]) for candidate in candidates] == [
+        (1, {"requested_star": 3.0, "cfg_scale": 1.25}),
+        (10_001, {"requested_star": 3.0, "cfg_scale": 1.0}),
+        (20_001, {"requested_star": 2.5, "cfg_scale": 1.0}),
     ]
 
 
