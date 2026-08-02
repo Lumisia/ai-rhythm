@@ -167,6 +167,30 @@ def test_piecewise_fit_splits_a_real_tempo_change_at_a_downbeat():
     assert points[1].bpm == pytest.approx(100.0, abs=0.05)
 
 
+def test_piecewise_fit_preserves_the_fitted_timing_intercept():
+    beat_ms = 100.0 + np.arange(8) * 500.0
+    beat_ms[0] += 20.0
+    beats = beat_ms / 1_000.0
+    grid = build_beat_grid(beats, beats[::4])
+
+    points = fit_piecewise_timing(grid)
+
+    assert points[0].time_ms == 108
+
+
+def test_piecewise_fit_does_not_remerge_similar_bpms_when_quality_would_fail():
+    beat_index = np.arange(48, dtype=np.float64)
+    alternating_jitter_ms = np.resize(np.array([0.0, 30.0, -30.0, 0.0]), 48)
+    beat_ms = 100.0 + 500.0 * beat_index + 0.05 * beat_index**2 + alternating_jitter_ms
+    beats = beat_ms / 1_000.0
+    grid = build_beat_grid(beats, beats[::4])
+
+    points = fit_piecewise_timing(grid)
+
+    assert [point.start_beat_index for point in points] == [0, 24]
+    assert abs(points[1].bpm - points[0].bpm) / points[0].bpm < 0.005
+
+
 def test_match_times_is_one_to_one_and_reports_f1_at_the_window():
     result = match_times((100, 101, 300), (100, 300), window_ms=20)
 
@@ -202,9 +226,9 @@ def test_error_limits_allow_exact_30ms_and_50ms_but_reject_values_above_either_l
     assert _exceeds_error_limits(30.0, np.nextafter(50.0, np.inf))
 
 
-def test_sse_improvement_accepts_exactly_35_percent_and_rejects_less():
-    assert _sse_improvement_is_sufficient(100.0, 65.0)
-    assert not _sse_improvement_is_sufficient(100.0, np.nextafter(65.0, np.inf))
+def test_sse_improvement_accepts_exactly_ten_percent_and_rejects_less():
+    assert _sse_improvement_is_sufficient(100.0, 90.0)
+    assert not _sse_improvement_is_sufficient(100.0, np.nextafter(90.0, np.inf))
 
 
 def test_piecewise_fit_stops_at_32_timing_points():

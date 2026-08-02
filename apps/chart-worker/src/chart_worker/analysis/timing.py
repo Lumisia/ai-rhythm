@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 MIN_SEGMENT_BEATS = 8
 P95_LIMIT_MS = 30.0
 MAX_LIMIT_MS = 50.0
-MIN_SSE_IMPROVEMENT = 0.35
+MIN_SSE_IMPROVEMENT = 0.10
 MAX_TIMING_POINTS = 32
 DEFAULT_METER = 4
 
@@ -116,6 +116,7 @@ class _Segment:
     start: int
     end: int
     bpm: float
+    intercept_ms: float
     sse: float
     p95_abs_ms: float
     max_abs_ms: float
@@ -130,6 +131,7 @@ def _fit_segment(beat_ms: tuple[int, ...], start: int, end: int) -> _Segment:
         start=start,
         end=end,
         bpm=60_000.0 / float(slope),
+        intercept_ms=float(intercept),
         sse=float(np.square(residual).sum()),
         p95_abs_ms=float(np.percentile(np.abs(residual), 95)),
         max_abs_ms=float(np.abs(residual).max()),
@@ -178,10 +180,11 @@ def _merge_adjacent(beat_ms: tuple[int, ...], segments: list[_Segment]) -> list[
     merged: list[_Segment] = []
     for segment in segments:
         if merged and _bps_are_mergeable(merged[-1].bpm, segment.bpm):
-            previous = merged.pop()
-            merged.append(_fit_segment(beat_ms, previous.start, segment.end))
-        else:
-            merged.append(segment)
+            combined = _fit_segment(beat_ms, merged[-1].start, segment.end)
+            if not _exceeds_error_limits(combined.p95_abs_ms, combined.max_abs_ms):
+                merged[-1] = combined
+                continue
+        merged.append(segment)
     return merged
 
 
@@ -206,7 +209,7 @@ def fit_piecewise_timing(grid: BeatGrid) -> tuple[TimingPoint, ...]:
     meter = grid.beats_per_bar or DEFAULT_METER
     return tuple(
         TimingPoint(
-            time_ms=grid.beat_ms[segment.start],
+            time_ms=round(segment.intercept_ms),
             bpm=segment.bpm,
             meter=meter,
             start_beat_index=segment.start,
