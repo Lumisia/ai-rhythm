@@ -12,6 +12,7 @@ from chart_worker.generation.mapperatorinator import (
     MapperatorinatorGenerator,
     build_command,
     find_generated_osu,
+    inference_env,
 )
 from chart_worker.generation.params import (
     DESCRIPTORS,
@@ -427,3 +428,11 @@ def test_a_bare_interpreter_name_is_left_for_path_lookup():
     )
     argv = build_command(bare, _request(Path("t.osu")), Path("out"))
     assert argv[0] == "python"
+
+
+def test_mapperatorinator_child_process_forces_utf8_without_losing_path():
+    env = inference_env({"Path": "C:/tools", "pythonutf8": "0"})
+    assert env["Path"] == "C:/tools"
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert sum(name.upper() == "PYTHONUTF8" for name in env) == 1

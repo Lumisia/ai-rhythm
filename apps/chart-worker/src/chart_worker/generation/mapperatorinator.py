@@ -4,7 +4,8 @@
 같은 구조다.
 """
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -37,6 +38,17 @@ class GeneratedChart:
 
 class ChartGenerator(Protocol):
     def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart: ...
+
+
+def inference_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Unicode 제목도 Windows 자식 프로세스가 UTF-8로 출력하게 한다."""
+    env = dict(os.environ if base is None else base)
+    forced = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    for name in list(env):
+        if name.upper() in forced:
+            del env[name]
+    env.update(forced)
+    return env
 
 
 def _hydra_list(values: tuple[str, ...]) -> str:
@@ -149,6 +161,7 @@ class MapperatorinatorGenerator:
             # inference.py 는 상대 경로이고 Hydra 는 실행 위치에서 configs/ 를
             # 찾는다. 체크아웃 밖에서 돌리면 스크립트도 설정도 못 찾는다.
             cwd=self.config.mapperatorinator_home,
+            env=inference_env(),
         )
         argv = build_command(self.config, request, workdir)
         try:
