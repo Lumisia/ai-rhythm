@@ -75,7 +75,10 @@ def candidate_parameters(
             else star_candidates[0]
         )
         requested_star = previous_star
-        if attempt == 3 and previous.rating_error > MAX_RATING_ERROR:
+        if attempt == 3 and (
+            previous.rating_error > MAX_RATING_ERROR
+            or previous.removed_ratio > MAX_REMOVED_RATIO
+        ):
             requested_star = max(star_candidates[-1], previous_star - 0.5)
 
     return CandidateParameters(

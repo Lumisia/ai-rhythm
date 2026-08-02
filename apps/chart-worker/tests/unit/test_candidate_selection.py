@@ -99,6 +99,10 @@ def test_requested_star_candidates_are_three_half_star_steps():
     assert candidate_selection.requested_star_candidates("NORMAL") == (3.0, 2.5, 2.0)
 
 
+def test_easy_requested_star_candidates_start_at_the_calibrated_one_point_five():
+    assert candidate_selection.requested_star_candidates("EASY") == (1.5, 1.0, 0.5)
+
+
 def test_requested_star_candidates_reject_an_unsupported_difficulty():
     with pytest.raises(ValueError, match="unsupported difficulty"):
         candidate_selection.requested_star_candidates("NOMAL")
@@ -134,6 +138,69 @@ def test_third_candidate_lowers_the_unguided_request_by_half_a_star_when_too_har
     assert third_parameters.seed == 20_008
     assert third_parameters.requested_star == 2.5
     assert third_parameters.cfg_scale == 1.0
+
+
+def test_third_easy_candidate_lowers_star_when_unguided_removal_is_too_high():
+    second = passing_quality(
+        rating_error=0.16,
+        removed_ratio=0.4501,
+        requested_star=1.5,
+        cfg_scale=1.0,
+    )
+
+    third_parameters = candidate_selection.candidate_parameters(0, 0, 3, second)
+
+    assert third_parameters == CandidateParameters(
+        seed=20_000,
+        requested_star=1.0,
+        cfg_scale=1.0,
+    )
+
+
+def test_third_normal_candidate_also_lowers_star_on_excessive_removal():
+    second = passing_quality(
+        rating_error=0.0,
+        removed_ratio=0.4501,
+        requested_star=3.0,
+        cfg_scale=1.0,
+    )
+
+    parameters = candidate_selection.candidate_parameters(0, 1, 3, second)
+
+    assert parameters.requested_star == 2.5
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rating_error": -0.3501},
+        {"rating_error": 0.35},
+        {"removed_ratio": 0.45},
+    ],
+)
+def test_third_candidate_keeps_star_at_non_triggering_boundaries(overrides):
+    second = passing_quality(
+        **overrides,
+        requested_star=3.0,
+        cfg_scale=1.0,
+    )
+
+    parameters = candidate_selection.candidate_parameters(0, 1, 3, second)
+
+    assert parameters.requested_star == 3.0
+
+
+def test_third_candidate_does_not_lower_below_the_difficulty_floor():
+    second = passing_quality(
+        rating_error=0.36,
+        removed_ratio=0.4501,
+        requested_star=2.0,
+        cfg_scale=1.0,
+    )
+
+    parameters = candidate_selection.candidate_parameters(0, 1, 3, second)
+
+    assert parameters.requested_star == 2.0
 
 
 @pytest.mark.parametrize(

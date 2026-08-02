@@ -72,9 +72,13 @@ def test_requested_star_is_never_below_the_solver_target():
         assert REQUESTED_STAR[difficulty] >= target, difficulty
 
 
-@pytest.mark.parametrize("difficulty", ["EASY", "NORMAL", "HARD"])
+@pytest.mark.parametrize("difficulty", ["NORMAL", "HARD"])
 def test_lower_tiers_have_explicit_solver_headroom(difficulty):
     assert REQUESTED_STAR[difficulty] > TARGET_RATING[difficulty]
+
+
+def test_easy_request_matches_the_solver_target_after_real_candidate_calibration():
+    assert REQUESTED_STAR["EASY"] == TARGET_RATING["EASY"] == 1.5
 
 
 def test_expert_has_no_headroom_from_the_request_alone():
