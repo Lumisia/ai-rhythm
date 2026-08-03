@@ -47,4 +47,3 @@ def test_prepare_only_normalizes_the_source_audio(tmp_path: Path):
         (source, tmp_path / "audio" / "game.flac", config, marker),
     ]
     assert not (tmp_path / "analysis").exists()
-
