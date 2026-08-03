@@ -5,6 +5,7 @@ from uuid import UUID
 import numpy as np
 import soundfile as sf
 
+from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.config import WorkerConfig
 from chart_worker.generation.fake import FakeGenerator
@@ -51,9 +52,21 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
             sample_rate_hz=sample_rate_hz,
         )
 
+    def analyze(path: Path) -> OnsetAnalysis:
+        del path
+        duration_ms = round(len(samples) * 1_000 / sample_rate_hz)
+        return OnsetAnalysis(
+            sample_rate_hz=sample_rate_hz,
+            hop_length=512,
+            strength=np.zeros(1),
+            band_strength=np.zeros((3, 1)),
+            onset_ms=tuple(range(0, duration_ms, 125)),
+        )
+
     return PipelineDependencies(
         config=WorkerConfig(),
         prepare=prepare,
+        analyze=analyze,
         select_generator=lambda _name, _config: FakeGenerator(),
         now=lambda: datetime(2026, 8, 2, tzinfo=UTC),
         new_run_id=lambda: UUID("00000000-0000-0000-0000-000000000007"),

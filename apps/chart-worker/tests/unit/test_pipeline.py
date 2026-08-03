@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.schema.playtest_run import PlaytestRunManifest
@@ -31,7 +32,12 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     )
     assert len(manifest.charts) == 12
     assert len(result.raw_osu_paths) == 12
-    assert set(result.elapsed_ms_by_stage) == {"prepare", "generation", "export"}
+    assert set(result.elapsed_ms_by_stage) == {
+        "prepare",
+        "analysis",
+        "generation",
+        "export",
+    }
     assert manifest.audio.no_drums is None
     assert manifest.audio.keys is None
     assert manifest.keysound_manifest_path is None
@@ -42,6 +48,8 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["timingAuthority"] == "FAKE"
     assert report["noteMutationEnabled"] is False
     assert report["attemptsPerChartMax"] == 2
+    assert report["canonicalAudioSha256"] == manifest.audio.game.sha256
+    assert report["timingReviewRequired"] is False
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
 
@@ -55,6 +63,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["finalNoteCount"] == len(document.notes)
         assert chart_report["attemptCount"] == 1
         assert chart_report["attemptErrors"] == []
+        assert chart_report["timingDiagnostics"]["status"] == "PASS"
         assert chart_report["cfgScale"] == 1.0
         assert chart_report["chartPath"] == chart_ref.path
         assert chart_report["rawOsuPath"] == raw_path.relative_to(output_dir).as_posix()
@@ -93,6 +102,63 @@ def test_generation_report_records_the_selected_retry_attempt(tmp_path: Path):
     assert first["attemptCount"] == 2
     assert first["seed"] == 19
     assert first["attemptErrors"] == ["lane 4 is outside requested 4K"]
+
+
+def test_pipeline_analyzes_only_the_canonical_game_audio_once(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    calls = []
+
+    def analyze(path):
+        calls.append(path)
+        return dependencies.analyze(path)
+
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, analyze=analyze),
+    )
+
+    assert calls == [result.output_dir / "audio" / "game.flac"]
+
+
+def test_pipeline_rejects_canonical_audio_changed_after_prepare(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    analyze_calls = []
+
+    def prepare(source_path, run_dir, config):
+        prepared = dependencies.prepare(source_path, run_dir, config)
+        prepared.normalized.path.write_bytes(b"tampered after hashing")
+        return prepared
+
+    def analyze(path):
+        analyze_calls.append(path)
+        return dependencies.analyze(path)
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+            ),
+            dependencies=replace(
+                dependencies,
+                prepare=prepare,
+                analyze=analyze,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.ASSET_HASH_MISMATCH
+    assert analyze_calls == []
 
 
 def test_pipeline_defaults_to_mapperatorinator():

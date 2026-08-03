@@ -10,10 +10,14 @@ from time import perf_counter_ns
 from typing import Literal
 from uuid import UUID, uuid4
 
+from chart_worker.analysis.onset import OnsetAnalysis, analyze_canonical_audio
+from chart_worker.analysis.timing_diagnostics import diagnose_chart_timing
 from chart_worker.config import WorkerConfig, load_config
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
 from chart_worker.generation.params import DESCRIPTORS
+from chart_worker.hashing import sha256_file
 from chart_worker.schema.playtest_run import (
     AudioFileRef,
     PlaytestRunManifest,
@@ -27,6 +31,7 @@ from chart_worker.stages.types import ExportedVariant, GeneratedVariant, Prepare
 
 GeneratorName = Literal["fake", "mapperatorinator"]
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
+AnalysisStage = Callable[[Path], OnsetAnalysis]
 GenerationStage = Callable[
     [PreparedAudio, Path, ChartGenerator, int], tuple[GeneratedVariant, ...]
 ]
@@ -47,6 +52,10 @@ def _generation_stage(
     seed: int,
 ) -> tuple[GeneratedVariant, ...]:
     return run_generation(prepared, run_dir, generator=generator, seed=seed)
+
+
+def _analysis_stage(path: Path) -> OnsetAnalysis:
+    return analyze_canonical_audio(path)
 
 
 def _export_stage(
@@ -77,6 +86,7 @@ def _utc_now() -> datetime:
 class PipelineDependencies:
     config: WorkerConfig = field(default_factory=load_config)
     prepare: PrepareStage = _prepare_stage
+    analyze: AnalysisStage = _analysis_stage
     select_generator: Callable[[GeneratorName, WorkerConfig], ChartGenerator] = _select_generator
     generation: GenerationStage = _generation_stage
     export: ExportStage = _export_stage
@@ -148,10 +158,17 @@ def _generation_report(
     exported: tuple[ExportedVariant, ...],
     run_dir: Path,
     config: WorkerConfig,
+    prepared: PreparedAudio,
+    onsets: OnsetAnalysis,
 ) -> dict[str, object]:
     charts = []
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
+        timing_diagnostics = diagnose_chart_timing(
+            notes,
+            onsets.onset_ms,
+            duration_ms=prepared.normalized.duration_ms,
+        )
         charts.append(
             {
                 "keyMode": variant.key_mode,
@@ -163,6 +180,7 @@ def _generation_report(
                 "cfgScale": variant.cfg_scale,
                 "attemptCount": variant.attempt,
                 "attemptErrors": list(variant.attempt_errors),
+                "timingDiagnostics": timing_diagnostics.to_report(),
                 "rawNoteCount": len(notes),
                 "finalNoteCount": len(result.document.notes),
                 "holdCount": sum(note.kind == "HOLD" for note in notes),
@@ -183,6 +201,10 @@ def _generation_report(
         ),
         "noteMutationEnabled": False,
         "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
+        "canonicalAudioSha256": prepared.normalized.sha256,
+        "timingReviewRequired": any(
+            chart["timingDiagnostics"]["status"] == "REVIEW" for chart in charts
+        ),
         "elapsedMsByStage": elapsed,
         "warnings": [],
         "charts": charts,
@@ -206,6 +228,22 @@ def run_pipeline(
         dependencies.config,
     )
     elapsed["prepare"] = _elapsed_ms(started)
+
+    started = perf_counter_ns()
+    normalized = prepared.normalized
+    actual_audio_sha = sha256_file(normalized.path)
+    if actual_audio_sha != normalized.sha256:
+        raise WorkerError(
+            ErrorCode.ASSET_HASH_MISMATCH,
+            "canonical game audio changed after prepare",
+            context={
+                "path": str(normalized.path),
+                "expected": normalized.sha256,
+                "actual": actual_audio_sha,
+            },
+        )
+    onsets = dependencies.analyze(normalized.path)
+    elapsed["analysis"] = _elapsed_ms(started)
 
     started = perf_counter_ns()
     generator = dependencies.select_generator(options.generator, dependencies.config)
@@ -232,6 +270,8 @@ def run_pipeline(
                 exported,
                 run_dir,
                 dependencies.config,
+                prepared,
+                onsets,
             ),
             ensure_ascii=False,
             indent=2,
@@ -239,7 +279,6 @@ def run_pipeline(
         + "\n",
         encoding="utf-8",
     )
-    normalized = prepared.normalized
     manifest = PlaytestRunManifest(
         run_id=run_id,
         title=options.title,

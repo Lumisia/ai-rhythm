@@ -6,11 +6,12 @@
 import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
 
-from chart_worker.analysis.audio_io import AudioSignal
+from chart_worker.analysis.audio_io import AudioSignal, load_audio
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.schema.note import Chart
@@ -111,6 +112,11 @@ def analyze_onsets(signal: AudioSignal, *, backend: OnsetBackend) -> OnsetAnalys
             ErrorCode.CHART_ANALYSIS_FAILED,
             f"onset analysis failed: {error}",
         ) from error
+
+
+def analyze_canonical_audio(path: Path) -> OnsetAnalysis:
+    """Analyze the exact normalized audio later referenced by the manifest."""
+    return analyze_onsets(load_audio(path), backend=librosa_backend())
 
 
 def mel_band_channels(

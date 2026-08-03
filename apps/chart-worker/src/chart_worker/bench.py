@@ -18,7 +18,7 @@ from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
 
 class BenchmarkReport(CamelModel):
-    status: Literal["PASS"]
+    status: Literal["PASS", "REVIEW"]
     source_name: str
     source_sha256: Sha256
     generator: str
@@ -43,6 +43,7 @@ def _load_generation_report(path: Path) -> dict[str, object]:
     elapsed = value.get("elapsedMsByStage")
     if not isinstance(elapsed, dict) or set(elapsed) != {
         "prepare",
+        "analysis",
         "generation",
         "export",
     }:
@@ -85,9 +86,11 @@ def run_benchmark(
     manifest = PlaytestRunManifest.model_validate_json(
         pipeline.manifest_path.read_text(encoding="utf-8")
     )
-    _load_generation_report(pipeline.output_dir / manifest.generation_report_path)
+    generation = _load_generation_report(
+        pipeline.output_dir / manifest.generation_report_path
+    )
     report = BenchmarkReport(
-        status="PASS",
+        status="REVIEW" if generation.get("timingReviewRequired") is True else "PASS",
         source_name=options.source.name,
         source_sha256=sha256_file(options.source),
         generator=options.generator,

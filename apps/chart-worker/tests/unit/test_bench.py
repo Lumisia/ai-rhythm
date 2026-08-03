@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,12 @@ def test_benchmark_writes_direct_generation_report_for_all_charts(tmp_path: Path
     assert report.source_name == "fixture.wav"
     assert report.status == "PASS"
     assert len(report.charts) == 12
-    assert set(report.elapsed_ms_by_stage) == {"prepare", "generation", "export"}
+    assert set(report.elapsed_ms_by_stage) == {
+        "prepare",
+        "analysis",
+        "generation",
+        "export",
+    }
     generation = json.loads((output_dir / "generation-report.json").read_text())
     assert generation["strategy"] == "MAPPERATORINATOR_DIRECT"
     assert all(chart["attemptCount"] == 1 for chart in generation["charts"])
@@ -64,3 +70,26 @@ def test_benchmark_rejects_a_generation_report_without_direct_strategy(
             ),
             dependencies=fake_dependencies(),
         )
+
+
+def test_benchmark_requires_review_when_timing_diagnostics_do(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    aligned = dependencies.analyze(Path("unused"))
+    review_analysis = replace(aligned, onset_ms=(1_937,))
+
+    result = run_benchmark(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(
+            dependencies,
+            analyze=lambda _path: review_analysis,
+        ),
+    )
+
+    assert result.report.status == "REVIEW"

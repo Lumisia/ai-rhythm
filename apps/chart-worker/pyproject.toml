@@ -3,18 +3,16 @@ name = "chart-worker"
 version = "0.1.0"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+  "librosa>=0.10",
   "numpy>=1.26",
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
+  "soundfile>=0.12",
   "typer>=0.12",
 ]
 
 [project.scripts]
 chart-worker = "chart_worker.cli:app"
-
-[project.optional-dependencies]
-# 생성 뒤 명시적으로 실행하는 onset 진단에만 사용한다.
-diagnostics = ["librosa>=0.10", "soundfile>=0.12"]
 
 [dependency-groups]
 dev = ["hypothesis>=6.100", "pytest>=8.2", "ruff>=0.5"]

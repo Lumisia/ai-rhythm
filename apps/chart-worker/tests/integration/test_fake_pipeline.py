@@ -48,4 +48,9 @@ def test_fake_pipeline_writes_twelve_hash_verified_charts(tmp_path: Path):
         assert hashlib.sha256(path.read_bytes()).hexdigest() == reference.sha256
     assert (output_dir / manifest.audio.game.path).is_file()
     assert not (output_dir / "analysis").exists()
-    assert set(result.elapsed_ms_by_stage) == {"prepare", "generation", "export"}
+    assert set(result.elapsed_ms_by_stage) == {
+        "prepare",
+        "analysis",
+        "generation",
+        "export",
+    }
