@@ -15,6 +15,8 @@ MIN_SECTION_ROWS = 8
 OVERALL_PRECISION_50_MIN = 0.70
 SECTION_PRECISION_50_MIN = 0.60
 SECTION_PHASE_DRIFT_MAX_MS = 25.0
+ACTIVE_GAP_MIN_MS = 8_000
+ACTIVE_GAP_MIN_ONSETS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,11 +54,27 @@ class TimingSection:
 
 
 @dataclass(frozen=True, slots=True)
+class TimingCoverageGap:
+    start_ms: int
+    end_ms: int
+    onset_count: int
+
+    def to_report(self) -> dict[str, int]:
+        return {
+            "startMs": self.start_ms,
+            "endMs": self.end_ms,
+            "durationMs": self.end_ms - self.start_ms,
+            "onsetCount": self.onset_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class TimingDiagnostics:
     status: TimingStatus
     onset_count: int
     first_note_time_ms: int | None
     max_gap_ms: int
+    coverage_gaps: tuple[TimingCoverageGap, ...]
     overall: TimingMetrics
     sections: tuple[TimingSection, ...]
 
@@ -66,6 +84,7 @@ class TimingDiagnostics:
             "onsetCount": self.onset_count,
             "firstNoteTimeMs": self.first_note_time_ms,
             "maxGapMs": self.max_gap_ms,
+            "coverageGaps": [gap.to_report() for gap in self.coverage_gaps],
             "overall": self.overall.to_report(),
             "sections": [section.to_report() for section in self.sections],
         }
@@ -126,6 +145,31 @@ def _section_status(
     return "PASS"
 
 
+def _coverage_gaps(
+    rows: tuple[int, ...],
+    onsets: np.ndarray,
+    *,
+    duration_ms: int,
+) -> tuple[TimingCoverageGap, ...]:
+    boundaries = tuple(sorted({0, duration_ms, *rows}))
+    gaps = []
+    for start_ms, end_ms in pairwise(boundaries):
+        if end_ms - start_ms < ACTIVE_GAP_MIN_MS:
+            continue
+        onset_start = int(np.searchsorted(onsets, start_ms, side="right"))
+        onset_end = int(np.searchsorted(onsets, end_ms, side="left"))
+        onset_count = onset_end - onset_start
+        if onset_count >= ACTIVE_GAP_MIN_ONSETS:
+            gaps.append(
+                TimingCoverageGap(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    onset_count=onset_count,
+                )
+            )
+    return tuple(gaps)
+
+
 def diagnose_chart_timing(
     notes: Chart,
     onset_ms: tuple[int, ...],
@@ -145,6 +189,7 @@ def diagnose_chart_timing(
     rows = tuple(sorted({note.time_ms for note in notes}))
     onsets = np.asarray(sorted(set(onset_ms)), dtype=np.int64)
     overall = _metrics(rows, onsets)
+    coverage_gaps = _coverage_gaps(rows, onsets, duration_ms=duration_ms)
     sections = []
     for start_ms in range(0, max(1, duration_ms), section_ms):
         end_ms = min(duration_ms, start_ms + section_ms)
@@ -170,8 +215,10 @@ def diagnose_chart_timing(
 
     if overall.row_count == 0 or overall.precision_50 is None:
         status: TimingStatus = "INSUFFICIENT"
-    elif overall.precision_50 < OVERALL_PRECISION_50_MIN or any(
-        section.status == "REVIEW" for section in sections
+    elif (
+        overall.precision_50 < OVERALL_PRECISION_50_MIN
+        or coverage_gaps
+        or any(section.status == "REVIEW" for section in sections)
     ):
         status = "REVIEW"
     else:
@@ -183,6 +230,7 @@ def diagnose_chart_timing(
         onset_count=int(onsets.size),
         first_note_time_ms=rows[0] if rows else None,
         max_gap_ms=max_gap_ms,
+        coverage_gaps=coverage_gaps,
         overall=overall,
         sections=tuple(sections),
     )

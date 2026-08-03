@@ -79,6 +79,25 @@ def test_reports_insufficient_when_rows_or_onsets_are_missing():
     assert no_onsets.overall.precision_50 is None
 
 
+def test_marks_long_gap_with_active_onsets_for_review():
+    onset_ms = (0, *range(1_000, 21_000, 1_000), 30_838)
+    result = diagnose_chart_timing(
+        [tap(0), tap(30_838)],
+        onset_ms,
+        duration_ms=60_000,
+    )
+
+    assert result.status == "REVIEW"
+    assert [gap.to_report() for gap in result.coverage_gaps] == [
+        {
+            "startMs": 0,
+            "endMs": 30_838,
+            "durationMs": 30_838,
+            "onsetCount": 20,
+        }
+    ]
+
+
 def test_serializes_stable_camel_case_report_fields():
     result = diagnose_chart_timing(
         [tap(row) for row in range(1_000, 9_000, 1_000)],
@@ -91,6 +110,7 @@ def test_serializes_stable_camel_case_report_fields():
         "onsetCount": 8,
         "firstNoteTimeMs": 1000,
         "maxGapMs": 1000,
+        "coverageGaps": [],
         "overall": {
             "rowCount": 8,
             "precision20": 1.0,

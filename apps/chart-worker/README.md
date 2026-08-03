@@ -88,7 +88,9 @@ uv run --project apps/chart-worker chart-worker bench `
 `audio/game.flac`에서 곡당 한 번 실행하고 12개 채보가 같은 onset 배열을 공유한다.
 30초 단위 구간과 전체 고유 노트 행을 평가하며, 전체 ±50ms precision 70% 미만,
 충분한 행이 있는 구간의 60% 미만 또는 전체 median과 25ms를 넘게 벗어난 구간은
-`REVIEW`다. 이는 사람 라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
+`REVIEW`다. 노트 사이 또는 곡 앞뒤에 8초 이상 공백이 있고 그 안에 onset이 8개
+이상 있으면 `coverageGaps`로 기록해 누락된 활성 구간도 `REVIEW`한다. 이는 사람
+라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
 
 원본 osu!mania 키 수, X 좌표와 변환 레인 범위, 음원 길이 안의 TAP/HOLD 시각,
 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD, timing point를 검사한다. 실패 조합은
