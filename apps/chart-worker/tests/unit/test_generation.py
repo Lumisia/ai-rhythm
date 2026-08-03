@@ -69,8 +69,8 @@ def test_requested_stars_and_descriptors_are_explicit():
     assert DESCRIPTORS == {
         "EASY": ("expression/simple",),
         "NORMAL": ("style/mixed rice",),
-        "HARD": ("style/generic hybrid",),
-        "EXPERT": ("tech/technical hybrid",),
+        "HARD": ("style/mixed rice",),
+        "EXPERT": ("style/mixed rice",),
     }
 
 
@@ -113,7 +113,7 @@ def test_command_requests_one_direct_timing_and_map_generation(config, tmp_path)
         "year": "2023",
         "end_time": str(DURATION_MS),
         "cfg_scale": "1.0",
-        "descriptors": "[tech/technical hybrid]",
+        "descriptors": "[style/mixed rice]",
         "precision": "fp16",
         "export_osz": "false",
         "output_type": "[TIMING,MAP]",
