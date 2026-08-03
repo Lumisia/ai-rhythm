@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
 
+from chart_worker.postprocess.ergonomics import ErgonomicRole, ergonomic_roles, hand_of
 from chart_worker.postprocess.patterns import rows_of
 from chart_worker.schema.note import Chart
 from chart_worker.schema.types import DIFFICULTIES, LaneSemantic, lane_semantics
@@ -25,11 +26,6 @@ class FingerClass(StrEnum):
 
     MAIN = "MAIN"
     """검지·중지. 빠른 잭이 강하다."""
-
-
-class Hand(StrEnum):
-    LEFT = "LEFT"
-    RIGHT = "RIGHT"
 
 
 class Rule(StrEnum):
@@ -48,16 +44,6 @@ _FINGER_OF: dict[LaneSemantic, FingerClass] = {
     LaneSemantic.MAIN_3: FingerClass.MAIN,
     LaneSemantic.MAIN_4: FingerClass.MAIN,
 }
-
-_HAND_OF: dict[LaneSemantic, Hand] = {
-    LaneSemantic.SIDE_LEFT: Hand.LEFT,
-    LaneSemantic.MAIN_1: Hand.LEFT,
-    LaneSemantic.MAIN_2: Hand.LEFT,
-    LaneSemantic.MAIN_3: Hand.RIGHT,
-    LaneSemantic.MAIN_4: Hand.RIGHT,
-    LaneSemantic.SIDE_RIGHT: Hand.RIGHT,
-}
-"""CENTER 는 엄지라 어느 손에도 고정되지 않으므로 빠진다."""
 
 JACK_MIN_INTERVAL_MS: dict[str, dict[FingerClass, int]] = {
     "EASY": {FingerClass.SIDE: 500, FingerClass.CENTER: 400, FingerClass.MAIN: 250},
@@ -114,13 +100,17 @@ def finger_of(semantic: LaneSemantic) -> FingerClass:
     return _FINGER_OF[semantic]
 
 
-def hand_of(semantic: LaneSemantic) -> Hand | None:
-    """CENTER 는 엄지라 어느 손에도 고정되지 않는다."""
-    return _HAND_OF.get(semantic)
-
-
 def jack_interval_ms(semantic: LaneSemantic, difficulty: str) -> int:
     return JACK_MIN_INTERVAL_MS[difficulty][finger_of(semantic)]
+
+
+def jack_interval_for_lane(key_mode: int, lane: int, difficulty: str) -> int:
+    _require_difficulty(difficulty)
+    roles = ergonomic_roles(key_mode)
+    if not 0 <= lane < len(roles):
+        raise ValueError(f"lane {lane} is outside {key_mode}K")
+    finger = FingerClass.CENTER if roles[lane] is ErgonomicRole.CENTER else FingerClass.MAIN
+    return JACK_MIN_INTERVAL_MS[difficulty][finger]
 
 
 def _require_difficulty(difficulty: str) -> None:
@@ -136,14 +126,15 @@ def check_jack_intervals(notes: Chart, *, key_mode: int, difficulty: str) -> lis
     음표 단위(EXPERT MAIN 85ms = 176 BPM 의 16분)에서 나왔다.
     """
     _require_difficulty(difficulty)
-    semantics = lane_semantics(key_mode)
+    roles = ergonomic_roles(key_mode)
     by_lane: dict[int, list[int]] = {}
     for note in sorted(notes, key=lambda n: n.time_ms):
         by_lane.setdefault(note.lane, []).append(note.time_ms)
 
     found = []
     for lane, times in by_lane.items():
-        limit = jack_interval_ms(semantics[lane], difficulty)
+        limit = jack_interval_for_lane(key_mode, lane, difficulty)
+        role = roles[lane]
         for previous, current in pairwise(times):
             gap = current - previous
             if gap < limit:
@@ -152,7 +143,7 @@ def check_jack_intervals(notes: Chart, *, key_mode: int, difficulty: str) -> lis
                         Rule.S1_JACK_INTERVAL,
                         current,
                         (lane,),
-                        f"{gap}ms gap on a {finger_of(semantics[lane]).value} lane "
+                        f"{gap}ms gap on a {role.value} lane "
                         f"needs at least {limit}ms at {difficulty}",
                     )
                 )
@@ -162,6 +153,8 @@ def check_jack_intervals(notes: Chart, *, key_mode: int, difficulty: str) -> lis
 def check_side_hold_density(notes: Chart, *, key_mode: int, difficulty: str) -> list[Violation]:
     """S3 — 사이드 HOLD 를 잡은 손이 같은 시간에 얼마나 치는지 본다."""
     _require_difficulty(difficulty)
+    if key_mode in (6, 7):
+        return []
     semantics = lane_semantics(key_mode)
     limit = SAME_HAND_NPS_DURING_SIDE_HOLD[difficulty]
 
@@ -196,6 +189,8 @@ def check_side_hold_density(notes: Chart, *, key_mode: int, difficulty: str) -> 
 def check_both_sides(notes: Chart, *, key_mode: int, difficulty: str) -> list[Violation]:
     """S4 — 양쪽 사이드를 동시에 누르는 순간을 본다."""
     _require_difficulty(difficulty)
+    if key_mode in (6, 7):
+        return []
     semantics = lane_semantics(key_mode)
     policy = BOTH_SIDES[difficulty]
     if policy is BothSidesPolicy.FREE:
@@ -241,6 +236,8 @@ def _is_accent(row) -> bool:
 def check_center_combinations(notes: Chart, *, key_mode: int, difficulty: str) -> list[Violation]:
     """C3 — Space 와 양쪽 사이드가 겹치는 순간을 본다."""
     _require_difficulty(difficulty)
+    if key_mode in (6, 7):
+        return []
     semantics = lane_semantics(key_mode)
     if LaneSemantic.CENTER not in semantics:
         return []

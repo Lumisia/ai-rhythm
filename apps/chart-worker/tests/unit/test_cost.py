@@ -15,6 +15,7 @@ from chart_worker.schema.note import NoteEvent
 # 7키: SIDE_LEFT MAIN_1 MAIN_2 CENTER MAIN_3 MAIN_4 SIDE_RIGHT
 SIDE_L, MAIN_1, MAIN_2, CENTER, MAIN_3, MAIN_4, SIDE_R = range(7)
 MAIN_LANES = (MAIN_1, MAIN_2, MAIN_3, MAIN_4)
+ERGONOMIC_MAIN_LANES = (SIDE_L, MAIN_1, MAIN_2, MAIN_3, MAIN_4, SIDE_R)
 
 
 def _context(**overrides):
@@ -85,10 +86,9 @@ def test_a_repeat_beyond_the_finger_limit_is_free():
     assert _term(_note(), MAIN_1, context, "w1_same_lane_repeat") == 0.0
 
 
-def test_the_same_gap_costs_more_on_a_side_lane():
-    """손가락이 다르면 한계가 다르다."""
+def test_the_same_gap_costs_the_same_on_outer_and_inner_home_keys():
     context = _context(last_time_by_lane={SIDE_L: 850, MAIN_1: 850})
-    assert _term(_note(), SIDE_L, context, "w1_same_lane_repeat") > _term(
+    assert _term(_note(), SIDE_L, context, "w1_same_lane_repeat") == _term(
         _note(), MAIN_1, context, "w1_same_lane_repeat"
     )
 
@@ -202,25 +202,29 @@ def test_a_placement_that_breaks_the_finger_limit_is_expensive_but_possible():
     assert math.isfinite(total)
 
 
-def test_pressing_the_second_side_is_a_violation():
+def test_pressing_both_outer_home_keys_is_not_a_shift_violation():
     context = _context(occupied_lanes=frozenset({SIDE_L}))
-    assert _term(_note(), SIDE_R, context, "w8_rule_violation") > 0
+    assert _term(_note(), SIDE_R, context, "w8_rule_violation") == 0.0
     assert _term(_note(), MAIN_1, context, "w8_rule_violation") == 0.0
 
 
-def test_center_on_top_of_both_sides_is_a_violation():
+def test_center_with_both_outer_home_keys_is_not_a_shift_violation():
     context = _context(occupied_lanes=frozenset({SIDE_L, SIDE_R}))
-    assert _term(_note(), CENTER, context, "w8_rule_violation") > 0
+    assert _term(_note(), CENTER, context, "w8_rule_violation") == 0.0
 
 
 # --- 후보와 선택 -------------------------------------------------------------
 
 
-def test_candidates_are_main_lanes_only_by_default():
-    """사이드로 옮기면 새끼손가락 문제를 다른 새끼손가락으로 옮기는 것뿐이다."""
+def test_candidates_use_every_main_finger_home_key_by_default():
     assert candidate_lanes(_note(), _context()) == sorted(
-        MAIN_LANES, key=lambda lane: abs(lane - SIDE_L)
+        ERGONOMIC_MAIN_LANES, key=lambda lane: abs(lane - SIDE_L)
     )
+
+
+def test_six_key_candidates_include_all_six_home_keys():
+    context = _context(key_mode=6)
+    assert candidate_lanes(_note(), context) == list(range(6))
 
 
 def test_candidates_can_include_every_lane_when_asked():
@@ -230,17 +234,17 @@ def test_candidates_can_include_every_lane_when_asked():
 
 def test_occupied_lanes_are_not_candidates():
     context = _context(occupied_lanes=frozenset({MAIN_1, MAIN_2}))
-    assert set(candidate_lanes(_note(), context)) == {MAIN_3, MAIN_4}
+    assert set(candidate_lanes(_note(), context)) == {SIDE_L, MAIN_3, MAIN_4, SIDE_R}
 
 
 def test_candidates_start_from_the_original_lane():
     note = _note(lane=SIDE_R)
-    assert candidate_lanes(note, _context())[0] == MAIN_4
+    assert candidate_lanes(note, _context())[0] == SIDE_R
 
 
-def test_best_lane_prefers_the_nearest_main_lane():
+def test_best_lane_can_keep_an_outer_home_key():
     lane, breakdown = best_lane(_note(lane=SIDE_L), _context())
-    assert lane == MAIN_1
+    assert lane == SIDE_L
     assert math.isfinite(breakdown.total)
 
 
@@ -251,7 +255,7 @@ def test_best_lane_avoids_a_lane_that_just_fired():
 
 
 def test_best_lane_is_none_when_every_main_lane_is_taken():
-    context = _context(occupied_lanes=frozenset(MAIN_LANES))
+    context = _context(occupied_lanes=frozenset(ERGONOMIC_MAIN_LANES))
     assert best_lane(_note(), context) is None
 
 
@@ -259,17 +263,15 @@ def test_infeasible_is_infinite():
     assert math.isinf(INFEASIBLE)
 
 
-def test_a_held_lane_is_unavailable_but_is_not_a_chord():
-    """앞선 사이드 롱노트가 지금 치는 반대쪽 사이드와 동시타로 오인되면
-    lane_rules 가 통과시킨 배치를 비용함수가 위반으로 매긴다."""
+def test_a_held_lane_is_unavailable_but_outer_home_chords_are_allowed():
     held = _context(difficulty="NORMAL", held_lanes=frozenset({SIDE_L}))
     chord = _context(difficulty="NORMAL", occupied_lanes=frozenset({SIDE_L}))
     note = _note(lane=SIDE_R)
     assert _term(note, SIDE_R, held, "w8_rule_violation") == 0.0
-    assert _term(note, SIDE_R, chord, "w8_rule_violation") > 0.0
+    assert _term(note, SIDE_R, chord, "w8_rule_violation") == 0.0
     assert math.isinf(placement_cost(note, SIDE_L, held).total)
 
 
 def test_held_lanes_are_not_candidates():
     context = _context(held_lanes=frozenset({MAIN_1, MAIN_2}))
-    assert set(candidate_lanes(_note(), context)) == {MAIN_3, MAIN_4}
+    assert set(candidate_lanes(_note(), context)) == {SIDE_L, MAIN_3, MAIN_4, SIDE_R}

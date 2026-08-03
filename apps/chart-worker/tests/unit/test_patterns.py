@@ -200,6 +200,14 @@ def test_one_handed_trill_stays_on_one_side():
     assert PatternKind.TRILL_ONE_HANDED in _kinds(notes)
 
 
+@pytest.mark.parametrize("finger_lane", [2, 4])
+def test_seven_key_center_trill_is_not_assigned_to_one_hand(finger_lane):
+    notes = _taps([(0, 3), (125, finger_lane), (250, 3), (375, finger_lane)])
+    kinds = _kinds(notes, key_mode=7)
+    assert PatternKind.TRILL_TWO_HANDED in kinds
+    assert PatternKind.TRILL_ONE_HANDED not in kinds
+
+
 def test_a_trill_needs_three_notes():
     notes = _taps([(0, 0), (125, 1)])
     kinds = _kinds(notes)

@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.postprocess.ergonomics import hand_of
 from chart_worker.postprocess.lane_conversion import convert_lanes
-from chart_worker.postprocess.lane_rules import check_lane_rules, hand_of
+from chart_worker.postprocess.lane_rules import check_lane_rules
 from chart_worker.postprocess.pattern_policy import Allow, allowance_of, quota_excesses
 from chart_worker.postprocess.patterns import (
     DENIM_MIN_NOTES,

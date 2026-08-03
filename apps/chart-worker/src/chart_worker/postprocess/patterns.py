@@ -15,7 +15,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import pairwise
 
+from chart_worker.postprocess.ergonomics import hand_of
 from chart_worker.schema.note import Chart, NoteEvent
+from chart_worker.schema.types import lane_semantics
 
 GRACE_DIVISOR = 6.0
 """1/6 스냅보다 빠른 서로 다른 레인 연속은 화음처럼 들린다."""
@@ -139,11 +141,6 @@ def _single_note_runs(rows: list[Row], *, beat_ms: float) -> list[list[Row]]:
     if len(current) > 1:
         runs.append(current)
     return runs
-
-
-def _hand_of(lane: int, key_mode: int) -> int:
-    """0 이 왼손, 1 이 오른손. 홀수 키의 가운데 레인은 오른손으로 센다."""
-    return 0 if lane < key_mode // 2 else 1
 
 
 def _close(a: float, b: float, tolerance: float = INTERVAL_TOLERANCE) -> bool:
@@ -388,6 +385,7 @@ def _stairs_instance(run: list[Row]) -> PatternInstance:
 def detect_trills(rows: list[Row], *, key_mode: int, beat_ms: float) -> list[PatternInstance]:
     """두 레인을 오가는 단노트 교대."""
     found = []
+    semantics = lane_semantics(key_mode)
     for singles in _single_note_runs(rows, beat_ms=beat_ms):
         index = 0
         while index + TRILL_MIN_NOTES <= len(singles):
@@ -402,7 +400,9 @@ def detect_trills(rows: list[Row], *, key_mode: int, beat_ms: float) -> list[Pat
                 end += 1
             length = end - index
             if length >= TRILL_MIN_NOTES:
-                same_hand = _hand_of(first, key_mode) == _hand_of(second, key_mode)
+                first_hand = hand_of(semantics[first])
+                second_hand = hand_of(semantics[second])
+                same_hand = first_hand is not None and first_hand is second_hand
                 kind = PatternKind.TRILL_ONE_HANDED if same_hand else PatternKind.TRILL_TWO_HANDED
                 found.append(
                     PatternInstance(

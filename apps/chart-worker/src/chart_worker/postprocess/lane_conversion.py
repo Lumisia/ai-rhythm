@@ -17,14 +17,13 @@ from chart_worker.postprocess.cost import (
     best_lane,
     placement_cost,
 )
+from chart_worker.postprocess.ergonomics import Hand, hand_of
 from chart_worker.postprocess.lane_rules import (
     ACCENT_STRENGTH,
-    Hand,
     Rule,
     Violation,
     check_lane_rules,
     finger_of,
-    hand_of,
 )
 from chart_worker.postprocess.lane_rules import FingerClass as Finger
 from chart_worker.schema.note import Chart, NoteEvent

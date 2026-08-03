@@ -11,18 +11,8 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from chart_worker.postprocess.lane_rules import (
-    ACCENT_STRENGTH,
-    BOTH_SIDES,
-    CENTER_WITH_BOTH_SIDES_FROM,
-    MAX_MAIN_WITH_CENTER_AND_BOTH_SIDES,
-    BothSidesPolicy,
-    FingerClass,
-    Hand,
-    finger_of,
-    hand_of,
-    jack_interval_ms,
-)
+from chart_worker.postprocess.ergonomics import ErgonomicRole, Hand, ergonomic_roles, hand_of
+from chart_worker.postprocess.lane_rules import jack_interval_for_lane
 from chart_worker.schema.note import NoteEvent
 from chart_worker.schema.types import LaneSemantic, lane_semantics
 
@@ -125,7 +115,7 @@ def _same_lane_repeat(note: NoteEvent, lane: int, context: PlacementContext) -> 
     last = context.last_time_by_lane.get(lane)
     if last is None:
         return 0.0
-    limit = jack_interval_ms(context.semantics[lane], context.difficulty)
+    limit = jack_interval_for_lane(context.key_mode, lane, context.difficulty)
     gap = note.time_ms - last
     if gap >= limit:
         return 0.0
@@ -183,56 +173,13 @@ def _band_mismatch(note: NoteEvent, lane: int, context: PlacementContext) -> flo
     return 0.0 if hand is wanted else 1.0
 
 
-def _both_sides_allowed(note: NoteEvent, context: PlacementContext) -> bool:
-    """S4 정책. lane_rules 의 판정과 같은 답을 내야 한다.
-
-    난이도를 보지 않으면 EXPERT 에서 합법인 사이드 화음까지 옮기고
-    이동 예산을 깎아먹는다.
-    """
-    policy = BOTH_SIDES[context.difficulty]
-    if policy is BothSidesPolicy.FREE:
-        return True
-    downbeat = context.row_is_downbeat or note.is_downbeat
-    if policy is BothSidesPolicy.DOWNBEAT_ONLY:
-        return downbeat
-    if policy is BothSidesPolicy.ACCENT_ONLY:
-        strong = note.onset_strength is not None and note.onset_strength >= ACCENT_STRENGTH
-        return downbeat or context.row_is_accent or strong
-    return False
-
-
 def _rule_violation(note: NoteEvent, lane: int, context: PlacementContext) -> float:
-    """S1 위반 여부. S4·C3 는 같은 시각 구성에서 나온다."""
+    """홈 포지션 손가락 역할에 따른 같은 레인 잭 위반 여부."""
     violations = 0.0
     last = context.last_time_by_lane.get(lane)
     if last is not None:
-        limit = jack_interval_ms(context.semantics[lane], context.difficulty)
+        limit = jack_interval_for_lane(context.key_mode, lane, context.difficulty)
         if note.time_ms - last < limit:
-            violations += 1.0
-
-    semantic = context.semantics[lane]
-    others = {context.semantics[other] for other in context.occupied_lanes}
-    if finger_of(semantic) is FingerClass.SIDE:
-        opposite = (
-            LaneSemantic.SIDE_RIGHT
-            if semantic is LaneSemantic.SIDE_LEFT
-            else LaneSemantic.SIDE_LEFT
-        )
-        if opposite in others and not _both_sides_allowed(note, context):
-            violations += 1.0
-    if (
-        semantic is LaneSemantic.CENTER
-        and {
-            LaneSemantic.SIDE_LEFT,
-            LaneSemantic.SIDE_RIGHT,
-        }
-        <= others
-    ):
-        mains = sum(1 for kind in others if finger_of(kind) is FingerClass.MAIN)
-        if (
-            mains > MAX_MAIN_WITH_CENTER_AND_BOTH_SIDES
-            or context.difficulty != CENTER_WITH_BOTH_SIDES_FROM
-        ):
             violations += 1.0
     return violations
 
@@ -281,16 +228,15 @@ def candidate_lanes(
 ) -> list[int]:
     """이동 후보. 같은 시각에 비어있는 레인만.
 
-    기본은 MAIN 만 후보로 둔다(Phase3 §7 3단계 — 사이드는 후보 제외).
-    사이드로 옮기면 새끼손가락 문제를 다른 새끼손가락으로 옮기는 것뿐이다.
-    가까운 레인부터 본다.
+    기본은 실제 홈 포지션에서 MAIN 손가락이 맡는 레인만 후보로 둔다.
+    6K는 6개 전부, 7K는 Space를 제외한 6개다. 가까운 레인부터 본다.
     """
-    semantics = context.semantics
+    roles = ergonomic_roles(context.key_mode)
     lanes = [
         lane
         for lane in range(context.key_mode)
         if lane not in context.unavailable_lanes
-        and (preference == "ANY" or finger_of(semantics[lane]) is FingerClass.MAIN)
+        and (preference == "ANY" or roles[lane] is ErgonomicRole.MAIN)
     ]
     return sorted(lanes, key=lambda lane: (abs(lane - note.origin_lane), lane))
 

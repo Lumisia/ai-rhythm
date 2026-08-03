@@ -5,10 +5,13 @@ from chart_worker.postprocess.lane_conversion import (
     MOVE_BUDGET,
     convert_lanes,
 )
-from chart_worker.postprocess.lane_rules import FingerClass as Finger
-from chart_worker.postprocess.lane_rules import Rule, check_lane_rules, finger_of
+from chart_worker.postprocess.lane_rules import (
+    ErgonomicRole,
+    Rule,
+    check_lane_rules,
+    ergonomic_roles,
+)
 from chart_worker.schema.note import NoteEvent
-from chart_worker.schema.types import lane_semantics
 
 SIDE_L, MAIN_1, MAIN_2, CENTER, MAIN_3, MAIN_4, SIDE_R = range(7)
 
@@ -21,11 +24,11 @@ def _convert(notes, difficulty="HARD", key_mode=7, **kwargs):
     return convert_lanes(notes, key_mode=key_mode, difficulty=difficulty, **kwargs)
 
 
-def _side_jack(count=4, gap=125, lane=SIDE_L):
+def _side_jack(count=4, gap=100, lane=SIDE_L):
     return [_tap(index * gap, lane) for index in range(count)]
 
 
-def _chart_with_side_jack(*, filler=60, jack=4, gap=125):
+def _chart_with_side_jack(*, filler=60, jack=4, gap=100):
     """합법적인 본문에 사이드 연타를 하나 심는다.
 
     이동 예산이 노트 수의 15% 라 짧은 채보로는 이동 자체를 검증할 수 없다.
@@ -70,18 +73,17 @@ def test_an_empty_chart_stays_empty():
 # --- 이동 -------------------------------------------------------------------
 
 
-def test_a_side_jack_is_moved_onto_main_lanes():
-    """125ms 사이드 연타는 HARD 의 새끼손가락 한계(250ms)를 넘는다."""
+def test_a_fast_outer_home_key_jack_is_moved_onto_main_finger_lanes():
+    """100ms 연타는 HARD의 MAIN 손가락 한계 120ms를 넘는다."""
     notes = _chart_with_side_jack()
     result = _convert(notes)
     assert result.moved_count > 0
-    semantics = lane_semantics(7)
     moved = {
-        finger_of(semantics[note.lane])
+        ergonomic_roles(7)[note.lane]
         for note in result.notes
         if note.origin_lane == SIDE_L and note.lane != SIDE_L
     }
-    assert moved <= {Finger.MAIN}
+    assert moved <= {ErgonomicRole.MAIN}
 
 
 def test_notes_are_moved_not_deleted():
@@ -92,7 +94,7 @@ def test_notes_are_moved_not_deleted():
     assert result.deleted_count == 0
 
 
-def test_the_side_jack_becomes_a_trill_without_a_trill_rule():
+def test_the_fast_outer_jack_becomes_a_trill_without_a_trill_rule():
     """w1 이 같은 레인 재사용을 눌러 교대 배분을 유도한다."""
     result = _convert(_chart_with_side_jack())
     lanes = [
@@ -125,40 +127,47 @@ def test_a_main_lane_jack_within_the_limit_is_untouched():
 
 
 def test_conversion_clears_the_finger_limit_violations():
-    notes = _chart_with_side_jack()
+    notes = _chart_with_side_jack(gap=100)
     before = check_lane_rules(notes, key_mode=7, difficulty="HARD")
     result = _convert(notes)
     assert before
     assert not [v for v in result.remaining_violations if v.rule is Rule.S1_JACK_INTERVAL]
 
 
-def test_both_sides_at_once_is_split_at_easy():
+def test_both_outer_home_keys_are_left_alone_at_easy():
     notes = _chart_with_side_jack(jack=0) + [_tap(1000, SIDE_L), _tap(1000, SIDE_R)]
     result = _convert(notes, difficulty="EASY")
-    semantics = lane_semantics(7)
-    sides = [n for n in result.notes if finger_of(semantics[n.lane]) is Finger.SIDE]
-    assert len(sides) < 2
+    lanes = {note.lane for note in result.notes if note.time_ms == 1000}
+    assert lanes == {SIDE_L, SIDE_R}
+    assert result.moved_count == 0
 
 
-def test_center_with_both_sides_is_broken_up_below_expert():
+def test_center_with_both_outer_home_keys_is_left_alone_below_expert():
     notes = _chart_with_side_jack(jack=0) + [
         _tap(1000, CENTER),
         _tap(1000, SIDE_L),
         _tap(1000, SIDE_R),
     ]
     result = _convert(notes, difficulty="HARD")
+    lanes = {note.lane for note in result.notes if note.time_ms == 1000}
+    assert lanes == {SIDE_L, CENTER, SIDE_R}
+    assert result.moved_count == 0
     assert not [v for v in result.remaining_violations if v.rule is Rule.C3_CENTER_WITH_BOTH_SIDES]
 
 
-def test_side_hold_density_is_relieved_by_moving_to_the_other_hand():
+def test_shift_side_hold_density_rule_is_inactive_for_home_position_keys():
     notes = _chart_with_side_jack(jack=0) + [
         NoteEvent(time_ms=0, lane=SIDE_L, kind="HOLD", duration_ms=1000),
         *(_tap(index * 200, MAIN_1) for index in range(1, 5)),
     ]
     before = check_lane_rules(notes, key_mode=7, difficulty="NORMAL")
     result = _convert(notes, difficulty="NORMAL")
-    assert [v.rule for v in before] == [Rule.S3_SIDE_HOLD_SAME_HAND]
-    assert len(result.remaining_violations) < len(before)
+    assert before == []
+    assert not [
+        violation
+        for violation in result.remaining_violations
+        if violation.rule is Rule.S3_SIDE_HOLD_SAME_HAND
+    ]
 
 
 def test_four_key_charts_need_no_conversion():
@@ -232,7 +241,7 @@ def test_no_two_notes_share_a_lane_at_the_same_time():
 def test_a_moved_note_never_lands_inside_an_active_hold():
     """롱노트가 물고 있는 레인은 그 끝까지 비어 있지 않다."""
     notes = [NoteEvent(time_ms=0, lane=MAIN_1, kind="HOLD", duration_ms=1000)]
-    notes += _side_jack(4, 125)
+    notes += _side_jack(4, 100)
     notes += [_tap(2000 + i * 400, MAIN_2 + i % 3) for i in range(60)]
     result = _convert(notes)
     hold = next(n for n in result.notes if n.kind == "HOLD")
@@ -265,8 +274,7 @@ def test_move_count_is_distinct_notes_not_operations(gap, count):
     assert result.moved_count == sum(1 for n in result.notes if n.lane != n.origin_lane)
 
 
-def test_an_expert_side_chord_is_left_alone():
-    """EXPERT 의 양쪽 사이드 동시는 합법이다. 옮기면 예산만 깎는다."""
+def test_an_expert_outer_home_key_chord_is_left_alone():
     notes = _chart_with_side_jack(jack=0) + [_tap(1000, SIDE_L), _tap(1000, SIDE_R)]
     result = _convert(notes, difficulty="EXPERT")
     lanes = {n.lane for n in result.notes if n.time_ms == 1000}
@@ -293,8 +301,8 @@ def test_a_shared_endpoint_is_deleted_once(strengths):
     """연타가 셋이면 가운데 노트가 앞뒤 두 위반에 동시에 얽힌다."""
     notes = [
         _tap(time_ms, SIDE_L, onset_strength=strength)
-        for time_ms, strength in zip((0, 100, 300), strengths)
+        for time_ms, strength in zip((0, 60, 120), strengths)
     ]
     result = _convert(notes, difficulty="HARD", budget=0.0)
     assert result.deleted_count == 1
-    assert [n.time_ms for n in result.notes] == [0, 300]
+    assert [n.time_ms for n in result.notes] == [0, 120]

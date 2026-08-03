@@ -28,6 +28,27 @@ def test_recovery_reduces_a_forbidden_easy_hand_to_an_allowed_jump():
     assert result.violations == ()
 
 
+def test_normal_seven_key_center_trill_is_not_forbidden_as_one_handed():
+    notes = [
+        NoteEvent(0, 3),
+        NoteEvent(250, 4),
+        NoteEvent(500, 3),
+        NoteEvent(750, 4),
+    ]
+    violations = find_violations(
+        notes,
+        key_mode=7,
+        difficulty="NORMAL",
+        duration_ms=2_000,
+        beat_ms=500.0,
+    )
+    assert not [
+        violation
+        for violation in violations
+        if violation.code is ViolationCode.PATTERN_FORBIDDEN
+    ]
+
+
 def test_recovery_keeps_only_the_stronger_duplicate_note():
     notes = [
         NoteEvent(500, 0, onset_strength=0.9),
