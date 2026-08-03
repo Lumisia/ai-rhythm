@@ -47,7 +47,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["strategy"] == "MAPPERATORINATOR_DIRECT"
     assert report["timingAuthority"] == "FAKE"
     assert report["noteMutationEnabled"] is False
-    assert report["attemptsPerChartMax"] == 2
+    assert report["attemptsPerChartMax"] == 3
     assert report["canonicalAudioSha256"] == manifest.audio.game.sha256
     assert report["timingReviewRequired"] is False
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage

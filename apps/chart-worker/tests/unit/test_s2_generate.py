@@ -176,7 +176,7 @@ def test_retries_only_the_failed_variant_with_the_next_seed(tmp_path: Path):
     assert all(not variant.attempt_errors for variant in variants[1:])
 
 
-def test_reports_both_errors_when_one_variant_exhausts_its_attempts(tmp_path: Path):
+def test_reports_all_errors_when_one_variant_exhausts_its_attempts(tmp_path: Path):
     prepared = _prepared(tmp_path)
 
     class AlwaysInvalid(RecordingGenerator):
@@ -198,6 +198,6 @@ def test_reports_both_errors_when_one_variant_exhausts_its_attempts(tmp_path: Pa
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert captured.value.context["key_mode"] == 4
     assert captured.value.context["difficulty"] == "EASY"
-    assert captured.value.context["seeds"] == [0, 12]
-    assert len(captured.value.context["errors"]) == 2
-    assert [request.seed for request, _ in generator.calls] == [0, 12]
+    assert captured.value.context["seeds"] == [0, 12, 24]
+    assert len(captured.value.context["errors"]) == 3
+    assert [request.seed for request, _ in generator.calls] == [0, 12, 24]

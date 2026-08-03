@@ -8,7 +8,7 @@
 ## 생성 계약
 
 정상 출력은 조합마다 한 번만 추론한다. 파싱 또는 구조 검증에 실패한 조합만 다른
-seed로 한 번 재시도하며, 이미 성공한 조합은 다시 만들지 않는다.
+seed로 최대 두 번 재시도하며, 이미 성공한 조합은 다시 만들지 않는다.
 
 | 난이도 | 요청 별 | descriptor |
 | --- | ---: | --- |
@@ -76,14 +76,14 @@ uv run --project apps/chart-worker chart-worker bench `
 주요 산출물은 다음과 같다.
 
 - `raw/<key>k-<difficulty>.osu`: 검증을 통과한 Mapperatorinator 원본
-- `raw/work/<variant>/attempt-1|2/`: 시도별 원문과 Hydra 로그
+- `raw/work/<variant>/attempt-1..3/`: 시도별 원문과 Hydra 로그
 - `charts/*.json`: 원본 노트와 timing을 보존한 chart-v1
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
 - `generation-report.json`: descriptor, 정밀도, 생성 시간, 노트·HOLD 수, 첫 노트와 최대 공백
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
-`generation-report.json`에는 `attemptsPerChartMax=2`, 실제 시도 횟수·seed·실패
+`generation-report.json`에는 `attemptsPerChartMax=3`, 실제 시도 횟수·seed·실패
 원문, `canonicalAudioSha256`와 채보별 `timingDiagnostics`가 기록된다. 분석은
 `audio/game.flac`에서 곡당 한 번 실행하고 12개 채보가 같은 onset 배열을 공유한다.
 30초 단위 구간과 전체 고유 노트 행을 평가하며, 전체 ±50ms precision 70% 미만,
@@ -92,7 +92,8 @@ uv run --project apps/chart-worker chart-worker bench `
 
 원본 osu!mania 키 수, X 좌표와 변환 레인 범위, 음원 길이 안의 TAP/HOLD 시각,
 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD, timing point를 검사한다. 실패 조합은
-한 번만 재시도하고 두 출력이 모두 잘못되면 실행을 실패시킨다.
+최대 두 번 재시도하고 세 출력이 모두 잘못되면 실행을 실패시킨다. 정상 출력의
+추론 횟수는 여전히 한 번이다.
 
 ## GPU 없는 구조 검사
 

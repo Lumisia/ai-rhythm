@@ -13,7 +13,7 @@ from chart_worker.validation.generated_chart import (
     validate_generated_chart,
 )
 
-MAX_VARIANT_ATTEMPTS = 2
+MAX_VARIANT_ATTEMPTS = 3
 _VARIANT_COUNT = len(KEY_MODES) * len(DIFFICULTIES)
 _RETRYABLE_GENERATION_CODES = {
     ErrorCode.CHART_GENERATION_FAILED,
