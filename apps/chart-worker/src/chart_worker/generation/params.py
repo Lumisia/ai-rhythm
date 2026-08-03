@@ -16,8 +16,8 @@ YEAR_RANGE = (2007, 2024)
 REQUESTED_STAR: dict[str, float] = {
     "EASY": 1.0,
     "NORMAL": 1.5,
-    "HARD": 3.5,
-    "EXPERT": 4.5,
+    "HARD": 2.0,
+    "EXPERT": 2.75,
 }
 """기존 시험곡의 과생성을 반영한 직접 요청값.
 
