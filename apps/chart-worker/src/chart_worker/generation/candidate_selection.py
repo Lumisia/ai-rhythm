@@ -113,6 +113,7 @@ def candidate_parameters(
             _exceeds_rating_limit(
                 previous.rating_error, MAX_RATING_ERROR[difficulty]
             )
+            or previous.long_gap_bars > MAX_LONG_GAP_BARS
             or previous.removed_ratio > MAX_REMOVED_RATIO
         ):
             requested_star = max(star_candidates[-1], previous_star - 0.5)
@@ -215,7 +216,7 @@ def longest_active_bar_gap(
     duration_ms: int,
     note_times: tuple[int, ...],
 ) -> float:
-    """Count the longest note-empty bar run bounded by active bars."""
+    """Count leading and internal note-empty bars while audio is active."""
     spans = _bar_spans(timing, duration_ms=duration_ms)
     if not spans or not onsets.onset_ms:
         return 0.0
@@ -233,15 +234,28 @@ def longest_active_bar_gap(
             if (index := _bar_index(time_ms, spans)) is not None
         }
     )
-    if len(active) < 2:
-        return 0.0
-
     occupied = {
         index
         for time_ms in set(note_times)
         if (index := _bar_index(time_ms, spans)) is not None
     }
-    longest = 0
+    onset_bars = [
+        index
+        for time_ms in onsets.onset_ms
+        if (index := _bar_index(time_ms, spans)) is not None
+    ]
+    if not onset_bars:
+        return 0.0
+    if occupied:
+        leading = max(0, min(occupied) - min(onset_bars))
+    elif active:
+        leading = max(0, active[-1] - min(onset_bars) + 1)
+    else:
+        leading = 0
+    if len(active) < 2:
+        return float(leading)
+
+    longest = leading
     run = 0
     for bar_index in range(active[0] + 1, active[-1]):
         if bar_index in occupied:

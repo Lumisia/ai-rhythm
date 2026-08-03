@@ -210,6 +210,18 @@ def test_third_candidate_lowers_the_unguided_request_by_half_a_star_when_too_har
     assert third_parameters.cfg_scale == 1.0
 
 
+def test_third_candidate_lowers_star_when_the_unguided_map_has_a_long_gap():
+    second = passing_quality(
+        long_gap_bars=2.1,
+        requested_star=4.5,
+        cfg_scale=1.0,
+    )
+
+    parameters = candidate_selection.candidate_parameters(0, 3, 3, second)
+
+    assert parameters.requested_star == 4.0
+
+
 def test_third_easy_candidate_lowers_star_when_unguided_removal_is_too_high():
     second = passing_quality(
         rating_error=0.16,
@@ -420,6 +432,66 @@ def test_onset_at_the_exact_seventy_fifth_percentile_makes_a_bar_active():
         duration_ms=4_000,
         note_times=(100, 1_100, 3_100),
     ) == 1.0
+
+
+def test_leading_note_empty_bars_are_counted_from_the_first_audio_onset():
+    timing = TimingCandidate(
+        source=TimingSource.BEAT_THIS_PIECEWISE,
+        points=(TimingPoint(0, 60.0, 1, 0),),
+        projected_beat_ms=(0, 1_000, 2_000, 3_000),
+        f1_20ms=1.0,
+        f1_50ms=1.0,
+        p95_abs_ms=0.0,
+        status=TimingStatus.PASS,
+        reasons=(),
+    )
+    strengths = np.zeros(41)
+    strengths[[1, 11, 21, 31]] = 1.0
+    onsets = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strengths,
+        band_strength=np.zeros((3, 41)),
+        onset_ms=(100, 1_100, 2_100, 3_100),
+        n_fft=100,
+    )
+
+    assert longest_active_bar_gap(
+        onsets=onsets,
+        timing=timing,
+        duration_ms=4_000,
+        note_times=(3_100,),
+    ) == 3.0
+
+
+def test_note_before_the_first_timing_bar_does_not_hide_a_leading_gap():
+    timing = TimingCandidate(
+        source=TimingSource.BEAT_THIS_PIECEWISE,
+        points=(TimingPoint(100, 60.0, 1, 0),),
+        projected_beat_ms=(100, 1_100, 2_100, 3_100),
+        f1_20ms=1.0,
+        f1_50ms=1.0,
+        p95_abs_ms=0.0,
+        status=TimingStatus.PASS,
+        reasons=(),
+    )
+    strengths = np.zeros(42)
+    strengths[[1, 2, 12, 22, 32]] = 1.0
+    onsets = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strengths,
+        band_strength=np.zeros((3, 42)),
+        onset_ms=(50, 150, 1_150, 2_150, 3_150),
+        n_fft=100,
+    )
+
+    assert longest_active_bar_gap(
+        onsets=onsets,
+        timing=timing,
+        duration_ms=4_100,
+        note_times=(50, 3_150),
+    ) == 3.0
 
 
 def test_active_but_note_empty_bars_remain_one_contiguous_gap():
