@@ -38,6 +38,7 @@ def main() -> None:
                 source=source,
                 output_dir=output_dir,
                 title="contract fixture",
+                generator="fake",
                 seed=7,
                 worker_version="fixture",
             ),

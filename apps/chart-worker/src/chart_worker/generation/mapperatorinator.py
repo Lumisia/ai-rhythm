@@ -13,10 +13,9 @@ from typing import Protocol
 from chart_worker.audio.runner import CommandError, CommandResult, CommandRunner
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
-from chart_worker.generation.osu_parser import parse_osu_file
+from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.generation.params import (
     GAMEMODE_MANIA,
-    MANIA_COLUMN_TEMPERATURE,
     PRECISION,
     GenerationRequest,
 )
@@ -34,6 +33,7 @@ class GeneratedChart:
     osu_text: str
     generator_name: str
     seed: int | None
+    bpm_events: tuple[OsuBpmEvent, ...] = ()
 
 
 class ChartGenerator(Protocol):
@@ -73,6 +73,17 @@ def _absolute(path: Path) -> Path:
     return path.resolve()
 
 
+def _hydra_path(path: Path) -> str:
+    """Quote a path as one Hydra string value.
+
+    Passing one subprocess argv item is not enough: Hydra parses spaces, parentheses and
+    brackets again using its override grammar. Mapperatorinator's own CLI examples wrap
+    Windows paths in single quotes inside the override value for this reason.
+    """
+    value = str(path.resolve())
+    return "'" + value.replace("'", "\\'") + "'"
+
+
 def build_command(
     config: WorkerConfig,
     request: GenerationRequest,
@@ -92,53 +103,26 @@ def build_command(
         INFERENCE_SCRIPT,
         "-cn",
         CONFIG_NAME,
-        f"audio_path={_absolute(request.audio_path)}",
-        f"output_path={_absolute(output_dir)}",
+        f"hydra.run.dir={_hydra_path(output_dir / '.hydra-run')}",
+        f"audio_path={_hydra_path(request.audio_path)}",
+        f"output_path={_hydra_path(output_dir)}",
         f"gamemode={GAMEMODE_MANIA}",
         f"keycount={request.key_mode}",
         f"difficulty={request.requested_star}",
         f"year={request.year}",
-        f"hold_note_ratio={request.hold_note_ratio}",
+        f"end_time={request.duration_ms}",
         f"cfg_scale={request.cfg_scale}",
-        f"mania_column_temperature={MANIA_COLUMN_TEMPERATURE}",
         f"descriptors={_hydra_list(request.descriptors)}",
-        f"negative_descriptors={_hydra_list(request.negative_descriptors if request.cfg_scale > 1.0 else ())}",
         f"precision={config.mapperatorinator_precision or PRECISION}",
         "export_osz=false",
+        "output_type=[TIMING,MAP]",
+        "hitsounded=false",
+        "fast_decoder_loop=true",
         "resnap_events=true",
     ]
     if request.seed is not None:
         argv.append(f"seed={request.seed}")
-    if request.timing_osu_path is not None:
-        # 참조 .osu 없이 in_context=[TIMING] 을 켜면 줄 타이밍이 없다.
-        argv.append(f"beatmap_path={_absolute(request.timing_osu_path)}")
-        argv.append("in_context=[TIMING]")
     return argv
-
-
-def build_super_timing_command(
-    config: WorkerConfig,
-    audio_path: Path,
-    output_dir: Path,
-) -> list[str]:
-    """Build the V32 timing-only inference command without a reference map."""
-    if config.mapperatorinator_python is None or config.mapperatorinator_home is None:
-        raise ValueError("mapperatorinator_python and mapperatorinator_home must be configured")
-
-    return [
-        str(_absolute(config.mapperatorinator_python)),
-        INFERENCE_SCRIPT,
-        "-cn",
-        CONFIG_NAME,
-        f"audio_path={_absolute(audio_path)}",
-        f"output_path={_absolute(output_dir)}",
-        f"gamemode={GAMEMODE_MANIA}",
-        f"precision={config.mapperatorinator_precision or PRECISION}",
-        "export_osz=false",
-        "output_type=[TIMING]",
-        "in_context=[NONE]",
-        "super_timing=true",
-    ]
 
 
 def _require_clean_output_dir(output_dir: Path) -> None:
@@ -218,32 +202,5 @@ class MapperatorinatorGenerator:
             osu_text=osu_path.read_text(encoding="utf-8-sig"),
             generator_name="mapperatorinator-v32",
             seed=request.seed,
+            bpm_events=beatmap.bpm_events,
         )
-
-
-@dataclass(frozen=True, slots=True)
-class MapperatorinatorTimingGenerator:
-    """Run V32 super timing and return its timing-only .osu response verbatim."""
-
-    config: WorkerConfig
-    run: RunCommand | None = None
-
-    def __call__(self, audio_path: Path, workdir: Path) -> str:
-        workdir.mkdir(parents=True, exist_ok=True)
-        _require_clean_output_dir(workdir)
-        run = self.run or CommandRunner(
-            shared_bin_dir=self.config.ffmpeg_shared_bin_dir,
-            timeout_sec=1800.0,
-            cwd=self.config.mapperatorinator_home,
-            env=inference_env(),
-        )
-        argv = build_super_timing_command(self.config, audio_path, workdir)
-        try:
-            run(argv)
-        except CommandError as error:
-            raise WorkerError(
-                ErrorCode.CHART_GENERATION_FAILED,
-                f"super timing inference failed: {error}",
-                context={"stderr": error.stderr[-2000:]},
-            ) from error
-        return find_generated_osu(workdir).read_text(encoding="utf-8-sig")

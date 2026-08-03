@@ -13,11 +13,8 @@ dependencies = [
 chart-worker = "chart_worker.cli:app"
 
 [project.optional-dependencies]
-# 분석 백엔드는 무겁다(torch). 핵심 패키지는 가볍게 두고 필요할 때만 켠다.
-analysis = ["beat-this>=0.1", "librosa>=0.10", "soundfile>=0.12"]
-# 스템 분리는 chart-gpu 에서 돈다. chart-cpu 와 배포가 갈리므로 따로 둔다.
-# soxr 은 demucs 가 주지 않는다. 48 kHz 를 htdemucs 의 44.1 kHz 로 옮기는 데 쓴다.
-stems = ["demucs>=4.0", "soundfile>=0.12", "soxr>=0.3"]
+# 생성 뒤 명시적으로 실행하는 onset 진단에만 사용한다.
+diagnostics = ["librosa>=0.10", "soundfile>=0.12"]
 
 [dependency-groups]
 dev = ["hypothesis>=6.100", "pytest>=8.2", "ruff>=0.5"]
@@ -34,8 +31,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "ffmpeg: 실제 FFmpeg 설치가 필요하다. 없으면 건너뛴다.",
-  "beat_this: beat-this 와 torch 가 필요하다. 없으면 건너뛴다.",
-  "librosa: librosa 가 필요하다. beat_this 를 빼도 이건 돌아야 한다.",
+  "librosa: librosa 진단 extra가 필요하다. 없으면 건너뛴다.",
 ]
 
 [tool.ruff]

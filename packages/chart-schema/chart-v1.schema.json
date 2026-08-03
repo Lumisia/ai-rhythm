@@ -4,7 +4,6 @@
       "additionalProperties": false,
       "properties": {
         "timeMs": {
-          "minimum": 0,
           "title": "Timems",
           "type": "integer"
         },

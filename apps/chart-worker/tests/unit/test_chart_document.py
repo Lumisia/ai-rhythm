@@ -118,6 +118,20 @@ def test_round_trip_through_json():
     assert ChartDocument.model_validate_json(document.to_json()) == document
 
 
+def test_preserves_a_negative_first_mapperatorinator_timing_point():
+    document = _document(
+        bpm_events=[
+            BpmEvent(time_ms=-120, bpm=120.0),
+            BpmEvent(time_ms=16000, bpm=100.0),
+        ],
+        bpm_source="MAPPERATORINATOR",
+    )
+    assert [(event.time_ms, event.bpm) for event in document.bpm_events] == [
+        (-120, 120.0),
+        (16000, 100.0),
+    ]
+
+
 def test_json_schema_is_generated_with_aliases():
     schema = chart_json_schema()
     assert "timeMs" in schema["$defs"]["ChartNote"]["properties"]
@@ -139,7 +153,6 @@ def test_document_is_frozen():
         ({"auto_play_onsets": [1200, 900]}, "autoPlayOnsets"),
         ({"auto_play_onsets": [900, 900]}, "autoPlayOnsets"),
         ({"auto_play_onsets": [2000]}, "autoPlayOnsets"),
-        ({"bpm_events": [BpmEvent(time_ms=10, bpm=150.0)]}, "bpmEvents must start"),
         (
             {
                 "bpm_events": [

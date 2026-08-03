@@ -1,13 +1,14 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from chart_worker.config import load_config
+from chart_worker.config import WorkerConfig, load_config
 
 
-def test_defaults_to_fake_generator(monkeypatch):
+def test_defaults_to_mapperatorinator_generator(monkeypatch):
     monkeypatch.delenv("CHART_GENERATOR", raising=False)
-    assert load_config().chart_generator == "fake"
+    assert load_config().chart_generator == "mapperatorinator"
 
 
 def test_reads_mapperatorinator_paths(monkeypatch):
@@ -20,6 +21,16 @@ def test_reads_mapperatorinator_paths(monkeypatch):
 def test_precision_defaults_to_fp16(monkeypatch):
     monkeypatch.delenv("MAPPERATORINATOR_PRECISION", raising=False)
     assert load_config().mapperatorinator_precision == "fp16"
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+def test_supported_mapperatorinator_precisions_are_accepted(precision):
+    assert WorkerConfig(mapperatorinator_precision=precision).mapperatorinator_precision == precision
+
+
+def test_unknown_mapperatorinator_precision_is_rejected():
+    with pytest.raises(ValidationError):
+        WorkerConfig(mapperatorinator_precision="fp32")
 
 
 @pytest.mark.parametrize(

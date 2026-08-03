@@ -38,23 +38,11 @@ def test_generate_cli_writes_worker_error_as_json(monkeypatch, tmp_path: Path):
     )
 
     assert result.exit_code == 1
-    payload = json.loads(result.stderr)
-    assert payload == {
+    assert json.loads(result.stderr) == {
         "code": "CHART_GENERATION_FAILED",
         "message": "generator stopped",
         "context": {"key_mode": 4},
     }
-
-
-def test_postprocess_cli_rejects_the_input_directory_as_output(tmp_path: Path):
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    result = runner.invoke(
-        app,
-        ["postprocess", str(run_dir), "--out", str(run_dir)],
-    )
-    assert result.exit_code == 2
-    assert "must be different" in result.output
 
 
 def test_bench_cli_is_exposed():
@@ -63,11 +51,9 @@ def test_bench_cli_is_exposed():
     assert "--generator" in result.output
 
 
-def test_generate_cli_passes_human_reference_onsets_to_pipeline(monkeypatch, tmp_path: Path):
+def test_generate_cli_defaults_to_mapperatorinator(monkeypatch, tmp_path: Path):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
-    reference = tmp_path / "reference.json"
-    reference.write_text("{}", encoding="utf-8")
     captured = {}
 
     def succeed(options):
@@ -76,26 +62,22 @@ def test_generate_cli_passes_human_reference_onsets_to_pipeline(monkeypatch, tmp
 
     monkeypatch.setattr("chart_worker.cli.run_pipeline", succeed)
     result = runner.invoke(
-        app,
-        [
-            "generate",
-            str(source),
-            "--out",
-            str(tmp_path / "run"),
-            "--reference-onsets",
-            str(reference),
-        ],
+        app, ["generate", str(source), "--out", str(tmp_path / "run")]
     )
 
     assert result.exit_code == 0
-    assert captured["options"].reference_onsets_path == reference
+    assert captured["options"].generator == "mapperatorinator"
 
 
-def test_bench_cli_passes_human_reference_onsets_to_pipeline(monkeypatch, tmp_path: Path):
+def test_generate_cli_does_not_offer_destructive_overwrite():
+    result = runner.invoke(app, ["generate", "--help"])
+    assert result.exit_code == 0
+    assert "--overwrite" not in result.output
+
+
+def test_bench_cli_can_select_the_gpu_free_fake_generator(monkeypatch, tmp_path: Path):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
-    reference = tmp_path / "reference.json"
-    reference.write_text("{}", encoding="utf-8")
     captured = {}
 
     def succeed(options):
@@ -110,10 +92,15 @@ def test_bench_cli_passes_human_reference_onsets_to_pipeline(monkeypatch, tmp_pa
             str(source),
             "--out",
             str(tmp_path / "run"),
-            "--reference-onsets",
-            str(reference),
+            "--generator",
+            "fake",
         ],
     )
 
     assert result.exit_code == 0
-    assert captured["options"].reference_onsets_path == reference
+    assert captured["options"].generator == "fake"
+
+
+def test_removed_postprocess_command_is_not_exposed():
+    result = runner.invoke(app, ["postprocess", "run", "--out", "output"])
+    assert result.exit_code == 2

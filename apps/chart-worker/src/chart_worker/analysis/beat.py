@@ -1,13 +1,8 @@
-"""Beat This! 비트 격자.
-
-Beat This! 는 노트를 만들지 않는다. 비트·다운비트·BPM 만 낸다.
-노트를 만드는 도구는 Mapperatorinator 하나뿐이다.
-"""
+"""선택적 진단 백엔드의 비트 격자 유틸리티."""
 
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
@@ -189,25 +184,3 @@ def analyze_beats(signal: AudioSignal, *, backend: BeatBackend) -> BeatGrid:
             f"beat grid is unusable: {error}",
             context={"beat_count": int(np.asarray(beat_sec).size)},
         ) from error
-
-
-def beat_this_backend(
-    *,
-    checkpoint: str = "final0",
-    device: str = "cpu",
-    **kwargs: Any,
-) -> BeatBackend:
-    """Beat This! 를 백엔드로 감싼다.
-
-    dbn 을 켜지 않는다. DBN 후처리는 madmom 이 필요하고 PyPI 판이
-    Python<3.10 과 numpy<1.20 만 지원해 git 설치를 강요한다. Beat This!
-    논문의 요지가 DBN 없이도 정확하다는 것이다.
-    """
-    from beat_this.inference import Audio2Beats
-
-    model = Audio2Beats(checkpoint_path=checkpoint, device=device, dbn=False, **kwargs)
-
-    def run(signal: np.ndarray, sample_rate_hz: int) -> tuple[np.ndarray, np.ndarray]:
-        return model(signal, sample_rate_hz)
-
-    return run

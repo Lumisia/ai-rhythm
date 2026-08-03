@@ -1,30 +1,20 @@
 from pathlib import Path
 
-import numpy as np
-
-from chart_worker.analysis.audio_io import AudioSignal
-from chart_worker.analysis.beat import BeatGrid
-from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
-from chart_worker.generation.candidate_selection import CandidateParameters
 from chart_worker.generation.mapperatorinator import GeneratedChart
-from chart_worker.generation.osu_parser import parse_osu_file
+from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.schema.note import NoteEvent
-from chart_worker.stages.s2_generate import run_generation, run_generation_variant
-from chart_worker.stages.types import AnalysisStageResult
-from tests.support import timing_candidate
+from chart_worker.stages.s2_generate import run_generation
+from chart_worker.stages.types import PreparedAudio
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def _analysis(tmp_path: Path) -> AnalysisStageResult:
+def _prepared(tmp_path: Path) -> PreparedAudio:
     audio_path = tmp_path / "audio" / "game.flac"
     audio_path.parent.mkdir(parents=True)
     audio_path.write_bytes(b"audio")
-    timing_path = tmp_path / "analysis" / "timing.osu"
-    timing_path.parent.mkdir(parents=True)
-    timing_path.write_text("timing", encoding="utf-8")
-    return AnalysisStageResult(
+    return PreparedAudio(
         normalized=NormalizedAudio(
             audio_path,
             "audio-profile-v1",
@@ -40,12 +30,6 @@ def _analysis(tmp_path: Path) -> AnalysisStageResult:
             0.0,
             "LOUDNESS",
         ),
-        signal=AudioSignal(np.zeros((96_000, 2)), 48_000),
-        beat_grid=BeatGrid((0, 500, 1_000, 1_500), (0, 2), 120.0, 4, 0.0, 4, 0, 0.0, 0.0),
-        onsets=OnsetAnalysis(48_000, 512, np.ones(2), np.ones((3, 2)), (500,)),
-        timing_candidate=timing_candidate(),
-        timing_osu_path=timing_path,
-        timing_quality_report_path=tmp_path / "analysis" / "timing-quality-v1.json",
     )
 
 
@@ -61,13 +45,14 @@ class RecordingGenerator:
             osu_text="",
             generator_name="recording-fake",
             seed=request.seed,
+            bpm_events=(OsuBpmEvent(0, 120.0),),
         )
 
 
 def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path):
-    analysis = _analysis(tmp_path)
+    prepared = _prepared(tmp_path)
     generator = RecordingGenerator()
-    variants = run_generation(analysis, tmp_path, generator=generator, seed=17)
+    variants = run_generation(prepared, tmp_path, generator=generator, seed=17)
 
     assert {(variant.key_mode, variant.difficulty) for variant in variants} == {
         (key_mode, difficulty)
@@ -88,19 +73,23 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
         )
     ]
     assert len(set(workdirs)) == 12
-    assert all("candidates" in workdir.parts for workdir in workdirs)
-    assert all("attempt-1" in workdir.parts for workdir in workdirs)
-    assert all(request.timing_osu_path == analysis.timing_osu_path for request in requests)
+    assert all(workdir.parent.name == "work" for workdir in workdirs)
+    assert all("candidates" not in workdir.parts for workdir in workdirs)
     assert all(request.duration_ms == 2_000 for request in requests)
-    assert all(request.cfg_scale == 1.25 for request in requests)
-    assert all(request.negative_descriptors for request in requests)
+    assert all(request.cfg_scale == 1.0 for request in requests)
+    assert all(len(request.descriptors) == 1 for request in requests)
+    assert [variant.raw_osu_path.name for variant in variants] == [
+        f"{key_mode}k-{difficulty.lower()}.osu"
+        for key_mode in (4, 6, 7)
+        for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+    ]
     assert all(
         parse_osu_file(variant.raw_osu_path).key_mode == variant.key_mode for variant in variants
     )
 
 
 def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
-    analysis = _analysis(tmp_path)
+    prepared = _prepared(tmp_path)
 
     class OriginalGenerator:
         def __init__(self):
@@ -114,40 +103,14 @@ def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
             )
             self.texts.append(text)
             return GeneratedChart(
-                [NoteEvent(500, 0)], request.key_mode, text, "original", request.seed
+                [NoteEvent(500, 0)],
+                request.key_mode,
+                text,
+                "original",
+                request.seed,
+                (OsuBpmEvent(0, 120.0),),
             )
 
     generator = OriginalGenerator()
-    variants = run_generation(analysis, tmp_path, generator=generator, seed=1)
+    variants = run_generation(prepared, tmp_path, generator=generator, seed=1)
     assert variants[0].raw_osu_path.read_text(encoding="utf-8") == generator.texts[0]
-
-
-def test_generation_attempts_use_unique_raw_and_work_directories(tmp_path: Path):
-    analysis = _analysis(tmp_path)
-    generator = RecordingGenerator()
-
-    first = run_generation_variant(
-        analysis,
-        tmp_path,
-        generator=generator,
-        key_mode=4,
-        difficulty="NORMAL",
-        attempt=1,
-        parameters=CandidateParameters(seed=19, requested_star=3.0, cfg_scale=1.0),
-    )
-    second = run_generation_variant(
-        analysis,
-        tmp_path,
-        generator=generator,
-        key_mode=4,
-        difficulty="NORMAL",
-        attempt=2,
-        parameters=CandidateParameters(seed=10_019, requested_star=3.0, cfg_scale=1.0),
-    )
-
-    assert first.raw_osu_path != second.raw_osu_path
-    assert first.raw_osu_path.parent.name == "attempt-1"
-    assert second.raw_osu_path.parent.name == "attempt-2"
-    assert generator.calls[0][1] != generator.calls[1][1]
-    assert first.raw_osu_path.is_file()
-    assert second.raw_osu_path.is_file()

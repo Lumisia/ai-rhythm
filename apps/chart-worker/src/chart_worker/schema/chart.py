@@ -35,7 +35,7 @@ class CamelModel(BaseModel):
 
 
 class BpmEvent(CamelModel):
-    time_ms: int = Field(ge=0)
+    time_ms: int
     bpm: float = Field(gt=0)
 
 
@@ -184,8 +184,6 @@ class ChartDocument(CamelModel):
                 hold_end_by_lane[note.lane] = note.end_ms
 
     def _check_bpm_events(self) -> None:
-        if self.bpm_events[0].time_ms != 0:
-            raise ValueError("bpmEvents must start at timeMs 0")
         times = [event.time_ms for event in self.bpm_events]
         if times != sorted(set(times)):
             raise ValueError("bpmEvents must be sorted by timeMs without duplicates")

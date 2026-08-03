@@ -7,10 +7,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class WorkerConfig(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    chart_generator: Literal["mapperatorinator", "fake"] = "fake"
+    chart_generator: Literal["mapperatorinator", "fake"] = "mapperatorinator"
     mapperatorinator_home: Path | None = None
     mapperatorinator_python: Path | None = None
-    mapperatorinator_precision: str = "fp16"
+    mapperatorinator_precision: Literal["fp16", "bf16"] = "fp16"
     ffmpeg_bin: Path = Path("ffmpeg")
     ffmpeg_shared_bin_dir: Path | None = None
     storage_local_root: Path = Path(".data/storage")

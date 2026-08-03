@@ -2,32 +2,28 @@ from pathlib import Path
 
 import pytest
 
-from chart_worker.generation.osu_parser import parse_osu_file, parse_osu_mania, parse_osu_timing
+from chart_worker.generation.osu_parser import parse_osu_file, parse_osu_mania
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "mini-4k.osu"
 
 
-def test_timing_parser_does_not_require_mania_difficulty_or_hit_objects():
-    """A timing-only Mapperatorinator response has no playable-map sections."""
-    text = "osu file format v14\n\n[TimingPoints]\n120,731.707317,4,2,0,60,1,0\n"
-
-    points = parse_osu_timing(text)
-
-    assert len(points) == 1
-    assert points[0].time_ms == 120
-    assert points[0].bpm == pytest.approx(82.0, abs=0.001)
-    assert points[0].meter == 4
-    assert points[0].start_beat_index is None
-
-
-def test_timing_parser_ignores_inherited_points():
-    """Only uninherited timing points define BPM; inherited points are slider velocity."""
+def test_mania_parser_preserves_raw_uninherited_timing_as_an_immutable_tuple():
     text = (
-        "osu file format v14\n\n[TimingPoints]\n"
-        "0,500,4,2,0,60,1,0\n250,-100,4,2,0,60,0,0\n"
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
+        "\n[TimingPoints]\n"
+        "-120,500,4,2,0,60,1,0\n"
+        "500,-100,4,2,0,60,0,0\n"
+        "16000,600,4,2,0,60,1,0\n"
+        "\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n"
     )
 
-    assert [(point.time_ms, point.bpm) for point in parse_osu_timing(text)] == [(0, 120.0)]
+    beatmap = parse_osu_mania(text)
+
+    assert isinstance(beatmap.bpm_events, tuple)
+    assert [(event.time_ms, round(event.bpm, 3)) for event in beatmap.bpm_events] == [
+        (-120, 120.0),
+        (16000, 100.0),
+    ]
 
 
 def test_parses_mania_fixture():

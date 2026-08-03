@@ -1,7 +1,6 @@
-"""librosa onset 강도와 대역 분석.
+"""생성 뒤 명시적으로 실행하는 librosa onset 진단 유틸리티.
 
-librosa 는 노트를 만들지 않는다. 점수를 매긴다. 난이도 solver 가 어떤
-노트를 뺄지 정할 때 쓰는 순위 함수이고, 키음 어택 스냅용 onset 목록이다.
+진단은 원본 채보를 설명할 뿐 노트를 선택·삭제하거나 timing을 바꾸지 않는다.
 """
 
 import dataclasses

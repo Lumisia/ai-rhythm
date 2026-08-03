@@ -1,21 +1,14 @@
-"""Mapperatorinator 생성 파라미터.
-
-Mapperatorinator 는 노트를 만드는 유일한 도구다. Beat This! · librosa ·
-Demucs 는 절대 노트를 만들지 않는다.
-"""
+"""Mapperatorinator 직접 생성 파라미터."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from chart_worker.schema.note import coerce_int
-from chart_worker.schema.types import DIFFICULTIES, KEY_MODES, TARGET_HOLD_RATIO
+from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
 GAMEMODE_MANIA = 3
 PRECISION = "fp16"
 """v32.yaml 기본값은 bf16 이다. Turing(sm_75)은 bf16 을 지원하지 않는다."""
-
-MANIA_COLUMN_TEMPERATURE = 0.8
-"""레인 선택 샘플링 온도. 패턴 다양성에 직결된다."""
 
 DEFAULT_YEAR = 2023
 YEAR_RANGE = (2007, 2024)
@@ -26,31 +19,18 @@ REQUESTED_STAR: dict[str, float] = {
     "HARD": 3.5,
     "EXPERT": 4.5,
 }
-"""모든 난이도는 실제 곡의 과생성을 반영해 solver 목표 이하에서 시작한다.
+"""기존 시험곡의 과생성을 반영한 직접 요청값.
 
-solver 는 내리는 방향으로만 동작한다. 없는 시각에 노트를 만들면 타이밍
-불변 위반이므로 솎을 재료가 필요하지만, 실제 시험곡에서는 모든 난이도가
-요청보다 높게 생성됐다. EASY는 1.0★, NORMAL은 1.5★, HARD는 3.5★,
-EXPERT는 4.5★에서 시작한다.
+생성 뒤 난이도 solver로 노트를 삭제하지 않으므로 요청 단계에서만 밀도를
+조절한다. 결과 난이도는 보고서와 수동 플레이로 확인한다.
 """
-
-HOLD_NOTE_RATIO = TARGET_HOLD_RATIO
-"""생성이 요청하는 롱노트 비율. 난이도 solver 가 내리는 바닥과 같은 값이라
-schema.types 에 둔다."""
 
 # style/clean 은 존재하지 않는 태그다. 아래는 전부 실존 mania 태그다.
 DESCRIPTORS: dict[str, tuple[str, ...]] = {
-    "EASY": ("expression/simple", "style/mixed rice"),
-    "NORMAL": ("style/mixed rice", "style/jumpstream"),
-    "HARD": ("style/jumpstream", "style/handstream", "style/LN coordination"),
-    "EXPERT": ("style/handstream", "style/chordstream", "tech/technical hybrid"),
-}
-
-NEGATIVE_DESCRIPTORS: dict[str, tuple[str, ...]] = {
-    "EASY": ("style/chordjack", "style/longjack"),
-    "NORMAL": ("style/chordjack", "skillset/speedjack"),
-    "HARD": ("style/dump", "style/chordjack", "skillset/wristjack"),
-    "EXPERT": ("style/dump", "style/longjack", "style/o2jam"),
+    "EASY": ("expression/simple",),
+    "NORMAL": ("style/mixed rice",),
+    "HARD": ("style/generic hybrid",),
+    "EXPERT": ("tech/technical hybrid",),
 }
 
 
@@ -61,14 +41,9 @@ class GenerationRequest:
     difficulty: str
     year: int = DEFAULT_YEAR
     seed: int | None = None
-    timing_osu_path: Path | None = None
-    """Beat This! 격자를 담은 참조 .osu. 있으면 in_context=[TIMING] 을 켠다."""
-
     cfg_scale: float = 1.0
     descriptors: tuple[str, ...] = ()
-    negative_descriptors: tuple[str, ...] = ()
     requested_star: float = field(default=0.0)
-    hold_note_ratio: float = field(default=0.0)
     duration_ms: int = 0
     """표준화 단계가 이미 재놨다. fake 생성기와 start/end 지정에 쓴다."""
 
@@ -80,25 +55,14 @@ class GenerationRequest:
             raise ValueError(f"unsupported key_mode: {self.key_mode}")
         if self.difficulty not in DIFFICULTIES:
             raise ValueError(f"unsupported difficulty: {self.difficulty}")
+        if self.duration_ms <= 0:
+            raise ValueError("duration_ms must be positive")
         if not YEAR_RANGE[0] <= self.year <= YEAR_RANGE[1]:
             raise ValueError(f"year must be within {YEAR_RANGE}, got {self.year}")
 
         if not self.descriptors:
             object.__setattr__(self, "descriptors", DESCRIPTORS[self.difficulty])
-        if self.cfg_scale <= 1.0:
-            object.__setattr__(self, "negative_descriptors", ())
-        elif not self.negative_descriptors:
-            object.__setattr__(self, "negative_descriptors", NEGATIVE_DESCRIPTORS[self.difficulty])
+        if self.cfg_scale != 1.0:
+            raise ValueError("direct generation requires cfg_scale=1.0")
         if self.requested_star <= 0:
             object.__setattr__(self, "requested_star", REQUESTED_STAR[self.difficulty])
-        if self.hold_note_ratio <= 0:
-            object.__setattr__(self, "hold_note_ratio", HOLD_NOTE_RATIO[self.difficulty])
-
-        # cfg_scale > 1 이면 classifier-free guidance 가 두 목록을 짝지어 쓴다.
-        # 개수가 다르면 조용히 어긋난 조건으로 생성된다.
-        if self.cfg_scale > 1.0 and len(self.descriptors) != len(self.negative_descriptors):
-            raise ValueError(
-                "cfg_scale > 1 requires the same number of descriptors and "
-                f"negative_descriptors ({len(self.descriptors)} vs "
-                f"{len(self.negative_descriptors)})"
-            )

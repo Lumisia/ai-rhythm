@@ -10,9 +10,10 @@ from pathlib import Path
 
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedChart
-from chart_worker.generation.osu_parser import parse_osu_file
+from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.generation.params import GenerationRequest
 from chart_worker.schema.note import Chart, NoteEvent
+from chart_worker.schema.types import TARGET_HOLD_RATIO
 
 NOTES_PER_BEAT: dict[str, int] = {
     "EASY": 1,
@@ -24,21 +25,9 @@ NOTES_PER_BEAT: dict[str, int] = {
 MIN_HOLD_MS = 60
 
 
-def _timing_of(request: GenerationRequest) -> tuple[int, float]:
-    """참조 .osu 에서 첫 박 시각과 한 박 길이를 읽는다."""
-    if request.timing_osu_path is None:
-        raise WorkerError(
-            ErrorCode.CHART_GENERATION_FAILED,
-            "the fake generator needs a timing .osu to place notes on",
-        )
-    beatmap = parse_osu_file(request.timing_osu_path)
-    if not beatmap.bpm_events:
-        raise WorkerError(
-            ErrorCode.CHART_GENERATION_FAILED,
-            "the timing .osu has no uninherited timing point",
-        )
-    event = beatmap.bpm_events[0]
-    return event.time_ms, 60_000.0 / event.bpm
+def _timing_of() -> tuple[int, float]:
+    """GPU 없는 구조 테스트용 고정 120 BPM 격자."""
+    return 0, 500.0
 
 
 def synthesize_chart(request: GenerationRequest) -> Chart:
@@ -48,7 +37,7 @@ def synthesize_chart(request: GenerationRequest) -> Chart:
             ErrorCode.CHART_GENERATION_FAILED,
             "the fake generator needs duration_ms",
         )
-    offset_ms, beat_ms = _timing_of(request)
+    offset_ms, beat_ms = _timing_of()
     step_ms = beat_ms / NOTES_PER_BEAT[request.difficulty]
     # 문자열이 낀 튜플의 hash() 는 PYTHONHASHSEED 로 소금이 쳐져 프로세스마다
     # 다르다. 골든 테스트가 재현되려면 시드가 프로세스에 무관해야 한다.
@@ -68,7 +57,7 @@ def synthesize_chart(request: GenerationRequest) -> Chart:
         lane = rng.randrange(request.key_mode)
         if time_ms < lane_free_at[lane]:
             continue
-        if rng.random() < request.hold_note_ratio:
+        if rng.random() < TARGET_HOLD_RATIO[request.difficulty]:
             duration_ms = max(MIN_HOLD_MS, round(step_ms))
             if time_ms + duration_ms >= request.duration_ms:
                 continue
@@ -101,6 +90,7 @@ class FakeGenerator:
                 osu_text=self.fixture_path.read_text(encoding="utf-8-sig"),
                 generator_name="fake-fixture",
                 seed=request.seed,
+                bpm_events=beatmap.bpm_events,
             )
 
         notes = synthesize_chart(request)
@@ -110,4 +100,5 @@ class FakeGenerator:
             osu_text="",
             generator_name="fake-synthetic",
             seed=request.seed,
+            bpm_events=(OsuBpmEvent(time_ms=0, bpm=120.0),),
         )
