@@ -24,6 +24,7 @@ MAX_RATING_ERROR = {
 MAX_REMOVED_RATIO = 0.45
 MIN_AUDIO_ONSET_PRECISION = 0.70
 AUDIO_ONSET_WINDOW_MS = 50
+MIN_REQUESTED_STAR = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +78,11 @@ def requested_star_candidates(difficulty: str) -> tuple[float, float, float]:
     """Return the bounded half-star schedule for one difficulty."""
     _require_difficulty(difficulty)
     current = REQUESTED_STAR[difficulty]
-    return (current, current - 0.5, current - 1.0)
+    return (
+        current,
+        max(MIN_REQUESTED_STAR, current - 0.5),
+        max(MIN_REQUESTED_STAR, current - 1.0),
+    )
 
 
 def candidate_parameters(

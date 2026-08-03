@@ -68,7 +68,7 @@ def _request(timing_osu=None, **overrides):
 
 def test_real_song_calibrated_requested_stars_are_explicit():
     assert REQUESTED_STAR == {
-        "EASY": 1.5,
+        "EASY": 1.0,
         "NORMAL": 1.5,
         "HARD": 3.5,
         "EXPERT": 4.5,
@@ -80,8 +80,8 @@ def test_real_song_calibration_compensates_for_overgeneration(difficulty):
     assert REQUESTED_STAR[difficulty] < TARGET_RATING[difficulty]
 
 
-def test_easy_request_matches_the_solver_target_after_real_candidate_calibration():
-    assert REQUESTED_STAR["EASY"] == TARGET_RATING["EASY"] == 1.5
+def test_easy_request_compensates_for_real_song_overgeneration():
+    assert REQUESTED_STAR["EASY"] < TARGET_RATING["EASY"]
 
 
 def test_defaults_are_filled_from_the_difficulty_tables():

@@ -164,8 +164,8 @@ def test_normal_requested_star_candidates_use_the_real_song_calibration():
     assert candidate_selection.requested_star_candidates("NORMAL") == (1.5, 1.0, 0.5)
 
 
-def test_easy_requested_star_candidates_start_at_the_calibrated_one_point_five():
-    assert candidate_selection.requested_star_candidates("EASY") == (1.5, 1.0, 0.5)
+def test_easy_requested_star_candidates_use_the_real_song_calibration_and_floor():
+    assert candidate_selection.requested_star_candidates("EASY") == (1.0, 0.5, 0.5)
 
 
 def test_hard_and_expert_requested_stars_use_real_song_calibration():
@@ -214,7 +214,7 @@ def test_third_easy_candidate_lowers_star_when_unguided_removal_is_too_high():
     second = passing_quality(
         rating_error=0.16,
         removed_ratio=0.4501,
-        requested_star=1.5,
+        requested_star=1.0,
         cfg_scale=1.0,
     )
 
@@ -222,7 +222,7 @@ def test_third_easy_candidate_lowers_star_when_unguided_removal_is_too_high():
 
     assert third_parameters == CandidateParameters(
         seed=20_000,
-        requested_star=1.0,
+        requested_star=0.5,
         cfg_scale=1.0,
     )
 
