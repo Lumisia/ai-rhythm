@@ -31,7 +31,9 @@ from chart_worker.generation.candidate_selection import (
     CandidateParameters,
     CandidateQuality,
     candidate_parameters,
+    measured_tier,
     needs_retry,
+    rating_error_exceeds,
     select_candidate_index,
 )
 from chart_worker.generation.fake import FakeGenerator
@@ -488,8 +490,13 @@ def _candidate_failure_reasons(
         return reasons
     if quality.long_gap_bars > MAX_LONG_GAP_BARS:
         reasons.append("long gap exceeds two bars")
-    if abs(quality.rating_error) >= MAX_RATING_ERROR:
-        reasons.append("rating error is at least 0.35")
+    if rating_error_exceeds(quality.rating_error, difficulty=difficulty):
+        reasons.append(
+            f"rating error exceeds {MAX_RATING_ERROR[difficulty]:.2f}"
+        )
+    actual_tier = measured_tier(difficulty, quality.rating_error)
+    if actual_tier != difficulty:
+        reasons.append(f"measured tier is {actual_tier}, expected {difficulty}")
     if quality.removed_ratio > MAX_REMOVED_RATIO:
         reasons.append("total removal ratio exceeds 0.45")
     if quality.playability_violations > 0:
@@ -564,6 +571,7 @@ def _quality_payload(
         "playabilityViolationCount": quality.playability_violations,
         "targetRating": target_rating,
         "actualRating": actual_rating,
+        "actualTier": evaluation.result.document.metrics.project_tier,
         "signedRatingError": signed_rating_error,
         "absoluteRatingError": abs(signed_rating_error),
         "audioOnsetPrecision": _precision_payload(quality.audio_onset_precision),
@@ -581,6 +589,7 @@ def _quality_payload(
         "failure_metrics": {
             "long_gap_bars": quality.long_gap_bars,
             "rating_error": quality.rating_error,
+            "actual_tier": evaluation.result.document.metrics.project_tier,
             "removed_ratio": quality.removed_ratio,
             "audio_onset_precision": _precision_payload(
                 quality.audio_onset_precision
@@ -759,6 +768,7 @@ def _generation_report(
                 "playabilityPasses": selected_payload["playabilityPasses"],
                 "targetRating": selected_payload["targetRating"],
                 "actualRating": selected_payload["actualRating"],
+                "actualTier": selected_payload["actualTier"],
                 "signedRatingError": selected_payload["signedRatingError"],
                 "absoluteRatingError": selected_payload["absoluteRatingError"],
                 "reachedTarget": result.reports.difficulty.reached_target,

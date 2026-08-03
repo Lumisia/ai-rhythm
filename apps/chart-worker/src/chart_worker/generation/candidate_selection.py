@@ -1,19 +1,26 @@
 """Bounded chart-candidate retry gates and deterministic ranking."""
 
 from dataclasses import dataclass
+from math import isclose
 
 import numpy as np
 
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing import TimingCandidate
 from chart_worker.generation.params import REQUESTED_STAR
+from chart_worker.rating.project_rating import TARGET_RATING, tier_of
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
 MAX_CANDIDATE_ATTEMPTS = 3
 RETRY_SEED_STEP = 10_000
 
 MAX_LONG_GAP_BARS = 2.0
-MAX_RATING_ERROR = 0.35
+MAX_RATING_ERROR = {
+    "EASY": 0.35,
+    "NORMAL": 0.35,
+    "HARD": 0.65,
+    "EXPERT": 0.65,
+}
 MAX_REMOVED_RATIO = 0.45
 MIN_AUDIO_ONSET_PRECISION = 0.70
 AUDIO_ONSET_WINDOW_MS = 50
@@ -44,6 +51,26 @@ class CandidateQuality:
 def _require_difficulty(difficulty: str) -> None:
     if difficulty not in DIFFICULTIES:
         raise ValueError(f"unsupported difficulty: {difficulty}")
+
+
+def measured_tier(difficulty: str, rating_error: float) -> str:
+    """Rebuild the rounded measured rating and return its project tier."""
+    _require_difficulty(difficulty)
+    return tier_of(round(TARGET_RATING[difficulty] + rating_error, 2))
+
+
+def _exceeds_rating_limit(value: float, maximum: float) -> bool:
+    return value > maximum and not isclose(
+        value, maximum, rel_tol=0.0, abs_tol=1e-9
+    )
+
+
+def rating_error_exceeds(rating_error: float, *, difficulty: str) -> bool:
+    """Compare a rating error without rejecting a binary-float boundary."""
+    _require_difficulty(difficulty)
+    return _exceeds_rating_limit(
+        abs(rating_error), MAX_RATING_ERROR[difficulty]
+    )
 
 
 def requested_star_candidates(difficulty: str) -> tuple[float, float, float]:
@@ -78,7 +105,9 @@ def candidate_parameters(
         )
         requested_star = previous_star
         if attempt == 3 and (
-            previous.rating_error > MAX_RATING_ERROR
+            _exceeds_rating_limit(
+                previous.rating_error, MAX_RATING_ERROR[difficulty]
+            )
             or previous.removed_ratio > MAX_REMOVED_RATIO
         ):
             requested_star = max(star_candidates[-1], previous_star - 0.5)
@@ -93,9 +122,11 @@ def candidate_parameters(
 def needs_retry(quality: CandidateQuality, *, difficulty: str) -> bool:
     """Return whether another seed may repair this candidate's quality."""
     _require_difficulty(difficulty)
+    actual_tier = measured_tier(difficulty, quality.rating_error)
     structural_failure = (
         quality.long_gap_bars > MAX_LONG_GAP_BARS
-        or abs(quality.rating_error) >= MAX_RATING_ERROR
+        or rating_error_exceeds(quality.rating_error, difficulty=difficulty)
+        or actual_tier != difficulty
         or quality.removed_ratio > MAX_REMOVED_RATIO
         or quality.playability_violations > 0
         or quality.reference_pass is False

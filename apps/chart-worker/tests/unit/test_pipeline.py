@@ -144,6 +144,11 @@ def test_fake_pipeline_writes_playtest_manifest(tmp_path: Path):
         assert chart["signedRatingError"] == pytest.approx(
             chart["actualRating"] - chart["targetRating"]
         )
+        assert chart["actualTier"] == chart["candidates"][0]["actualTier"]
+        assert (
+            chart["candidates"][0]["failure_metrics"]["actual_tier"]
+            == chart["actualTier"]
+        )
         assert chart["absoluteRatingError"] == pytest.approx(
             abs(chart["signedRatingError"])
         )

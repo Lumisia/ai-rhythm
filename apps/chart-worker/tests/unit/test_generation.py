@@ -70,31 +70,18 @@ def test_real_song_calibrated_requested_stars_are_explicit():
     assert REQUESTED_STAR == {
         "EASY": 1.5,
         "NORMAL": 1.5,
-        "HARD": 4.0,
-        "EXPERT": 5.0,
+        "HARD": 3.5,
+        "EXPERT": 4.5,
     }
 
 
-def test_normal_request_compensates_for_mapperatorinator_overgeneration():
-    assert REQUESTED_STAR["NORMAL"] < TARGET_RATING["NORMAL"]
-
-
-def test_hard_keeps_explicit_solver_headroom():
-    assert REQUESTED_STAR["HARD"] > TARGET_RATING["HARD"]
+@pytest.mark.parametrize("difficulty", ["NORMAL", "HARD", "EXPERT"])
+def test_real_song_calibration_compensates_for_overgeneration(difficulty):
+    assert REQUESTED_STAR[difficulty] < TARGET_RATING[difficulty]
 
 
 def test_easy_request_matches_the_solver_target_after_real_candidate_calibration():
     assert REQUESTED_STAR["EASY"] == TARGET_RATING["EASY"] == 1.5
-
-
-def test_expert_has_no_headroom_from_the_request_alone():
-    """설계 표에서 EXPERT 만 요청값과 목표가 같다(둘 다 5.0).
-
-    여유가 "요청값 > 목표" 가 아니라 "실제 생성 결과가 요청값보다 한 티어
-    높게 나온다"는 실측에서만 나온다. 그 관측이 무너지면 EXPERT 는 solver
-    가 손댈 재료가 없다. 표본이 2곡뿐이라 곡을 늘리며 확인해야 한다.
-    """
-    assert REQUESTED_STAR["EXPERT"] == TARGET_RATING["EXPERT"] == 5.0
 
 
 def test_defaults_are_filled_from_the_difficulty_tables():

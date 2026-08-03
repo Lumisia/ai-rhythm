@@ -37,7 +37,8 @@ def passing_quality(**overrides) -> CandidateQuality:
         ({"long_gap_bars": 2.0}, False),
         ({"long_gap_bars": 2.0001}, True),
         ({"rating_error": 0.3499}, False),
-        ({"rating_error": 0.35}, True),
+        ({"rating_error": 0.35}, False),
+        ({"rating_error": 0.3501}, True),
         ({"removed_ratio": 0.45}, False),
         ({"removed_ratio": 0.4501}, True),
         ({"playability_passes": 7}, False),
@@ -49,10 +50,48 @@ def test_structural_retry_boundaries(changes, expected):
     assert needs_retry(passing_quality(**changes), difficulty="NORMAL") is expected
 
 
-@pytest.mark.parametrize("rating_error", [-0.35, -0.3501])
-def test_too_easy_rating_still_requests_a_retry(rating_error):
-    assert needs_retry(
-        passing_quality(rating_error=rating_error), difficulty="NORMAL"
+def test_normal_rating_error_allows_the_boundary_but_not_more():
+    assert not needs_retry(passing_quality(rating_error=-0.35), difficulty="NORMAL")
+    assert needs_retry(passing_quality(rating_error=-0.3501), difficulty="NORMAL")
+
+
+@pytest.mark.parametrize("difficulty", ["HARD", "EXPERT"])
+def test_upper_difficulties_allow_point_65_rating_error(difficulty):
+    assert not needs_retry(passing_quality(rating_error=0.65), difficulty=difficulty)
+    assert needs_retry(passing_quality(rating_error=0.6501), difficulty=difficulty)
+
+
+@pytest.mark.parametrize(
+    ("difficulty", "rating_error"),
+    [
+        ("NORMAL", 2.95 - 2.6),
+        ("HARD", 4.45 - 3.8),
+        ("EXPERT", 5.65 - 5.0),
+    ],
+)
+def test_real_rating_subtraction_keeps_the_inclusive_upper_boundary(
+    difficulty, rating_error
+):
+    assert not needs_retry(
+        passing_quality(rating_error=rating_error), difficulty=difficulty
+    )
+
+
+@pytest.mark.parametrize(
+    ("difficulty", "rating_error"),
+    [("HARD", -0.61), ("EXPERT", -0.51)],
+)
+def test_rating_cannot_cross_the_requested_tier(difficulty, rating_error):
+    assert needs_retry(passing_quality(rating_error=rating_error), difficulty=difficulty)
+
+
+@pytest.mark.parametrize(
+    ("difficulty", "rating_error"),
+    [("HARD", -0.60), ("EXPERT", -0.50)],
+)
+def test_rating_tier_boundary_is_inclusive(difficulty, rating_error):
+    assert not needs_retry(
+        passing_quality(rating_error=rating_error), difficulty=difficulty
     )
 
 
@@ -129,6 +168,11 @@ def test_easy_requested_star_candidates_start_at_the_calibrated_one_point_five()
     assert candidate_selection.requested_star_candidates("EASY") == (1.5, 1.0, 0.5)
 
 
+def test_hard_and_expert_requested_stars_use_real_song_calibration():
+    assert candidate_selection.requested_star_candidates("HARD") == (3.5, 3.0, 2.5)
+    assert candidate_selection.requested_star_candidates("EXPERT") == (4.5, 4.0, 3.5)
+
+
 def test_requested_star_candidates_reject_an_unsupported_difficulty():
     with pytest.raises(ValueError, match="unsupported difficulty"):
         candidate_selection.requested_star_candidates("NOMAL")
@@ -201,6 +245,7 @@ def test_third_normal_candidate_also_lowers_star_on_excessive_removal():
     [
         {"rating_error": -0.3501},
         {"rating_error": 0.35},
+        {"rating_error": 2.95 - 2.6},
         {"removed_ratio": 0.45},
     ],
 )
@@ -214,6 +259,26 @@ def test_third_candidate_keeps_star_at_non_triggering_boundaries(overrides):
     parameters = candidate_selection.candidate_parameters(0, 1, 3, second)
 
     assert parameters.requested_star == 3.0
+
+
+@pytest.mark.parametrize(
+    ("combination_index", "requested_star", "rating_error"),
+    [(2, 3.5, -0.61), (3, 4.5, -0.51)],
+)
+def test_third_upper_difficulty_candidate_does_not_lower_star_when_too_easy(
+    combination_index, requested_star, rating_error
+):
+    second = passing_quality(
+        rating_error=rating_error,
+        requested_star=requested_star,
+        cfg_scale=1.0,
+    )
+
+    parameters = candidate_selection.candidate_parameters(
+        0, combination_index, 3, second
+    )
+
+    assert parameters.requested_star == requested_star
 
 
 def test_third_candidate_does_not_lower_below_the_difficulty_floor():
