@@ -98,6 +98,25 @@ def test_reports_malformed_numeric_hit_object_with_context():
         parse_osu_mania(text)
 
 
+@pytest.mark.parametrize("x", [-1, 513, 576, 704])
+def test_rejects_mania_x_outside_the_osu_playfield(x):
+    text = (
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
+        f"\n[HitObjects]\n{x},192,0,1,0,0:0:0:0:\n"
+    )
+    with pytest.raises(ValueError, match=r"x coordinate .*0\.\.512"):
+        parse_osu_mania(text)
+
+
+def test_preserves_a_valid_zero_millisecond_note():
+    text = (
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
+        "\n[HitObjects]\n64,192,0,1,0,0:0:0:0:\n"
+    )
+    beatmap = parse_osu_mania(text)
+    assert [(note.time_ms, note.lane) for note in beatmap.notes] == [(0, 0)]
+
+
 @pytest.mark.parametrize("object_type", [9, 136, 257, -127])
 def test_rejects_mixed_or_unknown_hit_object_bits(object_type):
     text = (
@@ -109,15 +128,13 @@ def test_rejects_mixed_or_unknown_hit_object_bits(object_type):
 
 
 @pytest.mark.parametrize("end_ms", [1000, 900])
-def test_degenerate_hold_is_demoted_to_tap(end_ms):
-    """길이가 0 이하인 롱노트는 예외 대신 일반 노트가 된다."""
+def test_rejects_a_hold_that_does_not_end_after_its_start(end_ms):
     text = (
         "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
         f"\n[HitObjects]\n64,192,1000,128,0,{end_ms}:0:0:0:0:\n"
     )
-    beatmap = parse_osu_mania(text)
-    assert [(note.kind, note.duration_ms) for note in beatmap.notes] == [("TAP", None)]
-    assert beatmap.notes[0].time_ms == 1000
+    with pytest.raises(ValueError, match=r"hold.*end.*start"):
+        parse_osu_mania(text)
 
 
 def test_allows_new_combo_and_combo_offset_auxiliary_bits():

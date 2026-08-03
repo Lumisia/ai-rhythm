@@ -85,6 +85,10 @@ def parse_osu_mania(text: str) -> OsuBeatmap:
             object_type = int(parts[3])
         except ValueError as error:
             raise ValueError(f"malformed HitObject: {line!r}") from error
+        if not 0 <= x <= 512:
+            raise ValueError(
+                f"mania x coordinate {x} is outside the osu! playfield 0..512"
+            )
         base_type = object_type & ~_AUXILIARY_TYPE_BITS
         lane = min(key_mode - 1, max(0, math.floor(x * key_mode / 512)))
         if base_type == _HOLD_BIT:
@@ -96,18 +100,18 @@ def parse_osu_mania(text: str) -> OsuBeatmap:
                 raise ValueError(f"malformed HitObject: {line!r}") from error
             duration_ms = end_ms - time_ms
             if duration_ms <= 0:
-                # 길이가 0 이하인 롱노트는 눌렀다 떼는 동작이 성립하지 않는다.
-                # 음악 이벤트 자체는 살려야 하므로 일반 노트로 강등한다.
-                notes.append(NoteEvent(time_ms=time_ms, lane=lane))
-            else:
-                notes.append(
-                    NoteEvent(
-                        time_ms=time_ms,
-                        lane=lane,
-                        kind="HOLD",
-                        duration_ms=duration_ms,
-                    )
+                raise ValueError(
+                    f"mania hold at {time_ms}ms has end {end_ms}ms "
+                    "that is not after its start"
                 )
+            notes.append(
+                NoteEvent(
+                    time_ms=time_ms,
+                    lane=lane,
+                    kind="HOLD",
+                    duration_ms=duration_ms,
+                )
+            )
         elif base_type == _CIRCLE_BIT:
             notes.append(NoteEvent(time_ms=time_ms, lane=lane))
         else:

@@ -1,11 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages.s2_generate import run_generation
 from chart_worker.stages.types import PreparedAudio
+from chart_worker.validation.generated_chart import GeneratedChartValidationError
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -114,3 +117,23 @@ def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
     generator = OriginalGenerator()
     variants = run_generation(prepared, tmp_path, generator=generator, seed=1)
     assert variants[0].raw_osu_path.read_text(encoding="utf-8") == generator.texts[0]
+
+
+def test_run_generation_rejects_invalid_output_before_writing_stable_raw(tmp_path: Path):
+    prepared = _prepared(tmp_path)
+
+    class InvalidLaneGenerator(RecordingGenerator):
+        def __call__(self, request, workdir):
+            generated = super().__call__(request, workdir)
+            return GeneratedChart(
+                notes=[NoteEvent(500, request.key_mode)],
+                key_mode=generated.key_mode,
+                osu_text=generated.osu_text,
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                bpm_events=generated.bpm_events,
+            )
+
+    with pytest.raises(GeneratedChartValidationError, match="outside"):
+        run_generation(prepared, tmp_path, generator=InvalidLaneGenerator(), seed=0)
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()

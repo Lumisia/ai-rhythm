@@ -7,6 +7,7 @@ from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.types import GeneratedVariant, PreparedAudio
+from chart_worker.validation.generated_chart import validate_generated_chart
 
 
 def run_generation(
@@ -33,10 +34,11 @@ def run_generation(
         )
         workdir = run_dir / "raw" / "work" / f"{key_mode}k-{difficulty.lower()}"
         generated = generator(request, workdir)
-        if not generated.bpm_events:
-            raise ValueError(
-                f"generated {key_mode}K {difficulty} map has no timing events"
-            )
+        validate_generated_chart(
+            generated,
+            key_mode=key_mode,
+            duration_ms=prepared.normalized.duration_ms,
+        )
         first_timing = generated.bpm_events[0]
         osu_text = generated.osu_text or notes_to_osu_mania(
             generated.notes,
