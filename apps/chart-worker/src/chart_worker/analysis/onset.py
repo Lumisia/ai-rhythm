@@ -11,6 +11,7 @@ from typing import Literal
 
 import numpy as np
 
+from chart_worker.analysis.activity import AudioActivity, build_audio_activity
 from chart_worker.analysis.audio_io import AudioSignal, load_audio
 from chart_worker.analysis.beat import BeatGrid
 from chart_worker.errors import ErrorCode, WorkerError
@@ -65,6 +66,7 @@ class OnsetAnalysis:
 
     onset_ms: tuple[int, ...]
     n_fft: int = N_FFT
+    activity: AudioActivity | None = None
 
     @property
     def frame_count(self) -> int:
@@ -172,15 +174,37 @@ def librosa_backend(
             # 키음 어택 스냅이 밀린 소리를 내지 않는다. 실측 평균 오차 6.9 -> 4.1 ms.
             backtrack=True,
         )
+        rms = librosa.feature.rms(
+            y=mono,
+            frame_length=n_fft,
+            hop_length=hop_length,
+        )[0]
+        rms_db = librosa.amplitude_to_db(rms, ref=1.0)
+        frame_count = min(aggregate.size, bands.shape[1], rms_db.size)
+        aggregate = aggregate[:frame_count]
+        bands = bands[:, :frame_count]
+        rms_db = rms_db[:frame_count]
+        peaks = np.asarray(peaks, dtype=np.int64)
+        peaks = peaks[(peaks >= 0) & (peaks < frame_count)]
         frame_ms = hop_length * 1000.0 / sample_rate_hz
+        normalized_strength = normalize_envelope(aggregate)
+        activity = build_audio_activity(
+            rms_db=rms_db,
+            normalized_strength=normalized_strength,
+            onset_frames=peaks,
+            frame_ms=frame_ms,
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )
         return OnsetAnalysis(
             sample_rate_hz=int(sample_rate_hz),
             hop_length=hop_length,
-            strength=normalize_envelope(aggregate),
+            strength=normalized_strength,
             # 대역마다 mel bin 수가 달라 원값 argmax 는 고역으로 쏠린다.
             band_strength=np.vstack([normalize_envelope(band) for band in bands]),
             onset_ms=tuple(np.round(np.asarray(peaks) * frame_ms).astype(np.int64).tolist()),
             n_fft=n_fft,
+            activity=activity,
         )
 
     return run

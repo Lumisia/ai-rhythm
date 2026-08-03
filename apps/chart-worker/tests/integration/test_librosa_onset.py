@@ -71,6 +71,14 @@ def test_envelopes_are_normalized(struck_signal, backend):
     assert analysis.band_strength.shape[1] == analysis.frame_count
 
 
+def test_activity_uses_the_same_librosa_time_axis(struck_signal, backend):
+    analysis = analyze_onsets(struck_signal, backend=backend)
+
+    assert analysis.activity is not None
+    assert analysis.activity.rms_db.size == analysis.frame_count
+    assert set(analysis.activity.active_onset_ms) <= set(analysis.onset_ms)
+
+
 def test_frame_spacing_beats_the_judgment_window(struck_signal, backend):
     analysis = analyze_onsets(struck_signal, backend=backend)
     assert analysis.frame_ms == pytest.approx(10.667, abs=0.01)
