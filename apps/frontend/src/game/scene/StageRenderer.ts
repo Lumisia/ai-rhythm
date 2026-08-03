@@ -2,9 +2,9 @@ import Phaser from "phaser";
 
 import type { LaneGeometry, StageGeometry } from "../core/LaneLayout";
 
-const HAIRLINE = 0x38404e;
-const AMBER = 0xe2b75b;
-const OUTSIDE = 0x0d1016;
+const HAIRLINE = 0x31364d;
+const ACCENT = 0x5eead4;
+const OUTSIDE = 0x07080f;
 
 /** 리셉터 높이. 노트가 여기 겹치면 친다. */
 export const RECEPTOR_HEIGHT = 26;
@@ -41,7 +41,7 @@ export class StageRenderer {
           .text(0, 0, label, {
             fontFamily: '"Cascadia Mono", Consolas, monospace',
             fontSize: "12px",
-            color: "#aab3c0",
+            color: "#c5cbea",
           })
           .setDepth(3)
           .setOrigin(0.5, 0),
@@ -142,7 +142,7 @@ export class StageRenderer {
   #drawReceptorBase(graphics: Phaser.GameObjects.Graphics): void {
     const top = this.judgeLineY - RECEPTOR_HEIGHT;
     for (const lane of this.stage.lanes) {
-      graphics.fillStyle(0x252b38, 1);
+      graphics.fillStyle(0x171a2a, 1);
       graphics.fillRect(lane.x + 1, top, lane.width - 2, RECEPTOR_HEIGHT);
       graphics.fillStyle(lane.color, 0.22);
       graphics.fillRect(lane.x + 1, top, lane.width - 2, 2);
@@ -150,7 +150,7 @@ export class StageRenderer {
       graphics.strokeRect(lane.x + 1.5, top + 0.5, lane.width - 3, RECEPTOR_HEIGHT - 1);
     }
     // 판정선. 무대 폭만큼만 긋는다 — 화면을 가로지르면 무대가 안 보인다.
-    graphics.fillStyle(AMBER, 1);
+    graphics.fillGradientStyle(ACCENT, 0xa78bfa, ACCENT, 0xa78bfa, 1, 1, 1, 1);
     graphics.fillRect(this.stage.left, this.judgeLineY - 2, this.stage.width, 3);
   }
 

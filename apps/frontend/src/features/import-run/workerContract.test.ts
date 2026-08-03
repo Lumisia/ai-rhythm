@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { loadRunDirectory } from "../../test/loadRunDirectory";
+import { validateChart } from "../../shared/contracts/schemas";
 import { importRun } from "./importRun";
 
 const fixtureRoot = resolve(process.cwd(), "src/test/fixtures/playtest-run");
@@ -43,5 +44,15 @@ describe("chart worker output contract", () => {
       await imported.source.readText(imported.manifest.generationReportPath),
     ) as { charts: unknown[] };
     expect(report.charts).toHaveLength(12);
+  });
+
+  it("accepts Mapperatorinator timing that begins before audio zero", async () => {
+    const imported = await importRun(loadRunDirectory(fixtureRoot));
+    const document = {
+      ...imported.charts[0].document,
+      bpmEvents: [{ timeMs: -120, bpm: 120 }],
+    };
+
+    expect(() => validateChart(document, "negative-timing.chart.json")).not.toThrow();
   });
 });

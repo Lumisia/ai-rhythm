@@ -41,16 +41,16 @@ function widthFor(semantic: LaneSemantic): number {
 
 /** 손가락으로 색을 나눈다. 레인 번호가 아니라 어느 손가락인지가 읽는 단위다. */
 function colorFor(semantic: LaneSemantic): number {
-  if (semantic.startsWith("SIDE_")) return 0x78cbb8; // 새끼
-  if (semantic === "CENTER") return 0xe2b75b; // 엄지
-  if (semantic === "MAIN_2" || semantic === "MAIN_3") return 0x7f9fc2; // 중지
-  return 0xdce3e8; // 검지·약지
+  if (semantic.startsWith("SIDE_")) return 0x67e8f9;
+  if (semantic === "CENTER") return 0xa78bfa;
+  if (semantic === "MAIN_2" || semantic === "MAIN_3") return 0x8b9cf6;
+  return 0x5eead4;
 }
 
 function backgroundFor(semantic: LaneSemantic): number {
-  if (semantic === "CENTER") return 0x1d2230;
-  if (semantic.startsWith("SIDE_")) return 0x161b26;
-  return semantic === "MAIN_2" || semantic === "MAIN_3" ? 0x1a1f2b : 0x171c27;
+  if (semantic === "CENTER") return 0x181529;
+  if (semantic.startsWith("SIDE_")) return 0x0e1522;
+  return semantic === "MAIN_2" || semantic === "MAIN_3" ? 0x141626 : 0x101522;
 }
 
 /** 무대를 배치한다.

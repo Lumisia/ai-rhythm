@@ -6,19 +6,19 @@ import type { ScoreSnapshot } from "../core/ScoreCalculator";
 import type { JudgmentName, JudgmentWindows } from "../core/types";
 
 /** 계기판 색. app.css 의 CSS 변수와 같은 값을 쓴다. */
-const INK = 0xdce3e8;
-const MUTED = 0x8e98a6;
-const HAIRLINE = 0x38404e;
-const AMBER = 0xe2b75b;
-const MINT = 0x78cbb8;
-const CORAL = 0xe27268;
-const SLATE = 0x252b38;
+const INK = 0xe8ecf8;
+const MUTED = 0x8d97b5;
+const HAIRLINE = 0x31364d;
+const ACCENT = 0x5eead4;
+const VIOLET = 0xa78bfa;
+const CORAL = 0xf87171;
+const SLATE = 0x171a2a;
 
 const JUDGMENT_COLOR: Record<JudgmentName, number> = {
-  PERFECT: MINT,
-  GREAT: 0x7f9fc2,
-  GOOD: AMBER,
-  BAD: 0xc98a52,
+  PERFECT: 0x67e8f9,
+  GREAT: 0x86efac,
+  GOOD: 0xfde047,
+  BAD: 0xfb923c,
   MISS: CORAL,
 };
 
@@ -72,6 +72,10 @@ export class HudRenderer {
   readonly #comboText: Phaser.GameObjects.Text;
   readonly #accuracyText: Phaser.GameObjects.Text;
   readonly #accuracyLabel: Phaser.GameObjects.Text;
+  readonly #scoreText: Phaser.GameObjects.Text;
+  readonly #scoreLabel: Phaser.GameObjects.Text;
+  readonly #maxComboText: Phaser.GameObjects.Text;
+  readonly #maxComboLabel: Phaser.GameObjects.Text;
   readonly #leftText: Phaser.GameObjects.Text;
   readonly #countsText: Phaser.GameObjects.Text;
   readonly #scopeText: Phaser.GameObjects.Text;
@@ -115,8 +119,12 @@ export class HudRenderer {
     this.#snapshot = options.snapshot;
 
     this.#graphics = scene.add.graphics().setDepth(20);
-    this.#accuracyText = this.#text(DISPLAY, 30, INK).setDepth(24);
+    this.#scoreText = this.#text(DISPLAY, 26, INK).setDepth(24);
+    this.#scoreLabel = this.#text(MONO, 9, MUTED).setDepth(24);
+    this.#accuracyText = this.#text(DISPLAY, 26, INK).setDepth(24);
     this.#accuracyLabel = this.#text(MONO, 9, MUTED).setDepth(24);
+    this.#maxComboText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(1, 0);
+    this.#maxComboLabel = this.#text(MONO, 9, MUTED).setDepth(24).setOrigin(1, 0);
     this.#leftText = this.#text(MONO, 11, MUTED).setDepth(24);
     this.#countsText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(1, 0);
     this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(0.5, 0.5);
@@ -124,7 +132,7 @@ export class HudRenderer {
     this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(23).setOrigin(0.5, 0.5);
     this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(24).setOrigin(0.5, 0);
     this.#markerText = this.#text(MONO, 11, CORAL).setDepth(24).setOrigin(1, 0);
-    this.#countdownText = this.#text(DISPLAY, 84, AMBER).setDepth(25).setOrigin(0.5, 0.5);
+    this.#countdownText = this.#text(DISPLAY, 84, ACCENT).setDepth(25).setOrigin(0.5, 0.5);
     this.#layout();
   }
 
@@ -175,6 +183,10 @@ export class HudRenderer {
     for (const text of [
       this.#accuracyText,
       this.#accuracyLabel,
+      this.#scoreText,
+      this.#scoreLabel,
+      this.#maxComboText,
+      this.#maxComboLabel,
       this.#leftText,
       this.#countsText,
       this.#judgmentText,
@@ -210,14 +222,19 @@ export class HudRenderer {
 
   #layout(): void {
     const centerX = this.#stage.left + this.#stage.width / 2;
-    const leftGutter = Math.max(GUTTER_PADDING, this.#stage.left - 150);
-    const rightEdge = Math.min(this.#width - GUTTER_PADDING, this.#stage.right + 150);
+    const leftGutter = GUTTER_PADDING + 8;
+    const rightEdge = this.#width - GUTTER_PADDING - 8;
 
-    this.#accuracyLabel.setPosition(leftGutter, 22);
-    this.#accuracyText.setPosition(leftGutter, 34);
-    this.#leftText.setPosition(leftGutter, 78);
-    this.#countsText.setPosition(rightEdge, 34);
-    this.#markerText.setPosition(rightEdge, 14);
+    this.#scoreLabel.setPosition(leftGutter, 18);
+    this.#scoreText.setPosition(leftGutter, 30);
+    const accuracyX = leftGutter + Math.min(156, this.#width * 0.34);
+    this.#accuracyLabel.setPosition(accuracyX, 18);
+    this.#accuracyText.setPosition(accuracyX, 30);
+    this.#maxComboLabel.setPosition(rightEdge, 18);
+    this.#maxComboText.setPosition(rightEdge, 30);
+    this.#leftText.setPosition(leftGutter, 70);
+    this.#countsText.setPosition(rightEdge, Math.max(112, this.#height * 0.42));
+    this.#markerText.setPosition(rightEdge, 72);
 
     this.#comboText.setPosition(centerX, this.#judgeLineY - 190);
     this.#judgmentText.setPosition(centerX, this.#judgeLineY - 116);
@@ -228,26 +245,22 @@ export class HudRenderer {
 
   // --- 그리기 ---------------------------------------------------------------
 
-  /** 곡 진행과 찍어둔 문제 마커.
-   *
-   * 무대 폭에 앰버 가로선으로 두면 판정선과 헷갈린다. 무대 바깥 왼쪽에
-   * 세로로 세워서 형태부터 다르게 한다.
-   */
+  /** 화면 바닥의 곡 진행도와 문제 마커. */
   #drawProgressRail(songTimeMs: number): void {
-    const x = Math.max(6, this.#stage.left - 26);
-    const top = 24;
-    const height = this.#height - top - 24;
+    const left = 0;
+    const top = this.#height - 3;
+    const width = this.#width;
     this.#graphics.fillStyle(SLATE, 1);
-    this.#graphics.fillRect(x, top, 3, height);
+    this.#graphics.fillRect(left, top, width, 3);
     const ratio = Phaser.Math.Clamp(songTimeMs / this.#durationMs, 0, 1);
-    this.#graphics.fillStyle(MUTED, 0.9);
-    this.#graphics.fillRect(x, top, 3, height * ratio);
+    this.#graphics.fillGradientStyle(ACCENT, VIOLET, ACCENT, VIOLET, 1, 1, 1, 1);
+    this.#graphics.fillRect(left, top, width * ratio, 3);
     this.#graphics.fillStyle(INK, 1);
-    this.#graphics.fillRect(x - 2, top + height * ratio - 1, 7, 2);
+    this.#graphics.fillRect(width * ratio - 1, top - 2, 2, 5);
     this.#graphics.fillStyle(CORAL, 1);
     for (const markerTimeMs of this.#markerTimes) {
-      const y = top + height * Phaser.Math.Clamp(markerTimeMs / this.#durationMs, 0, 1);
-      this.#graphics.fillRect(x - 4, y - 1, 11, 2);
+      const x = width * Phaser.Math.Clamp(markerTimeMs / this.#durationMs, 0, 1);
+      this.#graphics.fillRect(x - 1, top - 5, 2, 8);
     }
   }
 
@@ -267,14 +280,14 @@ export class HudRenderer {
     for (const [name, color, alpha] of [
       ["GOOD", HAIRLINE, 0.9],
       ["GREAT", MUTED, 0.55],
-      ["PERFECT", MINT, 0.8],
+      ["PERFECT", ACCENT, 0.8],
     ] as const) {
       const offset = this.#windows[name] * perMs;
       this.#graphics.fillStyle(color, alpha);
       this.#graphics.fillRect(centerX - offset, y - 8, 1, 16);
       this.#graphics.fillRect(centerX + offset, y - 8, 1, 16);
     }
-    this.#graphics.fillStyle(AMBER, 1);
+    this.#graphics.fillStyle(ACCENT, 1);
     this.#graphics.fillRect(centerX - 1, y - 12, 2, 24);
 
     let visible = 0;
@@ -297,7 +310,7 @@ export class HudRenderer {
       const meanX = centerX + clamped * perMs;
       // 바 아래로 세운다. 위로 세우면 평균이 0 근처일 때 가운데 레인의
       // 키 라벨을 가린다 — 평균은 대개 0 근처다.
-      this.#graphics.fillStyle(MINT, 1);
+      this.#graphics.fillStyle(ACCENT, 1);
       this.#graphics.fillTriangle(meanX, y + 12, meanX - 5, y + 21, meanX + 5, y + 21);
       const sign = snapshot.meanErrMs >= 0 ? "+" : "−";
       const drift = Math.abs(snapshot.meanErrMs).toFixed(1);
@@ -357,13 +370,17 @@ export class HudRenderer {
     if (signature === this.#statSignature) return;
     this.#statSignature = signature;
     const counts = snapshot.counts;
+    const score = Math.round(snapshot.accuracy * 1_000_000);
+    this.#scoreLabel.setText("SCORE");
+    this.#scoreText.setText(score.toLocaleString("en-US"));
     this.#accuracyLabel.setText("ACCURACY");
     this.#accuracyText.setText(`${accuracy}%`);
+    this.#maxComboLabel.setText("MAX COMBO");
+    this.#maxComboText.setText(String(snapshot.maxCombo));
     this.#leftText.setText(
       [
         `${clock(songTimeMs)} / ${clock(this.#durationMs)}`,
         `NOTES  ${judged} / ${this.#noteCount}`,
-        `MAX    ${snapshot.maxCombo}`,
       ].join("\n"),
     );
     this.#countsText.setText(

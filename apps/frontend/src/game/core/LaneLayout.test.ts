@@ -54,13 +54,12 @@ describe("layoutStage", () => {
     }
   });
 
-  it("derives note colour from the finger, not the lane number", () => {
+  it("uses matching colours for mirrored fingers and a distinct centre", () => {
     const { lanes } = layoutStage(1600, SEVEN);
-    expect(lanes[0].color).toBe(0x78cbb8); // 새끼
-    expect(lanes[6].color).toBe(0x78cbb8);
-    expect(lanes[3].color).toBe(0xe2b75b); // 엄지
-    expect(lanes[2].color).toBe(0x7f9fc2); // 중지
-    expect(lanes[1].color).toBe(0xdce3e8); // 약지
+    expect(lanes[0].color).toBe(lanes[6].color);
+    expect(lanes[2].color).toBe(lanes[4].color);
+    expect(lanes[3].color).not.toBe(lanes[0].color);
+    expect(new Set(lanes.map((lane) => lane.color)).size).toBeGreaterThan(2);
   });
 
   it("rejects empty semantics and non-positive width", () => {
