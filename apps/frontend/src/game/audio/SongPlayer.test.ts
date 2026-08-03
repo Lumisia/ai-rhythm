@@ -47,15 +47,27 @@ function fakeAudioContext() {
 }
 
 describe("SongPlayer", () => {
-  it("decodes bytes and schedules playback with a 1.6 second lead-in", async () => {
+  it("decodes bytes and schedules playback with a 1.8 second lead-in", async () => {
     const { context, sources } = fakeAudioContext();
     const clock = new GameClock(context);
     const player = new SongPlayer(context as unknown as AudioContext, clock);
     await player.load(new ArrayBuffer(8));
     player.play(2000);
     expect(sources).toHaveLength(1);
-    expect(sources[0].starts).toEqual([{ when: 13.6, offset: 2 }]);
+    expect(sources[0].starts).toEqual([{ when: 13.8, offset: 2 }]);
     expect(player.durationMs).toBe(10_000);
+  });
+
+  it("keeps chart time negative before a zero-offset song starts", async () => {
+    const { context, sources } = fakeAudioContext();
+    const clock = new GameClock(context);
+    const player = new SongPlayer(context as unknown as AudioContext, clock);
+    await player.load(new ArrayBuffer(8));
+
+    player.play(0);
+
+    expect(sources[0].starts).toEqual([{ when: 13.8, offset: 0 }]);
+    expect(clock.songTimeMs()).toBeCloseTo(-1800);
   });
 
   it("creates a fresh source for resume and a playing seek", async () => {
@@ -65,7 +77,7 @@ describe("SongPlayer", () => {
     await player.load(new ArrayBuffer(8));
 
     player.play(2000);
-    context.currentTime = 14.6;
+    context.currentTime = 14.8;
     expect(player.pause()).toBeCloseTo(3000);
     player.play();
     player.seek(5000);

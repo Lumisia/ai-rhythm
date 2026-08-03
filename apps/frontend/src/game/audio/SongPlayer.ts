@@ -1,6 +1,6 @@
 import { GameClock } from "./GameClock";
 
-const DEFAULT_LEAD_IN_SECONDS = 1.6;
+const DEFAULT_LEAD_IN_SECONDS = 1.8;
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
