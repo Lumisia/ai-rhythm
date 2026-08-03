@@ -33,8 +33,8 @@ def generated(
     )
 
 
-def test_accepts_zero_millisecond_rows_and_a_note_at_audio_end():
-    chart = generated([tap(0, 0), tap(10_000, 3)])
+def test_accepts_zero_millisecond_rows_and_a_note_before_audio_end():
+    chart = generated([tap(0, 0), tap(9_999, 3)])
     validate_generated_chart(chart, key_mode=4, duration_ms=10_000)
 
 
@@ -63,6 +63,7 @@ def test_allows_the_next_note_exactly_when_a_hold_ends():
 @pytest.mark.parametrize(
     ("notes", "message"),
     [
+        ([tap(10_000, 0)], "duration"),
         ([tap(10_001, 0)], "duration"),
         ([hold(9_800, 0, 300)], "duration"),
         ([tap(100, 4)], "lane 4"),
@@ -86,6 +87,44 @@ def test_rejects_a_chart_without_timing_events():
     with pytest.raises(GeneratedChartValidationError, match="timing"):
         validate_generated_chart(
             generated([tap(100, 0)], timing=()),
+            key_mode=4,
+            duration_ms=10_000,
+        )
+
+
+def test_rejects_a_chart_without_notes():
+    with pytest.raises(GeneratedChartValidationError, match="no notes"):
+        validate_generated_chart(
+            generated([]),
+            key_mode=4,
+            duration_ms=10_000,
+        )
+
+
+def test_rejects_duplicate_or_unsorted_timing_events():
+    duplicate = (
+        OsuBpmEvent(time_ms=0, bpm=120.0),
+        OsuBpmEvent(time_ms=0, bpm=130.0),
+    )
+    unsorted = (
+        OsuBpmEvent(time_ms=1_000, bpm=120.0),
+        OsuBpmEvent(time_ms=0, bpm=130.0),
+    )
+
+    for timing in (duplicate, unsorted):
+        with pytest.raises(GeneratedChartValidationError, match="timing"):
+            validate_generated_chart(
+                generated([tap(100, 0)], timing=timing),
+                key_mode=4,
+                duration_ms=10_000,
+            )
+
+
+@pytest.mark.parametrize("bpm", [0.0, -120.0, float("inf"), float("nan")])
+def test_rejects_non_positive_or_non_finite_bpm(bpm):
+    with pytest.raises(GeneratedChartValidationError, match="bpm"):
+        validate_generated_chart(
+            generated([tap(100, 0)], timing=(OsuBpmEvent(time_ms=0, bpm=bpm),)),
             key_mode=4,
             duration_ms=10_000,
         )

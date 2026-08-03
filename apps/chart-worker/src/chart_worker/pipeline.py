@@ -145,6 +145,21 @@ def _elapsed_ms(started_ns: int) -> int:
     return max(0, (perf_counter_ns() - started_ns) // 1_000_000)
 
 
+def _require_canonical_audio_hash(prepared: PreparedAudio) -> None:
+    normalized = prepared.normalized
+    actual_audio_sha = sha256_file(normalized.path)
+    if actual_audio_sha != normalized.sha256:
+        raise WorkerError(
+            ErrorCode.ASSET_HASH_MISMATCH,
+            "canonical game audio changed after prepare",
+            context={
+                "path": str(normalized.path),
+                "expected": normalized.sha256,
+                "actual": actual_audio_sha,
+            },
+        )
+
+
 def _max_gap_ms(variant: GeneratedVariant) -> int:
     times = sorted({note.time_ms for note in variant.generated.notes})
     return max((right - left for left, right in pairwise(times)), default=0)
@@ -203,7 +218,7 @@ def _generation_report(
         "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
         "canonicalAudioSha256": prepared.normalized.sha256,
         "timingReviewRequired": any(
-            chart["timingDiagnostics"]["status"] == "REVIEW" for chart in charts
+            chart["timingDiagnostics"]["status"] != "PASS" for chart in charts
         ),
         "elapsedMsByStage": elapsed,
         "warnings": [],
@@ -231,23 +246,14 @@ def run_pipeline(
 
     started = perf_counter_ns()
     normalized = prepared.normalized
-    actual_audio_sha = sha256_file(normalized.path)
-    if actual_audio_sha != normalized.sha256:
-        raise WorkerError(
-            ErrorCode.ASSET_HASH_MISMATCH,
-            "canonical game audio changed after prepare",
-            context={
-                "path": str(normalized.path),
-                "expected": normalized.sha256,
-                "actual": actual_audio_sha,
-            },
-        )
+    _require_canonical_audio_hash(prepared)
     onsets = dependencies.analyze(normalized.path)
     elapsed["analysis"] = _elapsed_ms(started)
 
     started = perf_counter_ns()
     generator = dependencies.select_generator(options.generator, dependencies.config)
     generated = dependencies.generation(prepared, run_dir, generator, options.seed)
+    _require_canonical_audio_hash(prepared)
     elapsed["generation"] = _elapsed_ms(started)
 
     started = perf_counter_ns()

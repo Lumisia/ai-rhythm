@@ -92,10 +92,15 @@ uv run --project apps/chart-worker chart-worker bench `
 이상 있으면 `coverageGaps`로 기록해 누락된 활성 구간도 `REVIEW`한다. 이는 사람
 라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
 
-원본 osu!mania 키 수, X 좌표와 변환 레인 범위, 음원 길이 안의 TAP/HOLD 시각,
-퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD, timing point를 검사한다. 실패 조합은
+원본 osu!mania 키 수, X 좌표와 변환 레인 범위, `0 <= 시작 < 음원 길이`와
+`HOLD 끝 <= 음원 길이`, 빈 채보, 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD,
+정렬되고 중복 없는 양의 유한 BPM timing point를 검사한다. 실패 조합은
 최대 두 번 재시도하고 세 출력이 모두 잘못되면 실행을 실패시킨다. 정상 출력의
 추론 횟수는 여전히 한 번이다.
+
+canonical `game.flac`의 SHA-256은 onset 분석 전과 외부 Mapperatorinator 생성 직후
+다시 계산한다. 중간에 오디오가 바뀌면 export·manifest 작성 전에 실패한다. 채보 전체
+timing 진단이 `INSUFFICIENT`여도 공개 가능한 `PASS`가 아니라 `REVIEW`로 기록한다.
 
 ## GPU 없는 구조 검사
 

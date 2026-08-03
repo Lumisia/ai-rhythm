@@ -1,5 +1,6 @@
 """Structural validation that rejects, but never rewrites, generated charts."""
 
+import math
 from collections import defaultdict
 
 from chart_worker.generation.mapperatorinator import GeneratedChart
@@ -27,6 +28,17 @@ def validate_generated_chart(
         )
     if not chart.bpm_events:
         raise GeneratedChartValidationError("generated chart has no timing events")
+    timing_times = [event.time_ms for event in chart.bpm_events]
+    if timing_times != sorted(set(timing_times)):
+        raise GeneratedChartValidationError(
+            "generated chart timing events must be sorted without duplicates"
+        )
+    if any(not math.isfinite(event.bpm) or event.bpm <= 0 for event in chart.bpm_events):
+        raise GeneratedChartValidationError(
+            "generated chart bpm values must be positive and finite"
+        )
+    if not chart.notes:
+        raise GeneratedChartValidationError("generated chart has no notes")
 
     by_lane: dict[int, list[NoteEvent]] = defaultdict(list)
     for note in chart.notes:
@@ -34,7 +46,7 @@ def validate_generated_chart(
             raise GeneratedChartValidationError(
                 f"lane {note.lane} is outside requested {key_mode}K"
             )
-        if note.time_ms > duration_ms or _end_ms(note) > duration_ms:
+        if note.time_ms >= duration_ms or _end_ms(note) > duration_ms:
             raise GeneratedChartValidationError(
                 f"note at {note.time_ms}ms exceeds canonical audio duration {duration_ms}ms"
             )

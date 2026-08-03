@@ -93,3 +93,27 @@ def test_benchmark_requires_review_when_timing_diagnostics_do(tmp_path: Path):
     )
 
     assert result.report.status == "REVIEW"
+
+
+def test_benchmark_requires_review_when_timing_diagnostics_are_insufficient(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    analyzed = dependencies.analyze(Path("unused"))
+
+    result = run_benchmark(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(
+            dependencies,
+            analyze=lambda _path: replace(analyzed, onset_ms=()),
+        ),
+    )
+
+    assert result.report.status == "REVIEW"

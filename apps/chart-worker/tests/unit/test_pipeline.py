@@ -161,6 +161,40 @@ def test_pipeline_rejects_canonical_audio_changed_after_prepare(tmp_path: Path):
     assert analyze_calls == []
 
 
+def test_pipeline_rejects_canonical_audio_changed_during_generation(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    export_calls = []
+
+    def generation(prepared, run_dir, generator, seed):
+        variants = dependencies.generation(prepared, run_dir, generator, seed)
+        prepared.normalized.path.write_bytes(b"tampered during generation")
+        return variants
+
+    def export(prepared, generated, run_dir, worker_version):
+        export_calls.append(run_dir)
+        return dependencies.export(prepared, generated, run_dir, worker_version)
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+            ),
+            dependencies=replace(
+                dependencies,
+                generation=generation,
+                export=export,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.ASSET_HASH_MISMATCH
+    assert export_calls == []
+
+
 def test_pipeline_defaults_to_mapperatorinator():
     options = PipelineOptions(
         source=Path("song.wav"),
