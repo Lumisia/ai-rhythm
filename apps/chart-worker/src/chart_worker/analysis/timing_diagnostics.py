@@ -6,6 +6,7 @@ from typing import Literal
 
 import numpy as np
 
+from chart_worker.analysis.activity import AudioActivity
 from chart_worker.schema.note import Chart
 
 TimingStatus = Literal["PASS", "REVIEW", "INSUFFICIENT"]
@@ -17,6 +18,7 @@ SECTION_PRECISION_50_MIN = 0.60
 SECTION_PHASE_DRIFT_MAX_MS = 25.0
 ACTIVE_GAP_MIN_MS = 8_000
 ACTIVE_GAP_MIN_ONSETS = 8
+ACTIVE_GAP_MIN_FRAME_RATIO = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,13 +60,17 @@ class TimingCoverageGap:
     start_ms: int
     end_ms: int
     onset_count: int
+    active_onset_count: int
+    active_frame_ratio: float
 
-    def to_report(self) -> dict[str, int]:
+    def to_report(self) -> dict[str, int | float]:
         return {
             "startMs": self.start_ms,
             "endMs": self.end_ms,
             "durationMs": self.end_ms - self.start_ms,
             "onsetCount": self.onset_count,
+            "activeOnsetCount": self.active_onset_count,
+            "activeFrameRatio": self.active_frame_ratio,
         }
 
 
@@ -72,9 +78,11 @@ class TimingCoverageGap:
 class TimingDiagnostics:
     status: TimingStatus
     onset_count: int
+    active_onset_count: int
     first_note_time_ms: int | None
     max_gap_ms: int
     coverage_gaps: tuple[TimingCoverageGap, ...]
+    quiet_coverage_gaps: tuple[TimingCoverageGap, ...]
     overall: TimingMetrics
     sections: tuple[TimingSection, ...]
 
@@ -82,9 +90,11 @@ class TimingDiagnostics:
         return {
             "status": self.status,
             "onsetCount": self.onset_count,
+            "activeOnsetCount": self.active_onset_count,
             "firstNoteTimeMs": self.first_note_time_ms,
             "maxGapMs": self.max_gap_ms,
             "coverageGaps": [gap.to_report() for gap in self.coverage_gaps],
+            "quietCoverageGaps": [gap.to_report() for gap in self.quiet_coverage_gaps],
             "overall": self.overall.to_report(),
             "sections": [section.to_report() for section in self.sections],
         }
@@ -148,11 +158,14 @@ def _section_status(
 def _coverage_gaps(
     rows: tuple[int, ...],
     onsets: np.ndarray,
+    active_onsets: np.ndarray,
     *,
     duration_ms: int,
-) -> tuple[TimingCoverageGap, ...]:
+    activity: AudioActivity | None,
+) -> tuple[tuple[TimingCoverageGap, ...], tuple[TimingCoverageGap, ...]]:
     boundaries = tuple(sorted({0, duration_ms, *rows}))
-    gaps = []
+    active_gaps = []
+    quiet_gaps = []
     for start_ms, end_ms in pairwise(boundaries):
         if end_ms - start_ms < ACTIVE_GAP_MIN_MS:
             continue
@@ -160,14 +173,29 @@ def _coverage_gaps(
         onset_end = int(np.searchsorted(onsets, end_ms, side="left"))
         onset_count = onset_end - onset_start
         if onset_count >= ACTIVE_GAP_MIN_ONSETS:
-            gaps.append(
-                TimingCoverageGap(
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    onset_count=onset_count,
-                )
+            active_start = int(np.searchsorted(active_onsets, start_ms, side="right"))
+            active_end = int(np.searchsorted(active_onsets, end_ms, side="left"))
+            active_onset_count = active_end - active_start
+            active_frame_ratio = (
+                1.0
+                if activity is None
+                else round(activity.active_frame_ratio(start_ms, end_ms), 6)
             )
-    return tuple(gaps)
+            gap = TimingCoverageGap(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                onset_count=onset_count,
+                active_onset_count=active_onset_count,
+                active_frame_ratio=active_frame_ratio,
+            )
+            target = (
+                active_gaps
+                if active_onset_count >= ACTIVE_GAP_MIN_ONSETS
+                and active_frame_ratio >= ACTIVE_GAP_MIN_FRAME_RATIO
+                else quiet_gaps
+            )
+            target.append(gap)
+    return tuple(active_gaps), tuple(quiet_gaps)
 
 
 def diagnose_chart_timing(
@@ -177,6 +205,7 @@ def diagnose_chart_timing(
     duration_ms: int,
     section_ms: int = SECTION_MS,
     minimum_section_rows: int = MIN_SECTION_ROWS,
+    activity: AudioActivity | None = None,
 ) -> TimingDiagnostics:
     """Compare unique note rows with nearest onsets without changing the chart."""
     if duration_ms < 0:
@@ -188,8 +217,22 @@ def diagnose_chart_timing(
 
     rows = tuple(sorted({note.time_ms for note in notes}))
     onsets = np.asarray(sorted(set(onset_ms)), dtype=np.int64)
+    active_onsets = (
+        onsets
+        if activity is None
+        else np.asarray(
+            sorted(set(onsets.tolist()).intersection(activity.active_onset_ms)),
+            dtype=np.int64,
+        )
+    )
     overall = _metrics(rows, onsets)
-    coverage_gaps = _coverage_gaps(rows, onsets, duration_ms=duration_ms)
+    coverage_gaps, quiet_coverage_gaps = _coverage_gaps(
+        rows,
+        onsets,
+        active_onsets,
+        duration_ms=duration_ms,
+        activity=activity,
+    )
     sections = []
     for start_ms in range(0, max(1, duration_ms), section_ms):
         end_ms = min(duration_ms, start_ms + section_ms)
@@ -228,9 +271,11 @@ def diagnose_chart_timing(
     return TimingDiagnostics(
         status=status,
         onset_count=int(onsets.size),
+        active_onset_count=int(active_onsets.size),
         first_note_time_ms=rows[0] if rows else None,
         max_gap_ms=max_gap_ms,
         coverage_gaps=coverage_gaps,
+        quiet_coverage_gaps=quiet_coverage_gaps,
         overall=overall,
         sections=tuple(sections),
     )

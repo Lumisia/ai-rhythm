@@ -1,3 +1,6 @@
+import numpy as np
+
+from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.timing_diagnostics import diagnose_chart_timing
 from chart_worker.schema.note import NoteEvent
 
@@ -94,8 +97,53 @@ def test_marks_long_gap_with_active_onsets_for_review():
             "endMs": 30_838,
             "durationMs": 30_838,
             "onsetCount": 20,
+            "activeOnsetCount": 20,
+            "activeFrameRatio": 1.0,
         }
     ]
+
+
+def test_marks_only_sustained_active_gap_for_review():
+    activity = AudioActivity(
+        frame_ms=1_000.0,
+        rms_db=np.array([-10.0] * 40),
+        floor_db=-20.0,
+        active_onset_ms=tuple(range(1_000, 21_000, 1_000)),
+    )
+    result = diagnose_chart_timing(
+        [tap(0), tap(30_000)],
+        (0, *range(1_000, 21_000, 1_000), 30_000),
+        duration_ms=40_000,
+        activity=activity,
+    )
+
+    assert result.status == "REVIEW"
+    assert len(result.coverage_gaps) == 1
+    assert result.quiet_coverage_gaps == ()
+    assert result.coverage_gaps[0].active_onset_count == 20
+    assert result.coverage_gaps[0].active_frame_ratio == 1.0
+
+
+def test_reports_quiet_gap_without_forcing_review():
+    activity = AudioActivity(
+        frame_ms=1_000.0,
+        rms_db=np.array([-30.0] * 30 + [-10.0] * 10),
+        floor_db=-20.0,
+        active_onset_ms=(),
+    )
+    result = diagnose_chart_timing(
+        [tap(0), tap(30_000)],
+        (0, *range(1_000, 21_000, 1_000), 30_000),
+        duration_ms=40_000,
+        activity=activity,
+    )
+
+    assert result.coverage_gaps == ()
+    assert len(result.quiet_coverage_gaps) == 1
+    assert result.quiet_coverage_gaps[0].onset_count == 20
+    assert result.quiet_coverage_gaps[0].active_onset_count == 0
+    assert result.quiet_coverage_gaps[0].active_frame_ratio == 0.0
+    assert result.status == "PASS"
 
 
 def test_serializes_stable_camel_case_report_fields():
@@ -108,9 +156,11 @@ def test_serializes_stable_camel_case_report_fields():
     assert result.to_report() == {
         "status": "PASS",
         "onsetCount": 8,
+        "activeOnsetCount": 8,
         "firstNoteTimeMs": 1000,
         "maxGapMs": 1000,
         "coverageGaps": [],
+        "quietCoverageGaps": [],
         "overall": {
             "rowCount": 8,
             "precision20": 1.0,
