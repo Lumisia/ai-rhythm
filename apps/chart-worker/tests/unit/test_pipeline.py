@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["strategy"] == "MAPPERATORINATOR_DIRECT"
     assert report["timingAuthority"] == "FAKE"
     assert report["noteMutationEnabled"] is False
-    assert report["attemptsPerChart"] == 1
+    assert report["attemptsPerChartMax"] == 2
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
 
@@ -53,11 +54,45 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["rawNoteCount"] == len(document.notes)
         assert chart_report["finalNoteCount"] == len(document.notes)
         assert chart_report["attemptCount"] == 1
+        assert chart_report["attemptErrors"] == []
         assert chart_report["cfgScale"] == 1.0
         assert chart_report["chartPath"] == chart_ref.path
         assert chart_report["rawOsuPath"] == raw_path.relative_to(output_dir).as_posix()
         assert "candidates" not in chart_report
         assert raw_path.parent == output_dir / "raw"
+
+
+def test_generation_report_records_the_selected_retry_attempt(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, run_dir, generator, seed):
+        variants = dependencies.generation(prepared, run_dir, generator, seed)
+        retried = replace(
+            variants[0],
+            generated=replace(variants[0].generated, seed=19),
+            attempt=2,
+            attempt_errors=("lane 4 is outside requested 4K",),
+        )
+        return (retried, *variants[1:])
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    first = report["charts"][0]
+    assert first["attemptCount"] == 2
+    assert first["seed"] == 19
+    assert first["attemptErrors"] == ["lane 4 is outside requested 4K"]
 
 
 def test_pipeline_defaults_to_mapperatorinator():

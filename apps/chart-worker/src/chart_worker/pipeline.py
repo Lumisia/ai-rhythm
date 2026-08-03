@@ -21,7 +21,7 @@ from chart_worker.schema.playtest_run import (
     RunChartRef,
 )
 from chart_worker.stages.s1_prepare import run_prepare
-from chart_worker.stages.s2_generate import run_generation
+from chart_worker.stages.s2_generate import MAX_VARIANT_ATTEMPTS, run_generation
 from chart_worker.stages.s3_export import run_export
 from chart_worker.stages.types import ExportedVariant, GeneratedVariant, PreparedAudio
 
@@ -161,7 +161,8 @@ def _generation_report(
                 "seed": variant.generated.seed,
                 "requestedStar": variant.requested_star,
                 "cfgScale": variant.cfg_scale,
-                "attemptCount": 1,
+                "attemptCount": variant.attempt,
+                "attemptErrors": list(variant.attempt_errors),
                 "rawNoteCount": len(notes),
                 "finalNoteCount": len(result.document.notes),
                 "holdCount": sum(note.kind == "HOLD" for note in notes),
@@ -181,7 +182,7 @@ def _generation_report(
             "MAPPERATORINATOR" if options.generator == "mapperatorinator" else "FAKE"
         ),
         "noteMutationEnabled": False,
-        "attemptsPerChart": 1,
+        "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
         "elapsedMsByStage": elapsed,
         "warnings": [],
         "charts": charts,

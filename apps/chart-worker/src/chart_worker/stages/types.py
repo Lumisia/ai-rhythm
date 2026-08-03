@@ -22,6 +22,7 @@ class GeneratedVariant:
     generated: GeneratedChart
     cfg_scale: float = 1.0
     attempt: int = 1
+    attempt_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
