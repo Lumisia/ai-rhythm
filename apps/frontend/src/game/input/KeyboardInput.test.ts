@@ -71,7 +71,7 @@ function setup() {
     noteTimeMs: 1100,
   };
   const keyDown = vi.fn(() => judgment);
-  const keyUp = vi.fn(() => null);
+  const keyUp = vi.fn((): JudgmentEvent | null => null);
   const engine = { keyDown, keyUp } as unknown as JudgmentEngine;
   const recorder = new InputRecorder();
   const onJudgment = vi.fn();
@@ -153,5 +153,35 @@ describe("KeyboardInput", () => {
     target.dispatchEvent(new KeyboardEvent("keydown", { code: "Space" }));
     target.dispatchEvent(new Event("blur"));
     expect(onLaneUp.mock.calls.map(([lane]) => lane).sort()).toEqual([0, 3]);
+  });
+
+  it("records and judges every held key release on blur exactly once", () => {
+    const { target, keyUp, recorder, onLaneUp, onJudgment } = setup();
+    const tail: JudgmentEvent = {
+      noteId: 2,
+      lane: 0,
+      noteType: "HOLD",
+      phase: "TAIL",
+      judgment: "GOOD",
+      errMs: 10,
+      timeMs: 7000,
+      noteTimeMs: 6990,
+    };
+    keyUp.mockReturnValue(tail);
+    target.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyA" }));
+    target.dispatchEvent(new KeyboardEvent("keydown", { code: "Space" }));
+    target.dispatchEvent(new Event("blur"));
+    target.dispatchEvent(new KeyboardEvent("keyup", { code: "KeyA" }));
+
+    expect(keyUp.mock.calls).toEqual([
+      [0, 7000],
+      [3, 7000],
+    ]);
+    expect(recorder.snapshot().filter((event) => event.action === "UP")).toEqual([
+      { action: "UP", lane: 0, code: "KeyA", timeMs: 7000 },
+      { action: "UP", lane: 3, code: "Space", timeMs: 7000 },
+    ]);
+    expect(onLaneUp).toHaveBeenCalledTimes(2);
+    expect(onJudgment).toHaveBeenCalledTimes(4);
   });
 });

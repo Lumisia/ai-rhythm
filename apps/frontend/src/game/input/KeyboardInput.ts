@@ -71,22 +71,25 @@ export class KeyboardInput {
 
   readonly #handleKeyUp = (rawEvent: Event): void => {
     if (!(rawEvent instanceof KeyboardEvent)) return;
-    const lane = this.#bindings.get(rawEvent.code);
-    if (lane === undefined) return;
+    if (!this.#bindings.has(rawEvent.code)) return;
     rawEvent.preventDefault();
-    if (!this.#heldCodes.delete(rawEvent.code)) return;
     const timeMs = this.#clock.performanceToSongTimeMs(rawEvent.timeStamp);
-    this.#recorder.record({ action: "UP", lane, code: rawEvent.code, timeMs });
+    this.#release(rawEvent.code, timeMs);
+  };
+
+  #release(code: string, timeMs: number): void {
+    const lane = this.#bindings.get(code);
+    if (lane === undefined || !this.#heldCodes.delete(code)) return;
+    this.#recorder.record({ action: "UP", lane, code, timeMs });
     this.#onLaneUp?.(lane, timeMs);
     const judgment = this.#engine.keyUp(lane, timeMs);
     if (judgment) this.#onJudgment?.(judgment);
-  };
+  }
 
   readonly #handleBlur = (): void => {
-    for (const code of this.#heldCodes) {
-      const lane = this.#bindings.get(code);
-      if (lane !== undefined) this.#onLaneUp?.(lane, this.#clock.songTimeMs());
+    const timeMs = this.#clock.songTimeMs();
+    for (const code of [...this.#heldCodes]) {
+      this.#release(code, timeMs);
     }
-    this.#heldCodes.clear();
   };
 }
