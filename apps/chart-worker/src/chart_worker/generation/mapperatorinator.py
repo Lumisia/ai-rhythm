@@ -13,6 +13,7 @@ from typing import Protocol
 from chart_worker.audio.runner import CommandError, CommandResult, CommandRunner
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.mapperatorinator_patch import require_mapperatorinator_patch
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.generation.params import (
     GAMEMODE_MANIA,
@@ -24,6 +25,7 @@ from chart_worker.schema.note import Chart
 INFERENCE_SCRIPT = "inference.py"
 CONFIG_NAME = "v32"
 RunCommand = Callable[[list[str]], CommandResult]
+PatchVerifier = Callable[[Path], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +162,12 @@ def find_generated_osu(output_dir: Path) -> Path:
 class MapperatorinatorGenerator:
     config: WorkerConfig
     run: RunCommand | None = None
+    verify_patch: PatchVerifier = require_mapperatorinator_patch
 
     def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
+        if self.config.mapperatorinator_home is None:
+            raise ValueError("mapperatorinator_home must be configured")
+        self.verify_patch(self.config.mapperatorinator_home)
         workdir.mkdir(parents=True, exist_ok=True)
         _require_clean_output_dir(workdir)
         run = self.run or CommandRunner(

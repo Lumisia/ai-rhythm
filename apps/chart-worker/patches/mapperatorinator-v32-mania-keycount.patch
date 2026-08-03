@@ -1,0 +1,139 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -31,6 +31,39 @@ def get_scroll_speed_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
+                  if EventType.SCROLL_SPEED in tokenizer.event_start else [])
+ 
+ 
++class ManiaKeycountLogitsProcessor(LogitsProcessor):
++    """Prevent mania column tokens outside the requested keycount."""
++
++    def __init__(self, tokenizer: Tokenizer):
++        self.keycount_start = tokenizer.event_start[EventType.MANIA_KEYCOUNT]
++        self.keycount_end = tokenizer.event_end[EventType.MANIA_KEYCOUNT]
++        self.keycount_min = tokenizer.event_range[EventType.MANIA_KEYCOUNT].min_value
++        self.column_start = tokenizer.event_start[EventType.MANIA_COLUMN]
++        self.column_end = tokenizer.event_end[EventType.MANIA_COLUMN]
++
++    def __call__(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
++        scores_processed = scores.clone()
++        for row in range(input_ids.shape[0]):
++            tokens = input_ids[row]
++            keycount_tokens = tokens[
++                (tokens >= self.keycount_start) & (tokens < self.keycount_end)
++            ]
++            if keycount_tokens.numel() == 0:
++                continue
++            keycount = (
++                int(keycount_tokens[-1].item())
++                - self.keycount_start
++                + self.keycount_min
++            )
++            invalid_start = min(self.column_start + keycount, self.column_end)
++            scores_processed[row, invalid_start:self.column_end] = -torch.inf
++        return scores_processed
++
++
+ class TimeshiftBias(LogitsProcessor):
+     def __init__(self, timeshift_bias: float, time_start: int, time_end: int):
+         self.timeshift_bias = timeshift_bias
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -13,6 +13,6 @@ from ..event import EventType, ContextType
+ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
+     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
+-    MonotonicTimeShiftLogitsProcessor
++    MonotonicTimeShiftLogitsProcessor, ManiaKeycountLogitsProcessor
+ from .cache_utils import get_cache
+ from ..model import Mapperatorinator
+ from ..tokenizer import Tokenizer
+@@ -93,6 +93,7 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
+ 
+     logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
++    logits_processor_list.append(ManiaKeycountLogitsProcessor(tokenizer))
+ 
+     if timeshift_bias != 0:
+         logits_processor_list.append(
+diff --git a/tests/test_mania_keycount_logits_processor.py b/tests/test_mania_keycount_logits_processor.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mania_keycount_logits_processor.py
+@@ -0,0 +1,72 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from osuT5.osuT5.event import EventType
++from osuT5.osuT5.inference.logit_processors import ManiaKeycountLogitsProcessor
++
++
++class FakeTokenizer:
++    event_start = {
++        EventType.MANIA_COLUMN: 10,
++        EventType.MANIA_KEYCOUNT: 100,
++    }
++    event_end = {
++        EventType.MANIA_COLUMN: 28,
++        EventType.MANIA_KEYCOUNT: 118,
++    }
++    event_range = {
++        EventType.MANIA_KEYCOUNT: SimpleNamespace(min_value=1),
++    }
++
++
++def keycount_token(keycount: int) -> int:
++    return FakeTokenizer.event_start[EventType.MANIA_KEYCOUNT] + keycount - 1
++
++
++@pytest.mark.parametrize("keycount", [4, 6, 7])
++def test_masks_only_columns_outside_requested_keycount(keycount: int):
++    processor = ManiaKeycountLogitsProcessor(FakeTokenizer())
++    input_ids = torch.tensor([[1, keycount_token(keycount), 5]])
++    scores = torch.arange(32, dtype=torch.float32).unsqueeze(0)
++
++    result = processor(input_ids, scores)
++
++    column_start = FakeTokenizer.event_start[EventType.MANIA_COLUMN]
++    column_end = FakeTokenizer.event_end[EventType.MANIA_COLUMN]
++    assert torch.equal(
++        result[0, column_start:column_start + keycount],
++        scores[0, column_start:column_start + keycount],
++    )
++    assert torch.isneginf(result[0, column_start + keycount:column_end]).all()
++    assert torch.equal(result[0, :column_start], scores[0, :column_start])
++    assert torch.equal(result[0, column_end:], scores[0, column_end:])
++    assert torch.equal(scores, torch.arange(32, dtype=torch.float32).unsqueeze(0))
++
++
++def test_leaves_rows_without_a_keycount_condition_unchanged():
++    processor = ManiaKeycountLogitsProcessor(FakeTokenizer())
++    input_ids = torch.tensor([[1, 5, 6]])
++    scores = torch.arange(32, dtype=torch.float32).unsqueeze(0)
++
++    assert torch.equal(processor(input_ids, scores), scores)
++
++
++def test_uses_each_batch_rows_own_keycount():
++    processor = ManiaKeycountLogitsProcessor(FakeTokenizer())
++    input_ids = torch.tensor(
++        [
++            [1, keycount_token(4), 5],
++            [1, keycount_token(7), 5],
++        ]
++    )
++    scores = torch.zeros((2, 32), dtype=torch.float32)
++
++    result = processor(input_ids, scores)
++
++    column_start = FakeTokenizer.event_start[EventType.MANIA_COLUMN]
++    column_end = FakeTokenizer.event_end[EventType.MANIA_COLUMN]
++    assert torch.isneginf(result[0, column_start + 4:column_end]).all()
++    assert not torch.isneginf(result[1, column_start + 4:column_start + 7]).any()
++    assert torch.isneginf(result[1, column_start + 7:column_end]).all()

@@ -155,7 +155,9 @@ def test_find_generated_osu_requires_exactly_one_file(tmp_path):
 
 
 def test_generator_parses_notes_and_raw_timing(config, tmp_path):
-    result = MapperatorinatorGenerator(config=config, run=_fake_run())(
+    result = MapperatorinatorGenerator(
+        config=config, run=_fake_run(), verify_patch=lambda _home: None
+    )(
         _request(seed=3), tmp_path / "work"
     )
     assert [note.time_ms for note in result.notes] == [1000, 1200]
@@ -166,7 +168,9 @@ def test_generator_parses_notes_and_raw_timing(config, tmp_path):
 
 
 def test_generator_maps_subprocess_failure(config, tmp_path):
-    generator = MapperatorinatorGenerator(config=config, run=_fake_run(fail=True))
+    generator = MapperatorinatorGenerator(
+        config=config, run=_fake_run(fail=True), verify_patch=lambda _home: None
+    )
     with pytest.raises(WorkerError) as caught:
         generator(_request(), tmp_path / "work")
     assert caught.value.code is ErrorCode.CHART_GENERATION_FAILED
@@ -174,14 +178,20 @@ def test_generator_maps_subprocess_failure(config, tmp_path):
 
 
 def test_generator_maps_parse_failure(config, tmp_path):
-    generator = MapperatorinatorGenerator(config=config, run=_fake_run(osu_text="garbage"))
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(osu_text="garbage"),
+        verify_patch=lambda _home: None,
+    )
     with pytest.raises(WorkerError) as caught:
         generator(_request(), tmp_path / "work")
     assert caught.value.code is ErrorCode.CHART_OSU_PARSE_FAILED
 
 
 def test_generator_rejects_a_mismatched_keycount(config, tmp_path):
-    generator = MapperatorinatorGenerator(config=config, run=_fake_run())
+    generator = MapperatorinatorGenerator(
+        config=config, run=_fake_run(), verify_patch=lambda _home: None
+    )
     with pytest.raises(WorkerError, match="asked for 7K"):
         generator(_request(key_mode=7), tmp_path / "work")
 
@@ -233,3 +243,16 @@ def test_mapperatorinator_child_process_forces_utf8_without_losing_path():
     assert env["PYTHONUTF8"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert sum(name.upper() == "PYTHONUTF8" for name in env) == 1
+
+
+def test_generator_verifies_constraint_patch_before_inference(config, tmp_path):
+    calls = []
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(),
+        verify_patch=lambda home: calls.append(home),
+    )
+
+    generator(_request(), tmp_path / "work")
+
+    assert calls == [config.mapperatorinator_home]
