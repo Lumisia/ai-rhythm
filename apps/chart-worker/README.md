@@ -7,7 +7,8 @@
 
 ## 생성 계약
 
-각 조합은 한 번만 추론한다.
+정상 출력은 조합마다 한 번만 추론한다. 파싱 또는 구조 검증에 실패한 조합만 다른
+seed로 한 번 재시도하며, 이미 성공한 조합은 다시 만들지 않는다.
 
 | 난이도 | 요청 별 | descriptor |
 | --- | ---: | --- |
@@ -19,7 +20,7 @@
 공통 요청은 `cfg_scale=1.0`, `output_type=[TIMING,MAP]`,
 `hitsounded=false`, `fast_decoder_loop=true`다. `hold_note_ratio`를 보내지 않으므로
 롱노트는 모델이 곡과 패턴에 맞게 정한다. 룰 기반 채보, Beat This timing,
-super timing, 다중 seed 후보, solver와 레인 재배치는 실행하지 않는다.
+super timing, 정상 채보의 다중 seed 후보 경쟁, solver와 레인 재배치는 실행하지 않는다.
 
 `end_time`에는 정규화 오디오 길이를 전달한다. Mapperatorinator가 패딩 구간에
 오디오 밖 노트를 만드는 것을 모델 자체 크롭 단계에서 막고, 내보내기 단계는
@@ -74,17 +75,24 @@ uv run --project apps/chart-worker chart-worker bench `
 
 주요 산출물은 다음과 같다.
 
-- `raw/<key>-<difficulty>/...osu`: Mapperatorinator 원본
+- `raw/<key>k-<difficulty>.osu`: 검증을 통과한 Mapperatorinator 원본
+- `raw/work/<variant>/attempt-1|2/`: 시도별 원문과 Hydra 로그
 - `charts/*.json`: 원본 노트와 timing을 보존한 chart-v1
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
 - `generation-report.json`: descriptor, 정밀도, 생성 시간, 노트·HOLD 수, 첫 노트와 최대 공백
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
-보고서의 노트 수·공백·난이도는 원본을 설명할 뿐 결과를 수정하거나 실패로
-바꾸지 않는다. 사람 라벨이 없는 onset 일치율을 “정확도”로 단정하지 않는다.
-librosa 비교가 필요하면 `diagnostics` extra를 설치해 생성 뒤 별도 진단으로
-실행하며, 생성 경로와 성공 여부에는 연결하지 않는다.
+`generation-report.json`에는 `attemptsPerChartMax=2`, 실제 시도 횟수·seed·실패
+원문, `canonicalAudioSha256`와 채보별 `timingDiagnostics`가 기록된다. 분석은
+`audio/game.flac`에서 곡당 한 번 실행하고 12개 채보가 같은 onset 배열을 공유한다.
+30초 단위 구간과 전체 고유 노트 행을 평가하며, 전체 ±50ms precision 70% 미만,
+충분한 행이 있는 구간의 60% 미만 또는 전체 median과 25ms를 넘게 벗어난 구간은
+`REVIEW`다. 이는 사람 라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
+
+원본 osu!mania 키 수, X 좌표와 변환 레인 범위, 음원 길이 안의 TAP/HOLD 시각,
+퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD, timing point를 검사한다. 실패 조합은
+한 번만 재시도하고 두 출력이 모두 잘못되면 실행을 실패시킨다.
 
 ## GPU 없는 구조 검사
 
@@ -144,5 +152,19 @@ uv run --project apps/chart-worker pytest apps/chart-worker/tests/unit apps/char
 uv build --project apps/chart-worker
 ```
 
-선택 진단 의존성은 `uv sync --project apps/chart-worker --extra diagnostics`로
-설치한다. Beat This, Demucs와 키음 stem은 현재 패키지의 생성 의존성이 아니다.
+librosa와 soundfile은 기본 `uv sync --project apps/chart-worker`에 포함된다.
+Beat This, Demucs와 키음 stem은 현재 패키지의 생성 의존성이 아니다.
+
+## Modal 배포 경로 계약
+
+`game.flac`은 실행 패키지 안의 고정 역할명이다. 동시 요청 충돌은 파일명을 UUID로
+바꾸는 대신 실행 디렉터리를 UUID `runId`로 격리해 막는다.
+
+```text
+/tmp/jobs/<runId>/audio/game.flac
+/songs/<songId>/runs/<runId>/audio/game.flac
+```
+
+공유 Volume의 `/data/game.flac` 같은 한 경로에 여러 요청이 쓰면 안 된다. 이 계약은
+문서와 로컬 산출물 구조에 반영됐지만 Modal 실행·object storage 업로드 어댑터는
+아직 구현하지 않았다.

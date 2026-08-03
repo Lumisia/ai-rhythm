@@ -1,4 +1,4 @@
-"""S2: generate each Mapperatorinator key/difficulty map exactly once."""
+"""S2: generate each map and retry only invalid Mapperatorinator output."""
 
 from pathlib import Path
 
