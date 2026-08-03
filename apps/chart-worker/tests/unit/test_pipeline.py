@@ -2,8 +2,10 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from chart_worker.analysis.activity import AudioActivity
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
@@ -47,6 +49,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["strategy"] == "MAPPERATORINATOR_DIRECT"
     assert report["timingAuthority"] == "FAKE"
     assert report["noteMutationEnabled"] is False
+    assert report["mapperatorinatorConstraintPatch"] is None
     assert report["attemptsPerChartMax"] == 3
     assert report["canonicalAudioSha256"] == manifest.audio.game.sha256
     assert report["timingReviewRequired"] is False
@@ -64,6 +67,8 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["attemptCount"] == 1
         assert chart_report["attemptErrors"] == []
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
+        assert "activeOnsetCount" in chart_report["timingDiagnostics"]
+        assert "quietCoverageGaps" in chart_report["timingDiagnostics"]
         assert chart_report["cfgScale"] == 1.0
         assert chart_report["chartPath"] == chart_ref.path
         assert chart_report["rawOsuPath"] == raw_path.relative_to(output_dir).as_posix()
@@ -125,6 +130,57 @@ def test_pipeline_analyzes_only_the_canonical_game_audio_once(tmp_path: Path):
     )
 
     assert calls == [result.output_dir / "audio" / "game.flac"]
+
+
+def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def analyze(path):
+        analysis = dependencies.analyze(path)
+        return replace(
+            analysis,
+            activity=AudioActivity(
+                frame_ms=10.0,
+                rms_db=np.full(200, -80.0),
+                floor_db=-60.0,
+                active_onset_ms=(),
+            ),
+        )
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, analyze=analyze),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert {chart["timingDiagnostics"]["activeOnsetCount"] for chart in report["charts"]} == {
+        0
+    }
+
+
+def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="mapperatorinator",
+        ),
+        dependencies=fake_dependencies(),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["mapperatorinatorConstraintPatch"] == "mania-keycount-v1"
 
 
 def test_pipeline_rejects_canonical_audio_changed_after_prepare(tmp_path: Path):

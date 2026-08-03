@@ -16,6 +16,7 @@ from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
+from chart_worker.generation.mapperatorinator_patch import CONSTRAINT_PATCH_ID
 from chart_worker.generation.params import DESCRIPTORS
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.playtest_run import (
@@ -183,6 +184,7 @@ def _generation_report(
             notes,
             onsets.onset_ms,
             duration_ms=prepared.normalized.duration_ms,
+            activity=onsets.activity,
         )
         charts.append(
             {
@@ -215,6 +217,9 @@ def _generation_report(
             "MAPPERATORINATOR" if options.generator == "mapperatorinator" else "FAKE"
         ),
         "noteMutationEnabled": False,
+        "mapperatorinatorConstraintPatch": (
+            CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
+        ),
         "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
         "canonicalAudioSha256": prepared.normalized.sha256,
         "timingReviewRequired": any(

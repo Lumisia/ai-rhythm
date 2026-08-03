@@ -14,8 +14,8 @@ seed로 최대 두 번 재시도하며, 이미 성공한 조합은 다시 만들
 | --- | ---: | --- |
 | EASY | 1.0 | `expression/simple` |
 | NORMAL | 1.5 | `style/mixed rice` |
-| HARD | 3.5 | `style/generic hybrid` |
-| EXPERT | 4.5 | `tech/technical hybrid` |
+| HARD | 2.0 | `style/mixed rice` |
+| EXPERT | 2.75 | `style/mixed rice` |
 
 공통 요청은 `cfg_scale=1.0`, `output_type=[TIMING,MAP]`,
 `hitsounded=false`, `fast_decoder_loop=true`다. `hold_note_ratio`를 보내지 않으므로
@@ -28,6 +28,18 @@ super timing, 정상 채보의 다중 seed 후보 경쟁, solver와 레인 재�
 아래에 두므로 Mapperatorinator 체크아웃이 읽기 전용이어도 실행할 수 있다.
 
 ## 실제 Mapperatorinator 실행 준비
+
+먼저 프로젝트가 고정한 Mapperatorinator commit에 keycount 출력 제약 패치를 한 번
+적용한다. 이미 적용된 상태에서는 그대로 성공한다.
+
+```powershell
+Set-Location apps\chart-worker
+.\.venv\Scripts\python.exe scripts\apply_mapperatorinator_patch.py C:\Users\PC\mapperatorinator
+```
+
+worker는 실행 전에 commit과 패치 상태를 확인한다. 다른 commit, 일부만 적용된 패치,
+미적용 상태에서는 추론을 시작하지 않는다. 이 제약은 4K·6K·7K에서 요청 범위 밖
+`MANIA_COLUMN` 토큰만 차단하며 timing, TAP/HOLD, descriptor는 변경하지 않는다.
 
 PowerShell의 현재 프로세스에만 Mapperatorinator와 공유 FFmpeg 경로를 설정한다.
 환경에 맞게 실제 경로를 바꾼다.
@@ -84,13 +96,16 @@ uv run --project apps/chart-worker chart-worker bench `
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
 `generation-report.json`에는 `attemptsPerChartMax=3`, 실제 시도 횟수·seed·실패
-원문, `canonicalAudioSha256`와 채보별 `timingDiagnostics`가 기록된다. 분석은
+원문, `canonicalAudioSha256`, `mapperatorinatorConstraintPatch`와 채보별
+`timingDiagnostics`가 기록된다. 분석은
 `audio/game.flac`에서 곡당 한 번 실행하고 12개 채보가 같은 onset 배열을 공유한다.
 30초 단위 구간과 전체 고유 노트 행을 평가하며, 전체 ±50ms precision 70% 미만,
 충분한 행이 있는 구간의 60% 미만 또는 전체 median과 25ms를 넘게 벗어난 구간은
-`REVIEW`다. 노트 사이 또는 곡 앞뒤에 8초 이상 공백이 있고 그 안에 onset이 8개
-이상 있으면 `coverageGaps`로 기록해 누락된 활성 구간도 `REVIEW`한다. 이는 사람
-라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
+`REVIEW`다. 노트 사이 또는 곡 앞뒤에 8초 이상 공백이 있으면 raw onset뿐 아니라
+곡별 상대 RMS와 활성 onset을 함께 검사한다. 활성 onset 8개 이상이고 활성 프레임
+비율도 35% 이상인 공백만 `coverageGaps`와 `REVIEW` 근거가 된다. 조용한 인트로와
+브레이크는 `quietCoverageGaps`에 기록하지만 그 자체로 `REVIEW`를 만들지 않는다.
+이는 사람 라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
 
 원본 osu!mania 키 수, X 좌표와 변환 레인 범위, `0 <= 시작 < 음원 길이`와
 `HOLD 끝 <= 음원 길이`, 빈 채보, 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD,
@@ -157,14 +172,22 @@ NORMAL 요청이어도 6K·7K 측정 결과는 HARD이므로 키 수별 requeste
 새 구조 검증·선별 재시도·공유 onset 진단을 적용한 같은 곡의 12개 전체 `fp16`
 회귀는 약 17분 22초가 걸렸다. 4K EASY·HARD와 7K EXPERT는 두 번째 시도,
 6K EXPERT는 세 번째 시도에 통과했고 나머지는 첫 시도에 통과했다. 전체 ±50ms
-precision은 62.35~94.55%였지만, 활성 onset이 있는 시작 공백까지 검사하면 12개 중
-10개가 수동 검수 대상이다. 상세 표와 오류 원문 요약은
+precision은 62.35~94.55%였다. 이 수치는 상대 RMS 분류를 추가하기 전 raw onset
+공백 판정으로 얻은 과거 기준이며, 현재는 조용한 공백만으로 수동 검수를 요구하지
+않는다. 상세 표와 최신 재진단 결과는
 `../../docs/현재 구현 상태와 운영 가이드.md`에 기록한다.
+
+## 2026-08-04 keycount 패치 smoke
+
+저장된 `Ignite the Pulse` canonical audio로 4K NORMAL 한 장만 `fp16`, seed 0에서
+생성했다. 첫 시도 약 53초에 556노트(HOLD 106개)를 만들었고 raw X는 64~448,
+변환 레인은 0~3, 범위 밖 레인은 0개였다. HOLD 겹침·퇴화, 오디오 범위와 BPM을
+포함한 구조 검증도 통과했다. 사용 패치는 `mania-keycount-v1`이다.
 
 ## 개발 검증
 
 ```powershell
-uv run --project apps/chart-worker ruff check apps/chart-worker/src apps/chart-worker/tests
+uv run --project apps/chart-worker ruff check apps/chart-worker/src apps/chart-worker/tests apps/chart-worker/scripts
 uv run --project apps/chart-worker pytest apps/chart-worker/tests/unit apps/chart-worker/tests/integration/test_fake_pipeline.py -q
 uv build --project apps/chart-worker
 ```
@@ -185,3 +208,12 @@ Beat This, Demucs와 키음 stem은 현재 패키지의 생성 의존성이 아�
 공유 Volume의 `/data/game.flac` 같은 한 경로에 여러 요청이 쓰면 안 된다. 이 계약은
 문서와 로컬 산출물 구조에 반영됐지만 Modal 실행·object storage 업로드 어댑터는
 아직 구현하지 않았다.
+
+향후 Modal 이미지에서도 모델 추론 전에 같은 적용기를 이미지 구성 단계에서 실행한다.
+이미지의 실제 설치 경로에 맞추되 의미는 다음과 같다.
+
+```dockerfile
+RUN /app/apps/chart-worker/.venv/bin/python \
+    /app/apps/chart-worker/scripts/apply_mapperatorinator_patch.py \
+    /opt/mapperatorinator
+```
