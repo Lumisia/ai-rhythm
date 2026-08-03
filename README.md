@@ -8,11 +8,11 @@ AI 음악에서 4·6·7키 채보를 자동 생성하는 웹 리듬게임.
 
 ```text
 4키   A  S  ;  '
-6키   ShiftLeft  A  S  ;  '  ShiftRight
-7키   ShiftLeft  A  S  Space  ;  '  ShiftRight
+6키   A  S  D  L  ;  '
+7키   A  S  D  Space  L  ;  '
 ```
 
-DJMAX 계열 사이드 트랙 구조. 외곽 Shift는 SideTrack, 중앙 Space는 FX에 대응한다.
+키 입력은 `KeyboardEvent.code` 기준이라 한글·영문 입력 모드와 무관하게 같은 물리 키를 사용한다.
 
 난이도는 `EASY / NORMAL / HARD / EXPERT` 4단계.
 
