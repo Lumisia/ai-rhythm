@@ -1,7 +1,14 @@
 """테스트 생성 결과를 재파싱 가능한 osu!mania 문서로 직렬화한다."""
 
+import math
+
+from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import Chart
 from chart_worker.schema.types import KEY_MODES
+
+
+def _safe_title(title: str) -> str:
+    return title.replace("\r", " ").replace("\n", " ")
 
 
 def notes_to_osu_mania(
@@ -30,7 +37,7 @@ def notes_to_osu_mania(
             hit_objects.append(f"{x},192,{note.time_ms},1,0,0:0:0:0:")
 
     beat_length_ms = 60_000.0 / bpm
-    safe_title = title.replace("\r", " ").replace("\n", " ")
+    safe_title = _safe_title(title)
     lines = [
         "osu file format v14",
         "",
@@ -52,6 +59,41 @@ def notes_to_osu_mania(
         "",
         "[HitObjects]",
         *hit_objects,
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def timing_to_osu_mania(
+    bpm_events: tuple[OsuBpmEvent, ...], *, audio_filename: str, title: str
+) -> str:
+    """Serialize a timing-only 4K osu!mania reference without hit objects."""
+    timing_points = []
+    for event in bpm_events:
+        if not math.isfinite(event.bpm) or event.bpm <= 0:
+            raise ValueError("bpm must be positive and finite")
+        timing_points.append(f"{event.time_ms},{60_000.0 / event.bpm:.12f},4,2,0,60,1,0")
+
+    lines = [
+        "osu file format v14",
+        "",
+        "[General]",
+        f"AudioFilename: {audio_filename}",
+        "Mode: 3",
+        "",
+        "[Metadata]",
+        f"Title:{_safe_title(title)}",
+        "Artist:ai-rhythm",
+        "Version:timing-reference",
+        "",
+        "[Difficulty]",
+        "CircleSize:4",
+        "OverallDifficulty:8",
+        "",
+        "[TimingPoints]",
+        *timing_points,
+        "",
+        "[HitObjects]",
         "",
     ]
     return "\n".join(lines)

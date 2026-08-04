@@ -1,7 +1,7 @@
 import pytest
 
-from chart_worker.generation.osu_parser import parse_osu_mania
-from chart_worker.generation.osu_writer import notes_to_osu_mania
+from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_mania
+from chart_worker.generation.osu_writer import notes_to_osu_mania, timing_to_osu_mania
 from chart_worker.schema.note import NoteEvent
 
 
@@ -32,3 +32,18 @@ def test_osu_writer_rejects_a_non_positive_bpm():
         notes_to_osu_mania(
             [], key_mode=4, bpm=0.0, offset_ms=0, audio_filename="game.flac", title="x"
         )
+
+
+def test_timing_reference_serializes_every_bpm_event():
+    text = timing_to_osu_mania(
+        (OsuBpmEvent(0, 120.0), OsuBpmEvent(10_000, 150.0)),
+        audio_filename="game.flac",
+        title="fixture",
+    )
+    parsed = parse_osu_mania(text)
+
+    assert parsed.notes == []
+    assert [(event.time_ms, event.bpm) for event in parsed.bpm_events] == [
+        (0, 120.0),
+        (10_000, 150.0),
+    ]
