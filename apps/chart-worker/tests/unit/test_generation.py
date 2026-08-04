@@ -200,6 +200,24 @@ def test_generator_generates_map_and_parses_raw_timing(config, tmp_path):
     assert [(event.time_ms, event.bpm) for event in result.bpm_events] == [(0, 120.0)]
 
 
+def test_legacy_callable_keeps_combined_timing_and_map_generation(config, tmp_path):
+    observed_argv = []
+
+    def run(argv):
+        observed_argv.extend(argv)
+        return _fake_run()(argv)
+
+    request = _request(timing_reference_path=tmp_path / "missing-reference.osu")
+    MapperatorinatorGenerator(
+        config=config, run=run, verify_patch=lambda _home: None
+    )(request, tmp_path / "work")
+
+    pairs = _pairs(observed_argv)
+    assert pairs["output_type"] == "[TIMING,MAP]"
+    assert "beatmap_path" not in pairs
+    assert "in_context" not in pairs
+
+
 def test_generator_maps_subprocess_failure(config, tmp_path):
     generator = MapperatorinatorGenerator(
         config=config, run=_fake_run(fail=True), verify_patch=lambda _home: None

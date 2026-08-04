@@ -342,4 +342,19 @@ class MapperatorinatorGenerator:
 
     def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
         """Compatibility bridge until the generation stage uses generate_map directly."""
-        return self.generate_map(request, workdir)
+        osu_text, beatmap = self._run_and_parse(
+            build_command(self.config, request, workdir), workdir
+        )
+        if beatmap.key_mode != request.key_mode:
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                f"asked for {request.key_mode}K but got {beatmap.key_mode}K",
+            )
+        return GeneratedChart(
+            notes=beatmap.notes,
+            key_mode=beatmap.key_mode,
+            osu_text=osu_text,
+            generator_name="mapperatorinator-v32",
+            seed=request.seed,
+            bpm_events=beatmap.bpm_events,
+        )
