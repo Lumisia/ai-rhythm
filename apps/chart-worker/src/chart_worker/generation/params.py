@@ -35,10 +35,28 @@ DESCRIPTORS: dict[str, tuple[str, ...]] = {
 
 
 @dataclass(frozen=True, slots=True)
+class TimingGenerationRequest:
+    audio_path: Path
+    duration_ms: int
+    year: int = DEFAULT_YEAR
+    seed: int | None = None
+    super_timing: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "year", coerce_int(self.year, "year"))
+        object.__setattr__(self, "duration_ms", coerce_int(self.duration_ms, "duration_ms"))
+        if self.duration_ms <= 0:
+            raise ValueError("duration_ms must be positive")
+        if not YEAR_RANGE[0] <= self.year <= YEAR_RANGE[1]:
+            raise ValueError(f"year must be within {YEAR_RANGE}, got {self.year}")
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationRequest:
     audio_path: Path
     key_mode: int
     difficulty: str
+    timing_reference_path: Path = Path("timing-reference.osu")
     year: int = DEFAULT_YEAR
     seed: int | None = None
     cfg_scale: float = 1.0

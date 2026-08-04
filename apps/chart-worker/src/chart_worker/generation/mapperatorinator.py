@@ -8,17 +8,18 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from chart_worker.audio.runner import CommandError, CommandResult, CommandRunner
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator_patch import require_mapperatorinator_patch
-from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
+from chart_worker.generation.osu_parser import OsuBeatmap, OsuBpmEvent, parse_osu_file
 from chart_worker.generation.params import (
     GAMEMODE_MANIA,
     PRECISION,
     GenerationRequest,
+    TimingGenerationRequest,
 )
 from chart_worker.schema.note import Chart
 
@@ -38,8 +39,23 @@ class GeneratedChart:
     bpm_events: tuple[OsuBpmEvent, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class GeneratedTiming:
+    osu_text: str
+    bpm_events: tuple[OsuBpmEvent, ...]
+    generator_name: str
+    seed: int | None
+    mode: Literal["STANDARD", "SUPER_TIMING"]
+
+
 class ChartGenerator(Protocol):
-    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart: ...
+    def generate_timing(
+        self, request: TimingGenerationRequest, workdir: Path
+    ) -> GeneratedTiming: ...
+
+    def generate_map(
+        self, request: GenerationRequest, workdir: Path
+    ) -> GeneratedChart: ...
 
 
 def inference_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -127,6 +143,93 @@ def build_command(
     return argv
 
 
+def _command_prefix(config: WorkerConfig, output_dir: Path) -> list[str]:
+    if config.mapperatorinator_python is None or config.mapperatorinator_home is None:
+        raise ValueError("mapperatorinator_python and mapperatorinator_home must be configured")
+    return [
+        str(_absolute(config.mapperatorinator_python)),
+        INFERENCE_SCRIPT,
+        "-cn",
+        CONFIG_NAME,
+        f"hydra.run.dir={_hydra_path(output_dir / '.hydra-run')}",
+    ]
+
+
+def _common_generation_arguments(
+    config: WorkerConfig,
+    audio_path: Path,
+    duration_ms: int,
+    year: int,
+    output_dir: Path,
+) -> list[str]:
+    return [
+        *_command_prefix(config, output_dir),
+        f"audio_path={_hydra_path(audio_path)}",
+        f"output_path={_hydra_path(output_dir)}",
+        f"gamemode={GAMEMODE_MANIA}",
+        f"year={year}",
+        f"end_time={duration_ms}",
+        f"precision={config.mapperatorinator_precision or PRECISION}",
+        "export_osz=false",
+        "hitsounded=false",
+        "fast_decoder_loop=true",
+        "resnap_events=true",
+    ]
+
+
+def build_timing_command(
+    config: WorkerConfig,
+    request: TimingGenerationRequest,
+    output_dir: Path,
+) -> list[str]:
+    argv = _common_generation_arguments(
+        config,
+        request.audio_path,
+        request.duration_ms,
+        request.year,
+        output_dir,
+    )
+    argv.extend(
+        [
+            "output_type=[TIMING]",
+            f"super_timing={'true' if request.super_timing else 'false'}",
+        ]
+    )
+    if request.seed is not None:
+        argv.append(f"seed={request.seed}")
+    return argv
+
+
+def build_map_command(
+    config: WorkerConfig,
+    request: GenerationRequest,
+    output_dir: Path,
+) -> list[str]:
+    """Build MAP inference that consumes a stable timing reference."""
+    argv = _common_generation_arguments(
+        config,
+        request.audio_path,
+        request.duration_ms,
+        request.year,
+        output_dir,
+    )
+    argv.extend(
+        [
+            f"keycount={request.key_mode}",
+            f"difficulty={request.requested_star}",
+            f"cfg_scale={request.cfg_scale}",
+            f"descriptors={_hydra_list(request.descriptors)}",
+            f"beatmap_path={_hydra_path(request.timing_reference_path)}",
+            "in_context=[TIMING]",
+            "output_type=[MAP]",
+            "super_timing=false",
+        ]
+    )
+    if request.seed is not None:
+        argv.append(f"seed={request.seed}")
+    return argv
+
+
 def _require_clean_output_dir(output_dir: Path) -> None:
     """이전 실행의 .osu 를 이번 실행 결과로 오인하지 않게 한다."""
     existing = sorted(output_dir.rglob("*.osu"))
@@ -164,7 +267,7 @@ class MapperatorinatorGenerator:
     run: RunCommand | None = None
     verify_patch: PatchVerifier = require_mapperatorinator_patch
 
-    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
+    def _run_and_parse(self, argv: list[str], workdir: Path) -> tuple[str, OsuBeatmap]:
         if self.config.mapperatorinator_home is None:
             raise ValueError("mapperatorinator_home must be configured")
         self.verify_patch(self.config.mapperatorinator_home)
@@ -178,14 +281,13 @@ class MapperatorinatorGenerator:
             cwd=self.config.mapperatorinator_home,
             env=inference_env(),
         )
-        argv = build_command(self.config, request, workdir)
         try:
             run(argv)
         except CommandError as error:
             raise WorkerError(
                 ErrorCode.CHART_GENERATION_FAILED,
                 f"inference failed: {error}",
-                context={"stderr": error.stderr[-2000:], "key_mode": request.key_mode},
+                context={"stderr": error.stderr[-2000:]},
             ) from error
 
         osu_path = find_generated_osu(workdir)
@@ -197,6 +299,33 @@ class MapperatorinatorGenerator:
                 f"could not parse the generated beatmap: {error}",
                 context={"path": str(osu_path)},
             ) from error
+        return osu_path.read_text(encoding="utf-8-sig"), beatmap
+
+    def generate_timing(
+        self, request: TimingGenerationRequest, workdir: Path
+    ) -> GeneratedTiming:
+        osu_text, beatmap = self._run_and_parse(
+            build_timing_command(self.config, request, workdir), workdir
+        )
+        if not beatmap.bpm_events:
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                "timing inference produced no BPM events",
+            )
+        return GeneratedTiming(
+            osu_text=osu_text,
+            bpm_events=beatmap.bpm_events,
+            generator_name="mapperatorinator-v32",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+    def generate_map(
+        self, request: GenerationRequest, workdir: Path
+    ) -> GeneratedChart:
+        osu_text, beatmap = self._run_and_parse(
+            build_map_command(self.config, request, workdir), workdir
+        )
         if beatmap.key_mode != request.key_mode:
             raise WorkerError(
                 ErrorCode.CHART_GENERATION_FAILED,
@@ -205,8 +334,12 @@ class MapperatorinatorGenerator:
         return GeneratedChart(
             notes=beatmap.notes,
             key_mode=beatmap.key_mode,
-            osu_text=osu_path.read_text(encoding="utf-8-sig"),
+            osu_text=osu_text,
             generator_name="mapperatorinator-v32",
             seed=request.seed,
             bpm_events=beatmap.bpm_events,
         )
+
+    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
+        """Compatibility bridge until the generation stage uses generate_map directly."""
+        return self.generate_map(request, workdir)

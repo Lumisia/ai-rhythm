@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from chart_worker.errors import ErrorCode, WorkerError
-from chart_worker.generation.mapperatorinator import GeneratedChart
+from chart_worker.generation.mapperatorinator import GeneratedChart, GeneratedTiming
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
-from chart_worker.generation.params import GenerationRequest
+from chart_worker.generation.params import GenerationRequest, TimingGenerationRequest
 from chart_worker.schema.note import Chart, NoteEvent
 from chart_worker.schema.types import TARGET_HOLD_RATIO
 
@@ -76,7 +76,18 @@ class FakeGenerator:
     fixture_path: Path | None = None
     """주면 그 .osu 를 그대로 돌려준다. 골든 테스트용."""
 
-    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
+    def generate_timing(
+        self, request: TimingGenerationRequest, workdir: Path
+    ) -> GeneratedTiming:
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(OsuBpmEvent(time_ms=0, bpm=120.0),),
+            generator_name="fake-synthetic",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+    def generate_map(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
         if self.fixture_path is not None:
             beatmap = parse_osu_file(self.fixture_path)
             if beatmap.key_mode != request.key_mode:
@@ -102,3 +113,7 @@ class FakeGenerator:
             seed=request.seed,
             bpm_events=(OsuBpmEvent(time_ms=0, bpm=120.0),),
         )
+
+    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
+        """Compatibility bridge until the generation stage uses generate_map directly."""
+        return self.generate_map(request, workdir)
