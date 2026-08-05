@@ -11,7 +11,6 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from chart_worker.analysis.onset import OnsetAnalysis, analyze_canonical_audio
-from chart_worker.analysis.timing_diagnostics import diagnose_chart_timing
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
@@ -35,6 +34,7 @@ from chart_worker.stages.types import (
     PreparedAudio,
     SongTimingAuthority,
 )
+from chart_worker.validation.quality_gate import GateAction
 
 GeneratorName = Literal["fake", "mapperatorinator"]
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
@@ -43,7 +43,7 @@ TimingStage = Callable[
     [PreparedAudio, OnsetAnalysis, Path, ChartGenerator, int], SongTimingAuthority
 ]
 GenerationStage = Callable[
-    [PreparedAudio, SongTimingAuthority, Path, ChartGenerator, int],
+    [PreparedAudio, SongTimingAuthority, OnsetAnalysis, Path, ChartGenerator, int],
     tuple[GeneratedVariant, ...],
 ]
 ExportStage = Callable[
@@ -59,6 +59,7 @@ def _prepare_stage(source: Path, run_dir: Path, config: WorkerConfig) -> Prepare
 def _generation_stage(
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
+    analysis: OnsetAnalysis,
     run_dir: Path,
     generator: ChartGenerator,
     seed: int,
@@ -66,6 +67,7 @@ def _generation_stage(
     return run_generation(
         prepared,
         authority,
+        analysis,
         run_dir,
         generator=generator,
         seed=seed,
@@ -210,17 +212,11 @@ def _generation_report(
     config: WorkerConfig,
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
-    onsets: OnsetAnalysis,
 ) -> dict[str, object]:
     charts = []
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
-        timing_diagnostics = diagnose_chart_timing(
-            notes,
-            onsets.onset_ms,
-            duration_ms=prepared.normalized.duration_ms,
-            activity=onsets.activity,
-        )
+        acceptance = variant.acceptance.to_report()
         charts.append(
             {
                 "keyMode": variant.key_mode,
@@ -232,7 +228,15 @@ def _generation_report(
                 "cfgScale": variant.cfg_scale,
                 "attemptCount": variant.attempt,
                 "attemptErrors": list(variant.attempt_errors),
-                "timingDiagnostics": timing_diagnostics.to_report(),
+                "attemptEvidence": list(variant.attempt_evidence),
+                "acceptanceStatus": acceptance["action"],
+                "acceptanceReasons": [
+                    reason
+                    for decision in variant.acceptance.decisions
+                    for reason in decision.reasons
+                ],
+                "acceptanceDecisions": acceptance["decisions"],
+                "timingDiagnostics": acceptance["timing"],
                 "rawNoteCount": len(notes),
                 "finalNoteCount": len(result.document.notes),
                 "holdCount": sum(note.kind == "HOLD" for note in notes),
@@ -244,6 +248,9 @@ def _generation_report(
         )
     return {
         "version": 1,
+        "qualityGateVersion": "quality-gate-v1",
+        "publishable": True,
+        "status": "PASS",
         "runId": str(run_id),
         "sourceName": options.source.name,
         "generator": options.generator,
@@ -259,12 +266,84 @@ def _generation_report(
         "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
         "canonicalAudioSha256": prepared.normalized.sha256,
         "timingReviewRequired": any(
-            chart["timingDiagnostics"]["status"] != "PASS" for chart in charts
+            chart["acceptanceStatus"] != "PASS" for chart in charts
         ),
         "elapsedMsByStage": elapsed,
         "warnings": [],
         "charts": charts,
     }
+
+
+def _failure_generation_report(
+    options: PipelineOptions,
+    run_id: UUID,
+    elapsed: dict[str, int],
+    run_dir: Path,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    error: WorkerError,
+) -> dict[str, object]:
+    status = (
+        "REVIEW"
+        if error.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+        else "EXHAUSTED"
+    )
+    return {
+        "version": 1,
+        "qualityGateVersion": "quality-gate-v1",
+        "runId": str(run_id),
+        "sourceName": options.source.name,
+        "generator": options.generator,
+        "strategy": "MAPPERATORINATOR_SHARED_TIMING",
+        "publishable": False,
+        "status": status,
+        "error": {
+            "code": error.code.value,
+            "context": error.context,
+        },
+        "timingAuthority": _relative(authority.reference_path, run_dir),
+        "timingAuthoritySha256": authority.sha256,
+        "timingGenerationMode": authority.mode,
+        "timingAttemptCount": authority.attempt_count,
+        "canonicalAudioSha256": prepared.normalized.sha256,
+        "elapsedMsByStage": elapsed,
+        "charts": [],
+    }
+
+
+def _write_generation_report(path: Path, report: dict[str, object]) -> None:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _require_pass_acceptance(generated: tuple[GeneratedVariant, ...]) -> None:
+    rejected = [
+        {
+            "key_mode": variant.key_mode,
+            "difficulty": variant.difficulty,
+            "gate_report": variant.acceptance.to_report(),
+        }
+        for variant in generated
+        if variant.acceptance.action is not GateAction.PASS
+    ]
+    if not rejected:
+        return
+    code = (
+        ErrorCode.CHART_CANDIDATES_EXHAUSTED
+        if any(
+            variant.acceptance.action is GateAction.RETRY_MAP for variant in generated
+        )
+        else ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    )
+    raise WorkerError(
+        code,
+        "generation stage returned non-publishable chart candidates",
+        context={"variants": rejected},
+    )
 
 
 def run_pipeline(
@@ -299,13 +378,36 @@ def run_pipeline(
     elapsed["timing"] = _elapsed_ms(started)
 
     started = perf_counter_ns()
-    generated = dependencies.generation(
-        prepared,
-        authority,
-        run_dir,
-        generator,
-        options.seed,
-    )
+    try:
+        generated = dependencies.generation(
+            prepared,
+            authority,
+            onsets,
+            run_dir,
+            generator,
+            options.seed,
+        )
+        _require_pass_acceptance(generated)
+    except WorkerError as error:
+        if error.code not in {
+            ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+        }:
+            raise
+        elapsed["generation"] = _elapsed_ms(started)
+        _write_generation_report(
+            run_dir / "generation-report.json",
+            _failure_generation_report(
+                options,
+                run_id,
+                elapsed,
+                run_dir,
+                prepared,
+                authority,
+                error,
+            ),
+        )
+        raise
     _require_canonical_audio_hash(prepared)
     elapsed["generation"] = _elapsed_ms(started)
 
@@ -319,25 +421,19 @@ def run_pipeline(
     elapsed["export"] = _elapsed_ms(started)
 
     report_path = run_dir / "generation-report.json"
-    report_path.write_text(
-        json.dumps(
-            _generation_report(
-                options,
-                run_id,
-                elapsed,
-                generated,
-                exported,
-                run_dir,
-                dependencies.config,
-                prepared,
-                authority,
-                onsets,
-            ),
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+    _write_generation_report(
+        report_path,
+        _generation_report(
+            options,
+            run_id,
+            elapsed,
+            generated,
+            exported,
+            run_dir,
+            dependencies.config,
+            prepared,
+            authority,
+        ),
     )
     manifest = PlaytestRunManifest(
         run_id=run_id,

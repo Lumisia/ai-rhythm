@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from chart_worker.bench import BenchmarkReport, run_benchmark
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.pipeline import PipelineOptions
 from tests.support import fake_dependencies
 
@@ -82,20 +83,30 @@ def test_benchmark_requires_review_when_timing_diagnostics_do(tmp_path: Path):
     aligned = dependencies.analyze(Path("unused"))
     review_analysis = replace(aligned, onset_ms=(1_937,))
 
-    result = run_benchmark(
-        PipelineOptions(
-            source=source,
-            output_dir=tmp_path / "run",
-            title="fixture",
-            generator="fake",
-        ),
-        dependencies=replace(
-            dependencies,
-            analyze=lambda _path: review_analysis,
-        ),
-    )
+    output_dir = tmp_path / "run"
+    with pytest.raises(WorkerError) as captured:
+        run_benchmark(
+            PipelineOptions(
+                source=source,
+                output_dir=output_dir,
+                title="fixture",
+                generator="fake",
+            ),
+            dependencies=replace(
+                dependencies,
+                analyze=lambda _path: review_analysis,
+            ),
+        )
 
-    assert result.report.status == "REVIEW"
+    generation = json.loads((output_dir / "generation-report.json").read_text())
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert generation["publishable"] is False
+    assert generation["status"] == "EXHAUSTED"
+    assert all(
+        attempt["gateReport"]["action"] == "RETRY_MAP"
+        for attempt in generation["error"]["context"]["attempts"]
+    )
+    assert not (output_dir / "benchmark-report.json").exists()
 
 
 def test_benchmark_requires_review_when_timing_diagnostics_are_insufficient(
@@ -106,17 +117,24 @@ def test_benchmark_requires_review_when_timing_diagnostics_are_insufficient(
     dependencies = fake_dependencies()
     analyzed = dependencies.analyze(Path("unused"))
 
-    result = run_benchmark(
-        PipelineOptions(
-            source=source,
-            output_dir=tmp_path / "run",
-            title="fixture",
-            generator="fake",
-        ),
-        dependencies=replace(
-            dependencies,
-            analyze=lambda _path: replace(analyzed, onset_ms=()),
-        ),
-    )
+    output_dir = tmp_path / "run"
+    with pytest.raises(WorkerError) as captured:
+        run_benchmark(
+            PipelineOptions(
+                source=source,
+                output_dir=output_dir,
+                title="fixture",
+                generator="fake",
+            ),
+            dependencies=replace(
+                dependencies,
+                analyze=lambda _path: replace(analyzed, onset_ms=()),
+            ),
+        )
 
-    assert result.report.status == "REVIEW"
+    generation = json.loads((output_dir / "generation-report.json").read_text())
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert generation["publishable"] is False
+    assert generation["status"] == "REVIEW"
+    assert generation["error"]["context"]["gate_report"]["action"] == "REVIEW"
+    assert not (output_dir / "benchmark-report.json").exists()

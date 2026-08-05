@@ -6,6 +6,7 @@ from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages.s3_export import run_export
 from chart_worker.stages.types import GeneratedVariant, PreparedAudio
+from tests.support import pass_acceptance
 
 SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -51,6 +52,7 @@ def test_export_preserves_mapperatorinator_notes_and_timing_exactly(tmp_path: Pa
         difficulty="NORMAL",
         requested_star=1.5,
         raw_osu_path=raw_path,
+        acceptance=pass_acceptance(),
         generated=GeneratedChart(
             notes=notes,
             key_mode=4,
@@ -101,6 +103,7 @@ def test_export_rejects_a_generated_map_without_timing(tmp_path: Path):
         difficulty="EASY",
         requested_star=1.0,
         raw_osu_path=raw_path,
+        acceptance=pass_acceptance(),
         generated=GeneratedChart(
             notes=[NoteEvent(time_ms=500, lane=0)],
             key_mode=4,

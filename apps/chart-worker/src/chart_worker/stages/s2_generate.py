@@ -1,7 +1,9 @@
 """S2: generate each map and retry only invalid Mapperatorinator output."""
 
+import json
 from pathlib import Path
 
+from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedChart
 from chart_worker.generation.osu_parser import parse_osu_mania
@@ -14,6 +16,7 @@ from chart_worker.validation.generated_chart import (
     GeneratedChartValidationError,
     validate_generated_chart,
 )
+from chart_worker.validation.quality_gate import GateAction, evaluate_chart_candidate
 from chart_worker.validation.timing_authority import (
     TimingAuthorityValidationError,
     validate_timing_identity,
@@ -125,6 +128,7 @@ def _validate_serialized_candidate(
 def run_generation(
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
     run_dir: Path,
     *,
     generator: ChartGenerator,
@@ -139,6 +143,7 @@ def run_generation(
     )
     for index, (key_mode, difficulty) in enumerate(combinations):
         attempt_errors: list[str] = []
+        attempt_evidence: list[dict[str, object]] = []
         attempted_seeds: list[int] = []
         for attempt in range(1, MAX_VARIANT_ATTEMPTS + 1):
             _require_timing_authority(prepared, authority)
@@ -188,6 +193,55 @@ def run_generation(
                     prepared,
                     key_mode,
                 )
+                acceptance = evaluate_chart_candidate(
+                    generated,
+                    authority,
+                    onset_analysis,
+                    requested_key_mode=key_mode,
+                    requested_difficulty=difficulty,
+                    duration_ms=prepared.normalized.duration_ms,
+                )
+                gate_report = acceptance.to_report()
+                evidence = {
+                    "seed": attempt_seed,
+                    "workdir": workdir.relative_to(run_dir).as_posix(),
+                    "gateReport": gate_report,
+                }
+                if acceptance.action is GateAction.REVIEW:
+                    raise WorkerError(
+                        ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                        f"{key_mode}K {difficulty} requires timing review",
+                        context={
+                            "seed": attempt_seed,
+                            "workdir": evidence["workdir"],
+                            "key_mode": key_mode,
+                            "difficulty": difficulty,
+                            "gate_report": gate_report,
+                        },
+                    )
+                if acceptance.action is GateAction.RETRY_MAP:
+                    attempt_evidence.append(evidence)
+                    attempt_errors.append(
+                        json.dumps(
+                            gate_report,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                    if attempt < MAX_VARIANT_ATTEMPTS:
+                        continue
+                    raise WorkerError(
+                        ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+                        f"{key_mode}K {difficulty} failed {MAX_VARIANT_ATTEMPTS} attempts",
+                        context={
+                            "key_mode": key_mode,
+                            "difficulty": difficulty,
+                            "seeds": attempted_seeds,
+                            "errors": attempt_errors,
+                            "attempts": attempt_evidence,
+                        },
+                    )
                 raw_path.parent.mkdir(parents=True, exist_ok=True)
                 raw_path.write_text(osu_text, encoding="utf-8")
                 try:
@@ -223,6 +277,7 @@ def run_generation(
                         "difficulty": difficulty,
                         "seeds": attempted_seeds,
                         "errors": attempt_errors,
+                        "attempts": attempt_evidence,
                     },
                 ) from error
             break
@@ -236,7 +291,9 @@ def run_generation(
                 cfg_scale=request.cfg_scale,
                 attempt=attempt,
                 attempt_errors=tuple(attempt_errors),
+                attempt_evidence=tuple(attempt_evidence),
                 timing_authority_sha256=authority.sha256,
+                acceptance=acceptance,
             )
         )
     return tuple(variants)

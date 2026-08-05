@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from chart_worker.analysis.grid_alignment import TempoCandidateMetrics
 from chart_worker.audio.normalize import NormalizedAudio
@@ -10,6 +10,9 @@ from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.validation.timing_review import TimingAuthorityReview
+
+if TYPE_CHECKING:
+    from chart_worker.validation.quality_gate import ChartAcceptance
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +41,11 @@ class GeneratedVariant:
     requested_star: float
     raw_osu_path: Path
     generated: GeneratedChart
+    acceptance: "ChartAcceptance"
     cfg_scale: float = 1.0
     attempt: int = 1
     attempt_errors: tuple[str, ...] = ()
+    attempt_evidence: tuple[dict[str, object], ...] = ()
     timing_authority_sha256: str = ""
 
 

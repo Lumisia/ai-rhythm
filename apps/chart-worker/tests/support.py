@@ -5,7 +5,9 @@ from uuid import UUID
 import numpy as np
 import soundfile as sf
 
+from chart_worker.analysis.grid_alignment import NoteGridMetrics
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing_diagnostics import TimingDiagnostics, TimingMetrics
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.config import WorkerConfig
 from chart_worker.generation.fake import FakeGenerator
@@ -14,6 +16,47 @@ from chart_worker.pipeline import PipelineDependencies
 from chart_worker.stages.s2_generate import run_generation
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.types import PreparedAudio
+from chart_worker.validation.quality_gate import (
+    ChartAcceptance,
+    GateAction,
+    GateAxis,
+    GateDecision,
+)
+
+
+def pass_acceptance() -> ChartAcceptance:
+    metrics = TimingMetrics(
+        row_count=0,
+        precision_20=1.0,
+        precision_50=1.0,
+        signed_median_ms=0.0,
+        absolute_p95_ms=0.0,
+        absolute_p99_ms=0.0,
+    )
+    return ChartAcceptance(
+        action=GateAction.PASS,
+        decisions=tuple(
+            GateDecision(axis=axis, action=GateAction.PASS, reasons=())
+            for axis in GateAxis
+        ),
+        timing=TimingDiagnostics(
+            status="PASS",
+            onset_count=0,
+            active_onset_count=0,
+            first_note_time_ms=None,
+            max_gap_ms=0,
+            coverage_gaps=(),
+            quiet_coverage_gaps=(),
+            overall=metrics,
+            sections=(),
+        ),
+        note_grid=NoteGridMetrics(
+            unique_row_count=0,
+            clean_row_count=0,
+            clean_rate=1.0,
+            absolute_p95_beats=0.0,
+        ),
+    )
 
 
 def _write_prepared_audio(
@@ -76,10 +119,11 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
             seed=seed,
         )
 
-    def generation(prepared, authority, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
         return run_generation(
             prepared,
             authority,
+            analysis,
             run_dir,
             generator=generator,
             seed=seed,
