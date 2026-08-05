@@ -19,6 +19,7 @@ def notes_to_osu_mania(
     offset_ms: int,
     audio_filename: str,
     title: str,
+    bpm_events: tuple[OsuBpmEvent, ...] | None = None,
 ) -> str:
     if key_mode not in KEY_MODES:
         raise ValueError(f"unsupported key_mode: {key_mode}")
@@ -36,7 +37,13 @@ def notes_to_osu_mania(
         else:
             hit_objects.append(f"{x},192,{note.time_ms},1,0,0:0:0:0:")
 
-    beat_length_ms = 60_000.0 / bpm
+    timing_events = bpm_events or (OsuBpmEvent(offset_ms, bpm),)
+    timing_points = []
+    for event in timing_events:
+        if not math.isfinite(event.bpm) or event.bpm <= 0:
+            raise ValueError("bpm must be positive and finite")
+        timing_points.append(f"{event.time_ms},{60_000.0 / event.bpm:.12f},4,2,0,60,1,0")
+
     safe_title = _safe_title(title)
     lines = [
         "osu file format v14",
@@ -55,7 +62,7 @@ def notes_to_osu_mania(
         "OverallDifficulty:8",
         "",
         "[TimingPoints]",
-        f"{offset_ms},{beat_length_ms:.6f},4,2,0,60,1,0",
+        *timing_points,
         "",
         "[HitObjects]",
         *hit_objects,

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import ChartGenerator
+from chart_worker.generation.osu_parser import parse_osu_mania
 from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
 from chart_worker.hashing import sha256_file
@@ -61,6 +62,19 @@ def _require_timing_authority(
         )
 
 
+def _validate_serialized_timing(
+    osu_text: str, authority: SongTimingAuthority
+) -> None:
+    try:
+        bpm_events = parse_osu_mania(osu_text).bpm_events
+    except ValueError as error:
+        raise WorkerError(
+            ErrorCode.CHART_OSU_PARSE_FAILED,
+            "serialized MAP is not valid osu!mania",
+        ) from error
+    validate_timing_identity(bpm_events, authority.bpm_events)
+
+
 def run_generation(
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
@@ -98,6 +112,7 @@ def run_generation(
                 / f"{key_mode}k-{difficulty.lower()}"
                 / f"attempt-{attempt}"
             )
+            raw_path = run_dir / "raw" / f"{key_mode}k-{difficulty.lower()}.osu"
             try:
                 generated = generator.generate_map(request, workdir)
                 validate_timing_identity(generated.bpm_events, authority.bpm_events)
@@ -106,6 +121,26 @@ def run_generation(
                     key_mode=key_mode,
                     duration_ms=prepared.normalized.duration_ms,
                 )
+                first_timing = generated.bpm_events[0]
+                osu_text = generated.osu_text or notes_to_osu_mania(
+                    generated.notes,
+                    key_mode=key_mode,
+                    bpm=first_timing.bpm,
+                    offset_ms=first_timing.time_ms,
+                    audio_filename=prepared.normalized.path.name,
+                    title=prepared.normalized.path.stem,
+                    bpm_events=generated.bpm_events,
+                )
+                _validate_serialized_timing(osu_text, authority)
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(osu_text, encoding="utf-8")
+                try:
+                    _validate_serialized_timing(
+                        raw_path.read_text(encoding="utf-8-sig"), authority
+                    )
+                except (TimingAuthorityValidationError, WorkerError):
+                    raw_path.unlink(missing_ok=True)
+                    raise
             except (
                 GeneratedChartValidationError,
                 TimingAuthorityValidationError,
@@ -127,18 +162,6 @@ def run_generation(
                     },
                 ) from error
             break
-        first_timing = generated.bpm_events[0]
-        osu_text = generated.osu_text or notes_to_osu_mania(
-            generated.notes,
-            key_mode=key_mode,
-            bpm=first_timing.bpm,
-            offset_ms=first_timing.time_ms,
-            audio_filename=prepared.normalized.path.name,
-            title=prepared.normalized.path.stem,
-        )
-        raw_path = run_dir / "raw" / f"{key_mode}k-{difficulty.lower()}.osu"
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path.write_text(osu_text, encoding="utf-8")
         variants.append(
             GeneratedVariant(
                 key_mode=key_mode,

@@ -36,8 +36,11 @@ def _prepared(tmp_path: Path) -> PreparedAudio:
     )
 
 
-def _authority(prepared: PreparedAudio, tmp_path: Path) -> SongTimingAuthority:
-    bpm_events = (OsuBpmEvent(0, 120.0),)
+def _authority(
+    prepared: PreparedAudio,
+    tmp_path: Path,
+    bpm_events: tuple[OsuBpmEvent, ...] = (OsuBpmEvent(0, 120.0),),
+) -> SongTimingAuthority:
     reference_path = tmp_path / "audio" / "timing-reference.osu"
     reference_path.write_text(
         timing_to_osu_mania(
@@ -164,6 +167,74 @@ def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
         seed=1,
     )
     assert variants[0].raw_osu_path.read_text(encoding="utf-8") == generator.texts[0]
+
+
+def test_empty_osu_text_fallback_preserves_every_authority_timing_event(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path)
+    bpm_events = (OsuBpmEvent(0, 120.0), OsuBpmEvent(1_000, 150.0))
+    authority = _authority(prepared, tmp_path, bpm_events)
+
+    class MultipleTimingGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            return GeneratedChart(
+                notes=generated.notes,
+                key_mode=generated.key_mode,
+                osu_text="",
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                bpm_events=bpm_events,
+            )
+
+    variants = run_generation(
+        prepared,
+        authority,
+        tmp_path,
+        generator=MultipleTimingGenerator(),
+        seed=0,
+    )
+
+    assert parse_osu_file(variants[0].raw_osu_path).bpm_events == bpm_events
+
+
+def test_stable_raw_reparse_rejects_text_with_different_timing_identity(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    mismatched_text = (
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\n"
+        "CircleSize:4\n\n[TimingPoints]\n0,495.867768595041,4,2,0,60,1,0\n\n"
+        "[HitObjects]\n64,192,500,1,0,0:0:0:0:\n"
+    )
+
+    class MismatchedTextGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            return GeneratedChart(
+                notes=generated.notes,
+                key_mode=generated.key_mode,
+                osu_text=mismatched_text,
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                bpm_events=generated.bpm_events,
+            )
+
+    generator = MismatchedTextGenerator()
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert len(generator.map_calls) == 3
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
 def test_run_generation_never_writes_invalid_output_to_stable_raw(tmp_path: Path):
