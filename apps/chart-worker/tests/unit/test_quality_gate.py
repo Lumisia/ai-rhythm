@@ -241,6 +241,30 @@ def test_low_section_precision_without_phase_delta_is_advisory():
     assert "SECTION_PHASE_DELTA" not in decision.reasons
 
 
+def test_correlated_section_onset_errors_without_phase_drift_are_advisory():
+    first_section = tuple(range(1_000, 9_000, 1_000))
+    later_sections = tuple(range(16_000, 45_000, 1_000))
+    rows = first_section + later_sections
+    offsets = {
+        row: 100 if index % 2 == 0 else -100
+        for index, row in enumerate(first_section)
+    }
+    result = _evaluate(
+        _chart(rows),
+        tuple(row - offsets.get(row, 0) for row in rows),
+        duration_ms=45_000,
+    )
+
+    section = result.timing.sections[0]
+    assert section.status == "REVIEW"
+    assert section.metrics.precision_50 < 0.60
+    assert section.metrics.absolute_p95_ms >= 60
+    assert abs(section.phase_delta_ms or 0) <= 25
+    decision = _decision(result, "TIMING_ALIGNMENT")
+    assert decision.action is _gate().GateAction.PASS
+    assert "SECTION_TIMING_WEAK_SUPPORT" in decision.reasons
+
+
 @pytest.mark.parametrize("active_onset_ms", [(), (1_000, 2_000)])
 def test_missing_or_low_active_onset_support_requires_review(active_onset_ms):
     rows = tuple(range(1_000, 9_000, 1_000))

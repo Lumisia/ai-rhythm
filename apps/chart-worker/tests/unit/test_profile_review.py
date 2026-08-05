@@ -66,12 +66,12 @@ def _pattern_decision(profile: ChartQualityProfile):
     return decisions[0]
 
 
-def test_extreme_single_section_hold_concentration_is_review():
+def test_extreme_single_section_hold_concentration_is_advisory():
     decision = _pattern_decision(
         _profile(occupancy=(0.05, 0.06, 0.82, 0.04))
     )
 
-    assert decision.action is GateAction.REVIEW
+    assert decision.action is GateAction.PASS
     assert decision.reasons == ("HOLD_SECTION_OUTLIER",)
 
 
@@ -129,7 +129,7 @@ def test_lane_outlier_requires_enough_notes_for_statistical_support():
     assert decision.action is GateAction.PASS
 
 
-def test_independent_profile_metrics_have_stable_review_reasons():
+def test_independent_profile_metrics_have_stable_advisory_reasons():
     cases = (
         (_profile(releases=(1, 1, 12, 2)), "HOLD_RELEASE_SECTION_OUTLIER"),
         (
@@ -141,7 +141,7 @@ def test_independent_profile_metrics_have_stable_review_reasons():
 
     for profile, reason in cases:
         decision = _pattern_decision(profile)
-        assert decision.action is GateAction.REVIEW
+        assert decision.action is GateAction.PASS
         assert decision.reasons == (reason,)
 
 

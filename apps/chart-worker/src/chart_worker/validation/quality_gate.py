@@ -144,8 +144,10 @@ def _timing_alignment_decision(
         section.status == "REVIEW"
         and section.metrics.precision_50 is not None
         and section.metrics.absolute_p95_ms is not None
+        and section.phase_delta_ms is not None
         and section.metrics.precision_50 < 0.60
         and section.metrics.absolute_p95_ms >= 60
+        and abs(section.phase_delta_ms) > SECTION_PHASE_DRIFT_MAX_MS
         for section in timing.sections
     ):
         return GateDecision(

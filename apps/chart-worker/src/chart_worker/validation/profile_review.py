@@ -118,7 +118,7 @@ def review_profile(
 
     if reasons:
         return (
-            GateDecision(GateAxis.PATTERN, GateAction.REVIEW, tuple(reasons)),
+            GateDecision(GateAxis.PATTERN, GateAction.PASS, tuple(reasons)),
         )
     return (
         GateDecision(
