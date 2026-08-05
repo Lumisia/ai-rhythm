@@ -132,9 +132,6 @@ def _common_generation_arguments(
         "export_osz=false",
         "hitsounded=false",
         "fast_decoder_loop=true",
-        # The worker invokes Mapperatorinator sequentially. Its per-process server
-        # otherwise keeps every short-lived CLI alive for the 20s idle timeout.
-        "use_server=false",
         "resnap_events=true",
     ]
 
