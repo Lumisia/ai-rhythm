@@ -154,6 +154,19 @@ def test_global_sixty_millisecond_corruption_retries_timing_alignment():
     assert _decision(result, "TIMING_ALIGNMENT").reasons == ("OVERALL_TIMING_MISALIGNED",)
 
 
+def test_sparse_onset_support_with_aligned_global_phase_is_advisory():
+    rows = tuple(range(1_000, 61_000, 1_000))
+    onsets = tuple(row for index, row in enumerate(rows) if index % 3 != 0)
+    result = _evaluate(_chart(rows), onsets, duration_ms=61_000)
+
+    assert result.timing.overall.precision_50 < 0.70
+    assert result.timing.overall.absolute_p95_ms >= 60
+    assert abs(result.timing.overall.signed_median_ms or 0.0) < 20
+    decision = _decision(result, "TIMING_ALIGNMENT")
+    assert decision.action is _gate().GateAction.PASS
+    assert "OVERALL_TIMING_WEAK_SUPPORT" in decision.reasons
+
+
 def test_single_section_onset_shift_is_advisory_at_map_stage():
     rows = tuple(range(1_000, 60_000, 1_000))
     corrupted = set(range(31_000, 39_000, 1_000))

@@ -154,8 +154,10 @@ def _timing_alignment_decision(
     if (
         overall.precision_50 is not None
         and overall.absolute_p95_ms is not None
+        and overall.signed_median_ms is not None
         and overall.precision_50 < 0.70
         and overall.absolute_p95_ms >= 60
+        and abs(overall.signed_median_ms) > SECTION_PHASE_DRIFT_MAX_MS
     ):
         return GateDecision(
             GateAxis.TIMING_ALIGNMENT,
