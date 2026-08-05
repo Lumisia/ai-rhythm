@@ -7,8 +7,11 @@
 
 ## 생성 계약
 
-정상 출력은 조합마다 한 번만 추론한다. 파싱 또는 구조 검증에 실패한 조합만 다른
-seed로 최대 두 번 재시도하며, 이미 성공한 조합은 다시 만들지 않는다.
+곡마다 표준 timing을 한 번 생성하고, timing 구조 검증이 실패할 때만 Super Timing을
+한 번 더 시도한다. 검증된 기준은 `audio/timing-reference.osu`에 저장한다. 그 뒤
+4K·6K·7K와 네 난이도 조합의 MAP 12개가 모두 같은 reference를 재사용한다. MAP의
+파싱·timing identity·구조 검증에 실패한 조합만 다른 seed로 최대 두 번 재시도하며,
+이미 성공한 조합은 다시 만들지 않는다.
 
 | 난이도 | 요청 별 | descriptor |
 | --- | ---: | --- |
@@ -17,10 +20,17 @@ seed로 최대 두 번 재시도하며, 이미 성공한 조합은 다시 만들
 | HARD | 2.0 | `style/mixed rice` |
 | EXPERT | 2.75 | `style/mixed rice` |
 
-공통 요청은 `cfg_scale=1.0`, `output_type=[TIMING,MAP]`,
-`hitsounded=false`, `fast_decoder_loop=true`다. `hold_note_ratio`를 보내지 않으므로
-롱노트는 모델이 곡과 패턴에 맞게 정한다. 룰 기반 채보, Beat This timing,
-super timing, 정상 채보의 다중 seed 후보 경쟁, solver와 레인 재배치는 실행하지 않는다.
+timing 요청은 `output_type=[TIMING]`이고, MAP 요청은 `output_type=[MAP]`,
+`beatmap_path=audio/timing-reference.osu`, `in_context=[TIMING]`을 사용한다. MAP의 공통
+설정은 `cfg_scale=1.0`, `hitsounded=false`, `fast_decoder_loop=true`다.
+`hold_note_ratio`를 보내지 않으므로 롱노트는 모델이 곡과 패턴에 맞게 정한다. 룰 기반
+채보, Beat This timing, 정상 채보의 다중 seed 후보 경쟁, solver와 레인 재배치는
+실행하지 않는다.
+
+각 MAP 시도 직전에 timing reference SHA-256과 canonical audio SHA-256 identity를
+검사한다. 생성된 MAP의 BPM event가 reference와 하나라도 다르면 그 MAP만 재시도하고
+안정 경로로 승격하지 않는다. BPM event나 노트 시각·레인·종류·HOLD 길이를 reference에
+맞추기 위해 재작성하지 않는다.
 
 `end_time`에는 정규화 오디오 길이를 전달한다. Mapperatorinator가 패딩 구간에
 오디오 밖 노트를 만드는 것을 모델 자체 크롭 단계에서 막고, 내보내기 단계는
@@ -91,12 +101,14 @@ uv run --project apps/chart-worker chart-worker bench `
 - `raw/work/<variant>/attempt-1..3/`: 시도별 원문과 Hydra 로그
 - `charts/*.json`: 원본 노트와 timing을 보존한 chart-v1
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
+- `audio/timing-reference.osu`: 12개 MAP이 공유하는 SHA-256 고정 timing 기준
 - `generation-report.json`: descriptor, 정밀도, 생성 시간, 노트·HOLD 수, 첫 노트와 최대 공백
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
 `generation-report.json`에는 `attemptsPerChartMax=3`, 실제 시도 횟수·seed·실패
-원문, `canonicalAudioSha256`, `mapperatorinatorConstraintPatch`와 채보별
+원문, `canonicalAudioSha256`, `timingAuthoritySha256`, `timingGenerationMode`,
+`timingAttemptCount`, `mapperatorinatorConstraintPatch`와 채보별
 `timingDiagnostics`가 기록된다. 분석은
 `audio/game.flac`에서 곡당 한 번 실행하고 12개 채보가 같은 onset 배열을 공유한다.
 30초 단위 구간과 전체 고유 노트 행을 평가하며, 전체 ±50ms precision 70% 미만,

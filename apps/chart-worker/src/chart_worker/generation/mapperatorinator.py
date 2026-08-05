@@ -102,47 +102,6 @@ def _hydra_path(path: Path) -> str:
     return "'" + value.replace("'", "\\'") + "'"
 
 
-def build_command(
-    config: WorkerConfig,
-    request: GenerationRequest,
-    output_dir: Path,
-) -> list[str]:
-    """Hydra 인자를 조립한다.
-
-    precision 을 항상 명시한다. v32.yaml 기본값이 bf16 인데 Turing(sm_75)은
-    bf16 을 지원하지 않는다. 설정 파일 기본값에 기대면 GPU 를 바꿀 때
-    조용히 죽는다.
-    """
-    if config.mapperatorinator_python is None or config.mapperatorinator_home is None:
-        raise ValueError("mapperatorinator_python and mapperatorinator_home must be configured")
-
-    argv = [
-        str(_absolute(config.mapperatorinator_python)),
-        INFERENCE_SCRIPT,
-        "-cn",
-        CONFIG_NAME,
-        f"hydra.run.dir={_hydra_path(output_dir / '.hydra-run')}",
-        f"audio_path={_hydra_path(request.audio_path)}",
-        f"output_path={_hydra_path(output_dir)}",
-        f"gamemode={GAMEMODE_MANIA}",
-        f"keycount={request.key_mode}",
-        f"difficulty={request.requested_star}",
-        f"year={request.year}",
-        f"end_time={request.duration_ms}",
-        f"cfg_scale={request.cfg_scale}",
-        f"descriptors={_hydra_list(request.descriptors)}",
-        f"precision={config.mapperatorinator_precision or PRECISION}",
-        "export_osz=false",
-        "output_type=[TIMING,MAP]",
-        "hitsounded=false",
-        "fast_decoder_loop=true",
-        "resnap_events=true",
-    ]
-    if request.seed is not None:
-        argv.append(f"seed={request.seed}")
-    return argv
-
-
 def _command_prefix(config: WorkerConfig, output_dir: Path) -> list[str]:
     if config.mapperatorinator_python is None or config.mapperatorinator_home is None:
         raise ValueError("mapperatorinator_python and mapperatorinator_home must be configured")
@@ -325,25 +284,6 @@ class MapperatorinatorGenerator:
     ) -> GeneratedChart:
         osu_text, beatmap = self._run_and_parse(
             build_map_command(self.config, request, workdir), workdir
-        )
-        if beatmap.key_mode != request.key_mode:
-            raise WorkerError(
-                ErrorCode.CHART_GENERATION_FAILED,
-                f"asked for {request.key_mode}K but got {beatmap.key_mode}K",
-            )
-        return GeneratedChart(
-            notes=beatmap.notes,
-            key_mode=beatmap.key_mode,
-            osu_text=osu_text,
-            generator_name="mapperatorinator-v32",
-            seed=request.seed,
-            bpm_events=beatmap.bpm_events,
-        )
-
-    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
-        """Compatibility bridge until the generation stage uses generate_map directly."""
-        osu_text, beatmap = self._run_and_parse(
-            build_command(self.config, request, workdir), workdir
         )
         if beatmap.key_mode != request.key_mode:
             raise WorkerError(

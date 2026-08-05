@@ -9,7 +9,9 @@ from chart_worker.pipeline import PipelineOptions
 from tests.support import fake_dependencies
 
 
-def test_benchmark_writes_direct_generation_report_for_all_charts(tmp_path: Path):
+def test_benchmark_writes_shared_timing_generation_report_for_all_charts(
+    tmp_path: Path,
+):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     output_dir = tmp_path / "run"
@@ -34,15 +36,16 @@ def test_benchmark_writes_direct_generation_report_for_all_charts(tmp_path: Path
     assert set(report.elapsed_ms_by_stage) == {
         "prepare",
         "analysis",
+        "timing",
         "generation",
         "export",
     }
     generation = json.loads((output_dir / "generation-report.json").read_text())
-    assert generation["strategy"] == "MAPPERATORINATOR_DIRECT"
+    assert generation["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
     assert all(chart["attemptCount"] == 1 for chart in generation["charts"])
 
 
-def test_benchmark_rejects_a_generation_report_without_direct_strategy(
+def test_benchmark_rejects_a_generation_report_without_shared_timing_strategy(
     tmp_path: Path, monkeypatch
 ):
     source = tmp_path / "fixture.wav"
@@ -60,7 +63,7 @@ def test_benchmark_rejects_a_generation_report_without_direct_strategy(
         return result
 
     monkeypatch.setattr("chart_worker.bench.run_pipeline", corrupt)
-    with pytest.raises(ValueError, match="direct strategy"):
+    with pytest.raises(ValueError, match="shared-timing strategy"):
         run_benchmark(
             PipelineOptions(
                 source=source,

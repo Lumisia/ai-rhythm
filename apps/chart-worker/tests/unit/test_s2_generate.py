@@ -6,11 +6,11 @@ from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
+from chart_worker.generation.osu_writer import timing_to_osu_mania
+from chart_worker.hashing import sha256_file
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages.s2_generate import run_generation
-from chart_worker.stages.types import PreparedAudio
-
-SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
 
 
 def _prepared(tmp_path: Path) -> PreparedAudio:
@@ -21,7 +21,7 @@ def _prepared(tmp_path: Path) -> PreparedAudio:
         normalized=NormalizedAudio(
             audio_path,
             "audio-profile-v1",
-            SHA,
+            sha256_file(audio_path),
             2_000,
             48_000,
             2,
@@ -36,12 +36,37 @@ def _prepared(tmp_path: Path) -> PreparedAudio:
     )
 
 
+def _authority(prepared: PreparedAudio, tmp_path: Path) -> SongTimingAuthority:
+    bpm_events = (OsuBpmEvent(0, 120.0),)
+    reference_path = tmp_path / "audio" / "timing-reference.osu"
+    reference_path.write_text(
+        timing_to_osu_mania(
+            bpm_events,
+            audio_filename=prepared.normalized.path.name,
+            title="fixture",
+        ),
+        encoding="utf-8",
+    )
+    return SongTimingAuthority(
+        reference_path=reference_path,
+        sha256=sha256_file(reference_path),
+        audio_sha256=prepared.normalized.sha256,
+        bpm_events=bpm_events,
+        generator_name="recording-generator",
+        seed=17,
+        mode="STANDARD",
+        attempt_count=1,
+    )
+
+
 class RecordingGenerator:
     def __init__(self):
-        self.calls = []
+        self.map_calls = []
+        self.map_workdirs = []
 
-    def __call__(self, request, workdir):
-        self.calls.append((request, workdir))
+    def generate_map(self, request, workdir):
+        self.map_calls.append(request)
+        self.map_workdirs.append(workdir)
         return GeneratedChart(
             notes=[NoteEvent(500, request.key_mode - 1)],
             key_mode=request.key_mode,
@@ -54,16 +79,30 @@ class RecordingGenerator:
 
 def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path):
     prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
     generator = RecordingGenerator()
-    variants = run_generation(prepared, tmp_path, generator=generator, seed=17)
+    variants = run_generation(
+        prepared,
+        authority,
+        tmp_path,
+        generator=generator,
+        seed=17,
+    )
 
     assert {(variant.key_mode, variant.difficulty) for variant in variants} == {
         (key_mode, difficulty)
         for key_mode in (4, 6, 7)
         for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
     }
-    requests = [request for request, _ in generator.calls]
-    workdirs = [workdir for _, workdir in generator.calls]
+    requests = generator.map_calls
+    workdirs = generator.map_workdirs
+    assert len(requests) == 12
+    assert {request.timing_reference_path for request in requests} == {
+        authority.reference_path
+    }
+    assert all(
+        variant.timing_authority_sha256 == authority.sha256 for variant in variants
+    )
     assert len({request.seed for request in requests}) == 12
     assert [
         (request.key_mode, request.difficulty, request.seed) for request in requests
@@ -94,12 +133,13 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
 
 def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
     prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
 
     class OriginalGenerator:
         def __init__(self):
             self.texts = []
 
-        def __call__(self, request, workdir):
+        def generate_map(self, request, workdir):
             text = (
                 "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\n"
                 f"CircleSize:{request.key_mode}\n\n[TimingPoints]\n"
@@ -116,16 +156,23 @@ def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
             )
 
     generator = OriginalGenerator()
-    variants = run_generation(prepared, tmp_path, generator=generator, seed=1)
+    variants = run_generation(
+        prepared,
+        authority,
+        tmp_path,
+        generator=generator,
+        seed=1,
+    )
     assert variants[0].raw_osu_path.read_text(encoding="utf-8") == generator.texts[0]
 
 
 def test_run_generation_never_writes_invalid_output_to_stable_raw(tmp_path: Path):
     prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
 
     class InvalidLaneGenerator(RecordingGenerator):
-        def __call__(self, request, workdir):
-            generated = super().__call__(request, workdir)
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
             return GeneratedChart(
                 notes=[NoteEvent(500, request.key_mode)],
                 key_mode=generated.key_mode,
@@ -136,17 +183,24 @@ def test_run_generation_never_writes_invalid_output_to_stable_raw(tmp_path: Path
             )
 
     with pytest.raises(WorkerError) as captured:
-        run_generation(prepared, tmp_path, generator=InvalidLaneGenerator(), seed=0)
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=InvalidLaneGenerator(),
+            seed=0,
+        )
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
 def test_retries_only_the_failed_variant_with_the_next_seed(tmp_path: Path):
     prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
 
     class FirstEasyAttemptInvalid(RecordingGenerator):
-        def __call__(self, request, workdir):
-            generated = super().__call__(request, workdir)
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
             if request.key_mode == 4 and request.difficulty == "EASY" and request.seed == 0:
                 return GeneratedChart(
                     notes=[NoteEvent(500, request.key_mode)],
@@ -159,11 +213,19 @@ def test_retries_only_the_failed_variant_with_the_next_seed(tmp_path: Path):
             return generated
 
     generator = FirstEasyAttemptInvalid()
-    variants = run_generation(prepared, tmp_path, generator=generator, seed=0)
+    variants = run_generation(
+        prepared,
+        authority,
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
     calls = [
         (request.key_mode, request.difficulty, request.seed, workdir.name)
-        for request, workdir in generator.calls
+        for request, workdir in zip(
+            generator.map_calls, generator.map_workdirs, strict=True
+        )
     ]
     assert calls[:2] == [
         (4, "EASY", 0, "attempt-1"),
@@ -178,10 +240,11 @@ def test_retries_only_the_failed_variant_with_the_next_seed(tmp_path: Path):
 
 def test_reports_all_errors_when_one_variant_exhausts_its_attempts(tmp_path: Path):
     prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
 
     class AlwaysInvalid(RecordingGenerator):
-        def __call__(self, request, workdir):
-            generated = super().__call__(request, workdir)
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
             return GeneratedChart(
                 notes=[NoteEvent(500, request.key_mode)],
                 key_mode=generated.key_mode,
@@ -193,11 +256,57 @@ def test_reports_all_errors_when_one_variant_exhausts_its_attempts(tmp_path: Pat
 
     generator = AlwaysInvalid()
     with pytest.raises(WorkerError) as captured:
-        run_generation(prepared, tmp_path, generator=generator, seed=0)
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
 
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert captured.value.context["key_mode"] == 4
     assert captured.value.context["difficulty"] == "EASY"
     assert captured.value.context["seeds"] == [0, 12, 24]
     assert len(captured.value.context["errors"]) == 3
-    assert [request.seed for request, _ in generator.calls] == [0, 12, 24]
+    assert [request.seed for request in generator.map_calls] == [0, 12, 24]
+
+
+def test_different_timing_identity_retries_only_failed_map_without_promotion(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+
+    class DifferentTimingGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            return GeneratedChart(
+                notes=generated.notes,
+                key_mode=generated.key_mode,
+                osu_text=generated.osu_text,
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                bpm_events=(OsuBpmEvent(0, 121.0),),
+            )
+
+    generator = DifferentTimingGenerator()
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert [
+        (request.key_mode, request.difficulty, request.seed)
+        for request in generator.map_calls
+    ] == [
+        (4, "EASY", 0),
+        (4, "EASY", 12),
+        (4, "EASY", 24),
+    ]
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()

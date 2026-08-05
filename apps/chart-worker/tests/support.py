@@ -11,6 +11,8 @@ from chart_worker.config import WorkerConfig
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineDependencies
+from chart_worker.stages.s2_generate import run_generation
+from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.types import PreparedAudio
 
 
@@ -63,11 +65,30 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
             onset_ms=tuple(range(0, duration_ms, 125)),
         )
 
+    def timing(prepared, run_dir, generator, seed):
+        return run_timing_generation(
+            prepared,
+            run_dir,
+            generator=generator,
+            seed=seed,
+        )
+
+    def generation(prepared, authority, run_dir, generator, seed):
+        return run_generation(
+            prepared,
+            authority,
+            run_dir,
+            generator=generator,
+            seed=seed,
+        )
+
     return PipelineDependencies(
         config=WorkerConfig(),
         prepare=prepare,
         analyze=analyze,
         select_generator=lambda _name, _config: FakeGenerator(),
+        timing=timing,
+        generation=generation,
         now=lambda: datetime(2026, 8, 2, tzinfo=UTC),
         new_run_id=lambda: UUID("00000000-0000-0000-0000-000000000007"),
     )

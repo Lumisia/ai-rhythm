@@ -38,12 +38,13 @@ def _load_generation_report(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("generation report must be an object")  # noqa: TRY004
-    if value.get("strategy") != "MAPPERATORINATOR_DIRECT":
-        raise ValueError("generation report must use the direct strategy")
+    if value.get("strategy") != "MAPPERATORINATOR_SHARED_TIMING":
+        raise ValueError("generation report must use the shared-timing strategy")
     elapsed = value.get("elapsedMsByStage")
     if not isinstance(elapsed, dict) or set(elapsed) != {
         "prepare",
         "analysis",
+        "timing",
         "generation",
         "export",
     }:

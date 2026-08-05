@@ -7,6 +7,8 @@ import pytest
 
 from chart_worker.analysis.activity import AudioActivity
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.fake import FakeGenerator
+from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.schema.playtest_run import PlaytestRunManifest
@@ -37,6 +39,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert set(result.elapsed_ms_by_stage) == {
         "prepare",
         "analysis",
+        "timing",
         "generation",
         "export",
     }
@@ -46,8 +49,12 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert not (output_dir / "analysis").exists()
 
     report = json.loads((output_dir / "generation-report.json").read_text())
-    assert report["strategy"] == "MAPPERATORINATOR_DIRECT"
-    assert report["timingAuthority"] == "FAKE"
+    assert report["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
+    assert report["timingAuthoritySha256"] == sha256_file(
+        output_dir / "audio" / "timing-reference.osu"
+    )
+    assert report["timingGenerationMode"] == "STANDARD"
+    assert report["timingAttemptCount"] == 1
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
     assert report["attemptsPerChartMax"] == 3
@@ -76,13 +83,100 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert raw_path.parent == output_dir / "raw"
 
 
+def test_pipeline_runs_shared_timing_before_twelve_maps_with_one_generator(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    calls = []
+    select_calls = []
+
+    class RecordingGenerator:
+        def __init__(self):
+            self.delegate = FakeGenerator()
+            self.timing_calls = 0
+            self.map_calls = 0
+
+        def generate_timing(self, request, workdir):
+            self.timing_calls += 1
+            return self.delegate.generate_timing(request, workdir)
+
+        def generate_map(self, request, workdir):
+            self.map_calls += 1
+            return self.delegate.generate_map(request, workdir)
+
+    generator = RecordingGenerator()
+
+    def prepare(source_path, run_dir, config):
+        calls.append("prepare")
+        return dependencies.prepare(source_path, run_dir, config)
+
+    def analyze(path):
+        calls.append("analyze")
+        return dependencies.analyze(path)
+
+    def select_generator(name, config):
+        select_calls.append((name, config))
+        return generator
+
+    def timing(prepared, run_dir, selected_generator, seed):
+        calls.append("timing")
+        assert selected_generator is generator
+        return dependencies.timing(prepared, run_dir, selected_generator, seed)
+
+    def generation(prepared, authority, run_dir, selected_generator, seed):
+        calls.append("generation")
+        assert selected_generator is generator
+        return dependencies.generation(
+            prepared,
+            authority,
+            run_dir,
+            selected_generator,
+            seed,
+        )
+
+    def export(prepared, generated, run_dir, worker_version):
+        calls.append("export")
+        return dependencies.export(prepared, generated, run_dir, worker_version)
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(
+            dependencies,
+            prepare=prepare,
+            analyze=analyze,
+            select_generator=select_generator,
+            timing=timing,
+            generation=generation,
+            export=export,
+        ),
+    )
+
+    assert calls == ["prepare", "analyze", "timing", "generation", "export"]
+    assert len(select_calls) == 1
+    assert generator.timing_calls == 1
+    assert generator.map_calls == 12
+
+
 def test_generation_report_records_the_selected_retry_attempt(tmp_path: Path):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     dependencies = fake_dependencies()
 
-    def generation(prepared, run_dir, generator, seed):
-        variants = dependencies.generation(prepared, run_dir, generator, seed)
+    def generation(prepared, authority, run_dir, generator, seed):
+        variants = dependencies.generation(
+            prepared,
+            authority,
+            run_dir,
+            generator,
+            seed,
+        )
         retried = replace(
             variants[0],
             generated=replace(variants[0].generated, seed=19),
@@ -223,8 +317,14 @@ def test_pipeline_rejects_canonical_audio_changed_during_generation(tmp_path: Pa
     dependencies = fake_dependencies()
     export_calls = []
 
-    def generation(prepared, run_dir, generator, seed):
-        variants = dependencies.generation(prepared, run_dir, generator, seed)
+    def generation(prepared, authority, run_dir, generator, seed):
+        variants = dependencies.generation(
+            prepared,
+            authority,
+            run_dir,
+            generator,
+            seed,
+        )
         prepared.normalized.path.write_bytes(b"tampered during generation")
         return variants
 
@@ -249,6 +349,46 @@ def test_pipeline_rejects_canonical_audio_changed_during_generation(tmp_path: Pa
 
     assert captured.value.code is ErrorCode.ASSET_HASH_MISMATCH
     assert export_calls == []
+
+
+def test_pipeline_rejects_canonical_audio_changed_during_timing(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    generation_calls = []
+
+    def timing(prepared, run_dir, generator, seed):
+        authority = dependencies.timing(prepared, run_dir, generator, seed)
+        prepared.normalized.path.write_bytes(b"tampered during timing")
+        return authority
+
+    def generation(prepared, authority, run_dir, generator, seed):
+        generation_calls.append(run_dir)
+        return dependencies.generation(
+            prepared,
+            authority,
+            run_dir,
+            generator,
+            seed,
+        )
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+            ),
+            dependencies=replace(
+                dependencies,
+                timing=timing,
+                generation=generation,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.ASSET_HASH_MISMATCH
+    assert generation_calls == []
 
 
 def test_pipeline_defaults_to_mapperatorinator():

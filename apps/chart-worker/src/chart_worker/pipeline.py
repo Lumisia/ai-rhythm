@@ -27,14 +27,24 @@ from chart_worker.schema.playtest_run import (
 )
 from chart_worker.stages.s1_prepare import run_prepare
 from chart_worker.stages.s2_generate import MAX_VARIANT_ATTEMPTS, run_generation
+from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.s3_export import run_export
-from chart_worker.stages.types import ExportedVariant, GeneratedVariant, PreparedAudio
+from chart_worker.stages.types import (
+    ExportedVariant,
+    GeneratedVariant,
+    PreparedAudio,
+    SongTimingAuthority,
+)
 
 GeneratorName = Literal["fake", "mapperatorinator"]
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
 AnalysisStage = Callable[[Path], OnsetAnalysis]
+TimingStage = Callable[
+    [PreparedAudio, Path, ChartGenerator, int], SongTimingAuthority
+]
 GenerationStage = Callable[
-    [PreparedAudio, Path, ChartGenerator, int], tuple[GeneratedVariant, ...]
+    [PreparedAudio, SongTimingAuthority, Path, ChartGenerator, int],
+    tuple[GeneratedVariant, ...],
 ]
 ExportStage = Callable[
     [PreparedAudio, tuple[GeneratedVariant, ...], Path, str],
@@ -48,11 +58,32 @@ def _prepare_stage(source: Path, run_dir: Path, config: WorkerConfig) -> Prepare
 
 def _generation_stage(
     prepared: PreparedAudio,
+    authority: SongTimingAuthority,
     run_dir: Path,
     generator: ChartGenerator,
     seed: int,
 ) -> tuple[GeneratedVariant, ...]:
-    return run_generation(prepared, run_dir, generator=generator, seed=seed)
+    return run_generation(
+        prepared,
+        authority,
+        run_dir,
+        generator=generator,
+        seed=seed,
+    )
+
+
+def _timing_stage(
+    prepared: PreparedAudio,
+    run_dir: Path,
+    generator: ChartGenerator,
+    seed: int,
+) -> SongTimingAuthority:
+    return run_timing_generation(
+        prepared,
+        run_dir,
+        generator=generator,
+        seed=seed,
+    )
 
 
 def _analysis_stage(path: Path) -> OnsetAnalysis:
@@ -89,6 +120,7 @@ class PipelineDependencies:
     prepare: PrepareStage = _prepare_stage
     analyze: AnalysisStage = _analysis_stage
     select_generator: Callable[[GeneratorName, WorkerConfig], ChartGenerator] = _select_generator
+    timing: TimingStage = _timing_stage
     generation: GenerationStage = _generation_stage
     export: ExportStage = _export_stage
     now: Callable[[], datetime] = _utc_now
@@ -175,6 +207,7 @@ def _generation_report(
     run_dir: Path,
     config: WorkerConfig,
     prepared: PreparedAudio,
+    authority: SongTimingAuthority,
     onsets: OnsetAnalysis,
 ) -> dict[str, object]:
     charts = []
@@ -212,10 +245,11 @@ def _generation_report(
         "runId": str(run_id),
         "sourceName": options.source.name,
         "generator": options.generator,
-        "strategy": "MAPPERATORINATOR_DIRECT",
-        "timingAuthority": (
-            "MAPPERATORINATOR" if options.generator == "mapperatorinator" else "FAKE"
-        ),
+        "strategy": "MAPPERATORINATOR_SHARED_TIMING",
+        "timingAuthority": authority.generator_name,
+        "timingAuthoritySha256": authority.sha256,
+        "timingGenerationMode": authority.mode,
+        "timingAttemptCount": authority.attempt_count,
         "noteMutationEnabled": False,
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
@@ -255,9 +289,21 @@ def run_pipeline(
     onsets = dependencies.analyze(normalized.path)
     elapsed["analysis"] = _elapsed_ms(started)
 
-    started = perf_counter_ns()
     generator = dependencies.select_generator(options.generator, dependencies.config)
-    generated = dependencies.generation(prepared, run_dir, generator, options.seed)
+
+    started = perf_counter_ns()
+    authority = dependencies.timing(prepared, run_dir, generator, options.seed)
+    _require_canonical_audio_hash(prepared)
+    elapsed["timing"] = _elapsed_ms(started)
+
+    started = perf_counter_ns()
+    generated = dependencies.generation(
+        prepared,
+        authority,
+        run_dir,
+        generator,
+        options.seed,
+    )
     _require_canonical_audio_hash(prepared)
     elapsed["generation"] = _elapsed_ms(started)
 
@@ -282,6 +328,7 @@ def run_pipeline(
                 run_dir,
                 dependencies.config,
                 prepared,
+                authority,
                 onsets,
             ),
             ensure_ascii=False,

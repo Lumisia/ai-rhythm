@@ -37,6 +37,7 @@ class GeneratedVariant:
     cfg_scale: float = 1.0
     attempt: int = 1
     attempt_errors: tuple[str, ...] = ()
+    timing_authority_sha256: str = ""
 
 
 @dataclass(frozen=True, slots=True)

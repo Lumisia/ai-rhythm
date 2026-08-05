@@ -51,6 +51,7 @@ def test_fake_pipeline_writes_twelve_hash_verified_charts(tmp_path: Path):
     assert set(result.elapsed_ms_by_stage) == {
         "prepare",
         "analysis",
+        "timing",
         "generation",
         "export",
     }
