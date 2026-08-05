@@ -154,6 +154,7 @@ def test_map_command_requests_only_a_map_generation(config, tmp_path):
         "super_timing": "false",
         "hitsounded": "false",
         "fast_decoder_loop": "true",
+        "use_server": "false",
         "resnap_events": "true",
     }
 
