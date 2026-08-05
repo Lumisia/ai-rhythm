@@ -9,9 +9,13 @@
 
 곡마다 표준 timing을 한 번 생성하고, timing 구조 검증이 실패할 때만 Super Timing을
 한 번 더 시도한다. 검증된 기준은 `audio/timing-reference.osu`에 저장한다. 그 뒤
-4K·6K·7K와 네 난이도 조합의 MAP 12개가 모두 같은 reference를 재사용한다. MAP의
-파싱·timing identity·구조 검증에 실패한 조합만 다른 seed로 최대 두 번 재시도하며,
-이미 성공한 조합은 다시 만들지 않는다.
+4K·6K·7K와 네 난이도 조합의 MAP 12개가 모두 같은 reference를 재사용한다. 각 후보는
+안정된 raw 경로로 승격되기 전에 `STRUCTURE`, `TIMING_IDENTITY`, `TIMING_ALIGNMENT`,
+`COVERAGE` 네 축에서 독립적으로 판정된다. 전체 우선순위는
+`RETRY_MAP > REVIEW > PASS`다. 구조 오류나 충분한 근거가 함께 있는 MAP 결함처럼
+명확한 `RETRY_MAP`만 다음 seed를 소비하며, 한 조합당 총 세 번까지 시도한다. 약하거나
+모호한 근거인 `REVIEW`는 새 seed를 소비하지 않고 실행을 보류한다. 이미 성공한 조합은
+다시 만들지 않는다.
 
 | 난이도 | 요청 별 | descriptor |
 | --- | ---: | --- |
@@ -30,7 +34,9 @@ timing 요청은 `output_type=[TIMING]`이고, MAP 요청은 `output_type=[MAP]`
 각 MAP 시도 직전에 timing reference SHA-256과 canonical audio SHA-256 identity를
 검사한다. 생성된 MAP의 BPM event가 reference와 하나라도 다르면 그 MAP만 재시도하고
 안정 경로로 승격하지 않는다. BPM event나 노트 시각·레인·종류·HOLD 길이를 reference에
-맞추기 위해 재작성하지 않는다.
+맞추기 위해 재작성하지 않는다. timing authority 검토는 full-beat 기준의 base·half·double
+pulse 증거와 onset-envelope autocorrelation이 같은 대안을 지지하는지 확인한다. 노트 행의
+grid subdivision 정렬은 이 tempo 검토와 별개의 검증 신호다.
 
 `end_time`에는 정규화 오디오 길이를 전달한다. Mapperatorinator가 패딩 구간에
 오디오 밖 노트를 만드는 것을 모델 자체 크롭 단계에서 막고, 내보내기 단계는
@@ -97,37 +103,44 @@ uv run --project apps/chart-worker chart-worker bench `
 
 주요 산출물은 다음과 같다.
 
-- `raw/<key>k-<difficulty>.osu`: 검증을 통과한 Mapperatorinator 원본
-- `raw/work/<variant>/attempt-1..3/`: 시도별 원문과 Hydra 로그
-- `charts/*.json`: 원본 노트와 timing을 보존한 chart-v1
+- `raw/<key>k-<difficulty>.osu`: 네 축이 모두 `PASS`한 Mapperatorinator 원본
+- `raw/work/<variant>/attempt-1..3/`: 시도별 진단 작업 위치. 생성기가 만든 경우 원문과 Hydra 로그를 보존
+- `charts/*.json`: 전체 실행이 공개 가능할 때 원본 노트와 timing을 보존한 chart-v1
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
 - `audio/timing-reference.osu`: 12개 MAP이 공유하는 SHA-256 고정 timing 기준
-- `generation-report.json`: descriptor, 정밀도, 생성 시간, 노트·HOLD 수, 첫 노트와 최대 공백
+- `generation-report.json`: 성공 또는 보류 결과와 품질 게이트 근거
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
-`generation-report.json`에는 `attemptsPerChartMax=3`, 실제 시도 횟수·seed·실패
-원문, `canonicalAudioSha256`, `timingAuthoritySha256`, `timingGenerationMode`,
-`timingAttemptCount`, `mapperatorinatorConstraintPatch`와 채보별
-`timingDiagnostics`가 기록된다. 분석은
-`audio/game.flac`에서 곡당 한 번 실행하고 12개 채보가 같은 onset 배열을 공유한다.
-30초 단위 구간과 전체 고유 노트 행을 평가하며, 전체 ±50ms precision 70% 미만,
-충분한 행이 있는 구간의 60% 미만 또는 전체 median과 25ms를 넘게 벗어난 구간은
-`REVIEW`다. 노트 사이 또는 곡 앞뒤에 8초 이상 공백이 있으면 raw onset뿐 아니라
-곡별 상대 RMS와 활성 onset을 함께 검사한다. 활성 onset 8개 이상이고 활성 프레임
-비율도 35% 이상인 공백만 `coverageGaps`와 `REVIEW` 근거가 된다. 조용한 인트로와
-브레이크는 `quietCoverageGaps`에 기록하지만 그 자체로 `REVIEW`를 만들지 않는다.
-이는 사람 라벨 정확도가 아니라 수동 검수 신호이며 노트를 수정하지 않는다.
+성공한 `generation-report.json`은 `qualityGateVersion=quality-gate-v1`,
+`publishable=true`, `status=PASS`와 채보별 acceptance status·reason·축별 결정을 기록한다.
+`REVIEW` 또는 재시도 소진으로 보류된 실행도 같은 위치에 보고서를 남긴다. 이때
+`publishable=false`, `status=REVIEW` 또는 `EXHAUSTED`, error code/context,
+`canonicalAudioSha256`와 timing authority identity를 기록한다. 생성기가 후보 원문이나
+로그를 만든 경우에는 진단 작업 위치인 `raw/work/<variant>/attempt-*`에 보존한다.
+작업 산출물의 존재 여부와 관계없이 거절된 후보는 안정된 `raw/<variant>.osu`에 도달하지
+않는다. 보류된 실행은 export하지 않으며 `charts/`와 `playtest-run-v1.json`도 만들지 않는다.
+
+onset과 활성 구간은 canonical `audio/game.flac`의 `OnsetAnalysis`에서 곡당 한 번 계산하고
+12개 채보가 공유한다. nearest-onset ±20ms·±50ms 비율, 15초 구간, coverage metric도
+후보 acceptance에 한 번 기록하며 보고서는 이를 다시 계산하지 않고 직렬화한다. 이 비율은
+자동 proxy 진단이다. 예를 들어 70%는 사람이 라벨링한 Mapperatorinator 정확도가 아니다.
+활성 오디오 근거가 충분한 8초 이상 공백은 `ACTIVE_*_GAP`으로 `RETRY_MAP`이 된다.
+조용하거나 활성도가 낮은 공백은 `QUIET_*_GAP`, onset·구간·grid 근거가 약한 경우는
+그에 해당하는 reason과 함께 `REVIEW`가 되며 새 seed를 소비하지 않는다. 이 자동 게이트는
+사람의 음악적 정답이나 주관적 품질을 보증하지 않고 노트를 수정하지 않는다. 난이도 체감,
+HOLD 양, 패턴의 음악성은 수동 플레이테스트로 계속 확인해야 한다.
 
 원본 osu!mania 키 수, X 좌표와 변환 레인 범위, `0 <= 시작 < 음원 길이`와
 `HOLD 끝 <= 음원 길이`, 빈 채보, 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD,
 정렬되고 중복 없는 양의 유한 BPM timing point를 검사한다. 실패 조합은
-최대 두 번 재시도하고 세 출력이 모두 잘못되면 실행을 실패시킨다. 정상 출력의
-추론 횟수는 여전히 한 번이다.
+명확한 MAP 결함일 때만 최대 두 번 재시도하고 세 출력이 모두 잘못되면 실행을
+`EXHAUSTED`로 보류한다. 정상 출력의 추론 횟수는 여전히 한 번이다.
 
 canonical `game.flac`의 SHA-256은 onset 분석 전과 외부 Mapperatorinator 생성 직후
 다시 계산한다. 중간에 오디오가 바뀌면 export·manifest 작성 전에 실패한다. 채보 전체
-timing 진단이 `INSUFFICIENT`여도 공개 가능한 `PASS`가 아니라 `REVIEW`로 기록한다.
+timing 진단이 `INSUFFICIENT`여도 공개 가능한 `PASS`가 아니라 `REVIEW`로 기록하고
+export를 보류한다.
 
 ## GPU 없는 구조 검사
 
@@ -185,8 +198,8 @@ NORMAL 요청이어도 6K·7K 측정 결과는 HARD이므로 키 수별 requeste
 회귀는 약 17분 22초가 걸렸다. 4K EASY·HARD와 7K EXPERT는 두 번째 시도,
 6K EXPERT는 세 번째 시도에 통과했고 나머지는 첫 시도에 통과했다. 전체 ±50ms
 precision은 62.35~94.55%였다. 이 수치는 상대 RMS 분류를 추가하기 전 raw onset
-공백 판정으로 얻은 과거 기준이며, 현재는 조용한 공백만으로 수동 검수를 요구하지
-않는다. 상세 표와 최신 재진단 결과는
+공백 판정으로 얻은 과거 기준이다. 당시와 달리 현재 `quality-gate-v1`은 조용하거나
+활성도가 낮은 공백도 `REVIEW` 근거로 보존한다. 상세 표와 최신 재진단 결과는
 `../../docs/현재 구현 상태와 운영 가이드.md`에 기록한다.
 
 ## 2026-08-04 keycount 패치 smoke
