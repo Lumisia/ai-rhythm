@@ -70,6 +70,18 @@ class InvalidThenSuperGenerator(RecordingGenerator):
         )
 
 
+class PositiveFirstThenSuperGenerator(RecordingGenerator):
+    def generate_timing(self, request, workdir):
+        self.timing_calls.append(request)
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(OsuBpmEvent(250 if request.super_timing else 501, 120.0),),
+            generator_name="recording-generator",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+
 def test_generates_one_standard_timing_and_promotes_it_beside_audio(tmp_path):
     generator = RecordingGenerator()
     authority = run_timing_generation(_prepared(tmp_path), tmp_path, generator=generator, seed=9)
@@ -83,6 +95,16 @@ def test_generates_one_standard_timing_and_promotes_it_beside_audio(tmp_path):
 
 def test_structural_standard_failure_uses_super_timing_once(tmp_path):
     generator = InvalidThenSuperGenerator()
+    authority = run_timing_generation(_prepared(tmp_path), tmp_path, generator=generator, seed=9)
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "SUPER_TIMING"
+    assert authority.attempt_count == 2
+
+
+def test_standard_first_event_beyond_one_beat_uses_super_timing_once(tmp_path):
+    generator = PositiveFirstThenSuperGenerator()
+
     authority = run_timing_generation(_prepared(tmp_path), tmp_path, generator=generator, seed=9)
 
     assert [call.super_timing for call in generator.timing_calls] == [False, True]

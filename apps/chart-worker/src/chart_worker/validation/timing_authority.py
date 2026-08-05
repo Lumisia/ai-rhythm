@@ -13,6 +13,15 @@ def validate_timing_events(events: tuple[OsuBpmEvent, ...], duration_ms: int) ->
     """Validate ordered, finite timing events that fit within the audio."""
     if not events:
         raise TimingAuthorityValidationError("timing authority has no events")
+    first_event = events[0]
+    if (
+        math.isfinite(first_event.bpm)
+        and first_event.bpm > 0
+        and first_event.time_ms > 60_000.0 / first_event.bpm
+    ):
+        raise TimingAuthorityValidationError(
+            "timing authority first event must be within one beat of audio start"
+        )
 
     previous_time: int | None = None
     for event in events:

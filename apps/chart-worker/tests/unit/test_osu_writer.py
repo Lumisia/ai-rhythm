@@ -47,3 +47,31 @@ def test_timing_reference_serializes_every_bpm_event():
         (0, 120.0),
         (10_000, 150.0),
     ]
+
+
+@pytest.mark.parametrize(
+    "writer",
+    [
+        lambda: notes_to_osu_mania(
+            [NoteEvent(500, 0)],
+            key_mode=4,
+            bpm=120.0,
+            offset_ms=0,
+            audio_filename="game.flac",
+            title="fixture",
+        ),
+        lambda: timing_to_osu_mania(
+            (OsuBpmEvent(0, 120.0),),
+            audio_filename="game.flac",
+            title="fixture",
+        ),
+    ],
+)
+def test_writers_include_mapperatorinator_slider_required_fields(writer):
+    text = writer()
+
+    assert "Mode: 3" in text
+    assert "Creator:ai-rhythm" in text
+    assert "CircleSize:4" in text
+    assert "HPDrainRate:5" in text
+    assert "OverallDifficulty:8" in text
