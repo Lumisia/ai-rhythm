@@ -66,7 +66,7 @@ def test_insufficient_evidence_requires_review():
     assert review.reasons == ("INSUFFICIENT_TEMPO_EVIDENCE",)
 
 
-def test_disagreeing_or_single_strong_axes_require_review():
+def test_disagreeing_axes_require_review_but_single_strong_axis_is_not_disagreement():
     disagreeing = review_timing_authority(
         _metrics(periodicity_best_alternative="DOUBLE")
     )
@@ -77,7 +77,23 @@ def test_disagreeing_or_single_strong_axes_require_review():
     assert disagreeing.action is TimingAuthorityAction.REVIEW
     assert disagreeing.reasons == ("TEMPO_EVIDENCE_DISAGREES",)
     assert one_strong.action is TimingAuthorityAction.REVIEW
-    assert one_strong.reasons == ("TEMPO_EVIDENCE_DISAGREES",)
+    assert one_strong.reasons == ("WEAK_BASE_TEMPO_SUPPORT",)
+
+
+def test_same_direction_mixed_strength_with_supported_base_passes_as_diagnostic():
+    review = review_timing_authority(
+        _metrics(
+            base_pulse_support=0.640976,
+            half_pulse_support=0.714156,
+            pulse_alternative_margin=0.073180,
+            base_periodicity_support=0.554182,
+            half_periodicity_support=0.722164,
+            periodicity_margin=0.167982,
+        )
+    )
+
+    assert review.action is TimingAuthorityAction.PASS
+    assert review.reasons == ("TEMPO_ALTERNATIVE_MIXED_CONFIDENCE",)
 
 
 def test_weak_disagreeing_axes_require_review_even_without_strong_margins():

@@ -120,7 +120,7 @@ def _coverage_decision(timing: TimingDiagnostics) -> GateDecision:
         f"QUIET_{gap.position}_GAP" for gap in timing.quiet_coverage_gaps
     )
     if quiet_reasons:
-        return GateDecision(GateAxis.COVERAGE, GateAction.REVIEW, quiet_reasons)
+        return GateDecision(GateAxis.COVERAGE, GateAction.PASS, quiet_reasons)
     return GateDecision(GateAxis.COVERAGE, GateAction.PASS, ())
 
 
@@ -141,7 +141,8 @@ def _timing_alignment_decision(
         )
 
     if any(
-        section.metrics.precision_50 is not None
+        section.status == "REVIEW"
+        and section.metrics.precision_50 is not None
         and section.metrics.absolute_p95_ms is not None
         and section.metrics.precision_50 < 0.60
         and section.metrics.absolute_p95_ms >= 60
@@ -162,19 +163,21 @@ def _timing_alignment_decision(
             ("NOTE_GRID_MISALIGNED",),
         )
 
-    reasons: list[str] = []
+    advisory_reasons: list[str] = []
+    review_reasons: list[str] = []
     if overall.precision_50 is None:
-        reasons.append("LOW_OVERALL_ONSET_SUPPORT")
+        review_reasons.append("LOW_OVERALL_ONSET_SUPPORT")
     elif overall.precision_50 < 0.70 or (
         overall.absolute_p95_ms is not None and overall.absolute_p95_ms >= 60
     ):
-        reasons.append("OVERALL_TIMING_WEAK_SUPPORT")
+        advisory_reasons.append("OVERALL_TIMING_WEAK_SUPPORT")
     if activity_present and timing.active_onset_count < ACTIVE_GAP_MIN_ONSETS:
-        reasons.append("LOW_ACTIVE_ONSET_SUPPORT")
+        review_reasons.append("LOW_ACTIVE_ONSET_SUPPORT")
     if any(section.status == "INSUFFICIENT" for section in timing.sections):
-        reasons.append("SECTION_TIMING_INSUFFICIENT")
+        advisory_reasons.append("SECTION_TIMING_INSUFFICIENT")
     if any(
-        section.metrics.precision_50 is not None
+        section.status != "INSUFFICIENT"
+        and section.metrics.precision_50 is not None
         and section.metrics.absolute_p95_ms is not None
         and (
             section.metrics.precision_50 < 0.60
@@ -182,18 +185,20 @@ def _timing_alignment_decision(
         )
         for section in timing.sections
     ):
-        reasons.append("SECTION_TIMING_WEAK_SUPPORT")
+        advisory_reasons.append("SECTION_TIMING_WEAK_SUPPORT")
     if any(
-        section.phase_delta_ms is not None
+        section.status != "INSUFFICIENT"
+        and section.phase_delta_ms is not None
         and abs(section.phase_delta_ms) > SECTION_PHASE_DRIFT_MAX_MS
         for section in timing.sections
     ):
-        reasons.append("SECTION_PHASE_DELTA")
+        review_reasons.append("SECTION_PHASE_DELTA")
     if grid_weak_clean_rate or grid_weak_p95:
-        reasons.append("NOTE_GRID_WEAK_SUPPORT")
-    if reasons:
-        return GateDecision(GateAxis.TIMING_ALIGNMENT, GateAction.REVIEW, tuple(reasons))
-    return GateDecision(GateAxis.TIMING_ALIGNMENT, GateAction.PASS, ())
+        review_reasons.append("NOTE_GRID_WEAK_SUPPORT")
+    reasons = tuple(advisory_reasons + review_reasons)
+    if review_reasons:
+        return GateDecision(GateAxis.TIMING_ALIGNMENT, GateAction.REVIEW, reasons)
+    return GateDecision(GateAxis.TIMING_ALIGNMENT, GateAction.PASS, reasons)
 
 
 def _overall_action(decisions: tuple[GateDecision, ...]) -> GateAction:

@@ -187,7 +187,7 @@ def test_phase_only_section_drift_requires_review_without_retry():
         pytest.param((1_000, 2_000), 60, id="p95-only"),
     ],
 )
-def test_one_weak_overall_signal_requires_review_not_retry(shifted_rows, offset):
+def test_one_weak_overall_signal_is_advisory_not_blocking(shifted_rows, offset):
     rows = tuple(range(1_000, 15_000, 1_000))
     result = _evaluate(
         _chart(rows),
@@ -196,11 +196,11 @@ def test_one_weak_overall_signal_requires_review_not_retry(shifted_rows, offset)
     )
 
     decision = _decision(result, "TIMING_ALIGNMENT")
-    assert decision.action is _gate().GateAction.REVIEW
+    assert decision.action is _gate().GateAction.PASS
     assert "OVERALL_TIMING_WEAK_SUPPORT" in decision.reasons
 
 
-def test_section_p95_only_support_requires_review_without_phase_reason():
+def test_section_p95_only_support_is_advisory_without_phase_reason():
     rows = (
         tuple(range(1_000, 10_000, 1_000))
         + tuple(range(16_000, 30_000, 1_000))
@@ -214,12 +214,12 @@ def test_section_p95_only_support_requires_review_without_phase_reason():
     )
 
     decision = _decision(result, "TIMING_ALIGNMENT")
-    assert decision.action is _gate().GateAction.REVIEW
+    assert decision.action is _gate().GateAction.PASS
     assert "SECTION_TIMING_WEAK_SUPPORT" in decision.reasons
     assert "SECTION_PHASE_DELTA" not in decision.reasons
 
 
-def test_low_section_precision_without_phase_delta_requires_review():
+def test_low_section_precision_without_phase_delta_is_advisory():
     rows = (
         tuple(range(1_000, 9_000, 1_000))
         + tuple(range(16_000, 30_000, 1_000))
@@ -236,7 +236,7 @@ def test_low_section_precision_without_phase_delta_requires_review():
     )
 
     decision = _decision(result, "TIMING_ALIGNMENT")
-    assert decision.action is _gate().GateAction.REVIEW
+    assert decision.action is _gate().GateAction.PASS
     assert "SECTION_TIMING_WEAK_SUPPORT" in decision.reasons
     assert "SECTION_PHASE_DELTA" not in decision.reasons
 
@@ -265,27 +265,46 @@ def test_missing_activity_does_not_treat_a_short_aligned_chart_as_low_active_sup
     result = _evaluate(_chart(rows), rows, duration_ms=15_000)
 
     decision = _decision(result, "TIMING_ALIGNMENT")
-    assert decision.action is _gate().GateAction.REVIEW
+    assert decision.action is _gate().GateAction.PASS
     assert decision.reasons == ("SECTION_TIMING_INSUFFICIENT",)
 
 
-def test_quiet_coverage_gap_requires_review_with_a_position_specific_reason():
+def test_quiet_coverage_gap_is_advisory_with_a_position_specific_reason():
     result = _evaluate(
-        _chart((0, 30_000)),
-        (0, *range(1_000, 21_000, 1_000), 30_000),
+        _chart((0, *range(31_000, 39_000, 1_000))),
+        (0, *range(1_000, 21_000, 1_000), *range(31_000, 39_000, 1_000)),
         duration_ms=40_000,
         activity=AudioActivity(
             frame_ms=1_000.0,
             rms_db=np.array([-30.0] * 30 + [-10.0] * 10),
             floor_db=-20.0,
-            active_onset_ms=(),
+            active_onset_ms=tuple(range(31_000, 39_000, 1_000)),
         ),
     )
 
     decision = _decision(result, "COVERAGE")
-    assert decision.action is _gate().GateAction.REVIEW
+    assert decision.action is _gate().GateAction.PASS
     assert decision.reasons == ("QUIET_LEADING_GAP",)
-    assert result.action is _gate().GateAction.REVIEW
+    assert result.action is _gate().GateAction.PASS
+
+
+def test_insufficient_tail_section_cannot_force_a_map_retry():
+    aligned = tuple(range(1_000, 41_000, 1_000))
+    tail = (90_500, 92_500, 94_500, 96_500, 98_500)
+    rows = aligned + tail
+    onsets = aligned + tuple(row - 800 for row in tail)
+
+    result = _evaluate(_chart(rows), onsets, duration_ms=100_000)
+
+    tail_section = result.timing.sections[-1]
+    assert tail_section.status == "INSUFFICIENT"
+    assert tail_section.metrics.precision_50 < 0.60
+    decision = _decision(result, "TIMING_ALIGNMENT")
+    assert decision.action is _gate().GateAction.PASS
+    assert decision.reasons == (
+        "OVERALL_TIMING_WEAK_SUPPORT",
+        "SECTION_TIMING_INSUFFICIENT",
+    )
 
 
 def test_timing_identity_mismatch_retries_with_a_machine_reason():

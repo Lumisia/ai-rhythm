@@ -43,20 +43,24 @@ def review_timing_authority(metrics: TempoCandidateMetrics) -> TimingAuthorityRe
 
     pulse_strong = metrics.pulse_alternative_margin >= 0.15
     periodicity_strong = metrics.periodicity_margin >= 0.10
-    if pulse_strong or periodicity_strong:
-        if (
-            pulse_strong
-            and periodicity_strong
-            and metrics.pulse_best_alternative is not None
-            and metrics.pulse_best_alternative == metrics.periodicity_best_alternative
-            and metrics.base_pulse_support < 0.55
-        ):
+    if pulse_strong and periodicity_strong:
+        if metrics.base_pulse_support < 0.55:
             return TimingAuthorityReview(
                 TimingAuthorityAction.RETRY_TIMING,
                 (f"STRONG_{metrics.pulse_best_alternative}_TEMPO_ALTERNATIVE",),
             )
         return TimingAuthorityReview(
-            TimingAuthorityAction.REVIEW, ("TEMPO_EVIDENCE_DISAGREES",)
+            TimingAuthorityAction.PASS, ("TEMPO_CANDIDATE_AMBIGUOUS",)
+        )
+
+    if pulse_strong or periodicity_strong:
+        if metrics.base_pulse_support < 0.55:
+            return TimingAuthorityReview(
+                TimingAuthorityAction.REVIEW, ("WEAK_BASE_TEMPO_SUPPORT",)
+            )
+        return TimingAuthorityReview(
+            TimingAuthorityAction.PASS,
+            ("TEMPO_ALTERNATIVE_MIXED_CONFIDENCE",),
         )
 
     if metrics.base_pulse_support < 0.55:
