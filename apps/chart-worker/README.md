@@ -13,11 +13,15 @@ tempo 대안이 두 진단 축에서 강하게 일치할 때만 Super Timing을 
 검증된 기준은 `audio/timing-reference.osu`에 저장한다. 그 뒤
 4K·6K·7K와 네 난이도 조합의 MAP 12개가 모두 같은 reference를 재사용한다. 각 후보는
 안정된 raw 경로로 승격되기 전에 `STRUCTURE`, `TIMING_IDENTITY`, `TIMING_ALIGNMENT`,
-`COVERAGE` 네 축에서 독립적으로 판정된다. 전체 우선순위는
+`COVERAGE`, `PATTERN` 다섯 축에서 독립적으로 판정된다. 전체 우선순위는
 `RETRY_MAP > REVIEW > PASS`다. 구조 오류나 충분한 근거가 함께 있는 MAP 결함처럼
 명확한 `RETRY_MAP`만 다음 seed를 소비하며, 한 조합당 총 세 번까지 시도한다. 약하거나
 모호한 근거인 `REVIEW`는 새 seed를 소비하지 않고 실행을 보류한다. 이미 성공한 조합은
-다시 만들지 않는다.
+다시 만들지 않는다. 12개가 모두 만들어지면 키 모드별 측정 난이도가
+`EASY < NORMAL < HARD < EXPERT`인지 상대 순서만 검사한다. 뒤 라벨의 반올림된
+측정값이 조금이라도 낮은 엄격한 역전이면 그 인접 쌍을 다른 seed로 선택 재생성하고,
+동일값처럼 우열 근거가 모호하면 재생성하지
+않고 `REVIEW`로 보류한다. 절대 난이도 라벨이나 사용자의 체감 난이도는 자동 보정하지 않는다.
 
 | 난이도 | 요청 별 | descriptor |
 | --- | ---: | --- |
@@ -110,15 +114,17 @@ uv run --project apps/chart-worker chart-worker bench `
 - `charts/*.json`: 전체 실행이 공개 가능할 때 원본 노트와 timing을 보존한 chart-v1
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
 - `audio/timing-reference.osu`: 12개 MAP이 공유하는 SHA-256 고정 timing 기준
-- `generation-report.json`: 성공 또는 보류 결과와 품질 게이트 근거
+- `generation-report.json`: 성공 또는 보류 결과, 품질 프로필과 후보 선택 근거
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
 성공한 `generation-report.json`은 `qualityGateVersion=quality-gate-v1`,
 `publishable=true`, `status=PASS`, timing authority의 tempo metrics·review와 채보별
-acceptance status·reason·축별 결정·note-grid 근거를 기록한다.
+acceptance status·reason·축별 결정·note-grid 근거를 기록한다. 각 채보에는 선택 seed,
+실제 생성 횟수, 후보 수, 측정 난이도와 15초 구간별 HOLD·레인·반복 프로필을 남기고,
+키 모드별 `difficultyOrder`에는 네 라벨의 상대 난이도와 역전·동률 쌍을 남긴다.
 `REVIEW` 또는 재시도 소진으로 보류된 실행도 같은 위치에 보고서를 남긴다. 이때
-`publishable=false`, `status=REVIEW` 또는 `EXHAUSTED`, error code/context,
+`publishable=false`, `status=REVIEW`, `EXHAUSTED` 또는 내부 계약 오류의 `FAILED`, error code/context,
 `canonicalAudioSha256`와 timing authority identity를 기록한다. timing 단계에서 authority
 승격 전에 보류되면 `failureStage=TIMING`과 null authority identity를 기록한다. 생성기가 후보 원문이나
 로그를 만든 경우에는 진단 작업 위치인 `raw/work/<variant>/attempt-*`에 보존한다.
@@ -132,14 +138,19 @@ onset과 활성 구간은 canonical `audio/game.flac`의 `OnsetAnalysis`에서 �
 활성 오디오 근거가 충분한 8초 이상 공백은 `ACTIVE_*_GAP`으로 `RETRY_MAP`이 된다.
 조용하거나 활성도가 낮은 공백은 `QUIET_*_GAP`, onset·구간·grid 근거가 약한 경우는
 그에 해당하는 reason과 함께 `REVIEW`가 되며 새 seed를 소비하지 않는다. 이 자동 게이트는
-사람의 음악적 정답이나 주관적 품질을 보증하지 않고 노트를 수정하지 않는다. 난이도 체감,
-HOLD 양, 패턴의 음악성은 수동 플레이테스트로 계속 확인해야 한다.
+사람의 음악적 정답이나 주관적 품질을 보증하지 않고 노트를 수정하지 않는다. HOLD는
+난이도별 10/15/20/25% 같은 고정 목표를 적용하지 않는다. 대신 같은 곡·채보의 활성 15초
+구간들 사이에서 한 구간의 HOLD 점유·동시 릴리스, 레인 편향, 짧은 행 반복이 통계적으로
+두드러지면 `PATTERN`의 `REVIEW` 근거로 남긴다. 같은 레인에서 HOLD가 겹치는 구조 오류는
+별도로 `RETRY_MAP`이다. 난이도 체감과 패턴의 음악성은 수동 플레이테스트로 계속 확인해야 한다.
 
 원본 osu!mania 키 수, X 좌표와 변환 레인 범위, `0 <= 시작 < 음원 길이`와
 `HOLD 끝 <= 음원 길이`, 빈 채보, 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD,
 정렬되고 중복 없는 양의 유한 BPM timing point를 검사한다. 실패 조합은
 명확한 MAP 결함일 때만 최대 두 번 재시도하고 세 출력이 모두 잘못되면 실행을
-`EXHAUSTED`로 보류한다. 정상 출력의 추론 횟수는 여전히 한 번이다.
+`EXHAUSTED`로 보류한다. 정상 출력은 12개 조합을 각 한 번, 총 12회 추론한다. 프로필
+검사는 모델 추론 없이 동작하고, 추가 추론은 구조·타이밍 결함이 있는 조합 또는 엄격한
+난이도 역전에 포함된 라벨에만 발생하며 라벨별 총 세 번으로 제한된다.
 
 canonical `game.flac`의 SHA-256은 onset 분석 전과 외부 Mapperatorinator 생성 직후
 다시 계산한다. 중간에 오디오가 바뀌면 export·manifest 작성 전에 실패한다. 채보 전체

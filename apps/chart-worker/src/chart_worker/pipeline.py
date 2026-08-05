@@ -24,6 +24,7 @@ from chart_worker.schema.playtest_run import (
     RunAudioRefs,
     RunChartRef,
 )
+from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.s1_prepare import run_prepare
 from chart_worker.stages.s2_generate import MAX_VARIANT_ATTEMPTS, run_generation
 from chart_worker.stages.s2_timing import run_timing_generation
@@ -202,6 +203,59 @@ def _max_gap_ms(variant: GeneratedVariant) -> int:
     return max((right - left for left, right in pairwise(times)), default=0)
 
 
+def _require_difficulty_order_reports(
+    generated: tuple[GeneratedVariant, ...],
+) -> dict[str, dict[str, object]]:
+    expected = {(key_mode, difficulty) for key_mode in KEY_MODES for difficulty in DIFFICULTIES}
+    observed = [(variant.key_mode, variant.difficulty) for variant in generated]
+    context: dict[str, object] = {}
+
+    missing_variants = sorted(expected.difference(observed))
+    if missing_variants:
+        context["missingVariants"] = [
+            {"keyMode": key_mode, "difficulty": difficulty}
+            for key_mode, difficulty in missing_variants
+        ]
+    duplicate_variants = sorted(
+        pair for pair in set(observed) if observed.count(pair) > 1
+    )
+    if duplicate_variants:
+        context["duplicateVariants"] = [
+            {"keyMode": key_mode, "difficulty": difficulty}
+            for key_mode, difficulty in duplicate_variants
+        ]
+    missing_order = [
+        {"keyMode": variant.key_mode, "difficulty": variant.difficulty}
+        for variant in generated
+        if variant.difficulty_order is None
+    ]
+    if missing_order:
+        context["missingDifficultyOrder"] = missing_order
+
+    reports: dict[str, dict[str, object]] = {}
+    for key_mode in KEY_MODES:
+        reviews = [
+            variant.difficulty_order
+            for variant in generated
+            if variant.key_mode == key_mode and variant.difficulty_order is not None
+        ]
+        if not reviews:
+            continue
+        first = reviews[0]
+        if any(review != first for review in reviews[1:]):
+            context.setdefault("inconsistentDifficultyOrder", []).append(key_mode)
+            continue
+        reports[f"{key_mode}K"] = first.to_report()
+
+    if context:
+        raise WorkerError(
+            ErrorCode.CHART_VALIDATION_FAILED,
+            "generation stage returned incomplete difficulty-order evidence",
+            context=context,
+        )
+    return reports
+
+
 def _generation_report(
     options: PipelineOptions,
     run_id: UUID,
@@ -212,11 +266,13 @@ def _generation_report(
     config: WorkerConfig,
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
+    difficulty_order_reports: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     charts = []
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
         acceptance = variant.acceptance.to_report()
+        quality_profile = acceptance["qualityProfile"]
         charts.append(
             {
                 "keyMode": variant.key_mode,
@@ -224,9 +280,12 @@ def _generation_report(
                 "descriptor": DESCRIPTORS[variant.difficulty][0],
                 "precision": config.mapperatorinator_precision,
                 "seed": variant.generated.seed,
+                "selectedSeed": variant.selected_seed,
                 "requestedStar": variant.requested_star,
                 "cfgScale": variant.cfg_scale,
                 "attemptCount": variant.attempt,
+                "candidateCount": variant.candidate_count,
+                "generationAttemptCount": variant.generation_attempt_count,
                 "attemptErrors": list(variant.attempt_errors),
                 "attemptEvidence": list(variant.attempt_evidence),
                 "acceptanceStatus": acceptance["action"],
@@ -238,6 +297,21 @@ def _generation_report(
                 "acceptanceDecisions": acceptance["decisions"],
                 "timingDiagnostics": acceptance["timing"],
                 "noteGrid": acceptance["noteGrid"],
+                "difficultyProfile": (
+                    quality_profile["difficultyProfile"]
+                    if quality_profile is not None
+                    else None
+                ),
+                "holdProfile": (
+                    quality_profile["holdProfile"]
+                    if quality_profile is not None
+                    else None
+                ),
+                "patternProfile": (
+                    quality_profile["patternProfile"]
+                    if quality_profile is not None
+                    else None
+                ),
                 "rawNoteCount": len(notes),
                 "finalNoteCount": len(result.document.notes),
                 "holdCount": sum(note.kind == "HOLD" for note in notes),
@@ -279,6 +353,7 @@ def _generation_report(
         ),
         "elapsedMsByStage": elapsed,
         "warnings": [],
+        "difficultyOrder": difficulty_order_reports,
         "charts": charts,
     }
 
@@ -294,11 +369,11 @@ def _failure_generation_report(
     *,
     failure_stage: str | None = None,
 ) -> dict[str, object]:
-    status = (
-        "REVIEW"
-        if error.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-        else "EXHAUSTED"
-    )
+    status = {
+        ErrorCode.CHART_TIMING_REVIEW_REQUIRED: "REVIEW",
+        ErrorCode.CHART_CANDIDATES_EXHAUSTED: "EXHAUSTED",
+        ErrorCode.CHART_VALIDATION_FAILED: "FAILED",
+    }[error.code]
     report: dict[str, object] = {
         "version": 1,
         "qualityGateVersion": "quality-gate-v1",
@@ -423,10 +498,12 @@ def run_pipeline(
             options.seed,
         )
         _require_pass_acceptance(generated)
+        difficulty_order_reports = _require_difficulty_order_reports(generated)
     except WorkerError as error:
         if error.code not in {
             ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
             ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+            ErrorCode.CHART_VALIDATION_FAILED,
         }:
             raise
         elapsed["generation"] = _elapsed_ms(started)
@@ -468,6 +545,7 @@ def run_pipeline(
             dependencies.config,
             prepared,
             authority,
+            difficulty_order_reports,
         ),
     )
     manifest = PlaytestRunManifest(

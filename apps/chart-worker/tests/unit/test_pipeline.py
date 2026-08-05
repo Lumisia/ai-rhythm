@@ -90,6 +90,11 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["timingReviewRequired"] is False
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
+    assert set(report["difficultyOrder"]) == {"4K", "6K", "7K"}
+    assert all(
+        review["status"] == "PASS"
+        for review in report["difficultyOrder"].values()
+    )
 
     for chart_report, chart_ref, raw_path in zip(
         report["charts"], manifest.charts, result.raw_osu_paths, strict=True
@@ -100,6 +105,9 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["rawNoteCount"] == len(document.notes)
         assert chart_report["finalNoteCount"] == len(document.notes)
         assert chart_report["attemptCount"] == 1
+        assert chart_report["candidateCount"] == 1
+        assert chart_report["generationAttemptCount"] == 1
+        assert chart_report["selectedSeed"] == chart_report["seed"]
         assert chart_report["attemptErrors"] == []
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
         assert chart_report["acceptanceStatus"] == "PASS"
@@ -129,6 +137,14 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
             "COVERAGE",
             "PATTERN",
         }
+        assert set(chart_report) >= {
+            "difficultyProfile",
+            "holdProfile",
+            "patternProfile",
+        }
+        assert chart_report["difficultyProfile"]["projectRating"] > 0
+        assert "sectionOccupancyRatios" in chart_report["holdProfile"]
+        assert "sectionLaneImbalances" in chart_report["patternProfile"]
         assert "activeOnsetCount" in chart_report["timingDiagnostics"]
         assert "quietCoverageGaps" in chart_report["timingDiagnostics"]
         assert chart_report["cfgScale"] == 1.0
@@ -169,6 +185,7 @@ def test_success_report_uses_null_for_unavailable_optional_timing_evidence(
     [
         (ErrorCode.CHART_TIMING_REVIEW_REQUIRED, "REVIEW"),
         (ErrorCode.CHART_CANDIDATES_EXHAUSTED, "EXHAUSTED"),
+        (ErrorCode.CHART_VALIDATION_FAILED, "FAILED"),
     ],
 )
 def test_withheld_generation_writes_failure_report_without_publishable_artifacts(
@@ -227,6 +244,59 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
     assert report["timingAuthoritySha256"] == sha256_file(
         output_dir / "audio" / "timing-reference.osu"
     )
+    assert export_calls == []
+    assert not (output_dir / "charts").exists()
+    assert not (output_dir / "playtest-run-v1.json").exists()
+
+
+def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+    export_calls = []
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
+        variants = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+        )
+        return (replace(variants[0], difficulty_order=None), *variants[1:])
+
+    def export(prepared, generated, run_dir, worker_version):
+        export_calls.append(run_dir)
+        return dependencies.export(prepared, generated, run_dir, worker_version)
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=output_dir,
+                title="fixture",
+                generator="fake",
+            ),
+            dependencies=replace(
+                dependencies,
+                generation=generation,
+                export=export,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.CHART_VALIDATION_FAILED
+    assert captured.value.context == {
+        "missingDifficultyOrder": [{"keyMode": 4, "difficulty": "EASY"}]
+    }
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    assert report["publishable"] is False
+    assert report["status"] == "FAILED"
+    assert report["error"] == {
+        "code": "CHART_VALIDATION_FAILED",
+        "context": captured.value.context,
+    }
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v1.json").exists()
