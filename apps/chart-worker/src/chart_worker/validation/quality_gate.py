@@ -163,28 +163,6 @@ def _timing_alignment_decision(
             ("OVERALL_TIMING_MISALIGNED",),
         )
 
-    if any(
-        section.status == "REVIEW"
-        and section.metrics.precision_50 is not None
-        and section.metrics.absolute_p95_ms is not None
-        and _metrical_phase_distance_ms(
-            section.start_ms, section.phase_delta_ms, bpm_events
-        )
-        is not None
-        and section.metrics.precision_50 < 0.60
-        and section.metrics.absolute_p95_ms >= 60
-        and _metrical_phase_distance_ms(
-            section.start_ms, section.phase_delta_ms, bpm_events
-        )
-        > SECTION_PHASE_DRIFT_MAX_MS
-        for section in timing.sections
-    ):
-        return GateDecision(
-            GateAxis.TIMING_ALIGNMENT,
-            GateAction.RETRY_MAP,
-            ("SECTION_TIMING_MISALIGNED",),
-        )
-
     grid_weak_clean_rate = note_grid.clean_rate < 0.80
     grid_weak_p95 = note_grid.absolute_p95_beats > 0.04
     if grid_weak_clean_rate and grid_weak_p95:
@@ -228,7 +206,7 @@ def _timing_alignment_decision(
         > SECTION_PHASE_DRIFT_MAX_MS
         for section in timing.sections
     ):
-        review_reasons.append("SECTION_PHASE_DELTA")
+        advisory_reasons.append("SECTION_PHASE_DELTA")
     if grid_weak_clean_rate or grid_weak_p95:
         review_reasons.append("NOTE_GRID_WEAK_SUPPORT")
     reasons = tuple(advisory_reasons + review_reasons)

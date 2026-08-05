@@ -154,7 +154,7 @@ def test_global_sixty_millisecond_corruption_retries_timing_alignment():
     assert _decision(result, "TIMING_ALIGNMENT").reasons == ("OVERALL_TIMING_MISALIGNED",)
 
 
-def test_single_fifteen_second_section_corruption_retries_timing_alignment():
+def test_single_section_onset_shift_is_advisory_at_map_stage():
     rows = tuple(range(1_000, 60_000, 1_000))
     corrupted = set(range(31_000, 39_000, 1_000))
     onsets = tuple(row - 60 if row in corrupted else row for row in rows)
@@ -163,18 +163,21 @@ def test_single_fifteen_second_section_corruption_retries_timing_alignment():
     section = result.timing.sections[2]
     assert section.metrics.precision_50 < 0.60
     assert section.metrics.absolute_p95_ms >= 60
-    assert _decision(result, "TIMING_ALIGNMENT").reasons == ("SECTION_TIMING_MISALIGNED",)
+    decision = _decision(result, "TIMING_ALIGNMENT")
+    assert decision.action is _gate().GateAction.PASS
+    assert "SECTION_TIMING_WEAK_SUPPORT" in decision.reasons
+    assert "SECTION_PHASE_DELTA" in decision.reasons
 
 
-def test_phase_only_section_drift_requires_review_without_retry():
+def test_phase_only_section_drift_is_advisory_without_retry():
     first_rows = tuple(range(1_000, 9_000, 1_000))
     second_rows = tuple(range(31_000, 39_000, 1_000))
     rows = first_rows + second_rows
     onsets = tuple(row + 5 for row in first_rows) + tuple(row - 50 for row in second_rows)
     result = _evaluate(_chart(rows), onsets, duration_ms=60_000)
 
-    assert result.action is _gate().GateAction.REVIEW
-    assert _decision(result, "TIMING_ALIGNMENT").action is _gate().GateAction.REVIEW
+    assert result.action is _gate().GateAction.PASS
+    assert _decision(result, "TIMING_ALIGNMENT").action is _gate().GateAction.PASS
     assert "SECTION_PHASE_DELTA" in _decision(result, "TIMING_ALIGNMENT").reasons
 
 

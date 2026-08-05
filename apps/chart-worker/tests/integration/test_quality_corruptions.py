@@ -233,13 +233,17 @@ PASS = ("PASS", ())
         ),
         pytest.param(
             "section-shift",
-            "RETRY_MAP",
+            "PASS",
             {
                 "STRUCTURE": PASS,
                 "TIMING_IDENTITY": PASS,
                 "TIMING_ALIGNMENT": (
-                    "RETRY_MAP",
-                    ("SECTION_TIMING_MISALIGNED",),
+                    "PASS",
+                    (
+                        "OVERALL_TIMING_WEAK_SUPPORT",
+                        "SECTION_TIMING_WEAK_SUPPORT",
+                        "SECTION_PHASE_DELTA",
+                    ),
                 ),
                 "COVERAGE": PASS,
                 "PATTERN": PASS,
