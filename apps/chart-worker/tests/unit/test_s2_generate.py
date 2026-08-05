@@ -439,9 +439,16 @@ def test_canonical_audio_mutated_during_map_is_rejected_before_promotion(
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
-def test_run_generation_never_writes_invalid_output_to_stable_raw(tmp_path: Path):
+def test_generated_structure_defects_exhaust_with_gate_evidence_before_stable_raw(
+    monkeypatch, tmp_path: Path
+):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
+    monkeypatch.setattr(
+        s2_generate,
+        "evaluate_chart_candidate",
+        evaluate_chart_candidate,
+    )
 
     class InvalidLaneGenerator(RecordingGenerator):
         def generate_map(self, request, workdir):
@@ -455,16 +462,34 @@ def test_run_generation_never_writes_invalid_output_to_stable_raw(tmp_path: Path
                 bpm_events=generated.bpm_events,
             )
 
+    generator = InvalidLaneGenerator()
     with pytest.raises(WorkerError) as captured:
         run_generation(
             prepared,
             authority,
             _analysis(),
             tmp_path,
-            generator=InvalidLaneGenerator(),
+            generator=generator,
             seed=0,
         )
+
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert [request.seed for request in generator.map_calls] == [0, 12, 24]
+    assert [attempt["seed"] for attempt in captured.value.context["attempts"]] == [
+        0,
+        12,
+        24,
+    ]
+    assert [attempt["workdir"] for attempt in captured.value.context["attempts"]] == [
+        "raw/work/4k-easy/attempt-1",
+        "raw/work/4k-easy/attempt-2",
+        "raw/work/4k-easy/attempt-3",
+    ]
+    assert all(
+        attempt["gateReport"]["decisions"]["STRUCTURE"]["reasons"]
+        == ["STRUCTURE_INVALID"]
+        for attempt in captured.value.context["attempts"]
+    )
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
@@ -646,23 +671,31 @@ def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
     retry = _acceptance_with_action(authority, GateAction.RETRY_MAP)
+    evaluation_calls = 0
+
+    def evaluate(*args, **kwargs):
+        nonlocal evaluation_calls
+        del args, kwargs
+        evaluation_calls += 1
+        return retry
+
     monkeypatch.setattr(
         s2_generate,
         "evaluate_chart_candidate",
-        lambda *args, **kwargs: retry,
+        evaluate,
     )
 
-    class GateThenInvalidGenerator(RecordingGenerator):
+    class GateThenLegacyFailureGenerator(RecordingGenerator):
         def generate_map(self, request, workdir):
             generated = super().generate_map(request, workdir)
             if request.seed == 0:
                 return generated
-            return replace(
-                generated,
-                notes=[NoteEvent(500, request.key_mode)],
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                "fixture legacy generation failure",
             )
 
-    generator = GateThenInvalidGenerator()
+    generator = GateThenLegacyFailureGenerator()
     with pytest.raises(WorkerError) as captured:
         run_generation(
             prepared,
@@ -676,6 +709,7 @@ def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert captured.value.context["seeds"] == [0, 12, 24]
     assert len(captured.value.context["errors"]) == 3
+    assert evaluation_calls == 1
     assert captured.value.context["attempts"] == [
         {
             "seed": 0,
@@ -755,11 +789,16 @@ def test_reports_all_errors_when_one_variant_exhausts_its_attempts(tmp_path: Pat
     assert [request.seed for request in generator.map_calls] == [0, 12, 24]
 
 
-def test_different_timing_identity_retries_only_failed_map_without_promotion(
-    tmp_path: Path,
+def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
+    monkeypatch, tmp_path: Path,
 ):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
+    monkeypatch.setattr(
+        s2_generate,
+        "evaluate_chart_candidate",
+        evaluate_chart_candidate,
+    )
 
     class DifferentTimingGenerator(RecordingGenerator):
         def generate_map(self, request, workdir):
@@ -793,4 +832,19 @@ def test_different_timing_identity_retries_only_failed_map_without_promotion(
         (4, "EASY", 12),
         (4, "EASY", 24),
     ]
+    assert [attempt["seed"] for attempt in captured.value.context["attempts"]] == [
+        0,
+        12,
+        24,
+    ]
+    assert [attempt["workdir"] for attempt in captured.value.context["attempts"]] == [
+        "raw/work/4k-easy/attempt-1",
+        "raw/work/4k-easy/attempt-2",
+        "raw/work/4k-easy/attempt-3",
+    ]
+    assert all(
+        attempt["gateReport"]["decisions"]["TIMING_IDENTITY"]["reasons"]
+        == ["TIMING_REFERENCE_MISMATCH"]
+        for attempt in captured.value.context["attempts"]
+    )
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()

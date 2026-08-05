@@ -58,6 +58,28 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     )
     assert report["timingGenerationMode"] == "STANDARD"
     assert report["timingAttemptCount"] == 1
+    assert report["timingAuthorityTempoMetrics"] == {
+        "basePulseSupport": 1.0,
+        "halfPulseSupport": 1.0,
+        "doublePulseSupport": 0.5,
+        "baseSupportedPulses": 20,
+        "halfSupportedPulses": 10,
+        "doubleSupportedPulses": 20,
+        "pulseBestAlternative": None,
+        "pulseAlternativeMargin": 0.0,
+        "basePeriodicitySupport": 1.0,
+        "halfPeriodicitySupport": 1.0,
+        "doublePeriodicitySupport": 0.0,
+        "periodicityFrameCount": 100,
+        "periodicityBestAlternative": None,
+        "periodicityMargin": 0.0,
+        "evidenceAgrees": False,
+        "evidenceStatus": "SUFFICIENT",
+    }
+    assert report["timingAuthorityReview"] == {
+        "action": "PASS",
+        "reasons": ["TEMPO_CANDIDATE_AMBIGUOUS"],
+    }
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
     assert report["attemptsPerChartMax"] == 3
@@ -82,6 +104,22 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
         assert chart_report["acceptanceStatus"] == "PASS"
         assert chart_report["acceptanceReasons"] == []
+        assert set(chart_report["noteGrid"]) == {
+            "uniqueRowCount",
+            "cleanRowCount",
+            "cleanRate",
+            "absoluteP95Beats",
+        }
+        assert (
+            chart_report["noteGrid"]["uniqueRowCount"]
+            == chart_report["rawNoteCount"]
+        )
+        assert (
+            chart_report["noteGrid"]["cleanRowCount"]
+            == chart_report["rawNoteCount"]
+        )
+        assert chart_report["noteGrid"]["cleanRate"] == 1.0
+        assert 0.0 <= chart_report["noteGrid"]["absoluteP95Beats"] <= 0.025
         assert set(chart_report["acceptanceDecisions"]) == {
             "STRUCTURE",
             "TIMING_IDENTITY",
@@ -95,6 +133,32 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["rawOsuPath"] == raw_path.relative_to(output_dir).as_posix()
         assert "candidates" not in chart_report
         assert raw_path.parent == output_dir / "raw"
+
+
+def test_success_report_uses_null_for_unavailable_optional_timing_evidence(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        authority = dependencies.timing(prepared, analysis, run_dir, generator, seed)
+        return replace(authority, tempo_metrics=None, review=None)
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, timing=timing),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["timingAuthorityTempoMetrics"] is None
+    assert report["timingAuthorityReview"] is None
 
 
 @pytest.mark.parametrize(
@@ -161,6 +225,82 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
         output_dir / "audio" / "timing-reference.osu"
     )
     assert export_calls == []
+    assert not (output_dir / "charts").exists()
+    assert not (output_dir / "playtest-run-v1.json").exists()
+
+
+def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+    generation_calls = []
+    export_calls = []
+    failure = WorkerError(
+        ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+        "timing review fixture",
+        context={
+            "reasons": ("INSUFFICIENT_TEMPO_EVIDENCE",),
+            "attempt_count": 1,
+            "attempts": [{"attempt": 1, "seed": 7, "mode": "STANDARD"}],
+        },
+    )
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        del prepared, analysis, run_dir, generator, seed
+        raise failure
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
+        generation_calls.append(run_dir)
+        return dependencies.generation(
+            prepared, authority, analysis, run_dir, generator, seed
+        )
+
+    def export(prepared, generated, run_dir, worker_version):
+        export_calls.append(run_dir)
+        return dependencies.export(prepared, generated, run_dir, worker_version)
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=output_dir,
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(
+                dependencies,
+                timing=timing,
+                generation=generation,
+                export=export,
+            ),
+        )
+
+    assert captured.value is failure
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    assert report["publishable"] is False
+    assert report["status"] == "REVIEW"
+    assert report["failureStage"] == "TIMING"
+    assert report["error"] == {
+        "code": "CHART_TIMING_REVIEW_REQUIRED",
+        "context": {
+            "reasons": ["INSUFFICIENT_TEMPO_EVIDENCE"],
+            "attempt_count": 1,
+            "attempts": [{"attempt": 1, "seed": 7, "mode": "STANDARD"}],
+        },
+    }
+    assert report["canonicalAudioSha256"] == sha256_file(
+        output_dir / "audio" / "game.flac"
+    )
+    assert report["timingAuthority"] is None
+    assert report["timingAuthoritySha256"] is None
+    assert generation_calls == []
+    assert export_calls == []
+    assert not (output_dir / "audio" / "timing-reference.osu").exists()
+    assert not (output_dir / "raw").exists()
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v1.json").exists()
 

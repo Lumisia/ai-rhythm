@@ -44,6 +44,27 @@ class TempoCandidateMetrics:
     evidence_agrees: bool
     evidence_status: EvidenceStatus
 
+    def to_report(self) -> dict[str, object]:
+        """Serialize the stable timing-candidate evidence schema."""
+        return {
+            "basePulseSupport": self.base_pulse_support,
+            "halfPulseSupport": self.half_pulse_support,
+            "doublePulseSupport": self.double_pulse_support,
+            "baseSupportedPulses": self.base_supported_pulses,
+            "halfSupportedPulses": self.half_supported_pulses,
+            "doubleSupportedPulses": self.double_supported_pulses,
+            "pulseBestAlternative": self.pulse_best_alternative,
+            "pulseAlternativeMargin": self.pulse_alternative_margin,
+            "basePeriodicitySupport": self.base_periodicity_support,
+            "halfPeriodicitySupport": self.half_periodicity_support,
+            "doublePeriodicitySupport": self.double_periodicity_support,
+            "periodicityFrameCount": self.periodicity_frame_count,
+            "periodicityBestAlternative": self.periodicity_best_alternative,
+            "periodicityMargin": self.periodicity_margin,
+            "evidenceAgrees": self.evidence_agrees,
+            "evidenceStatus": self.evidence_status,
+        }
+
 
 def _event_index(events: tuple[OsuBpmEvent, ...], time_ms: int) -> int:
     return int(np.searchsorted([event.time_ms for event in events], time_ms, side="right")) - 1

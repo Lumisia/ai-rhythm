@@ -32,6 +32,17 @@ def test_same_strong_half_tempo_evidence_requests_one_retry():
     assert review.reasons == ("STRONG_HALF_TEMPO_ALTERNATIVE",)
 
 
+def test_timing_authority_review_report_serializes_action_and_reasons():
+    review = review_timing_authority(
+        _metrics(evidence_status="INSUFFICIENT")
+    )
+
+    assert review.to_report() == {
+        "action": "REVIEW",
+        "reasons": ["INSUFFICIENT_TEMPO_EVIDENCE"],
+    }
+
+
 def test_close_high_quality_candidates_pass_with_ambiguity_diagnostic():
     review = review_timing_authority(
         _metrics(

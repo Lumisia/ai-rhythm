@@ -1,11 +1,52 @@
 import numpy as np
 
 from chart_worker.analysis.grid_alignment import (
+    TempoCandidateMetrics,
     measure_note_grid_alignment,
     measure_tempo_candidates,
 )
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.generation.osu_parser import OsuBpmEvent
+
+
+def test_tempo_candidate_metrics_report_has_complete_stable_camel_case_schema():
+    metrics = TempoCandidateMetrics(
+        base_pulse_support=0.51,
+        half_pulse_support=0.72,
+        double_pulse_support=0.33,
+        base_supported_pulses=17,
+        half_supported_pulses=19,
+        double_supported_pulses=13,
+        pulse_best_alternative="HALF",
+        pulse_alternative_margin=0.21,
+        base_periodicity_support=0.41,
+        half_periodicity_support=0.56,
+        double_periodicity_support=0.12,
+        periodicity_frame_count=321,
+        periodicity_best_alternative="HALF",
+        periodicity_margin=0.15,
+        evidence_agrees=True,
+        evidence_status="SUFFICIENT",
+    )
+
+    assert metrics.to_report() == {
+        "basePulseSupport": 0.51,
+        "halfPulseSupport": 0.72,
+        "doublePulseSupport": 0.33,
+        "baseSupportedPulses": 17,
+        "halfSupportedPulses": 19,
+        "doubleSupportedPulses": 13,
+        "pulseBestAlternative": "HALF",
+        "pulseAlternativeMargin": 0.21,
+        "basePeriodicitySupport": 0.41,
+        "halfPeriodicitySupport": 0.56,
+        "doublePeriodicitySupport": 0.12,
+        "periodicityFrameCount": 321,
+        "periodicityBestAlternative": "HALF",
+        "periodicityMargin": 0.15,
+        "evidenceAgrees": True,
+        "evidenceStatus": "SUFFICIENT",
+    }
 
 
 def _analysis_with_second_pulses(*, seconds: int) -> OnsetAnalysis:

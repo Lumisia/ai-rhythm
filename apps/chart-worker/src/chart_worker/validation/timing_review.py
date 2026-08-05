@@ -17,6 +17,13 @@ class TimingAuthorityReview:
     action: TimingAuthorityAction
     reasons: tuple[str, ...]
 
+    def to_report(self) -> dict[str, object]:
+        """Serialize the stable timing-authority decision schema."""
+        return {
+            "action": self.action.value,
+            "reasons": list(self.reasons),
+        }
+
 
 def review_timing_authority(metrics: TempoCandidateMetrics) -> TimingAuthorityReview:
     """Only retry when both independent axes strongly corroborate one alternative."""

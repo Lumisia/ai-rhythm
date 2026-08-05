@@ -51,10 +51,15 @@ def run_timing_generation(
     generator: ChartGenerator,
     seed: int,
 ) -> SongTimingAuthority:
-    """Generate one standard timing candidate, with one structural Super Timing fallback."""
+    """Generate timing with one semantic Super Timing fallback.
+
+    It covers invalid timing structure/identity or a strongly corroborated
+    half/double tempo alternative.
+    """
     reference_path = run_dir / "audio" / "timing-reference.osu"
     errors: list[str] = []
     seeds: list[int] = []
+    attempt_reviews: list[dict[str, object]] = []
 
     for attempt_count, super_timing in enumerate((False, True), start=1):
         request = TimingGenerationRequest(
@@ -70,6 +75,16 @@ def run_timing_generation(
             _validate_candidate(generated, prepared)
             metrics = measure_tempo_candidates(generated.bpm_events, analysis)
             review = review_timing_authority(metrics)
+            attempt_reviews.append(
+                {
+                    "attempt": attempt_count,
+                    "seed": generated.seed,
+                    "mode": generated.mode,
+                    "workdir": workdir.relative_to(run_dir).as_posix(),
+                    "review": review.to_report(),
+                    "tempoMetrics": metrics.to_report(),
+                }
+            )
             if review.action is TimingAuthorityAction.PASS:
                 _promote(generated, prepared, reference_path)
         except TimingAuthorityValidationError as error:
@@ -102,7 +117,11 @@ def run_timing_generation(
         raise WorkerError(
             ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
             "timing candidate requires human review before MAP generation",
-            context={"reasons": review.reasons, "attempt_count": attempt_count},
+            context={
+                "reasons": review.reasons,
+                "attempt_count": attempt_count,
+                "attempts": attempt_reviews,
+            },
         )
 
     raise AssertionError("timing generation attempts were unexpectedly exhausted")

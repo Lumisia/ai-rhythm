@@ -7,8 +7,10 @@
 
 ## 생성 계약
 
-곡마다 표준 timing을 한 번 생성하고, timing 구조 검증이 실패할 때만 Super Timing을
-한 번 더 시도한다. 검증된 기준은 `audio/timing-reference.osu`에 저장한다. 그 뒤
+곡마다 표준 timing을 한 번 생성하고, timing 구조·identity가 유효하지 않거나 half/double
+tempo 대안이 두 진단 축에서 강하게 일치할 때만 Super Timing을 한 번 더 시도한다.
+약하거나 서로 다른 대안 또는 불충분한 근거는 반복 추론하지 않고 `REVIEW`로 보류한다.
+검증된 기준은 `audio/timing-reference.osu`에 저장한다. 그 뒤
 4K·6K·7K와 네 난이도 조합의 MAP 12개가 모두 같은 reference를 재사용한다. 각 후보는
 안정된 raw 경로로 승격되기 전에 `STRUCTURE`, `TIMING_IDENTITY`, `TIMING_ALIGNMENT`,
 `COVERAGE` 네 축에서 독립적으로 판정된다. 전체 우선순위는
@@ -113,10 +115,12 @@ uv run --project apps/chart-worker chart-worker bench `
 - `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
 성공한 `generation-report.json`은 `qualityGateVersion=quality-gate-v1`,
-`publishable=true`, `status=PASS`와 채보별 acceptance status·reason·축별 결정을 기록한다.
+`publishable=true`, `status=PASS`, timing authority의 tempo metrics·review와 채보별
+acceptance status·reason·축별 결정·note-grid 근거를 기록한다.
 `REVIEW` 또는 재시도 소진으로 보류된 실행도 같은 위치에 보고서를 남긴다. 이때
 `publishable=false`, `status=REVIEW` 또는 `EXHAUSTED`, error code/context,
-`canonicalAudioSha256`와 timing authority identity를 기록한다. 생성기가 후보 원문이나
+`canonicalAudioSha256`와 timing authority identity를 기록한다. timing 단계에서 authority
+승격 전에 보류되면 `failureStage=TIMING`과 null authority identity를 기록한다. 생성기가 후보 원문이나
 로그를 만든 경우에는 진단 작업 위치인 `raw/work/<variant>/attempt-*`에 보존한다.
 작업 산출물의 존재 여부와 관계없이 거절된 후보는 안정된 `raw/<variant>.osu`에 도달하지
 않는다. 보류된 실행은 export하지 않으며 `charts/`와 `playtest-run-v1.json`도 만들지 않는다.

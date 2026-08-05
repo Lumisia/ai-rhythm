@@ -115,8 +115,18 @@ def _base_tempo_analysis(*, offset_ms: int = 0) -> OnsetAnalysis:
     )
 
 
-class AlwaysHalfTempoGenerator(RecordingGenerator):
-    pass
+class RetryThenReviewGenerator(RecordingGenerator):
+    def generate_timing(self, request, workdir):
+        generated = super().generate_timing(request, workdir)
+        if not request.super_timing:
+            return generated
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(OsuBpmEvent(250, 120.0),),
+            generator_name=generated.generator_name,
+            seed=generated.seed,
+            mode=generated.mode,
+        )
 
 
 class IdentityFailureThenSuperGenerator(RecordingGenerator):
@@ -174,7 +184,7 @@ def test_standard_first_event_beyond_one_beat_uses_super_timing_once(tmp_path):
 
 
 def test_retry_worthy_standard_runs_super_once_then_blocks_map_generation(tmp_path):
-    generator = AlwaysHalfTempoGenerator()
+    generator = RetryThenReviewGenerator()
 
     with pytest.raises(WorkerError) as captured:
         run_timing_generation(
@@ -187,6 +197,68 @@ def test_retry_worthy_standard_runs_super_once_then_blocks_map_generation(tmp_pa
 
     assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
     assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert captured.value.context == {
+        "reasons": ("INSUFFICIENT_TEMPO_EVIDENCE",),
+        "attempt_count": 2,
+        "attempts": [
+            {
+                "attempt": 1,
+                "seed": 9,
+                "mode": "STANDARD",
+                "workdir": "timing/work/attempt-1",
+                "review": {
+                    "action": "RETRY_TIMING",
+                    "reasons": ["STRONG_HALF_TEMPO_ALTERNATIVE"],
+                },
+                "tempoMetrics": {
+                    "basePulseSupport": 0.5,
+                    "halfPulseSupport": 1.0,
+                    "doublePulseSupport": 0.25,
+                    "baseSupportedPulses": 40,
+                    "halfSupportedPulses": 40,
+                    "doubleSupportedPulses": 40,
+                    "pulseBestAlternative": "HALF",
+                    "pulseAlternativeMargin": 0.5,
+                    "basePeriodicitySupport": 0.0,
+                    "halfPeriodicitySupport": 1.0,
+                    "doublePeriodicitySupport": 0.0,
+                    "periodicityFrameCount": 400,
+                    "periodicityBestAlternative": "HALF",
+                    "periodicityMargin": 1.0,
+                    "evidenceAgrees": True,
+                    "evidenceStatus": "SUFFICIENT",
+                },
+            },
+            {
+                "attempt": 2,
+                "seed": 9,
+                "mode": "SUPER_TIMING",
+                "workdir": "timing/work/attempt-2",
+                "review": {
+                    "action": "REVIEW",
+                    "reasons": ["INSUFFICIENT_TEMPO_EVIDENCE"],
+                },
+                "tempoMetrics": {
+                    "basePulseSupport": 0.0,
+                    "halfPulseSupport": 0.0,
+                    "doublePulseSupport": 0.24528301886792453,
+                    "baseSupportedPulses": 0,
+                    "halfSupportedPulses": 0,
+                    "doubleSupportedPulses": 39,
+                    "pulseBestAlternative": "DOUBLE",
+                    "pulseAlternativeMargin": 0.24528301886792453,
+                    "basePeriodicitySupport": 0.0,
+                    "halfPeriodicitySupport": 1.0,
+                    "doublePeriodicitySupport": 0.0,
+                    "periodicityFrameCount": 397,
+                    "periodicityBestAlternative": "HALF",
+                    "periodicityMargin": 1.0,
+                    "evidenceAgrees": False,
+                    "evidenceStatus": "INSUFFICIENT",
+                },
+            },
+        ],
+    }
     assert not (tmp_path / "audio" / "timing-reference.osu").exists()
 
 
@@ -206,6 +278,36 @@ def test_standard_review_blocks_map_generation_without_a_super_retry(tmp_path):
 
     assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
     assert [call.super_timing for call in generator.timing_calls] == [False]
+    assert captured.value.context["attempts"] == [
+        {
+            "attempt": 1,
+            "seed": 9,
+            "mode": "STANDARD",
+            "workdir": "timing/work/attempt-1",
+            "review": {
+                "action": "REVIEW",
+                "reasons": ["INSUFFICIENT_TEMPO_EVIDENCE"],
+            },
+            "tempoMetrics": {
+                "basePulseSupport": 0.0,
+                "halfPulseSupport": 0.0,
+                "doublePulseSupport": 0.0,
+                "baseSupportedPulses": 0,
+                "halfSupportedPulses": 0,
+                "doubleSupportedPulses": 0,
+                "pulseBestAlternative": None,
+                "pulseAlternativeMargin": 0.0,
+                "basePeriodicitySupport": 0.0,
+                "halfPeriodicitySupport": 0.0,
+                "doublePeriodicitySupport": 0.0,
+                "periodicityFrameCount": 0,
+                "periodicityBestAlternative": None,
+                "periodicityMargin": 0.0,
+                "evidenceAgrees": False,
+                "evidenceStatus": "INSUFFICIENT",
+            },
+        }
+    ]
     assert not (tmp_path / "audio" / "timing-reference.osu").exists()
 
 

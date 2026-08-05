@@ -237,6 +237,7 @@ def _generation_report(
                 ],
                 "acceptanceDecisions": acceptance["decisions"],
                 "timingDiagnostics": acceptance["timing"],
+                "noteGrid": acceptance["noteGrid"],
                 "rawNoteCount": len(notes),
                 "finalNoteCount": len(result.document.notes),
                 "holdCount": sum(note.kind == "HOLD" for note in notes),
@@ -259,6 +260,14 @@ def _generation_report(
         "timingAuthoritySha256": authority.sha256,
         "timingGenerationMode": authority.mode,
         "timingAttemptCount": authority.attempt_count,
+        "timingAuthorityTempoMetrics": (
+            authority.tempo_metrics.to_report()
+            if authority.tempo_metrics is not None
+            else None
+        ),
+        "timingAuthorityReview": (
+            authority.review.to_report() if authority.review is not None else None
+        ),
         "noteMutationEnabled": False,
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
@@ -280,15 +289,17 @@ def _failure_generation_report(
     elapsed: dict[str, int],
     run_dir: Path,
     prepared: PreparedAudio,
-    authority: SongTimingAuthority,
+    authority: SongTimingAuthority | None,
     error: WorkerError,
+    *,
+    failure_stage: str | None = None,
 ) -> dict[str, object]:
     status = (
         "REVIEW"
         if error.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
         else "EXHAUSTED"
     )
-    return {
+    report: dict[str, object] = {
         "version": 1,
         "qualityGateVersion": "quality-gate-v1",
         "runId": str(run_id),
@@ -301,14 +312,19 @@ def _failure_generation_report(
             "code": error.code.value,
             "context": error.context,
         },
-        "timingAuthority": _relative(authority.reference_path, run_dir),
-        "timingAuthoritySha256": authority.sha256,
-        "timingGenerationMode": authority.mode,
-        "timingAttemptCount": authority.attempt_count,
+        "timingAuthority": (
+            _relative(authority.reference_path, run_dir) if authority is not None else None
+        ),
+        "timingAuthoritySha256": authority.sha256 if authority is not None else None,
+        "timingGenerationMode": authority.mode if authority is not None else None,
+        "timingAttemptCount": authority.attempt_count if authority is not None else None,
         "canonicalAudioSha256": prepared.normalized.sha256,
         "elapsedMsByStage": elapsed,
         "charts": [],
     }
+    if failure_stage is not None:
+        report["failureStage"] = failure_stage
+    return report
 
 
 def _write_generation_report(path: Path, report: dict[str, object]) -> None:
@@ -373,7 +389,26 @@ def run_pipeline(
     generator = dependencies.select_generator(options.generator, dependencies.config)
 
     started = perf_counter_ns()
-    authority = dependencies.timing(prepared, onsets, run_dir, generator, options.seed)
+    try:
+        authority = dependencies.timing(prepared, onsets, run_dir, generator, options.seed)
+    except WorkerError as error:
+        if error.code is not ErrorCode.CHART_TIMING_REVIEW_REQUIRED:
+            raise
+        elapsed["timing"] = _elapsed_ms(started)
+        _write_generation_report(
+            run_dir / "generation-report.json",
+            _failure_generation_report(
+                options,
+                run_id,
+                elapsed,
+                run_dir,
+                prepared,
+                None,
+                error,
+                failure_stage="TIMING",
+            ),
+        )
+        raise
     _require_canonical_audio_hash(prepared)
     elapsed["timing"] = _elapsed_ms(started)
 

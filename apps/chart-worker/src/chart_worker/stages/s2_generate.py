@@ -170,29 +170,6 @@ def run_generation(
                     generated = generator.generate_map(request, workdir)
                 finally:
                     _require_timing_authority(prepared, authority)
-                validate_timing_identity(generated.bpm_events, authority.bpm_events)
-                validate_generated_chart(
-                    generated,
-                    key_mode=key_mode,
-                    duration_ms=prepared.normalized.duration_ms,
-                )
-                first_timing = generated.bpm_events[0]
-                osu_text = generated.osu_text or notes_to_osu_mania(
-                    generated.notes,
-                    key_mode=key_mode,
-                    bpm=first_timing.bpm,
-                    offset_ms=first_timing.time_ms,
-                    audio_filename=prepared.normalized.path.name,
-                    title=prepared.normalized.path.stem,
-                    bpm_events=generated.bpm_events,
-                )
-                _validate_serialized_candidate(
-                    osu_text,
-                    generated,
-                    authority,
-                    prepared,
-                    key_mode,
-                )
                 acceptance = evaluate_chart_candidate(
                     generated,
                     authority,
@@ -242,6 +219,29 @@ def run_generation(
                             "attempts": attempt_evidence,
                         },
                     )
+                validate_timing_identity(generated.bpm_events, authority.bpm_events)
+                validate_generated_chart(
+                    generated,
+                    key_mode=key_mode,
+                    duration_ms=prepared.normalized.duration_ms,
+                )
+                first_timing = generated.bpm_events[0]
+                osu_text = generated.osu_text or notes_to_osu_mania(
+                    generated.notes,
+                    key_mode=key_mode,
+                    bpm=first_timing.bpm,
+                    offset_ms=first_timing.time_ms,
+                    audio_filename=prepared.normalized.path.name,
+                    title=prepared.normalized.path.stem,
+                    bpm_events=generated.bpm_events,
+                )
+                _validate_serialized_candidate(
+                    osu_text,
+                    generated,
+                    authority,
+                    prepared,
+                    key_mode,
+                )
                 raw_path.parent.mkdir(parents=True, exist_ok=True)
                 raw_path.write_text(osu_text, encoding="utf-8")
                 try:
