@@ -16,6 +16,7 @@ from chart_worker.analysis.timing_diagnostics import (
     diagnose_chart_timing,
 )
 from chart_worker.generation.mapperatorinator import GeneratedChart
+from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.types import DIFFICULTIES
 from chart_worker.stages.types import SongTimingAuthority
 from chart_worker.validation.generated_chart import (
@@ -124,8 +125,30 @@ def _coverage_decision(timing: TimingDiagnostics) -> GateDecision:
     return GateDecision(GateAxis.COVERAGE, GateAction.PASS, ())
 
 
+def _metrical_phase_distance_ms(
+    section_start_ms: int,
+    phase_delta_ms: float | None,
+    bpm_events: tuple[OsuBpmEvent, ...],
+) -> float | None:
+    """Measure phase modulo the local beat so one-beat ambiguity is equivalent."""
+    if phase_delta_ms is None or not bpm_events:
+        return None
+    event = bpm_events[0]
+    for candidate in bpm_events:
+        if candidate.time_ms > section_start_ms:
+            break
+        event = candidate
+    beat_ms = 60_000.0 / event.bpm
+    remainder = abs(phase_delta_ms) % beat_ms
+    return min(remainder, beat_ms - remainder)
+
+
 def _timing_alignment_decision(
-    timing: TimingDiagnostics, note_grid: NoteGridMetrics, *, activity_present: bool
+    timing: TimingDiagnostics,
+    note_grid: NoteGridMetrics,
+    *,
+    activity_present: bool,
+    bpm_events: tuple[OsuBpmEvent, ...],
 ) -> GateDecision:
     overall = timing.overall
     if (
@@ -144,10 +167,16 @@ def _timing_alignment_decision(
         section.status == "REVIEW"
         and section.metrics.precision_50 is not None
         and section.metrics.absolute_p95_ms is not None
-        and section.phase_delta_ms is not None
+        and _metrical_phase_distance_ms(
+            section.start_ms, section.phase_delta_ms, bpm_events
+        )
+        is not None
         and section.metrics.precision_50 < 0.60
         and section.metrics.absolute_p95_ms >= 60
-        and abs(section.phase_delta_ms) > SECTION_PHASE_DRIFT_MAX_MS
+        and _metrical_phase_distance_ms(
+            section.start_ms, section.phase_delta_ms, bpm_events
+        )
+        > SECTION_PHASE_DRIFT_MAX_MS
         for section in timing.sections
     ):
         return GateDecision(
@@ -190,8 +219,13 @@ def _timing_alignment_decision(
         advisory_reasons.append("SECTION_TIMING_WEAK_SUPPORT")
     if any(
         section.status != "INSUFFICIENT"
-        and section.phase_delta_ms is not None
-        and abs(section.phase_delta_ms) > SECTION_PHASE_DRIFT_MAX_MS
+        and (
+            _metrical_phase_distance_ms(
+                section.start_ms, section.phase_delta_ms, bpm_events
+            )
+            or 0.0
+        )
+        > SECTION_PHASE_DRIFT_MAX_MS
         for section in timing.sections
     ):
         review_reasons.append("SECTION_PHASE_DELTA")
@@ -266,6 +300,7 @@ def evaluate_chart_candidate(
             timing,
             note_grid,
             activity_present=onset_analysis.activity is not None,
+            bpm_events=authority.bpm_events,
         ),
         _coverage_decision(timing),
         *profile_decisions,

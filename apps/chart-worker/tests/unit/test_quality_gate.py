@@ -265,6 +265,28 @@ def test_correlated_section_onset_errors_without_phase_drift_are_advisory():
     assert "SECTION_TIMING_WEAK_SUPPORT" in decision.reasons
 
 
+def test_whole_beat_section_phase_is_metrically_equivalent_not_misaligned():
+    events = (OsuBpmEvent(190, 150.0),)  # 400ms per beat
+    first_section = tuple(1_390 + 1_200 * index for index in range(9))
+    later_sections = tuple(range(16_190, 44_191, 400))
+    rows = first_section + later_sections
+    onsets = tuple(row - 390 for row in first_section) + later_sections
+    result = _evaluate(
+        _chart(rows, events=events),
+        onsets,
+        duration_ms=45_000,
+        authority=_authority(events),
+    )
+
+    section = result.timing.sections[0]
+    assert section.metrics.precision_50 < 0.60
+    assert section.phase_delta_ms == 390.0
+    decision = _decision(result, "TIMING_ALIGNMENT")
+    assert decision.action is _gate().GateAction.PASS
+    assert "SECTION_TIMING_WEAK_SUPPORT" in decision.reasons
+    assert "SECTION_PHASE_DELTA" not in decision.reasons
+
+
 @pytest.mark.parametrize("active_onset_ms", [(), (1_000, 2_000)])
 def test_missing_or_low_active_onset_support_requires_review(active_onset_ms):
     rows = tuple(range(1_000, 9_000, 1_000))
