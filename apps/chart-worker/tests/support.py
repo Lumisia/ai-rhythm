@@ -57,17 +57,20 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
     def analyze(path: Path) -> OnsetAnalysis:
         del path
         duration_ms = round(len(samples) * 1_000 / sample_rate_hz)
+        strength = np.zeros(duration_ms // 100 + 1)
+        strength[::5] = 1.0
         return OnsetAnalysis(
             sample_rate_hz=sample_rate_hz,
-            hop_length=512,
-            strength=np.zeros(1),
-            band_strength=np.zeros((3, 1)),
+            hop_length=sample_rate_hz // 10,
+            strength=strength,
+            band_strength=np.zeros((3, strength.size)),
             onset_ms=tuple(range(0, duration_ms, 125)),
         )
 
-    def timing(prepared, run_dir, generator, seed):
+    def timing(prepared, analysis, run_dir, generator, seed):
         return run_timing_generation(
             prepared,
+            analysis,
             run_dir,
             generator=generator,
             seed=seed,
@@ -95,7 +98,7 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
 
 
 def fake_dependencies() -> PipelineDependencies:
-    return _dependencies(np.zeros((96_000, 2)), 48_000)
+    return _dependencies(np.zeros((480_000, 2)), 48_000)
 
 
 def contract_fixture_dependencies() -> PipelineDependencies:

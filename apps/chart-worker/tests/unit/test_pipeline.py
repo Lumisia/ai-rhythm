@@ -121,10 +121,10 @@ def test_pipeline_runs_shared_timing_before_twelve_maps_with_one_generator(
         select_calls.append((name, config))
         return generator
 
-    def timing(prepared, run_dir, selected_generator, seed):
+    def timing(prepared, analysis, run_dir, selected_generator, seed):
         calls.append("timing")
         assert selected_generator is generator
-        return dependencies.timing(prepared, run_dir, selected_generator, seed)
+        return dependencies.timing(prepared, analysis, run_dir, selected_generator, seed)
 
     def generation(prepared, authority, run_dir, selected_generator, seed):
         calls.append("generation")
@@ -225,6 +225,35 @@ def test_pipeline_analyzes_only_the_canonical_game_audio_once(tmp_path: Path):
     )
 
     assert calls == [result.output_dir / "audio" / "game.flac"]
+
+
+def test_pipeline_passes_one_shared_onset_analysis_to_timing_generation(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    analyses = []
+    timing_analyses = []
+
+    def analyze(path):
+        analysis = dependencies.analyze(path)
+        analyses.append(analysis)
+        return analysis
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        timing_analyses.append(analysis)
+        return dependencies.timing(prepared, analysis, run_dir, generator, seed)
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, analyze=analyze, timing=timing),
+    )
+
+    assert timing_analyses == analyses
 
 
 def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Path):
@@ -358,8 +387,8 @@ def test_pipeline_rejects_canonical_audio_changed_during_timing(tmp_path: Path):
     dependencies = fake_dependencies()
     generation_calls = []
 
-    def timing(prepared, run_dir, generator, seed):
-        authority = dependencies.timing(prepared, run_dir, generator, seed)
+    def timing(prepared, analysis, run_dir, generator, seed):
+        authority = dependencies.timing(prepared, analysis, run_dir, generator, seed)
         prepared.normalized.path.write_bytes(b"tampered during timing")
         return authority
 

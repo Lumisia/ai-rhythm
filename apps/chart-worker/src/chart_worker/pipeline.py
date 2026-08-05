@@ -40,7 +40,7 @@ GeneratorName = Literal["fake", "mapperatorinator"]
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
 AnalysisStage = Callable[[Path], OnsetAnalysis]
 TimingStage = Callable[
-    [PreparedAudio, Path, ChartGenerator, int], SongTimingAuthority
+    [PreparedAudio, OnsetAnalysis, Path, ChartGenerator, int], SongTimingAuthority
 ]
 GenerationStage = Callable[
     [PreparedAudio, SongTimingAuthority, Path, ChartGenerator, int],
@@ -74,12 +74,14 @@ def _generation_stage(
 
 def _timing_stage(
     prepared: PreparedAudio,
+    analysis: OnsetAnalysis,
     run_dir: Path,
     generator: ChartGenerator,
     seed: int,
 ) -> SongTimingAuthority:
     return run_timing_generation(
         prepared,
+        analysis,
         run_dir,
         generator=generator,
         seed=seed,
@@ -292,7 +294,7 @@ def run_pipeline(
     generator = dependencies.select_generator(options.generator, dependencies.config)
 
     started = perf_counter_ns()
-    authority = dependencies.timing(prepared, run_dir, generator, options.seed)
+    authority = dependencies.timing(prepared, onsets, run_dir, generator, options.seed)
     _require_canonical_audio_hash(prepared)
     elapsed["timing"] = _elapsed_ms(started)
 

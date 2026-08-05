@@ -1,11 +1,18 @@
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedTiming
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.hashing import sha256_file
+from chart_worker.stages import s2_timing
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.types import PreparedAudio
+from chart_worker.validation.timing_authority import TimingAuthorityValidationError
 
 
 def _prepared(tmp_path: Path) -> PreparedAudio:
@@ -82,20 +89,68 @@ class PositiveFirstThenSuperGenerator(RecordingGenerator):
         )
 
 
+def _half_tempo_analysis() -> OnsetAnalysis:
+    strength = np.zeros(401)
+    strength[::10] = 1.0
+    return OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.zeros((3, strength.size)),
+        onset_ms=(),
+        n_fft=1,
+    )
+
+
+def _base_tempo_analysis(*, offset_ms: int = 0) -> OnsetAnalysis:
+    strength = np.zeros(101)
+    strength[offset_ms // 100 :: 5] = 1.0
+    return OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.zeros((3, strength.size)),
+        onset_ms=(),
+        n_fft=1,
+    )
+
+
+class AlwaysHalfTempoGenerator(RecordingGenerator):
+    pass
+
+
+class IdentityFailureThenSuperGenerator(RecordingGenerator):
+    pass
+
+
 def test_generates_one_standard_timing_and_promotes_it_beside_audio(tmp_path):
     generator = RecordingGenerator()
-    authority = run_timing_generation(_prepared(tmp_path), tmp_path, generator=generator, seed=9)
+    authority = run_timing_generation(
+        _prepared(tmp_path),
+        _base_tempo_analysis(),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
 
     assert [call.super_timing for call in generator.timing_calls] == [False]
     assert authority.reference_path == tmp_path / "audio" / "timing-reference.osu"
     assert authority.sha256 == sha256_file(authority.reference_path)
     assert authority.audio_sha256 == _prepared_sha(tmp_path)
     assert authority.mode == "STANDARD"
+    assert authority.tempo_metrics is not None
+    assert authority.review is not None
 
 
 def test_structural_standard_failure_uses_super_timing_once(tmp_path):
     generator = InvalidThenSuperGenerator()
-    authority = run_timing_generation(_prepared(tmp_path), tmp_path, generator=generator, seed=9)
+    authority = run_timing_generation(
+        _prepared(tmp_path),
+        _base_tempo_analysis(),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
 
     assert [call.super_timing for call in generator.timing_calls] == [False, True]
     assert authority.mode == "SUPER_TIMING"
@@ -105,8 +160,78 @@ def test_structural_standard_failure_uses_super_timing_once(tmp_path):
 def test_standard_first_event_beyond_one_beat_uses_super_timing_once(tmp_path):
     generator = PositiveFirstThenSuperGenerator()
 
-    authority = run_timing_generation(_prepared(tmp_path), tmp_path, generator=generator, seed=9)
+    authority = run_timing_generation(
+        _prepared(tmp_path),
+        _base_tempo_analysis(offset_ms=250),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
 
     assert [call.super_timing for call in generator.timing_calls] == [False, True]
     assert authority.mode == "SUPER_TIMING"
     assert authority.attempt_count == 2
+
+
+def test_retry_worthy_standard_runs_super_once_then_blocks_map_generation(tmp_path):
+    generator = AlwaysHalfTempoGenerator()
+
+    with pytest.raises(WorkerError) as captured:
+        run_timing_generation(
+            _prepared(tmp_path),
+            _half_tempo_analysis(),
+            tmp_path,
+            generator=generator,
+            seed=9,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert not (tmp_path / "audio" / "timing-reference.osu").exists()
+
+
+def test_standard_review_blocks_map_generation_without_a_super_retry(tmp_path):
+    generator = RecordingGenerator()
+    silent = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=np.zeros(101),
+        band_strength=np.zeros((3, 101)),
+        onset_ms=(),
+        n_fft=1,
+    )
+
+    with pytest.raises(WorkerError) as captured:
+        run_timing_generation(_prepared(tmp_path), silent, tmp_path, generator=generator, seed=9)
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert [call.super_timing for call in generator.timing_calls] == [False]
+    assert not (tmp_path / "audio" / "timing-reference.osu").exists()
+
+
+def test_identity_failure_uses_super_timing_and_leaves_no_rejected_reference(tmp_path, monkeypatch):
+    generator = IdentityFailureThenSuperGenerator()
+    original = s2_timing.validate_timing_identity
+    calls = 0
+
+    def fail_standard_identity(actual, expected):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimingAuthorityValidationError("timing authority identity differs")
+        original(actual, expected)
+
+    monkeypatch.setattr(s2_timing, "validate_timing_identity", fail_standard_identity)
+
+    authority = run_timing_generation(
+        _prepared(tmp_path),
+        _base_tempo_analysis(),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "SUPER_TIMING"
+    assert authority.reference_path.is_file()
+    assert not list((tmp_path / "audio").glob("timing-reference-*.osu"))

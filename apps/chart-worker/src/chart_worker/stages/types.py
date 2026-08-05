@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from chart_worker.analysis.grid_alignment import TempoCandidateMetrics
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.chart import ChartDocument
+from chart_worker.validation.timing_review import TimingAuthorityReview
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +27,8 @@ class SongTimingAuthority:
     seed: int | None
     mode: Literal["STANDARD", "SUPER_TIMING"]
     attempt_count: int
+    tempo_metrics: TempoCandidateMetrics | None = None
+    review: TimingAuthorityReview | None = None
 
 
 @dataclass(frozen=True, slots=True)

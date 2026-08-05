@@ -91,14 +91,17 @@ def test_smoke_orchestrates_one_shared_timing_and_one_map_without_mutation(
         assert output == tmp_path
         return prepared
 
+    analysis = object()
+
     def analyze(path):
         calls.append("analyze")
         assert path == prepared.normalized.path
-        return object()
+        return analysis
 
-    def timing(prepared_audio, output, *, generator, seed):
+    def timing(prepared_audio, received_analysis, output, *, generator, seed):
         calls.append("timing")
         assert prepared_audio is prepared
+        assert received_analysis is analysis
         assert seed == 0
         reference_path = output / "audio" / "timing-reference.osu"
         reference_path.write_text(

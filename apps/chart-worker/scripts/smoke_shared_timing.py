@@ -149,11 +149,11 @@ def run_smoke(
     config = dependencies.config()
     output.mkdir(parents=True, exist_ok=True)
     prepared = dependencies.prepare(source, output, config=config)
-    dependencies.analyze(prepared.normalized.path)
+    analysis = dependencies.analyze(prepared.normalized.path)
     generator = dependencies.generator(config)
 
     timing_started = perf_counter()
-    authority = dependencies.timing(prepared, output, generator=generator, seed=seed)
+    authority = dependencies.timing(prepared, analysis, output, generator=generator, seed=seed)
     elapsed_timing_seconds = perf_counter() - timing_started
 
     request = GenerationRequest(
