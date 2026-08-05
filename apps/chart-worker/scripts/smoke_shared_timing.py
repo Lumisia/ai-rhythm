@@ -22,10 +22,12 @@ from chart_worker.generation.mapperatorinator import (
     ChartGenerator,
     GeneratedChart,
     MapperatorinatorGenerator,
+    build_map_command,
 )
 from chart_worker.generation.osu_parser import OsuBeatmap, OsuBpmEvent, parse_osu_mania
 from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
+from chart_worker.hashing import sha256_file
 from chart_worker.stages.s1_prepare import run_prepare
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
@@ -42,6 +44,7 @@ class SmokeDependencies:
     analyze: Callable[[Path], Any]
     timing: Callable[..., SongTimingAuthority]
     generator: Callable[[WorkerConfig], ChartGenerator]
+    map_command: Callable[[WorkerConfig, GenerationRequest, Path], list[str]]
 
 
 def _dependencies() -> SmokeDependencies:
@@ -51,6 +54,7 @@ def _dependencies() -> SmokeDependencies:
         analyze=analyze_canonical_audio,
         timing=run_timing_generation,
         generator=MapperatorinatorGenerator,
+        map_command=build_map_command,
     )
 
 
@@ -100,6 +104,37 @@ def _serialized_map(chart: GeneratedChart, prepared: PreparedAudio) -> str:
     )
 
 
+def _hydra_path(value: str) -> Path:
+    return Path(value.strip().strip("'").replace("\\'", "'"))
+
+
+def _verified_map_command_contract(
+    command: list[str],
+    *,
+    request: GenerationRequest,
+) -> dict[str, str]:
+    pairs = dict(item.split("=", 1) for item in command if "=" in item)
+    expected_reference = request.timing_reference_path.resolve()
+    try:
+        beatmap_path = _hydra_path(pairs["beatmap_path"]).resolve()
+        contract = {
+            "keycount": pairs["keycount"],
+            "beatmapPath": str(beatmap_path),
+            "outputType": pairs["output_type"],
+            "inContext": pairs["in_context"],
+        }
+    except KeyError as error:
+        raise ValueError(f"MAP command contract is missing {error.args[0]}") from error
+    if (
+        contract["keycount"] != str(request.key_mode)
+        or beatmap_path != expected_reference
+        or contract["outputType"] != "[MAP]"
+        or contract["inContext"] != "[TIMING]"
+    ):
+        raise ValueError("MAP command contract does not use the shared timing reference")
+    return contract
+
+
 def run_smoke(
     *,
     source: Path,
@@ -129,9 +164,16 @@ def run_smoke(
         seed=seed,
         duration_ms=prepared.normalized.duration_ms,
     )
+    map_workdir = output / "map" / "work" / "attempt-1"
+    map_command_contract = _verified_map_command_contract(
+        dependencies.map_command(config, request, map_workdir), request=request
+    )
     map_started = perf_counter()
-    generated = generator.generate_map(request, output / "map" / "work" / "attempt-1")
+    generated = generator.generate_map(request, map_workdir)
     elapsed_map_seconds = perf_counter() - map_started
+    final_reference_sha = sha256_file(authority.reference_path)
+    if final_reference_sha != authority.sha256:
+        raise ValueError("timing authority reference hash changed during MAP generation")
 
     raw_text = _serialized_map(generated, prepared)
     raw = parse_osu_mania(raw_text)
@@ -168,7 +210,7 @@ def run_smoke(
     summary: dict[str, object] = {
         "elapsedTimingSeconds": elapsed_timing_seconds,
         "elapsedMapSeconds": elapsed_map_seconds,
-        "timingReferenceSha256": authority.sha256,
+        "timingReferenceSha256": final_reference_sha,
         "referenceBpmEvents": _timing_events(reference.bpm_events),
         "mapBpmEvents": _timing_events(raw.bpm_events),
         "noteCount": len(accepted.notes),
@@ -180,7 +222,7 @@ def run_smoke(
             "durationMs": first_note.duration_ms,
         },
         "maximumGapMs": max((right - left for left, right in pairwise(times)), default=0),
-        "mapCommandContract": {"outputType": "[MAP]", "inContext": "[TIMING]"},
+        "mapCommandContract": map_command_contract,
     }
     (output / "shared-timing-smoke.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
