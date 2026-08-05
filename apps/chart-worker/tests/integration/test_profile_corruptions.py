@@ -80,7 +80,7 @@ def _block_sequence(repeat_count: int) -> tuple[int, ...]:
     return repeated + tail
 
 
-def test_single_section_hold_concentration_is_review_without_note_mutation():
+def test_single_section_hold_concentration_is_advisory_without_note_mutation():
     notes = [
         _hold(0, 0, 250),
         _tap(5_000, 3),
@@ -101,7 +101,7 @@ def test_single_section_hold_concentration_is_review_without_note_mutation():
 
     decision = _pattern_decision(notes)
 
-    assert decision.action is GateAction.REVIEW
+    assert decision.action is GateAction.PASS
     assert "HOLD_SECTION_OUTLIER" in decision.reasons
     assert tuple(notes) == before
 
@@ -148,7 +148,7 @@ def test_same_lane_hold_overlap_remains_a_structural_retry():
     assert acceptance.profile is None
 
 
-def test_one_lane_jack_concentration_is_review():
+def test_one_lane_jack_concentration_is_advisory():
     notes = _section_notes(
         (
             _lane_sequence(moved=0),
@@ -160,11 +160,11 @@ def test_one_lane_jack_concentration_is_review():
 
     decision = _pattern_decision(notes)
 
-    assert decision.action is GateAction.REVIEW
+    assert decision.action is GateAction.PASS
     assert "LANE_IMBALANCE_SECTION_OUTLIER" in decision.reasons
 
 
-def test_four_row_loop_collapse_is_review():
+def test_four_row_loop_collapse_is_advisory():
     notes = _section_notes(
         (
             _block_sequence(1),
@@ -178,7 +178,7 @@ def test_four_row_loop_collapse_is_review():
     decision = review_profile(profile, key_mode=4, difficulty="HARD")[0]
 
     assert profile.pattern.section_longest_row_ngram_repeats[2] == 15
-    assert decision.action is GateAction.REVIEW
+    assert decision.action is GateAction.PASS
     assert "ROW_LOOP_SECTION_OUTLIER" in decision.reasons
 
 
