@@ -113,6 +113,35 @@ def _acceptance_with_action(authority: SongTimingAuthority, action: GateAction):
     )
 
 
+def _acceptance_for_difficulty(acceptance, difficulty: str):
+    ratings = {"EASY": 1.0, "NORMAL": 2.0, "HARD": 3.0, "EXPERT": 4.0}
+    assert acceptance.profile is not None
+    return replace(
+        acceptance,
+        profile=replace(
+            acceptance.profile,
+            difficulty=replace(
+                acceptance.profile.difficulty,
+                project_rating=ratings[difficulty],
+            ),
+        ),
+    )
+
+
+def _acceptance_with_rating(acceptance, rating: float):
+    assert acceptance.profile is not None
+    return replace(
+        acceptance,
+        profile=replace(
+            acceptance.profile,
+            difficulty=replace(
+                acceptance.profile.difficulty,
+                project_rating=rating,
+            ),
+        ),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _accept_candidates_by_default(monkeypatch, tmp_path: Path):
     fixture_dir = tmp_path / "acceptance-fixture"
@@ -122,7 +151,9 @@ def _accept_candidates_by_default(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(
         s2_generate,
         "evaluate_chart_candidate",
-        lambda *args, **kwargs: accepted,
+        lambda *args, requested_difficulty, **kwargs: _acceptance_for_difficulty(
+            accepted, requested_difficulty
+        ),
         raising=False,
     )
 
@@ -200,6 +231,245 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
     )
 
 
+def test_difficulty_inversion_retries_only_pair_and_reuses_earliest_pass_candidate(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    ratings = {
+        (4, "EASY", 0): 1.0,
+        (4, "NORMAL", 1): 2.0,
+        (4, "HARD", 2): 4.1,
+        (4, "EXPERT", 3): 3.0,
+        (4, "HARD", 14): 4.2,
+        (4, "EXPERT", 15): 5.0,
+    }
+
+    def evaluate(generated, *args, requested_key_mode, requested_difficulty, **kwargs):
+        del args, kwargs
+        rating = ratings.get(
+            (requested_key_mode, requested_difficulty, generated.seed),
+            {"EASY": 1.0, "NORMAL": 2.0, "HARD": 3.0, "EXPERT": 4.0}[
+                requested_difficulty
+            ],
+        )
+        return _acceptance_with_rating(accepted, rating)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class NoEarlyPromotionGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            if request.key_mode == 4 and request.seed in (14, 15):
+                assert not any(
+                    (tmp_path / "raw" / f"4k-{difficulty.lower()}.osu").exists()
+                    for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+                )
+            return super().generate_map(request, workdir)
+
+    generator = NoEarlyPromotionGenerator()
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert [
+        (request.key_mode, request.difficulty, request.seed)
+        for request in generator.map_calls[:6]
+    ] == [
+        (4, "EASY", 0),
+        (4, "NORMAL", 1),
+        (4, "HARD", 2),
+        (4, "EXPERT", 3),
+        (4, "HARD", 14),
+        (4, "EXPERT", 15),
+    ]
+    selected_4k = {
+        variant.difficulty: variant
+        for variant in variants
+        if variant.key_mode == 4
+    }
+    assert selected_4k["HARD"].selected_seed == 2
+    assert selected_4k["HARD"].attempt == 1
+    assert selected_4k["HARD"].candidate_count == 2
+    assert selected_4k["HARD"].generation_attempt_count == 2
+    assert any(
+        evidence.get("reason")
+        == "NOT_SELECTED_EARLIEST_MONOTONIC_COMBINATION"
+        and evidence["seed"] == 14
+        and evidence["attempt"] == 2
+        and evidence["serializationValidated"] is True
+        and evidence["gateReport"]["qualityProfile"]["difficultyProfile"][
+            "projectRating"
+        ]
+        == 4.2
+        for evidence in selected_4k["HARD"].attempt_evidence
+    )
+    assert selected_4k["EXPERT"].selected_seed == 15
+    assert selected_4k["EXPERT"].attempt == 2
+    assert selected_4k["EASY"].candidate_count == 1
+    assert selected_4k["NORMAL"].candidate_count == 1
+    assert all(
+        variant.difficulty_order is not None
+        and variant.difficulty_order.status == "PASS"
+        for variant in selected_4k.values()
+    )
+
+
+def test_equal_difficulty_profiles_stop_for_review_without_more_seeds(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _acceptance_with_rating(_pass_acceptance(authority), 2.0)
+    monkeypatch.setattr(
+        s2_generate,
+        "evaluate_chart_candidate",
+        lambda *args, **kwargs: accepted,
+    )
+    generator = RecordingGenerator()
+
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert captured.value.context["reason"] == "DIFFICULTY_ORDER_AMBIGUOUS"
+    assert [request.seed for request in generator.map_calls] == [0, 1, 2, 3]
+    assert not any((tmp_path / "raw").glob("4k-*.osu"))
+
+
+def test_ambiguity_prevents_retrying_a_separate_inverted_pair(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+
+    def evaluate(*args, requested_difficulty, **kwargs):
+        del args, kwargs
+        rating = {"EASY": 2.0, "NORMAL": 2.0, "HARD": 4.0, "EXPERT": 3.0}[
+            requested_difficulty
+        ]
+        return _acceptance_with_rating(accepted, rating)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert captured.value.context["reason"] == "DIFFICULTY_ORDER_AMBIGUOUS"
+    assert [request.seed for request in generator.map_calls] == [0, 1, 2, 3]
+
+
+def test_persistent_inversion_exhausts_only_the_affected_label_budgets(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+
+    def evaluate(*args, requested_difficulty, **kwargs):
+        del args, kwargs
+        rating = {"EASY": 1.0, "NORMAL": 2.0, "HARD": 4.0, "EXPERT": 3.0}[
+            requested_difficulty
+        ]
+        return _acceptance_with_rating(accepted, rating)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert captured.value.context["difficulty"] == "HARD"
+    assert captured.value.context["seeds"] == [2, 14, 26]
+    assert [
+        (request.difficulty, request.seed) for request in generator.map_calls
+    ] == [
+        ("EASY", 0),
+        ("NORMAL", 1),
+        ("HARD", 2),
+        ("EXPERT", 3),
+        ("HARD", 14),
+        ("EXPERT", 15),
+        ("HARD", 26),
+        ("EXPERT", 27),
+    ]
+    assert not any((tmp_path / "raw").glob("4k-*.osu"))
+
+
+def test_earliest_ambiguous_pool_combination_is_not_skipped_for_later_pass(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    ratings = {
+        ("EASY", 0): 1.0,
+        ("NORMAL", 1): 2.0,
+        ("HARD", 2): 4.0,
+        ("EXPERT", 3): 3.0,
+        ("HARD", 14): 2.5,
+        ("EXPERT", 15): 4.0,
+    }
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        return _acceptance_with_rating(
+            accepted,
+            ratings[(requested_difficulty, generated.seed)],
+        )
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert captured.value.context["selected_seeds"] == [0, 1, 2, 15]
+    assert captured.value.context["difficulty_order"]["ambiguousPairs"] == [
+        ["HARD", "EXPERT"]
+    ]
+    assert [request.seed for request in generator.map_calls] == [0, 1, 2, 3, 14, 15]
+    assert not any((tmp_path / "raw").glob("4k-*.osu"))
+
+
 def test_run_generation_preserves_generator_osu_text(tmp_path: Path):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
@@ -265,6 +535,47 @@ def test_empty_osu_text_fallback_preserves_every_authority_timing_event(
     )
 
     assert parse_osu_file(variants[0].raw_osu_path).bpm_events == bpm_events
+
+
+def test_partial_stable_promotion_is_cleaned_and_normalized(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    original_read_text = Path.read_text
+
+    def corrupt_second_stable_raw(path: Path, *args, **kwargs):
+        if path.name == "4k-normal.osu":
+            return "not an osu beatmap"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", corrupt_second_stable_raw)
+
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=RecordingGenerator(),
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert captured.value.context == {
+        "key_mode": 4,
+        "failure_stage": "PROMOTION",
+        "paths": [
+            "raw/4k-easy.osu",
+            "raw/4k-normal.osu",
+            "raw/4k-hard.osu",
+            "raw/4k-expert.osu",
+        ],
+        "selected_seeds": [0, 1, 2, 3],
+        "cause_code": "CHART_OSU_PARSE_FAILED",
+        "cause": "CHART_OSU_PARSE_FAILED: serialized MAP is not valid osu!mania",
+    }
+    assert not any((tmp_path / "raw").glob("4k-*.osu"))
 
 
 def test_stable_raw_reparse_rejects_text_with_different_timing_identity(
@@ -547,14 +858,14 @@ def test_retry_map_uses_next_seed_and_promotes_only_the_pass_candidate(
     accepted = _acceptance_with_action(authority, GateAction.PASS)
     evaluations = []
 
-    def evaluate(*args, **kwargs):
+    def evaluate(*args, requested_difficulty, **kwargs):
         del args, kwargs
         evaluations.append(len(evaluations) + 1)
         if len(evaluations) == 1:
             return retry
         if len(evaluations) == 2:
             assert not (tmp_path / "raw" / "4k-easy.osu").exists()
-        return accepted
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
 
     monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
     generator = RecordingGenerator()
@@ -571,7 +882,7 @@ def test_retry_map_uses_next_seed_and_promotes_only_the_pass_candidate(
     first = variants[0]
     assert [request.seed for request in generator.map_calls[:2]] == [0, 12]
     assert first.attempt == 2
-    assert first.acceptance == accepted
+    assert first.acceptance == _acceptance_for_difficulty(accepted, "EASY")
     assert first.raw_osu_path == tmp_path / "raw" / "4k-easy.osu"
     assert first.raw_osu_path.is_file()
     assert first.attempt_evidence == (
@@ -733,11 +1044,18 @@ def test_real_acceptance_evidence_is_recorded_for_aligned_candidates(
     class AlignedGenerator(RecordingGenerator):
         def generate_map(self, request, workdir):
             generated = super().generate_map(request, workdir)
+            chord_size = {
+                "EASY": 1,
+                "NORMAL": 2,
+                "HARD": min(3, request.key_mode),
+                "EXPERT": min(4, request.key_mode),
+            }[request.difficulty]
             return replace(
                 generated,
                 notes=[
-                    NoteEvent(time_ms, index % request.key_mode)
-                    for index, time_ms in enumerate(range(125, 2_000, 125))
+                    NoteEvent(time_ms, lane)
+                    for time_ms in range(125, 2_000, 125)
+                    for lane in range(chord_size)
                 ],
             )
 

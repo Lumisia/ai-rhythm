@@ -12,6 +12,7 @@ from chart_worker.schema.chart import ChartDocument
 from chart_worker.validation.timing_review import TimingAuthorityReview
 
 if TYPE_CHECKING:
+    from chart_worker.validation.difficulty_order import DifficultyOrderReview
     from chart_worker.validation.quality_gate import ChartAcceptance
 
 
@@ -47,6 +48,10 @@ class GeneratedVariant:
     attempt_errors: tuple[str, ...] = ()
     attempt_evidence: tuple[dict[str, object], ...] = ()
     timing_authority_sha256: str = ""
+    candidate_count: int = 1
+    generation_attempt_count: int = 1
+    selected_seed: int | None = None
+    difficulty_order: "DifficultyOrderReview | None" = None
 
 
 @dataclass(frozen=True, slots=True)

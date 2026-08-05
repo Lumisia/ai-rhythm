@@ -1,6 +1,8 @@
 """S2: generate each map and retry only invalid Mapperatorinator output."""
 
 import json
+from dataclasses import dataclass, field
+from itertools import product
 from pathlib import Path
 
 from chart_worker.analysis.onset import OnsetAnalysis
@@ -12,11 +14,19 @@ from chart_worker.generation.params import GenerationRequest
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.types import GeneratedVariant, PreparedAudio, SongTimingAuthority
+from chart_worker.validation.difficulty_order import (
+    DifficultyOrderReview,
+    review_difficulty_order,
+)
 from chart_worker.validation.generated_chart import (
     GeneratedChartValidationError,
     validate_generated_chart,
 )
-from chart_worker.validation.quality_gate import GateAction, evaluate_chart_candidate
+from chart_worker.validation.quality_gate import (
+    ChartAcceptance,
+    GateAction,
+    evaluate_chart_candidate,
+)
 from chart_worker.validation.timing_authority import (
     TimingAuthorityValidationError,
     validate_timing_identity,
@@ -125,6 +135,296 @@ def _validate_serialized_candidate(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    request: GenerationRequest
+    generated: GeneratedChart
+    acceptance: ChartAcceptance
+    osu_text: str
+    workdir: Path
+    attempt: int
+    seed: int
+
+
+@dataclass(slots=True)
+class _VariantState:
+    key_mode: int
+    difficulty: str
+    flat_index: int
+    next_attempt: int = 1
+    attempt_errors: list[str] = field(default_factory=list)
+    attempt_evidence: list[dict[str, object]] = field(default_factory=list)
+    attempted_seeds: list[int] = field(default_factory=list)
+    pool: list[_Candidate] = field(default_factory=list)
+
+
+def _exhausted_error(state: _VariantState) -> WorkerError:
+    return WorkerError(
+        ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+        f"{state.key_mode}K {state.difficulty} failed {MAX_VARIANT_ATTEMPTS} attempts",
+        context={
+            "key_mode": state.key_mode,
+            "difficulty": state.difficulty,
+            "seeds": list(state.attempted_seeds),
+            "errors": list(state.attempt_errors),
+            "attempts": list(state.attempt_evidence),
+        },
+    )
+
+
+def _generate_next_pass(
+    state: _VariantState,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    generator: ChartGenerator,
+    base_seed: int,
+) -> _Candidate:
+    last_error: Exception | None = None
+    while state.next_attempt <= MAX_VARIANT_ATTEMPTS:
+        attempt = state.next_attempt
+        state.next_attempt += 1
+        _require_timing_authority(prepared, authority)
+        attempt_seed = base_seed + state.flat_index + (attempt - 1) * _VARIANT_COUNT
+        state.attempted_seeds.append(attempt_seed)
+        request = GenerationRequest(
+            audio_path=prepared.normalized.path,
+            timing_reference_path=authority.reference_path,
+            key_mode=state.key_mode,
+            difficulty=state.difficulty,
+            seed=attempt_seed,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+        workdir = (
+            run_dir
+            / "raw"
+            / "work"
+            / f"{state.key_mode}k-{state.difficulty.lower()}"
+            / f"attempt-{attempt}"
+        )
+        try:
+            try:
+                generated = generator.generate_map(request, workdir)
+            finally:
+                _require_timing_authority(prepared, authority)
+            acceptance = evaluate_chart_candidate(
+                generated,
+                authority,
+                onset_analysis,
+                requested_key_mode=state.key_mode,
+                requested_difficulty=state.difficulty,
+                duration_ms=prepared.normalized.duration_ms,
+            )
+            gate_report = acceptance.to_report()
+            evidence = {
+                "seed": attempt_seed,
+                "workdir": workdir.relative_to(run_dir).as_posix(),
+                "gateReport": gate_report,
+            }
+            if acceptance.action is GateAction.REVIEW:
+                raise WorkerError(
+                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                    f"{state.key_mode}K {state.difficulty} requires timing review",
+                    context={
+                        "seed": attempt_seed,
+                        "workdir": evidence["workdir"],
+                        "key_mode": state.key_mode,
+                        "difficulty": state.difficulty,
+                        "gate_report": gate_report,
+                    },
+                )
+            if acceptance.action is GateAction.RETRY_MAP:
+                state.attempt_evidence.append(evidence)
+                state.attempt_errors.append(
+                    json.dumps(
+                        gate_report,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+                continue
+
+            validate_timing_identity(generated.bpm_events, authority.bpm_events)
+            validate_generated_chart(
+                generated,
+                key_mode=state.key_mode,
+                duration_ms=prepared.normalized.duration_ms,
+            )
+            first_timing = generated.bpm_events[0]
+            osu_text = generated.osu_text or notes_to_osu_mania(
+                generated.notes,
+                key_mode=state.key_mode,
+                bpm=first_timing.bpm,
+                offset_ms=first_timing.time_ms,
+                audio_filename=prepared.normalized.path.name,
+                title=prepared.normalized.path.stem,
+                bpm_events=generated.bpm_events,
+            )
+            _validate_serialized_candidate(
+                osu_text,
+                generated,
+                authority,
+                prepared,
+                state.key_mode,
+            )
+            return _Candidate(
+                request=request,
+                generated=generated,
+                acceptance=acceptance,
+                osu_text=osu_text,
+                workdir=workdir,
+                attempt=attempt,
+                seed=attempt_seed,
+            )
+        except (
+            GeneratedChartValidationError,
+            TimingAuthorityValidationError,
+            WorkerError,
+        ) as error:
+            if not _should_retry(error):
+                raise
+            last_error = error
+            state.attempt_errors.append(str(error))
+
+    error = _exhausted_error(state)
+    if last_error is not None:
+        raise error from last_error
+    raise error
+
+
+def _review_candidates(candidates: tuple[_Candidate, ...]) -> DifficultyOrderReview:
+    profiles = {}
+    for candidate in candidates:
+        if candidate.acceptance.profile is None:
+            raise ValueError("PASS candidate must carry a chart quality profile")
+        profiles[candidate.request.difficulty] = candidate.acceptance.profile.difficulty
+    return review_difficulty_order(profiles)
+
+
+def _select_earliest_monotonic(
+    states: dict[str, _VariantState],
+) -> tuple[tuple[_Candidate, ...], DifficultyOrderReview] | None:
+    ordered_pools = tuple(
+        tuple(sorted(states[difficulty].pool, key=lambda candidate: candidate.seed))
+        for difficulty in DIFFICULTIES
+    )
+    for candidates in product(*ordered_pools):
+        review = _review_candidates(candidates)
+        if review.status != "RETRY":
+            return candidates, review
+    return None
+
+
+def _record_order_retry(
+    state: _VariantState,
+    review: DifficultyOrderReview,
+    *,
+    run_dir: Path,
+) -> None:
+    candidate = state.pool[-1]
+    evidence = _candidate_evidence(
+        candidate,
+        reason="DIFFICULTY_ORDER_INVERTED",
+        run_dir=run_dir,
+    )
+    evidence["difficultyOrder"] = review.to_report()
+    state.attempt_evidence.append(evidence)
+    state.attempt_errors.append(
+        json.dumps(
+            evidence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _candidate_evidence(
+    candidate: _Candidate,
+    *,
+    reason: str,
+    run_dir: Path,
+) -> dict[str, object]:
+    return {
+        "seed": candidate.seed,
+        "attempt": candidate.attempt,
+        "workdir": candidate.workdir.relative_to(run_dir).as_posix(),
+        "reason": reason,
+        "gateReport": candidate.acceptance.to_report(),
+        "serializationValidated": True,
+    }
+
+
+def _record_unselected_candidates(
+    state: _VariantState,
+    selected: _Candidate,
+    review: DifficultyOrderReview,
+    *,
+    run_dir: Path,
+) -> None:
+    for candidate in state.pool:
+        if candidate is selected:
+            continue
+        evidence = _candidate_evidence(
+            candidate,
+            reason="NOT_SELECTED_EARLIEST_MONOTONIC_COMBINATION",
+            run_dir=run_dir,
+        )
+        evidence["selectedDifficultyOrder"] = review.to_report()
+        state.attempt_evidence.append(evidence)
+
+
+def _promote_key_mode(
+    candidates: tuple[_Candidate, ...],
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    run_dir: Path,
+) -> tuple[Path, ...]:
+    raw_paths = tuple(
+        run_dir / "raw" / f"{candidate.request.key_mode}k-{candidate.request.difficulty.lower()}.osu"
+        for candidate in candidates
+    )
+    raw_paths[0].parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for candidate, raw_path in zip(candidates, raw_paths, strict=True):
+            raw_path.write_text(candidate.osu_text, encoding="utf-8")
+            _validate_serialized_candidate(
+                raw_path.read_text(encoding="utf-8-sig"),
+                candidate.generated,
+                authority,
+                prepared,
+                candidate.request.key_mode,
+            )
+    except (
+        GeneratedChartValidationError,
+        TimingAuthorityValidationError,
+        WorkerError,
+        OSError,
+    ) as error:
+        for raw_path in raw_paths:
+            raw_path.unlink(missing_ok=True)
+        cause_code = (
+            error.code.value if isinstance(error, WorkerError) else type(error).__name__
+        )
+        raise WorkerError(
+            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+            f"{candidates[0].request.key_mode}K selected charts failed stable promotion",
+            context={
+                "key_mode": candidates[0].request.key_mode,
+                "failure_stage": "PROMOTION",
+                "paths": [raw_path.relative_to(run_dir).as_posix() for raw_path in raw_paths],
+                "selected_seeds": [candidate.seed for candidate in candidates],
+                "cause_code": cause_code,
+                "cause": str(error),
+            },
+        ) from error
+    return raw_paths
+
+
 def run_generation(
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
@@ -134,166 +434,114 @@ def run_generation(
     generator: ChartGenerator,
     seed: int,
 ) -> tuple[GeneratedVariant, ...]:
-    """Generate every variant, retrying only the variant with invalid output."""
-    variants = []
-    combinations = (
-        (key_mode, difficulty)
-        for key_mode in KEY_MODES
-        for difficulty in DIFFICULTIES
-    )
-    for index, (key_mode, difficulty) in enumerate(combinations):
-        attempt_errors: list[str] = []
-        attempt_evidence: list[dict[str, object]] = []
-        attempted_seeds: list[int] = []
-        for attempt in range(1, MAX_VARIANT_ATTEMPTS + 1):
-            _require_timing_authority(prepared, authority)
-            attempt_seed = seed + index + (attempt - 1) * _VARIANT_COUNT
-            attempted_seeds.append(attempt_seed)
-            request = GenerationRequest(
-                audio_path=prepared.normalized.path,
-                timing_reference_path=authority.reference_path,
+    """Generate key-mode pools and retry only failed or inverted labels."""
+    variants: list[GeneratedVariant] = []
+    for key_index, key_mode in enumerate(KEY_MODES):
+        states = {
+            difficulty: _VariantState(
                 key_mode=key_mode,
                 difficulty=difficulty,
-                seed=attempt_seed,
-                duration_ms=prepared.normalized.duration_ms,
+                flat_index=key_index * len(DIFFICULTIES) + difficulty_index,
             )
-            workdir = (
-                run_dir
-                / "raw"
-                / "work"
-                / f"{key_mode}k-{difficulty.lower()}"
-                / f"attempt-{attempt}"
-            )
-            raw_path = run_dir / "raw" / f"{key_mode}k-{difficulty.lower()}.osu"
-            try:
-                try:
-                    generated = generator.generate_map(request, workdir)
-                finally:
-                    _require_timing_authority(prepared, authority)
-                acceptance = evaluate_chart_candidate(
-                    generated,
-                    authority,
-                    onset_analysis,
-                    requested_key_mode=key_mode,
-                    requested_difficulty=difficulty,
-                    duration_ms=prepared.normalized.duration_ms,
+            for difficulty_index, difficulty in enumerate(DIFFICULTIES)
+        }
+        for difficulty in DIFFICULTIES:
+            state = states[difficulty]
+            state.pool.append(
+                _generate_next_pass(
+                    state,
+                    prepared=prepared,
+                    authority=authority,
+                    onset_analysis=onset_analysis,
+                    run_dir=run_dir,
+                    generator=generator,
+                    base_seed=seed,
                 )
-                gate_report = acceptance.to_report()
-                evidence = {
-                    "seed": attempt_seed,
-                    "workdir": workdir.relative_to(run_dir).as_posix(),
-                    "gateReport": gate_report,
-                }
-                if acceptance.action is GateAction.REVIEW:
+            )
+
+        while True:
+            selected = _select_earliest_monotonic(states)
+            if selected is not None:
+                candidates, order_review = selected
+                if order_review.status == "REVIEW":
                     raise WorkerError(
                         ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-                        f"{key_mode}K {difficulty} requires timing review",
-                        context={
-                            "seed": attempt_seed,
-                            "workdir": evidence["workdir"],
-                            "key_mode": key_mode,
-                            "difficulty": difficulty,
-                            "gate_report": gate_report,
-                        },
-                    )
-                if acceptance.action is GateAction.RETRY_MAP:
-                    attempt_evidence.append(evidence)
-                    attempt_errors.append(
-                        json.dumps(
-                            gate_report,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                    )
-                    if attempt < MAX_VARIANT_ATTEMPTS:
-                        continue
-                    raise WorkerError(
-                        ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-                        f"{key_mode}K {difficulty} failed {MAX_VARIANT_ATTEMPTS} attempts",
+                        f"{key_mode}K difficulty order is ambiguous",
                         context={
                             "key_mode": key_mode,
-                            "difficulty": difficulty,
-                            "seeds": attempted_seeds,
-                            "errors": attempt_errors,
-                            "attempts": attempt_evidence,
+                            "reason": "DIFFICULTY_ORDER_AMBIGUOUS",
+                            "difficulty_order": order_review.to_report(),
+                            "selected_seeds": [candidate.seed for candidate in candidates],
                         },
                     )
-                validate_timing_identity(generated.bpm_events, authority.bpm_events)
-                validate_generated_chart(
-                    generated,
-                    key_mode=key_mode,
-                    duration_ms=prepared.normalized.duration_ms,
-                )
-                first_timing = generated.bpm_events[0]
-                osu_text = generated.osu_text or notes_to_osu_mania(
-                    generated.notes,
-                    key_mode=key_mode,
-                    bpm=first_timing.bpm,
-                    offset_ms=first_timing.time_ms,
-                    audio_filename=prepared.normalized.path.name,
-                    title=prepared.normalized.path.stem,
-                    bpm_events=generated.bpm_events,
-                )
-                _validate_serialized_candidate(
-                    osu_text,
-                    generated,
-                    authority,
-                    prepared,
-                    key_mode,
-                )
-                raw_path.parent.mkdir(parents=True, exist_ok=True)
-                raw_path.write_text(osu_text, encoding="utf-8")
-                try:
-                    _validate_serialized_candidate(
-                        raw_path.read_text(encoding="utf-8-sig"),
-                        generated,
-                        authority,
-                        prepared,
-                        key_mode,
-                    )
-                except (
-                    GeneratedChartValidationError,
-                    TimingAuthorityValidationError,
-                    WorkerError,
-                ):
-                    raw_path.unlink(missing_ok=True)
-                    raise
-            except (
-                GeneratedChartValidationError,
-                TimingAuthorityValidationError,
-                WorkerError,
-            ) as error:
-                if not _should_retry(error):
-                    raise
-                attempt_errors.append(str(error))
-                if attempt < MAX_VARIANT_ATTEMPTS:
-                    continue
+                break
+
+            latest_candidates = tuple(
+                states[difficulty].pool[-1] for difficulty in DIFFICULTIES
+            )
+            latest_review = _review_candidates(latest_candidates)
+            if latest_review.status == "REVIEW":
                 raise WorkerError(
-                    ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-                    f"{key_mode}K {difficulty} failed {MAX_VARIANT_ATTEMPTS} attempts",
+                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                    f"{key_mode}K difficulty order is ambiguous",
                     context={
                         "key_mode": key_mode,
-                        "difficulty": difficulty,
-                        "seeds": attempted_seeds,
-                        "errors": attempt_errors,
-                        "attempts": attempt_evidence,
+                        "reason": "DIFFICULTY_ORDER_AMBIGUOUS",
+                        "difficulty_order": latest_review.to_report(),
                     },
-                ) from error
-            break
-        variants.append(
-            GeneratedVariant(
-                key_mode=key_mode,
-                difficulty=difficulty,
-                requested_star=request.requested_star,
-                raw_osu_path=raw_path,
-                generated=generated,
-                cfg_scale=request.cfg_scale,
-                attempt=attempt,
-                attempt_errors=tuple(attempt_errors),
-                attempt_evidence=tuple(attempt_evidence),
-                timing_authority_sha256=authority.sha256,
-                acceptance=acceptance,
-            )
+                )
+            for difficulty in DIFFICULTIES:
+                if difficulty not in latest_review.retry_difficulties:
+                    continue
+                state = states[difficulty]
+                _record_order_retry(state, latest_review, run_dir=run_dir)
+            for difficulty in DIFFICULTIES:
+                if difficulty not in latest_review.retry_difficulties:
+                    continue
+                state = states[difficulty]
+                state.pool.append(
+                    _generate_next_pass(
+                        state,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                        run_dir=run_dir,
+                        generator=generator,
+                        base_seed=seed,
+                    )
+                )
+
+        raw_paths = _promote_key_mode(
+            candidates,
+            prepared=prepared,
+            authority=authority,
+            run_dir=run_dir,
         )
+        for candidate, raw_path in zip(candidates, raw_paths, strict=True):
+            state = states[candidate.request.difficulty]
+            _record_unselected_candidates(
+                state,
+                candidate,
+                order_review,
+                run_dir=run_dir,
+            )
+            variants.append(
+                GeneratedVariant(
+                    key_mode=key_mode,
+                    difficulty=candidate.request.difficulty,
+                    requested_star=candidate.request.requested_star,
+                    raw_osu_path=raw_path,
+                    generated=candidate.generated,
+                    cfg_scale=candidate.request.cfg_scale,
+                    attempt=candidate.attempt,
+                    attempt_errors=tuple(state.attempt_errors),
+                    attempt_evidence=tuple(state.attempt_evidence),
+                    timing_authority_sha256=authority.sha256,
+                    acceptance=candidate.acceptance,
+                    candidate_count=len(state.pool),
+                    generation_attempt_count=state.next_attempt - 1,
+                    selected_seed=candidate.seed,
+                    difficulty_order=order_review,
+                )
+            )
     return tuple(variants)
