@@ -113,7 +113,3 @@ class FakeGenerator:
             seed=request.seed,
             bpm_events=(OsuBpmEvent(time_ms=0, bpm=120.0),),
         )
-
-    def __call__(self, request: GenerationRequest, workdir: Path) -> GeneratedChart:
-        """Compatibility bridge until the generation stage uses generate_map directly."""
-        return self.generate_map(request, workdir)

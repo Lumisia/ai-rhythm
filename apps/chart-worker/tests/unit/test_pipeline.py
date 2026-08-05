@@ -50,6 +50,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
 
     report = json.loads((output_dir / "generation-report.json").read_text())
     assert report["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
+    assert report["timingAuthority"] == "audio/timing-reference.osu"
     assert report["timingAuthoritySha256"] == sha256_file(
         output_dir / "audio" / "timing-reference.osu"
     )

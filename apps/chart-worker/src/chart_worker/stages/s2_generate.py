@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from chart_worker.errors import ErrorCode, WorkerError
-from chart_worker.generation.mapperatorinator import ChartGenerator
+from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedChart
 from chart_worker.generation.osu_parser import parse_osu_mania
 from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
@@ -60,19 +60,66 @@ def _require_timing_authority(
                 "actual": actual_sha,
             },
         )
+    actual_audio_sha = (
+        sha256_file(prepared.normalized.path)
+        if prepared.normalized.path.is_file()
+        else None
+    )
+    if actual_audio_sha != prepared.normalized.sha256:
+        raise WorkerError(
+            ErrorCode.ASSET_HASH_MISMATCH,
+            "canonical audio changed during MAP generation",
+            context={
+                "path": str(prepared.normalized.path),
+                "expected": prepared.normalized.sha256,
+                "actual": actual_audio_sha,
+            },
+        )
 
 
-def _validate_serialized_timing(
-    osu_text: str, authority: SongTimingAuthority
+def _note_projection(generated: GeneratedChart) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (note.time_ms, note.lane, note.kind, note.duration_ms)
+        for note in generated.notes
+    )
+
+
+def _validate_serialized_candidate(
+    osu_text: str,
+    generated: GeneratedChart,
+    authority: SongTimingAuthority,
+    prepared: PreparedAudio,
+    key_mode: int,
 ) -> None:
     try:
-        bpm_events = parse_osu_mania(osu_text).bpm_events
+        parsed = parse_osu_mania(osu_text)
     except ValueError as error:
         raise WorkerError(
             ErrorCode.CHART_OSU_PARSE_FAILED,
             "serialized MAP is not valid osu!mania",
         ) from error
-    validate_timing_identity(bpm_events, authority.bpm_events)
+    validate_timing_identity(parsed.bpm_events, authority.bpm_events)
+    parsed_chart = GeneratedChart(
+        notes=parsed.notes,
+        key_mode=parsed.key_mode,
+        osu_text=osu_text,
+        generator_name=generated.generator_name,
+        seed=generated.seed,
+        bpm_events=parsed.bpm_events,
+    )
+    validate_generated_chart(
+        parsed_chart,
+        key_mode=key_mode,
+        duration_ms=prepared.normalized.duration_ms,
+    )
+    if parsed.key_mode != generated.key_mode:
+        raise GeneratedChartValidationError(
+            "serialized MAP key mode differs from generated object"
+        )
+    if _note_projection(parsed_chart) != _note_projection(generated):
+        raise GeneratedChartValidationError(
+            "serialized MAP note fields differ from generated object"
+        )
 
 
 def run_generation(
@@ -114,7 +161,10 @@ def run_generation(
             )
             raw_path = run_dir / "raw" / f"{key_mode}k-{difficulty.lower()}.osu"
             try:
-                generated = generator.generate_map(request, workdir)
+                try:
+                    generated = generator.generate_map(request, workdir)
+                finally:
+                    _require_timing_authority(prepared, authority)
                 validate_timing_identity(generated.bpm_events, authority.bpm_events)
                 validate_generated_chart(
                     generated,
@@ -131,14 +181,28 @@ def run_generation(
                     title=prepared.normalized.path.stem,
                     bpm_events=generated.bpm_events,
                 )
-                _validate_serialized_timing(osu_text, authority)
+                _validate_serialized_candidate(
+                    osu_text,
+                    generated,
+                    authority,
+                    prepared,
+                    key_mode,
+                )
                 raw_path.parent.mkdir(parents=True, exist_ok=True)
                 raw_path.write_text(osu_text, encoding="utf-8")
                 try:
-                    _validate_serialized_timing(
-                        raw_path.read_text(encoding="utf-8-sig"), authority
+                    _validate_serialized_candidate(
+                        raw_path.read_text(encoding="utf-8-sig"),
+                        generated,
+                        authority,
+                        prepared,
+                        key_mode,
                     )
-                except (TimingAuthorityValidationError, WorkerError):
+                except (
+                    GeneratedChartValidationError,
+                    TimingAuthorityValidationError,
+                    WorkerError,
+                ):
                     raw_path.unlink(missing_ok=True)
                     raise
             except (

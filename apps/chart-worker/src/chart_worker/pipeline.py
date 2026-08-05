@@ -246,7 +246,7 @@ def _generation_report(
         "sourceName": options.source.name,
         "generator": options.generator,
         "strategy": "MAPPERATORINATOR_SHARED_TIMING",
-        "timingAuthority": authority.generator_name,
+        "timingAuthority": _relative(authority.reference_path, run_dir),
         "timingAuthoritySha256": authority.sha256,
         "timingGenerationMode": authority.mode,
         "timingAttemptCount": authority.attempt_count,

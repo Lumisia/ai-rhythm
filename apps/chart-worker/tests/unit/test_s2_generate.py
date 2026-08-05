@@ -237,6 +237,136 @@ def test_stable_raw_reparse_rejects_text_with_different_timing_identity(
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
+@pytest.mark.parametrize(
+    ("generated_note", "serialized_key_mode", "serialized_hit_object"),
+    [
+        pytest.param(
+            NoteEvent(500, 0),
+            6,
+            "64,192,500,1,0,0:0:0:0:",
+            id="key-mode",
+        ),
+        pytest.param(
+            NoteEvent(500, 0),
+            4,
+            "192,192,500,1,0,0:0:0:0:",
+            id="lane",
+        ),
+        pytest.param(
+            NoteEvent(500, 0),
+            4,
+            "64,192,500,128,0,750:0:0:0:0:",
+            id="kind",
+        ),
+        pytest.param(
+            NoteEvent(500, 0, kind="HOLD", duration_ms=250),
+            4,
+            "64,192,500,128,0,800:0:0:0:0:",
+            id="hold-duration",
+        ),
+    ],
+)
+def test_serialized_note_or_key_mismatch_retries_without_stable_promotion(
+    tmp_path: Path,
+    generated_note: NoteEvent,
+    serialized_key_mode: int,
+    serialized_hit_object: str,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    mismatched_text = (
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\n"
+        f"CircleSize:{serialized_key_mode}\n\n[TimingPoints]\n"
+        "0,500,4,2,0,60,1,0\n\n[HitObjects]\n"
+        f"{serialized_hit_object}\n"
+    )
+
+    class MismatchedCandidateGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            return GeneratedChart(
+                notes=[generated_note],
+                key_mode=generated.key_mode,
+                osu_text=mismatched_text,
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                bpm_events=generated.bpm_events,
+            )
+
+    generator = MismatchedCandidateGenerator()
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert len(generator.map_calls) == 3
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
+def test_reference_metadata_mutated_during_map_is_rejected_before_promotion(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+
+    class MutatingReferenceGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            authority.reference_path.write_text(
+                authority.reference_path.read_text(encoding="utf-8").replace(
+                    "Title:fixture", "Title:mutated"
+                ),
+                encoding="utf-8",
+            )
+            return generated
+
+    generator = MutatingReferenceGenerator()
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.ASSET_HASH_MISMATCH
+    assert len(generator.map_calls) == 1
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
+def test_canonical_audio_mutated_during_map_is_rejected_before_promotion(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+
+    class MutatingAudioGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            prepared.normalized.path.write_bytes(b"mutated audio")
+            return generated
+
+    generator = MutatingAudioGenerator()
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.ASSET_HASH_MISMATCH
+    assert len(generator.map_calls) == 1
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
 def test_run_generation_never_writes_invalid_output_to_stable_raw(tmp_path: Path):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
