@@ -3,6 +3,10 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
+from chart_worker.analysis.chart_profile import (
+    ChartQualityProfile,
+    build_chart_quality_profile,
+)
 from chart_worker.analysis.grid_alignment import NoteGridMetrics, measure_note_grid_alignment
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing_diagnostics import (
@@ -29,6 +33,7 @@ class GateAxis(StrEnum):
     TIMING_IDENTITY = "TIMING_IDENTITY"
     TIMING_ALIGNMENT = "TIMING_ALIGNMENT"
     COVERAGE = "COVERAGE"
+    PATTERN = "PATTERN"
 
 
 class GateAction(StrEnum):
@@ -50,6 +55,7 @@ class ChartAcceptance:
     decisions: tuple[GateDecision, ...]
     timing: TimingDiagnostics
     note_grid: NoteGridMetrics
+    profile: ChartQualityProfile | None = None
 
     def decision(self, axis: GateAxis) -> GateDecision:
         """Return the independently recorded decision for one acceptance axis."""
@@ -76,6 +82,7 @@ class ChartAcceptance:
                 "cleanRate": self.note_grid.clean_rate,
                 "absoluteP95Beats": self.note_grid.absolute_p95_beats,
             },
+            "qualityProfile": self.profile.to_report() if self.profile is not None else None,
         }
 
 
@@ -210,6 +217,9 @@ def evaluate_chart_candidate(
     if requested_difficulty not in DIFFICULTIES:
         raise ValueError(f"unsupported difficulty: {requested_difficulty}")
 
+    structure = _structure_decision(
+        chart, key_mode=requested_key_mode, duration_ms=duration_ms
+    )
     timing = diagnose_chart_timing(
         chart.notes,
         onset_analysis.onset_ms,
@@ -218,8 +228,32 @@ def evaluate_chart_candidate(
     )
     unique_rows = tuple(sorted({note.time_ms for note in chart.notes}))
     note_grid = measure_note_grid_alignment(unique_rows, authority.bpm_events)
+    profile: ChartQualityProfile | None = None
+    if structure.action is GateAction.PASS:
+        profile = build_chart_quality_profile(
+            chart.notes,
+            key_mode=requested_key_mode,
+            duration_ms=duration_ms,
+            beat_ms=60_000.0 / authority.bpm_events[0].bpm,
+            activity=onset_analysis.activity,
+        )
+        from chart_worker.validation.profile_review import review_profile
+
+        profile_decisions = review_profile(
+            profile,
+            key_mode=requested_key_mode,
+            difficulty=requested_difficulty,
+        )
+    else:
+        profile_decisions = (
+            GateDecision(
+                GateAxis.PATTERN,
+                GateAction.PASS,
+                ("PROFILE_UNAVAILABLE_STRUCTURE_INVALID",),
+            ),
+        )
     decisions = (
-        _structure_decision(chart, key_mode=requested_key_mode, duration_ms=duration_ms),
+        structure,
         _timing_identity_decision(chart, authority),
         _timing_alignment_decision(
             timing,
@@ -227,10 +261,12 @@ def evaluate_chart_candidate(
             activity_present=onset_analysis.activity is not None,
         ),
         _coverage_decision(timing),
+        *profile_decisions,
     )
     return ChartAcceptance(
         action=_overall_action(decisions),
         decisions=decisions,
         timing=timing,
         note_grid=note_grid,
+        profile=profile,
     )

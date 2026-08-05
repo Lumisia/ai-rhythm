@@ -58,6 +58,7 @@ class PatternProfile:
     transition_counts: Mapping[str, int]
     longest_row_ngram_repeat: int
     lane_usage_ratios: tuple[float, ...]
+    section_note_counts: tuple[int, ...]
     section_lane_imbalances: tuple[float, ...]
     section_longest_row_ngram_repeats: tuple[int, ...]
 
@@ -68,6 +69,7 @@ class PatternProfile:
             "transitionCounts": dict(self.transition_counts),
             "longestRowNgramRepeat": self.longest_row_ngram_repeat,
             "laneUsageRatios": list(self.lane_usage_ratios),
+            "sectionNoteCounts": list(self.section_note_counts),
             "sectionLaneImbalances": list(self.section_lane_imbalances),
             "sectionLongestRowNgramRepeats": list(
                 self.section_longest_row_ngram_repeats
@@ -291,6 +293,7 @@ def _pattern_profile(
     row_lanes = tuple(row.lanes for row in rows_of(notes))
 
     section_histograms: list[Mapping[str, int]] = []
+    section_note_counts: list[int] = []
     section_lane_imbalances: list[float] = []
     section_row_repeats: list[int] = []
     for start_ms, end_ms in sections:
@@ -304,6 +307,7 @@ def _pattern_profile(
             )
         )
         section_notes = [note for note in notes if start_ms <= note.time_ms < end_ms]
+        section_note_counts.append(len(section_notes))
         ratios = _lane_ratios(section_notes, key_mode)
         section_lane_imbalances.append(max(ratios) - min(ratios) if ratios else 0.0)
         section_rows = tuple(
@@ -317,6 +321,7 @@ def _pattern_profile(
         transition_counts=_freeze_counts(transition_counts),
         longest_row_ngram_repeat=_longest_row_ngram_repeat(row_lanes),
         lane_usage_ratios=_lane_ratios(notes, key_mode),
+        section_note_counts=tuple(section_note_counts),
         section_lane_imbalances=tuple(section_lane_imbalances),
         section_longest_row_ngram_repeats=tuple(section_row_repeats),
     )

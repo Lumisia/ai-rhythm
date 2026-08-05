@@ -103,7 +103,9 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["attemptErrors"] == []
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
         assert chart_report["acceptanceStatus"] == "PASS"
-        assert chart_report["acceptanceReasons"] == []
+        assert chart_report["acceptanceReasons"] == [
+            "INSUFFICIENT_PROFILE_VARIATION"
+        ]
         assert set(chart_report["noteGrid"]) == {
             "uniqueRowCount",
             "cleanRowCount",
@@ -125,6 +127,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
             "TIMING_IDENTITY",
             "TIMING_ALIGNMENT",
             "COVERAGE",
+            "PATTERN",
         }
         assert "activeOnsetCount" in chart_report["timingDiagnostics"]
         assert "quietCoverageGaps" in chart_report["timingDiagnostics"]

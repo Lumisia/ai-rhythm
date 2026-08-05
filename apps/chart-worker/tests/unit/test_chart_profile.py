@@ -93,6 +93,7 @@ def test_pattern_profile_keeps_sections_and_longest_row_loop():
     assert profile.pattern.section_longest_row_ngram_repeats[0] >= 3
     assert sum(profile.pattern.histogram.values()) > 0
     assert sum(profile.pattern.lane_usage_ratios) == pytest.approx(1.0)
+    assert profile.pattern.section_note_counts == (30, 10)
     assert profile.active_section_mask == (True, True)
 
 

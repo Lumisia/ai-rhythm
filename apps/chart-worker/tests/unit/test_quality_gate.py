@@ -84,6 +84,33 @@ def _decision(result, axis: str):
     return result.decision(_gate().GateAxis(axis))
 
 
+def test_acceptance_keeps_shared_section_profile_and_report():
+    rows = (1_000, 16_000, 31_000, 46_000)
+    result = _evaluate(_chart(rows), rows, duration_ms=60_000)
+
+    assert result.profile is not None
+    assert result.profile.active_section_mask == (True, True, True, True)
+    assert _decision(result, "PATTERN").action is _gate().GateAction.PASS
+    report = result.to_report()
+    assert report["qualityProfile"] == result.profile.to_report()
+
+
+def test_structural_retry_is_not_hidden_by_profile_construction():
+    result = _evaluate(
+        _chart((1_000,), lane=4),
+        (1_000,),
+        duration_ms=2_000,
+    )
+
+    assert result.action is _gate().GateAction.RETRY_MAP
+    assert result.profile is None
+    assert _decision(result, "STRUCTURE").action is _gate().GateAction.RETRY_MAP
+    assert _decision(result, "PATTERN").reasons == (
+        "PROFILE_UNAVAILABLE_STRUCTURE_INVALID",
+    )
+    assert result.to_report()["qualityProfile"] is None
+
+
 def test_active_leading_coverage_gap_retries_the_map():
     result = _evaluate(
         _chart((30_000,)),
@@ -327,6 +354,7 @@ def test_axes_remain_independent_and_retry_beats_review_and_pass():
         "TIMING_IDENTITY",
         "TIMING_ALIGNMENT",
         "COVERAGE",
+        "PATTERN",
     }
     assert review.action is _gate().GateAction.REVIEW
     assert passed.action is _gate().GateAction.PASS
