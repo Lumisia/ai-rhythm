@@ -9,7 +9,7 @@ def tap(time_ms: int, lane: int = 0) -> NoteEvent:
     return NoteEvent(time_ms=time_ms, lane=lane)
 
 
-def test_diagnoses_unique_rows_in_thirty_second_sections():
+def test_diagnoses_unique_rows_in_fifteen_second_sections():
     notes = [
         tap(100, 0),
         tap(100, 1),
@@ -30,6 +30,8 @@ def test_diagnoses_unique_rows_in_thirty_second_sections():
     assert result.overall.signed_median_ms == -60.0
     assert result.overall.absolute_p95_ms == 182.0
     assert [section.status for section in result.sections] == [
+        "INSUFFICIENT",
+        "INSUFFICIENT",
         "INSUFFICIENT",
         "INSUFFICIENT",
     ]
@@ -54,6 +56,64 @@ def test_passes_well_aligned_rows_without_let_chords_inflate_the_score():
     assert result.status == "PASS"
 
 
+def test_reports_absolute_p99_for_a_globally_shifted_chart():
+    rows = tuple(range(1_000, 9_000, 1_000))
+
+    result = diagnose_chart_timing(
+        [tap(row) for row in rows],
+        tuple(row - 60 for row in rows),
+        duration_ms=15_000,
+    )
+
+    assert result.overall.signed_median_ms == 60.0
+    assert result.overall.absolute_p99_ms == 60.0
+
+
+def test_labels_deleted_active_front_as_a_leading_coverage_gap():
+    result = diagnose_chart_timing(
+        [tap(30_000)],
+        tuple(range(1_000, 21_000, 1_000)) + (30_000,),
+        duration_ms=40_000,
+    )
+
+    assert result.coverage_gaps[0].position == "LEADING"
+    assert result.coverage_gaps[0].to_report()["position"] == "LEADING"
+
+
+def test_reports_section_phase_delta_and_gap_positions_at_boundaries():
+    first_rows = tuple(range(1_000, 9_000, 1_000))
+    second_rows = tuple(range(16_000, 24_000, 1_000))
+    phase_result = diagnose_chart_timing(
+        [tap(row) for row in first_rows + second_rows],
+        first_rows + tuple(row - 40 for row in second_rows),
+        duration_ms=30_000,
+    )
+    gap_result = diagnose_chart_timing(
+        [tap(time_ms) for time_ms in (0, 20_000, 40_000, 60_000)],
+        tuple(range(1_000, 20_000, 1_000))
+        + tuple(range(21_000, 40_000, 1_000))
+        + tuple(range(41_000, 60_000, 1_000))
+        + (0, 20_000, 40_000, 60_000),
+        duration_ms=60_000,
+    )
+
+    assert [section.phase_delta_ms for section in phase_result.sections] == [-20.0, 20.0]
+    assert [section.to_report()["phaseDeltaMs"] for section in phase_result.sections] == [
+        -20.0,
+        20.0,
+    ]
+    assert [gap.position for gap in gap_result.coverage_gaps] == [
+        "LEADING",
+        "MIDDLE",
+        "TRAILING",
+    ]
+    assert [gap.to_report()["position"] for gap in gap_result.coverage_gaps] == [
+        "LEADING",
+        "MIDDLE",
+        "TRAILING",
+    ]
+
+
 def test_marks_section_phase_drift_for_review_even_when_every_row_is_within_50ms():
     first_rows = tuple(range(1_000, 9_000, 1_000))
     second_rows = tuple(range(31_000, 39_000, 1_000))
@@ -68,7 +128,12 @@ def test_marks_section_phase_drift_for_review_even_when_every_row_is_within_50ms
 
     assert result.overall.precision_50 == 1.0
     assert result.overall.signed_median_ms == 22.5
-    assert [section.status for section in result.sections] == ["REVIEW", "REVIEW"]
+    assert [section.status for section in result.sections] == [
+        "REVIEW",
+        "INSUFFICIENT",
+        "REVIEW",
+        "INSUFFICIENT",
+    ]
     assert result.status == "REVIEW"
 
 
@@ -99,6 +164,7 @@ def test_marks_long_gap_with_active_onsets_for_review():
             "onsetCount": 20,
             "activeOnsetCount": 20,
             "activeFrameRatio": 1.0,
+            "position": "LEADING",
         }
     ]
 
@@ -167,17 +233,32 @@ def test_serializes_stable_camel_case_report_fields():
             "precision50": 1.0,
             "signedMedianMs": 0.0,
             "absoluteP95Ms": 0.0,
+            "absoluteP99Ms": 0.0,
         },
         "sections": [
             {
                 "startMs": 0,
-                "endMs": 30000,
+                "endMs": 15000,
                 "status": "PASS",
                 "rowCount": 8,
                 "precision20": 1.0,
                 "precision50": 1.0,
                 "signedMedianMs": 0.0,
                 "absoluteP95Ms": 0.0,
+                "absoluteP99Ms": 0.0,
+                "phaseDeltaMs": 0.0,
+            },
+            {
+                "startMs": 15000,
+                "endMs": 30000,
+                "status": "INSUFFICIENT",
+                "rowCount": 0,
+                "precision20": None,
+                "precision50": None,
+                "signedMedianMs": None,
+                "absoluteP95Ms": None,
+                "absoluteP99Ms": None,
+                "phaseDeltaMs": None,
             }
         ],
     }

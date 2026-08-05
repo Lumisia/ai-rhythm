@@ -11,7 +11,7 @@ from chart_worker.schema.note import Chart
 
 TimingStatus = Literal["PASS", "REVIEW", "INSUFFICIENT"]
 
-SECTION_MS = 30_000
+SECTION_MS = 15_000
 MIN_SECTION_ROWS = 8
 OVERALL_PRECISION_50_MIN = 0.70
 SECTION_PRECISION_50_MIN = 0.60
@@ -28,6 +28,7 @@ class TimingMetrics:
     precision_50: float | None
     signed_median_ms: float | None
     absolute_p95_ms: float | None
+    absolute_p99_ms: float | None
 
     def to_report(self) -> dict[str, int | float | None]:
         return {
@@ -36,6 +37,7 @@ class TimingMetrics:
             "precision50": self.precision_50,
             "signedMedianMs": self.signed_median_ms,
             "absoluteP95Ms": self.absolute_p95_ms,
+            "absoluteP99Ms": self.absolute_p99_ms,
         }
 
 
@@ -45,12 +47,14 @@ class TimingSection:
     end_ms: int
     status: TimingStatus
     metrics: TimingMetrics
+    phase_delta_ms: float | None
 
     def to_report(self) -> dict[str, int | float | str | None]:
         return {
             "startMs": self.start_ms,
             "endMs": self.end_ms,
             "status": self.status,
+            "phaseDeltaMs": self.phase_delta_ms,
             **self.metrics.to_report(),
         }
 
@@ -62,8 +66,9 @@ class TimingCoverageGap:
     onset_count: int
     active_onset_count: int
     active_frame_ratio: float
+    position: Literal["LEADING", "MIDDLE", "TRAILING"]
 
-    def to_report(self) -> dict[str, int | float]:
+    def to_report(self) -> dict[str, int | float | str]:
         return {
             "startMs": self.start_ms,
             "endMs": self.end_ms,
@@ -71,6 +76,7 @@ class TimingCoverageGap:
             "onsetCount": self.onset_count,
             "activeOnsetCount": self.active_onset_count,
             "activeFrameRatio": self.active_frame_ratio,
+            "position": self.position,
         }
 
 
@@ -123,6 +129,7 @@ def _metrics(rows: tuple[int, ...], onsets: np.ndarray) -> TimingMetrics:
             precision_50=None,
             signed_median_ms=None,
             absolute_p95_ms=None,
+            absolute_p99_ms=None,
         )
     errors = _nearest_errors_ms(np.asarray(rows, dtype=np.int64), onsets)
     absolute = np.abs(errors)
@@ -132,6 +139,7 @@ def _metrics(rows: tuple[int, ...], onsets: np.ndarray) -> TimingMetrics:
         precision_50=round(float(np.mean(absolute <= 50)), 6),
         signed_median_ms=round(float(np.median(errors)), 6),
         absolute_p95_ms=round(float(np.percentile(absolute, 95)), 6),
+        absolute_p99_ms=round(float(np.percentile(absolute, 99)), 6),
     )
 
 
@@ -187,6 +195,13 @@ def _coverage_gaps(
                 onset_count=onset_count,
                 active_onset_count=active_onset_count,
                 active_frame_ratio=active_frame_ratio,
+                position=(
+                    "LEADING"
+                    if start_ms == 0
+                    else "TRAILING"
+                    if end_ms == duration_ms
+                    else "MIDDLE"
+                ),
             )
             target = (
                 active_gaps
@@ -253,6 +268,14 @@ def diagnose_chart_timing(
                     minimum_rows=minimum_section_rows,
                 ),
                 metrics=metrics,
+                phase_delta_ms=(
+                    None
+                    if (
+                        metrics.signed_median_ms is None
+                        or overall.signed_median_ms is None
+                    )
+                    else round(metrics.signed_median_ms - overall.signed_median_ms, 6)
+                ),
             )
         )
 
