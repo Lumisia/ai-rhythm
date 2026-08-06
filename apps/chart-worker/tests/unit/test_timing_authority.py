@@ -15,9 +15,8 @@ def test_timing_identity_rejects_a_different_event():
         validate_timing_identity((OsuBpmEvent(0, 121.0),), expected)
 
 
-def test_timing_authority_rejects_a_first_event_beyond_one_beat():
-    with pytest.raises(TimingAuthorityValidationError, match="within one beat"):
-        validate_timing_events((OsuBpmEvent(501, 120.0),), duration_ms=10_000)
+def test_timing_authority_allows_a_late_structurally_valid_first_event():
+    validate_timing_events((OsuBpmEvent(2_678, 222.0),), duration_ms=150_000)
 
 
 @pytest.mark.parametrize("first_event_ms", [-1_000, 0, 250, 500])
