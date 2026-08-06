@@ -21,6 +21,8 @@ function sessionWithMisses(): ReviewSession {
         counts: { PERFECT: 1, GREAT: 0, GOOD: 0, BAD: 0, MISS: 2 },
         combo: 0,
         maxCombo: 1,
+        rawCombo: 0,
+        rawMaxCombo: 1,
         totalJudgments: 3,
         accuracy: 1 / 3,
         meanErrMs: -10,
