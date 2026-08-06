@@ -13,7 +13,12 @@ from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.schema.playtest_run import PlaytestRunManifest
+from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.quality_gate import GateAction
+from chart_worker.validation.timing_review import (
+    TimingAuthorityAction,
+    TimingAuthorityReview,
+)
 from tests.support import fake_dependencies
 
 
@@ -190,6 +195,46 @@ def test_success_report_uses_null_for_unavailable_optional_timing_evidence(
     assert report["timingAuthorityTempoMetrics"] is None
     assert report["timingAuthorityReview"] is None
     assert report["timingAuthorityLeadingCoverage"] is None
+
+
+def test_authority_review_sets_review_required_when_all_maps_pass(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        authority = dependencies.timing(prepared, analysis, run_dir, generator, seed)
+        return replace(
+            authority,
+            review=TimingAuthorityReview(
+                TimingAuthorityAction.REVIEW,
+                ("SHORT_ACTIVE_LEADING_TIMING_GAP",),
+            ),
+            leading_coverage=LeadingTimingCoverage(
+                action=TimingAuthorityAction.REVIEW,
+                reasons=("SHORT_ACTIVE_LEADING_TIMING_GAP",),
+                first_event_time_ms=2_678,
+                leading_duration_ms=2_678,
+                onset_count=11,
+                active_onset_count=11,
+                active_frame_ratio=1.0,
+            ),
+        )
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, timing=timing),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert all(chart["acceptanceStatus"] == "PASS" for chart in report["charts"])
+    assert report["timingAuthorityReview"]["action"] == "REVIEW"
+    assert report["timingReviewRequired"] is True
 
 
 @pytest.mark.parametrize(
@@ -387,6 +432,66 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
     assert not (output_dir / "audio" / "timing-reference.osu").exists()
     assert not (output_dir / "raw").exists()
     assert not (output_dir / "charts").exists()
+    assert not (output_dir / "playtest-run-v1.json").exists()
+
+
+def test_timing_candidates_exhausted_writes_attempt_evidence_before_reraising(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+    failure = WorkerError(
+        ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+        "standard and Super Timing candidates missed active leading audio",
+        context={
+            "seeds": [7, 8],
+            "attempts": [
+                {
+                    "mode": "STANDARD",
+                    "leadingCoverage": {
+                        "action": "RETRY_TIMING",
+                        "reasons": ["ACTIVE_LEADING_TIMING_GAP"],
+                    },
+                },
+                {
+                    "mode": "SUPER_TIMING",
+                    "leadingCoverage": {
+                        "action": "RETRY_TIMING",
+                        "reasons": ["ACTIVE_LEADING_TIMING_GAP"],
+                    },
+                },
+            ],
+        },
+    )
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        del prepared, analysis, run_dir, generator, seed
+        raise failure
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=output_dir,
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(dependencies, timing=timing),
+        )
+
+    assert captured.value is failure
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    assert report["publishable"] is False
+    assert report["status"] == "EXHAUSTED"
+    assert report["failureStage"] == "TIMING"
+    assert report["error"] == {
+        "code": "CHART_TIMING_CANDIDATE_FAILED",
+        "context": failure.context,
+    }
+    assert report["timingAuthority"] is None
     assert not (output_dir / "playtest-run-v1.json").exists()
 
 

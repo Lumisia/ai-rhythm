@@ -36,6 +36,7 @@ from chart_worker.stages.types import (
     SongTimingAuthority,
 )
 from chart_worker.validation.quality_gate import GateAction
+from chart_worker.validation.timing_review import TimingAuthorityAction
 
 GeneratorName = Literal["fake", "mapperatorinator"]
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
@@ -353,7 +354,11 @@ def _generation_report(
         ),
         "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
         "canonicalAudioSha256": prepared.normalized.sha256,
-        "timingReviewRequired": any(
+        "timingReviewRequired": (
+            authority.review is not None
+            and authority.review.action is TimingAuthorityAction.REVIEW
+        )
+        or any(
             chart["acceptanceStatus"] != "PASS" for chart in charts
         ),
         "elapsedMsByStage": elapsed,
@@ -376,6 +381,7 @@ def _failure_generation_report(
 ) -> dict[str, object]:
     status = {
         ErrorCode.CHART_TIMING_REVIEW_REQUIRED: "REVIEW",
+        ErrorCode.CHART_TIMING_CANDIDATE_FAILED: "EXHAUSTED",
         ErrorCode.CHART_CANDIDATES_EXHAUSTED: "EXHAUSTED",
         ErrorCode.CHART_VALIDATION_FAILED: "FAILED",
     }[error.code]
@@ -465,7 +471,10 @@ def run_pipeline(
     try:
         authority = dependencies.timing(prepared, onsets, run_dir, generator, options.seed)
     except WorkerError as error:
-        if error.code is not ErrorCode.CHART_TIMING_REVIEW_REQUIRED:
+        if error.code not in {
+            ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+            ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+        }:
             raise
         elapsed["timing"] = _elapsed_ms(started)
         _write_generation_report(

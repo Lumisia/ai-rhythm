@@ -106,6 +106,20 @@ class ShortActiveIntroGenerator(RecordingGenerator):
         )
 
 
+class LongThenShortActiveIntroGenerator(RecordingGenerator):
+    def generate_timing(self, request, workdir):
+        self.timing_calls.append(request)
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(
+                OsuBpmEvent(2_678 if request.super_timing else 95_645, 120.0),
+            ),
+            generator_name="recording-generator",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+
 class AlwaysLongActiveGapGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
@@ -250,6 +264,24 @@ def test_short_active_intro_is_promoted_without_event_mutation(tmp_path):
 
     assert [call.super_timing for call in generator.timing_calls] == [False]
     assert authority.mode == "STANDARD"
+    assert authority.bpm_events[0].time_ms == 2_678
+    assert authority.leading_coverage is not None
+    assert authority.leading_coverage.action is TimingAuthorityAction.REVIEW
+
+
+def test_super_short_active_intro_is_promoted_without_event_mutation(tmp_path):
+    generator = LongThenShortActiveIntroGenerator()
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=150_000),
+        _active_analysis(150_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "SUPER_TIMING"
     assert authority.bpm_events[0].time_ms == 2_678
     assert authority.leading_coverage is not None
     assert authority.leading_coverage.action is TimingAuthorityAction.REVIEW
