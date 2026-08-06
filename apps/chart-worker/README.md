@@ -5,6 +5,11 @@
 후처리로 바꾸지 않는다. `generate`와 `bench` 명령을 실행하는 동안에만 모델이
 동작하며 상시 GPU 서비스가 아니다.
 
+canonical audio 프로파일은 `audio-profile-v2`다. 원본과 앞 무음 제거 후 결과를
+정확히 600초까지 허용하며, 600초를 초과하면 곡을 자르지 않고
+`AUDIO_TOO_LONG`으로 거절한다. 10분 곡도 하나의 timing authority와 12개 전체 MAP
+생성 경로를 사용한다.
+
 ## 생성 계약
 
 곡마다 표준 timing을 한 번 생성하고, timing 구조·identity가 유효하지 않거나 half/double
