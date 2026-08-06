@@ -49,6 +49,19 @@ describe("HoldTickTracker", () => {
     expect([...subject.advance(3000, laneSet(0))]).toEqual([]);
   });
 
+  it("틱 구간의 끝(toMs)에는 틱이 생기지 않는다", () => {
+    const subject = tracker();
+
+    // 한 번의 호출로 fromMs 부터 toMs 까지 전부 훑는다. 위 테스트는 두 번에
+    // 나눠 부르는 바람에 바깥 건너뛰기 가드에서 걸러져 while 루프의 끝 비교가
+    // 실행되지 않는다. 이 테스트가 `nextMs < toMs` 를 직접 잠근다 —
+    // 이 비교가 `<=` 로 새면 ppy/osu#24584 결함이 그대로 재현된다.
+    const ticks = [...subject.advance(2700, laneSet(0))];
+
+    expect(ticks.some((tick) => tick.timeMs === 2700)).toBe(false);
+    expect(ticks.at(-1)).toEqual({ lane: 0, timeMs: 2575 });
+  });
+
   it("짧은 롱노트는 틱이 0개다", () => {
     // 길이 300ms → 틱 구간 200 ~ 0ms 로 뒤집힌다
     const subject = tracker([hold(1, 0, 0, 300)]);
