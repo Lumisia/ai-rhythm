@@ -11,9 +11,15 @@ from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedCh
 from chart_worker.generation.osu_parser import parse_osu_mania
 from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
+from chart_worker.generation.recovery import build_recovery_chart
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
-from chart_worker.stages.types import GeneratedVariant, PreparedAudio, SongTimingAuthority
+from chart_worker.stages.types import (
+    GeneratedVariant,
+    GenerationProvenance,
+    PreparedAudio,
+    SongTimingAuthority,
+)
 from chart_worker.validation.difficulty_order import (
     DifficultyOrderReview,
     review_difficulty_order,
@@ -144,6 +150,8 @@ class _Candidate:
     workdir: Path
     attempt: int
     seed: int
+    provenance: GenerationProvenance
+    recovery_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -156,6 +164,7 @@ class _VariantState:
     attempt_evidence: list[dict[str, object]] = field(default_factory=list)
     attempted_seeds: list[int] = field(default_factory=list)
     pool: list[_Candidate] = field(default_factory=list)
+    exhausted_error: WorkerError | None = None
 
 
 def _exhausted_error(state: _VariantState) -> WorkerError:
@@ -266,6 +275,7 @@ def _generate_next_pass(
                 workdir=workdir,
                 attempt=attempt,
                 seed=attempt_seed,
+                provenance="PRIMARY" if attempt == 1 else "RETRY",
             )
         except (
             GeneratedChartValidationError,
@@ -281,6 +291,101 @@ def _generate_next_pass(
     if last_error is not None:
         raise error from last_error
     raise error
+
+
+def _build_recovery_candidate(
+    state: _VariantState,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    base_seed: int,
+) -> _Candidate:
+    seed = base_seed + state.flat_index
+    request = GenerationRequest(
+        audio_path=prepared.normalized.path,
+        timing_reference_path=authority.reference_path,
+        key_mode=state.key_mode,
+        difficulty=state.difficulty,
+        seed=seed,
+        duration_ms=prepared.normalized.duration_ms,
+    )
+    generated = build_recovery_chart(request, authority, onset_analysis)
+    acceptance = evaluate_chart_candidate(
+        generated,
+        authority,
+        onset_analysis,
+        requested_key_mode=state.key_mode,
+        requested_difficulty=state.difficulty,
+        duration_ms=prepared.normalized.duration_ms,
+    )
+    if acceptance.action is GateAction.RETRY_MAP:
+        model_failure = (
+            state.exhausted_error.context if state.exhausted_error is not None else None
+        )
+        raise WorkerError(
+            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+            f"{state.key_mode}K {state.difficulty} recovery failed quality gates",
+            context={
+                "key_mode": state.key_mode,
+                "difficulty": state.difficulty,
+                "gateReport": acceptance.to_report(),
+                "modelFailure": model_failure,
+            },
+        )
+    first_timing = generated.bpm_events[0]
+    osu_text = notes_to_osu_mania(
+        generated.notes,
+        key_mode=state.key_mode,
+        bpm=first_timing.bpm,
+        offset_ms=first_timing.time_ms,
+        audio_filename=prepared.normalized.path.name,
+        title=prepared.normalized.path.stem,
+        bpm_events=generated.bpm_events,
+    )
+    _validate_serialized_candidate(
+        osu_text,
+        generated,
+        authority,
+        prepared,
+        state.key_mode,
+    )
+    return _Candidate(
+        request=request,
+        generated=generated,
+        acceptance=acceptance,
+        osu_text=osu_text,
+        workdir=run_dir / "raw" / "recovery" / f"{state.key_mode}k-{state.difficulty.lower()}",
+        attempt=state.next_attempt - 1,
+        seed=seed,
+        provenance="RECOVERY_FALLBACK",
+        recovery_reason="MODEL_CANDIDATES_EXHAUSTED",
+    )
+
+
+def _ensure_recovery_candidate(
+    state: _VariantState,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    base_seed: int,
+) -> bool:
+    if any(candidate.provenance == "RECOVERY_FALLBACK" for candidate in state.pool):
+        return False
+    state.pool.append(
+        _build_recovery_candidate(
+            state,
+            prepared=prepared,
+            authority=authority,
+            onset_analysis=onset_analysis,
+            run_dir=run_dir,
+            base_seed=base_seed,
+        )
+    )
+    return True
 
 
 def _review_candidates(candidates: tuple[_Candidate, ...]) -> DifficultyOrderReview:
@@ -435,17 +540,33 @@ def run_generation(
         }
         for difficulty in DIFFICULTIES:
             state = states[difficulty]
-            state.pool.append(
-                _generate_next_pass(
+            try:
+                state.pool.append(
+                    _generate_next_pass(
+                        state,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                        run_dir=run_dir,
+                        generator=generator,
+                        base_seed=seed,
+                    )
+                )
+            except WorkerError as error:
+                if error.code is not ErrorCode.CHART_CANDIDATES_EXHAUSTED:
+                    raise
+                state.exhausted_error = error
+
+        for state in states.values():
+            if not state.pool:
+                _ensure_recovery_candidate(
                     state,
                     prepared=prepared,
                     authority=authority,
                     onset_analysis=onset_analysis,
                     run_dir=run_dir,
-                    generator=generator,
                     base_seed=seed,
                 )
-            )
 
         while True:
             selected = _select_earliest_monotonic(states)
@@ -489,9 +610,25 @@ def run_generation(
                 candidates, order_review = retry_selection
                 break
             if not generated_candidate:
-                if not exhausted_errors:
+                recovery_added = False
+                for state in states.values():
+                    recovery_added = _ensure_recovery_candidate(
+                        state,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                        run_dir=run_dir,
+                        base_seed=seed,
+                    ) or recovery_added
+                recovery_selection = _select_earliest_monotonic(states)
+                if recovery_selection is not None:
+                    candidates, order_review = recovery_selection
+                    break
+                if not exhausted_errors and not recovery_added:
                     raise RuntimeError("difficulty retry made no progress")
-                raise exhausted_errors[0]
+                if exhausted_errors:
+                    raise exhausted_errors[0]
+                raise RuntimeError("recovery candidates did not form a monotonic family")
 
         raw_paths = _promote_key_mode(
             candidates,
@@ -524,6 +661,8 @@ def run_generation(
                     generation_attempt_count=state.next_attempt - 1,
                     selected_seed=candidate.seed,
                     difficulty_order=order_review,
+                    provenance=candidate.provenance,
+                    recovery_reason=candidate.recovery_reason,
                 )
             )
     return tuple(variants)

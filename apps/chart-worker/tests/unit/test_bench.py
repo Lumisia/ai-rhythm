@@ -102,9 +102,11 @@ def test_benchmark_requires_review_when_timing_diagnostics_do(tmp_path: Path):
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert generation["publishable"] is False
     assert generation["status"] == "EXHAUSTED"
+    error_context = generation["error"]["context"]
+    assert error_context["gateReport"]["action"] == "RETRY_MAP"
     assert all(
         attempt["gateReport"]["action"] == "RETRY_MAP"
-        for attempt in generation["error"]["context"]["attempts"]
+        for attempt in error_context["modelFailure"]["attempts"]
     )
     assert not (output_dir / "benchmark-report.json").exists()
 

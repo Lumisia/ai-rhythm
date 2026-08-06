@@ -121,6 +121,8 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["attemptCount"] == 1
         assert chart_report["candidateCount"] == 1
         assert chart_report["generationAttemptCount"] == 1
+        assert chart_report["provenance"] == "PRIMARY"
+        assert chart_report["recoveryReason"] is None
         assert chart_report["selectedSeed"] == chart_report["seed"]
         assert chart_report["attemptErrors"] == []
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
@@ -776,6 +778,45 @@ def test_generation_report_records_the_selected_retry_attempt(tmp_path: Path):
     assert first["attemptCount"] == 2
     assert first["seed"] == 19
     assert first["attemptErrors"] == ["lane 4 is outside requested 4K"]
+
+
+def test_generation_report_records_recovery_provenance(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
+        variants = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+        )
+        recovered = replace(
+            variants[0],
+            provenance="RECOVERY_FALLBACK",
+            recovery_reason="MODEL_CANDIDATES_EXHAUSTED",
+        )
+        return (recovered, *variants[1:])
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    first = json.loads(
+        (tmp_path / "run" / "generation-report.json").read_text()
+    )["charts"][0]
+    assert first["provenance"] == "RECOVERY_FALLBACK"
+    assert first["recoveryReason"] == "MODEL_CANDIDATES_EXHAUSTED"
 
 
 def test_pipeline_analyzes_only_the_canonical_game_audio_once(tmp_path: Path):

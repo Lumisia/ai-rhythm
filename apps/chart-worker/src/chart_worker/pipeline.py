@@ -288,6 +288,8 @@ def _generation_report(
                 "attemptCount": variant.attempt,
                 "candidateCount": variant.candidate_count,
                 "generationAttemptCount": variant.generation_attempt_count,
+                "provenance": variant.provenance,
+                "recoveryReason": variant.recovery_reason,
                 "attemptErrors": list(variant.attempt_errors),
                 "attemptEvidence": list(variant.attempt_evidence),
                 "acceptanceStatus": acceptance["action"],

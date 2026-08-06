@@ -783,19 +783,21 @@ def test_stable_raw_reparse_rejects_text_with_different_timing_identity(
             )
 
     generator = MismatchedTextGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert len(generator.map_calls) == 3
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    assert len(generator.map_calls) == 36
+    assert all(variant.provenance == "RECOVERY_FALLBACK" for variant in variants)
+    assert all(
+        parse_osu_file(variant.raw_osu_path).bpm_events == authority.bpm_events
+        for variant in variants
+    )
 
 
 @pytest.mark.parametrize(
@@ -855,19 +857,23 @@ def test_serialized_note_or_key_mismatch_retries_without_stable_promotion(
             )
 
     generator = MismatchedCandidateGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert len(generator.map_calls) == 3
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    recovered = next(
+        variant
+        for variant in variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert len(generator.map_calls) >= 14
+    assert recovered.provenance == "RECOVERY_FALLBACK"
+    assert parse_osu_file(recovered.raw_osu_path).notes == recovered.generated.notes
 
 
 def test_reference_metadata_mutated_during_map_is_rejected_before_promotion(
@@ -955,24 +961,24 @@ def test_generated_structure_defects_exhaust_with_gate_evidence_before_stable_ra
             )
 
     generator = InvalidLaneGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert [request.seed for request in generator.map_calls] == [0, 12, 24]
-    assert [attempt["seed"] for attempt in captured.value.context["attempts"]] == [
+    recovered = variants[0]
+    assert len(generator.map_calls) == 36
+    assert recovered.provenance == "RECOVERY_FALLBACK"
+    assert [attempt["seed"] for attempt in recovered.attempt_evidence] == [
         0,
         12,
         24,
     ]
-    assert [attempt["workdir"] for attempt in captured.value.context["attempts"]] == [
+    assert [attempt["workdir"] for attempt in recovered.attempt_evidence] == [
         "raw/work/4k-easy/attempt-1",
         "raw/work/4k-easy/attempt-2",
         "raw/work/4k-easy/attempt-3",
@@ -980,9 +986,9 @@ def test_generated_structure_defects_exhaust_with_gate_evidence_before_stable_ra
     assert all(
         attempt["gateReport"]["decisions"]["STRUCTURE"]["reasons"]
         == ["STRUCTURE_INVALID"]
-        for attempt in captured.value.context["attempts"]
+        for attempt in recovered.attempt_evidence
     )
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    assert (tmp_path / "raw" / "4k-easy.osu").is_file()
 
 
 def test_real_hold_overlap_retries_only_the_failed_variant(tmp_path: Path):
@@ -1064,24 +1070,24 @@ def test_observed_zero_ms_duplicates_exhaust_three_raw_attempts(
             )
 
     generator = AlwaysDuplicatesAtZero()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert [call.seed for call in generator.map_calls] == [0, 12, 24]
-    assert [attempt["workdir"] for attempt in captured.value.context["attempts"]] == [
+    recovered = variants[0]
+    assert len(generator.map_calls) == 36
+    assert recovered.provenance == "RECOVERY_FALLBACK"
+    assert [attempt["workdir"] for attempt in recovered.attempt_evidence] == [
         "raw/work/4k-easy/attempt-1",
         "raw/work/4k-easy/attempt-2",
         "raw/work/4k-easy/attempt-3",
     ]
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    assert (tmp_path / "raw" / "4k-easy.osu").is_file()
 
 
 def test_retries_only_the_failed_variant_with_the_next_seed(tmp_path: Path):
@@ -1238,8 +1244,21 @@ def test_three_retry_map_decisions_exhaust_with_structured_attempt_evidence(
         )
 
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert [request.seed for request in generator.map_calls] == [0, 12, 24]
-    assert captured.value.context["attempts"] == [
+    assert [request.seed for request in generator.map_calls] == [
+        0,
+        12,
+        24,
+        1,
+        13,
+        25,
+        2,
+        14,
+        26,
+        3,
+        15,
+        27,
+    ]
+    assert captured.value.context["modelFailure"]["attempts"] == [
         {
             "seed": attempt_seed,
             "workdir": f"raw/work/4k-easy/attempt-{attempt}",
@@ -1247,8 +1266,67 @@ def test_three_retry_map_decisions_exhaust_with_structured_attempt_evidence(
         }
         for attempt, attempt_seed in enumerate((0, 12, 24), start=1)
     ]
-    assert len(captured.value.context["errors"]) == 3
+    assert len(captured.value.context["modelFailure"]["errors"]) == 3
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
+def test_one_exhausted_variant_recovers_without_regenerating_successes(tmp_path: Path):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+
+    class ExhaustedEasyGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if request.key_mode == 4 and request.difficulty == "EASY":
+                raise WorkerError(
+                    ErrorCode.CHART_GENERATION_FAILED,
+                    "fixture exhausted 4K EASY",
+                )
+            return generated
+
+    generator = ExhaustedEasyGenerator()
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert len(variants) == 12
+    recovered = next(
+        variant
+        for variant in variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert recovered.provenance == "RECOVERY_FALLBACK"
+    assert recovered.recovery_reason == "MODEL_CANDIDATES_EXHAUSTED"
+    assert all(
+        variant.provenance == "PRIMARY"
+        for variant in variants
+        if variant is not recovered
+    )
+    assert len(generator.map_calls) == 14
+
+
+def test_normal_generation_marks_every_variant_primary(tmp_path: Path):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    generator = RecordingGenerator()
+
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert len(generator.map_calls) == 12
+    assert all(variant.provenance == "PRIMARY" for variant in variants)
+    assert all(variant.recovery_reason is None for variant in variants)
 
 
 def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
@@ -1293,10 +1371,11 @@ def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
         )
 
     assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert captured.value.context["seeds"] == [0, 12, 24]
-    assert len(captured.value.context["errors"]) == 3
-    assert evaluation_calls == 1
-    assert captured.value.context["attempts"] == [
+    model_failure = captured.value.context["modelFailure"]
+    assert model_failure["seeds"] == [0, 12, 24]
+    assert len(model_failure["errors"]) == 3
+    assert evaluation_calls == 2
+    assert model_failure["attempts"] == [
         {
             "seed": 0,
             "workdir": "raw/work/4k-easy/attempt-1",
@@ -1364,22 +1443,18 @@ def test_reports_all_errors_when_one_variant_exhausts_its_attempts(tmp_path: Pat
             )
 
     generator = AlwaysInvalid()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert captured.value.context["key_mode"] == 4
-    assert captured.value.context["difficulty"] == "EASY"
-    assert captured.value.context["seeds"] == [0, 12, 24]
-    assert len(captured.value.context["errors"]) == 3
-    assert [request.seed for request in generator.map_calls] == [0, 12, 24]
+    assert len(generator.map_calls) == 36
+    assert all(variant.provenance == "RECOVERY_FALLBACK" for variant in variants)
+    assert all(len(variant.attempt_errors) == 3 for variant in variants)
 
 
 def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
@@ -1406,31 +1481,26 @@ def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
             )
 
     generator = DifferentTimingGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert [
-        (request.key_mode, request.difficulty, request.seed)
-        for request in generator.map_calls
-    ] == [
-        (4, "EASY", 0),
-        (4, "EASY", 12),
-        (4, "EASY", 24),
-    ]
-    assert [attempt["seed"] for attempt in captured.value.context["attempts"]] == [
+    assert len(generator.map_calls) == 36
+    assert all(variant.provenance == "RECOVERY_FALLBACK" for variant in variants)
+    assert all(
+        variant.generated.bpm_events == authority.bpm_events for variant in variants
+    )
+    assert [attempt["seed"] for attempt in variants[0].attempt_evidence] == [
         0,
         12,
         24,
     ]
-    assert [attempt["workdir"] for attempt in captured.value.context["attempts"]] == [
+    assert [attempt["workdir"] for attempt in variants[0].attempt_evidence] == [
         "raw/work/4k-easy/attempt-1",
         "raw/work/4k-easy/attempt-2",
         "raw/work/4k-easy/attempt-3",
@@ -1438,6 +1508,6 @@ def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
     assert all(
         attempt["gateReport"]["decisions"]["TIMING_IDENTITY"]["reasons"]
         == ["TIMING_REFERENCE_MISMATCH"]
-        for attempt in captured.value.context["attempts"]
+        for attempt in variants[0].attempt_evidence
     )
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    assert (tmp_path / "raw" / "4k-easy.osu").is_file()
