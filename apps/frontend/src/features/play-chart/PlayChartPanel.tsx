@@ -3,8 +3,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GameClock } from "../../game/audio/GameClock";
 import { KeysoundScheduler } from "../../game/audio/KeysoundScheduler";
 import { SongPlayer } from "../../game/audio/SongPlayer";
+import { HoldTickTracker } from "../../game/core/HoldTickTracker";
 import { InputRecorder } from "../../game/core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../../game/core/JudgmentEngine";
+import { loadJudgmentConfig } from "../../game/core/judgment-config";
 import { approachMsAt1x } from "../../game/core/LaneLayout";
 import { ScoreCalculator, type ScoreSnapshot } from "../../game/core/ScoreCalculator";
 import type { ImportedChart, ImportedRun } from "../import-run/importRun";
@@ -139,6 +141,17 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         return note.timeMs >= rangeStart && tail <= rangeEnd;
       });
       const engine = new JudgmentEngine(notes, settings.judgmentPreset);
+      const judgmentConfig = loadJudgmentConfig();
+      const windows = judgmentConfig.presets[settings.judgmentPreset];
+      const bpm = chart.document.bpmEvents[0]?.bpm;
+      const beatMs = bpm && bpm > 0 ? 60_000 / bpm : 500;
+      // 16분음표. ms 고정값이 아니라 박자 기준이라 곡이 빠를수록 촘촘해진다.
+      const holdTicks = new HoldTickTracker(
+        notes,
+        windows,
+        beatMs / 4,
+        judgmentConfig.holdReleaseScale,
+      );
       const score = new ScoreCalculator();
       const recorder = new InputRecorder();
       const judgments: JudgmentEvent[] = [];
@@ -171,12 +184,14 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         judgmentPreset: settings.judgmentPreset,
         keysoundScheduler,
         songPlayer: player,
+        holdTicks,
         loop: settings.loopEnabled
           ? {
               startMs: rangeStart,
               endMs: rangeEnd,
               restart: () => {
                 engine.reset();
+                holdTicks.reset();
                 keysoundScheduler?.resetAutoPlay();
                 player?.seek(rangeStart);
               },

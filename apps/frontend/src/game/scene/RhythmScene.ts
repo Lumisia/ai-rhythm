@@ -4,6 +4,7 @@ import type { Clock } from "../audio/Clock";
 import type { KeysoundScheduler } from "../audio/KeysoundScheduler";
 import type { SongPlayer } from "../audio/SongPlayer";
 import { EffectBus } from "../core/EffectBus";
+import { HoldTickTracker } from "../core/HoldTickTracker";
 import { InputRecorder } from "../core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../core/JudgmentEngine";
 import { layoutStage, type StageGeometry } from "../core/LaneLayout";
@@ -32,6 +33,8 @@ export interface RhythmSceneSession {
   keysoundScheduler?: KeysoundScheduler;
   songPlayer?: Pick<SongPlayer, "dispose">;
   loop?: { startMs: number; endMs: number; restart: () => void };
+  /** 롱노트 홀드 틱. 없으면 홀드 콤보가 붙지 않는다. */
+  holdTicks?: HoldTickTracker;
   onJudgment?: (event: JudgmentEvent) => void;
   onPause?: () => void;
   onMarkerSlot?: (slot: number, timeMs: number) => void;
@@ -96,6 +99,18 @@ export class RhythmScene extends Phaser.Scene {
     }
     for (const event of this.#session.engine.advance(songTimeMs)) {
       this.#acceptJudgment(event);
+    }
+    const ticks = this.#session.holdTicks?.advance(songTimeMs, this.#held);
+    if (ticks) {
+      for (const tick of ticks) {
+        this.#session.score.acceptHoldTick(tick.lane);
+        this.#effects.emit({
+          type: "HOLD_TICK",
+          lane: tick.lane,
+          combo: this.#session.score.snapshot().combo,
+          songTimeMs,
+        });
+      }
     }
     this.#session.keysoundScheduler?.scheduleAutoPlayUntil(songTimeMs + 250);
     const scrollSpeed =
