@@ -458,13 +458,14 @@ def run_generation(
             )
             latest_review = _review_candidates(latest_candidates)
             retry_selection = None
+            exhausted_errors: list[WorkerError] = []
+            generated_candidate = False
             for difficulty in DIFFICULTIES:
                 if difficulty not in latest_review.retry_difficulties:
                     continue
                 state = states[difficulty]
-                _record_order_retry(state, latest_review, run_dir=run_dir)
-                state.pool.append(
-                    _generate_next_pass(
+                try:
+                    candidate = _generate_next_pass(
                         state,
                         prepared=prepared,
                         authority=authority,
@@ -473,13 +474,24 @@ def run_generation(
                         generator=generator,
                         base_seed=seed,
                     )
-                )
+                except WorkerError as error:
+                    if error.code is not ErrorCode.CHART_CANDIDATES_EXHAUSTED:
+                        raise
+                    exhausted_errors.append(error)
+                    continue
+                generated_candidate = True
+                _record_order_retry(state, latest_review, run_dir=run_dir)
+                state.pool.append(candidate)
                 retry_selection = _select_earliest_monotonic(states)
                 if retry_selection is not None:
                     break
             if retry_selection is not None:
                 candidates, order_review = retry_selection
                 break
+            if not generated_candidate:
+                if not exhausted_errors:
+                    raise RuntimeError("difficulty retry made no progress")
+                raise exhausted_errors[0]
 
         raw_paths = _promote_key_mode(
             candidates,

@@ -474,6 +474,70 @@ def test_ambiguity_does_not_prevent_retrying_a_separate_inverted_pair(
     )
 
 
+def test_exhausted_hard_still_tries_available_expert_candidate(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        rating = {
+            ("HARD", 26): 4.0,
+            ("EXPERT", 3): 3.0,
+            ("EXPERT", 15): 5.0,
+        }.get(
+            (requested_difficulty, generated.seed),
+            {"EASY": 1.0, "NORMAL": 2.0, "HARD": 3.0, "EXPERT": 4.0}[
+                requested_difficulty
+            ],
+        )
+        return _acceptance_with_rating(accepted, rating)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class HardNeedsThirdAttempt(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if (
+                request.key_mode == 4
+                and request.difficulty == "HARD"
+                and request.seed in {2, 14}
+            ):
+                return replace(generated, notes=[NoteEvent(500, 4)])
+            return generated
+
+    generator = HardNeedsThirdAttempt()
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    selected_4k = {
+        variant.difficulty: variant for variant in variants if variant.key_mode == 4
+    }
+    assert selected_4k["HARD"].selected_seed == 26
+    assert selected_4k["EXPERT"].selected_seed == 15
+    assert [
+        (request.difficulty, request.seed)
+        for request in generator.map_calls
+        if request.key_mode == 4
+    ] == [
+        ("EASY", 0),
+        ("NORMAL", 1),
+        ("HARD", 2),
+        ("HARD", 14),
+        ("HARD", 26),
+        ("EXPERT", 3),
+        ("EXPERT", 15),
+    ]
+
+
 def test_persistent_inversion_exhausts_only_the_affected_label_budgets(
     monkeypatch, tmp_path: Path
 ):
