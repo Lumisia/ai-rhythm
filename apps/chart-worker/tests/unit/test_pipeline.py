@@ -162,6 +162,16 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert "activeOnsetCount" in chart_report["timingDiagnostics"]
         assert "quietCoverageGaps" in chart_report["timingDiagnostics"]
         assert chart_report["cfgScale"] == 1.0
+        assert chart_report["descriptors"] == {
+            "EASY": ["expression/simple"],
+            "NORMAL": ["style/mixed rice"],
+            "HARD": ["style/mixed rice", "streams/bursts"],
+            "EXPERT": [
+                "style/mixed rice",
+                "skillset/streams",
+                "skillset/tech",
+            ],
+        }[chart_report["difficulty"]]
         assert chart_report["chartPath"] == chart_ref.path
         assert chart_report["rawOsuPath"] == raw_path.relative_to(output_dir).as_posix()
         assert "candidates" not in chart_report

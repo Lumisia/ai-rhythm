@@ -279,6 +279,7 @@ def _generation_report(
                 "keyMode": variant.key_mode,
                 "difficulty": variant.difficulty,
                 "descriptor": DESCRIPTORS[variant.difficulty][0],
+                "descriptors": list(DESCRIPTORS[variant.difficulty]),
                 "precision": config.mapperatorinator_precision,
                 "seed": variant.generated.seed,
                 "selectedSeed": variant.selected_seed,
