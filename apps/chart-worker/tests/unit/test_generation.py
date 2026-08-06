@@ -13,12 +13,16 @@ from chart_worker.generation.mapperatorinator import (
     find_generated_osu,
     inference_env,
 )
-from chart_worker.generation.osu_parser import OsuBpmEvent
+from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_mania
 from chart_worker.generation.params import (
     DESCRIPTORS,
     REQUESTED_STAR,
     GenerationRequest,
     TimingGenerationRequest,
+)
+from chart_worker.validation.generated_chart import (
+    GeneratedChartValidationError,
+    validate_generated_chart,
 )
 
 DURATION_MS = 20_000
@@ -198,6 +202,48 @@ def test_generator_generates_map_and_parses_raw_timing(config, tmp_path):
     assert result.generator_name == "mapperatorinator-v32"
     assert result.seed == 3
     assert [(event.time_ms, event.bpm) for event in result.bpm_events] == [(0, 120.0)]
+
+
+def test_generator_normalizes_events_within_ten_ms_of_audio_end(config, tmp_path):
+    raw = (
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
+        "\n[TimingPoints]\n0,500,4,2,0,60,1,0\n"
+        "\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n"
+        "192,192,19000,128,0,20006:0:0:0:0:\n"
+        "320,192,20006,1,0,0:0:0:0:\n"
+        "448,192,20006,128,0,20500:0:0:0:0:\n"
+        "64,192,20010,1,0,0:0:0:0:\n"
+    )
+    result = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(osu_text=raw),
+        verify_patch=lambda _home: None,
+    ).generate_map(_request(), tmp_path / "work")
+
+    assert [
+        (note.time_ms, note.lane, note.kind, note.duration_ms)
+        for note in result.notes
+    ] == [
+        (1000, 0, "TAP", None),
+        (19000, 1, "HOLD", 1000),
+    ]
+    reparsed = parse_osu_mania(result.osu_text)
+    assert reparsed.notes == result.notes
+
+
+def test_generator_does_not_hide_events_beyond_end_tolerance(config, tmp_path):
+    raw = MINI_OSU.replace(
+        "192,192,1200,1,0,0:0:0:0:",
+        "192,192,20011,1,0,0:0:0:0:",
+    )
+    result = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(osu_text=raw),
+        verify_patch=lambda _home: None,
+    ).generate_map(_request(), tmp_path / "work")
+
+    with pytest.raises(GeneratedChartValidationError, match="duration"):
+        validate_generated_chart(result, key_mode=4, duration_ms=DURATION_MS)
 
 
 def test_generator_maps_subprocess_failure(config, tmp_path):

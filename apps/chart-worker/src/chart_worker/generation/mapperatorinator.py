@@ -6,7 +6,7 @@
 
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -15,6 +15,7 @@ from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator_patch import require_mapperatorinator_patch
 from chart_worker.generation.osu_parser import OsuBeatmap, OsuBpmEvent, parse_osu_file
+from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import (
     GAMEMODE_MANIA,
     PRECISION,
@@ -25,6 +26,7 @@ from chart_worker.schema.note import Chart
 
 INFERENCE_SCRIPT = "inference.py"
 CONFIG_NAME = "v32"
+END_BOUNDARY_TOLERANCE_MS = 10
 RunCommand = Callable[[list[str]], CommandResult]
 PatchVerifier = Callable[[Path], None]
 
@@ -56,6 +58,28 @@ class ChartGenerator(Protocol):
     def generate_map(
         self, request: GenerationRequest, workdir: Path
     ) -> GeneratedChart: ...
+
+
+def _normalize_end_boundary(
+    notes: Chart, *, duration_ms: int
+) -> tuple[Chart, bool]:
+    normalized: Chart = []
+    changed = False
+    for note in notes:
+        if note.time_ms >= duration_ms:
+            if note.time_ms <= duration_ms + END_BOUNDARY_TOLERANCE_MS:
+                changed = True
+                continue
+            normalized.append(note)
+            continue
+        if note.kind == "HOLD":
+            end_ms = note.time_ms + (note.duration_ms or 0)
+            if duration_ms < end_ms <= duration_ms + END_BOUNDARY_TOLERANCE_MS:
+                normalized.append(replace(note, duration_ms=duration_ms - note.time_ms))
+                changed = True
+                continue
+        normalized.append(note)
+    return normalized, changed
 
 
 def inference_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -290,8 +314,28 @@ class MapperatorinatorGenerator:
                 ErrorCode.CHART_GENERATION_FAILED,
                 f"asked for {request.key_mode}K but got {beatmap.key_mode}K",
             )
+        notes, changed = _normalize_end_boundary(
+            beatmap.notes,
+            duration_ms=request.duration_ms,
+        )
+        if changed:
+            if not beatmap.bpm_events:
+                raise WorkerError(
+                    ErrorCode.CHART_GENERATION_FAILED,
+                    "MAP inference produced no BPM events",
+                )
+            first_timing = beatmap.bpm_events[0]
+            osu_text = notes_to_osu_mania(
+                notes,
+                key_mode=beatmap.key_mode,
+                bpm=first_timing.bpm,
+                offset_ms=first_timing.time_ms,
+                audio_filename=request.audio_path.name,
+                title=request.audio_path.stem,
+                bpm_events=beatmap.bpm_events,
+            )
         return GeneratedChart(
-            notes=beatmap.notes,
+            notes=notes,
             key_mode=beatmap.key_mode,
             osu_text=osu_text,
             generator_name="mapperatorinator-v32",
