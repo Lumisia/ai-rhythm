@@ -240,6 +240,66 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
     )
 
 
+def test_rechecks_pool_after_each_retry_and_skips_seed_31(monkeypatch, tmp_path: Path):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    ratings = {
+        (6, "HARD", 6): 5.44,
+        (6, "EXPERT", 19): 5.04,
+        (6, "HARD", 18): 5.00,
+    }
+
+    def evaluate(generated, *args, requested_key_mode, requested_difficulty, **kwargs):
+        del args, kwargs
+        rating = ratings.get(
+            (requested_key_mode, requested_difficulty, generated.seed),
+            {"EASY": 1.0, "NORMAL": 2.0, "HARD": 3.0, "EXPERT": 4.0}[
+                requested_difficulty
+            ],
+        )
+        return _acceptance_with_rating(accepted, rating)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class SeedSevenFailsGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            chart = super().generate_map(request, workdir)
+            if request.seed == 7:
+                return replace(chart, key_mode=4)
+            return chart
+
+    generator = SeedSevenFailsGenerator()
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    calls_6k = [
+        (request.difficulty, request.seed)
+        for request in generator.map_calls
+        if request.key_mode == 6
+    ]
+    assert calls_6k == [
+        ("EASY", 4),
+        ("NORMAL", 5),
+        ("HARD", 6),
+        ("EXPERT", 7),
+        ("EXPERT", 19),
+        ("HARD", 18),
+    ]
+    assert 31 not in [request.seed for request in generator.map_calls]
+    selected_6k = {
+        variant.difficulty: variant for variant in variants if variant.key_mode == 6
+    }
+    assert selected_6k["HARD"].selected_seed == 18
+    assert selected_6k["EXPERT"].selected_seed == 19
+
+
 def test_difficulty_inversion_retries_only_pair_and_reuses_earliest_pass_candidate(
     monkeypatch, tmp_path: Path
 ):
@@ -398,7 +458,6 @@ def test_ambiguity_does_not_prevent_retrying_a_separate_inverted_pair(
         2,
         3,
         14,
-        15,
         4,
         5,
         6,
@@ -460,7 +519,7 @@ def test_persistent_inversion_exhausts_only_the_affected_label_budgets(
     assert not any((tmp_path / "raw").glob("4k-*.osu"))
 
 
-def test_earliest_ambiguous_pool_combination_is_published(
+def test_first_retry_candidate_can_reuse_the_existing_harder_candidate(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
@@ -507,16 +566,15 @@ def test_earliest_ambiguous_pool_combination_is_published(
     )
 
     assert len(variants) == 12
-    assert [variant.selected_seed for variant in variants[:4]] == [0, 1, 2, 15]
+    assert [variant.selected_seed for variant in variants[:4]] == [0, 1, 14, 3]
     assert variants[0].difficulty_order is not None
-    assert variants[0].difficulty_order.ambiguous_pairs == (("HARD", "EXPERT"),)
+    assert variants[0].difficulty_order.ambiguous_pairs == ()
     assert [request.seed for request in generator.map_calls] == [
         0,
         1,
         2,
         3,
         14,
-        15,
         4,
         5,
         6,

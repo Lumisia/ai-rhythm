@@ -457,15 +457,12 @@ def run_generation(
                 states[difficulty].pool[-1] for difficulty in DIFFICULTIES
             )
             latest_review = _review_candidates(latest_candidates)
+            retry_selection = None
             for difficulty in DIFFICULTIES:
                 if difficulty not in latest_review.retry_difficulties:
                     continue
                 state = states[difficulty]
                 _record_order_retry(state, latest_review, run_dir=run_dir)
-            for difficulty in DIFFICULTIES:
-                if difficulty not in latest_review.retry_difficulties:
-                    continue
-                state = states[difficulty]
                 state.pool.append(
                     _generate_next_pass(
                         state,
@@ -477,6 +474,12 @@ def run_generation(
                         base_seed=seed,
                     )
                 )
+                retry_selection = _select_earliest_monotonic(states)
+                if retry_selection is not None:
+                    break
+            if retry_selection is not None:
+                candidates, order_review = retry_selection
+                break
 
         raw_paths = _promote_key_mode(
             candidates,
