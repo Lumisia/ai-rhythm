@@ -451,33 +451,12 @@ def run_generation(
             selected = _select_earliest_monotonic(states)
             if selected is not None:
                 candidates, order_review = selected
-                if order_review.status == "REVIEW":
-                    raise WorkerError(
-                        ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-                        f"{key_mode}K difficulty order is ambiguous",
-                        context={
-                            "key_mode": key_mode,
-                            "reason": "DIFFICULTY_ORDER_AMBIGUOUS",
-                            "difficulty_order": order_review.to_report(),
-                            "selected_seeds": [candidate.seed for candidate in candidates],
-                        },
-                    )
                 break
 
             latest_candidates = tuple(
                 states[difficulty].pool[-1] for difficulty in DIFFICULTIES
             )
             latest_review = _review_candidates(latest_candidates)
-            if latest_review.status == "REVIEW":
-                raise WorkerError(
-                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-                    f"{key_mode}K difficulty order is ambiguous",
-                    context={
-                        "key_mode": key_mode,
-                        "reason": "DIFFICULTY_ORDER_AMBIGUOUS",
-                        "difficulty_order": latest_review.to_report(),
-                    },
-                )
             for difficulty in DIFFICULTIES:
                 if difficulty not in latest_review.retry_difficulties:
                     continue

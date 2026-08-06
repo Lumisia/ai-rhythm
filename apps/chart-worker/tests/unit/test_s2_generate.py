@@ -320,7 +320,7 @@ def test_difficulty_inversion_retries_only_pair_and_reuses_earliest_pass_candida
     )
 
 
-def test_equal_difficulty_profiles_stop_for_review_without_more_seeds(
+def test_equal_difficulty_profiles_publish_without_more_seeds(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
@@ -333,52 +333,77 @@ def test_equal_difficulty_profiles_stop_for_review_without_more_seeds(
     )
     generator = RecordingGenerator()
 
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    assert captured.value.context["reason"] == "DIFFICULTY_ORDER_AMBIGUOUS"
-    assert [request.seed for request in generator.map_calls] == [0, 1, 2, 3]
-    assert not any((tmp_path / "raw").glob("4k-*.osu"))
+    assert len(variants) == 12
+    assert [request.seed for request in generator.map_calls] == list(range(12))
+    assert variants[0].difficulty_order is not None
+    assert variants[0].difficulty_order.ambiguous_pairs == (
+        ("EASY", "NORMAL"),
+        ("NORMAL", "HARD"),
+        ("HARD", "EXPERT"),
+    )
+    assert len(list((tmp_path / "raw").glob("*k-*.osu"))) == 12
 
 
-def test_ambiguity_prevents_retrying_a_separate_inverted_pair(
+def test_ambiguity_does_not_prevent_retrying_a_separate_inverted_pair(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
     accepted = _pass_acceptance(authority)
 
-    def evaluate(*args, requested_difficulty, **kwargs):
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
         del args, kwargs
-        rating = {"EASY": 2.0, "NORMAL": 2.0, "HARD": 4.0, "EXPERT": 3.0}[
-            requested_difficulty
-        ]
+        if generated.seed in {2, 3}:
+            rating = {"HARD": 4.0, "EXPERT": 3.0}[requested_difficulty]
+        else:
+            rating = {"EASY": 2.0, "NORMAL": 2.0, "HARD": 3.0, "EXPERT": 4.0}[
+                requested_difficulty
+            ]
         return _acceptance_with_rating(accepted, rating)
 
     monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
     generator = RecordingGenerator()
 
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    assert captured.value.context["reason"] == "DIFFICULTY_ORDER_AMBIGUOUS"
-    assert [request.seed for request in generator.map_calls] == [0, 1, 2, 3]
+    assert len(variants) == 12
+    assert [request.seed for request in generator.map_calls] == [
+        0,
+        1,
+        2,
+        3,
+        14,
+        15,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+    ]
+    assert variants[0].difficulty_order is not None
+    assert variants[0].difficulty_order.ambiguous_pairs == (
+        ("EASY", "NORMAL"),
+        ("HARD", "EXPERT"),
+    )
 
 
 def test_persistent_inversion_exhausts_only_the_affected_label_budgets(
@@ -426,7 +451,7 @@ def test_persistent_inversion_exhausts_only_the_affected_label_budgets(
     assert not any((tmp_path / "raw").glob("4k-*.osu"))
 
 
-def test_earliest_ambiguous_pool_combination_is_not_skipped_for_later_pass(
+def test_earliest_ambiguous_pool_combination_is_published(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
@@ -451,23 +476,48 @@ def test_earliest_ambiguous_pool_combination_is_not_skipped_for_later_pass(
     monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
     generator = RecordingGenerator()
 
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
+    def evaluate_all_modes(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        rating = ratings.get(
+            (requested_difficulty, generated.seed),
+            {"EASY": 1.0, "NORMAL": 2.0, "HARD": 3.0, "EXPERT": 4.0}[
+                requested_difficulty
+            ],
         )
+        return _acceptance_with_rating(accepted, rating)
 
-    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    assert captured.value.context["selected_seeds"] == [0, 1, 2, 15]
-    assert captured.value.context["difficulty_order"]["ambiguousPairs"] == [
-        ["HARD", "EXPERT"]
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate_all_modes)
+
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert len(variants) == 12
+    assert [variant.selected_seed for variant in variants[:4]] == [0, 1, 2, 15]
+    assert variants[0].difficulty_order is not None
+    assert variants[0].difficulty_order.ambiguous_pairs == (("HARD", "EXPERT"),)
+    assert [request.seed for request in generator.map_calls] == [
+        0,
+        1,
+        2,
+        3,
+        14,
+        15,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
     ]
-    assert [request.seed for request in generator.map_calls] == [0, 1, 2, 3, 14, 15]
-    assert not any((tmp_path / "raw").glob("4k-*.osu"))
+    assert len(list((tmp_path / "raw").glob("4k-*.osu"))) == 4
 
 
 def test_run_generation_preserves_generator_osu_text(tmp_path: Path):

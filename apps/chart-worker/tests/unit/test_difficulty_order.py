@@ -32,12 +32,12 @@ def test_reports_only_the_inverted_adjacent_pair():
     assert review.retry_difficulties == frozenset({"HARD", "EXPERT"})
 
 
-def test_equal_profiles_require_review_not_arbitrary_relabel():
+def test_equal_profiles_pass_with_ambiguity_metadata():
     review = review_difficulty_order(
         {difficulty: _profile(2.0) for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")}
     )
 
-    assert review.status == "REVIEW"
+    assert review.status == "PASS"
     assert review.inverted_pairs == ()
     assert review.ambiguous_pairs == (
         ("EASY", "NORMAL"),
@@ -47,7 +47,7 @@ def test_equal_profiles_require_review_not_arbitrary_relabel():
     assert review.retry_difficulties == frozenset()
 
 
-def test_ambiguity_takes_precedence_over_a_separate_inversion():
+def test_separate_inversion_is_retried_while_ambiguity_is_preserved():
     review = review_difficulty_order(
         {
             "EASY": _profile(2.0),
@@ -57,10 +57,10 @@ def test_ambiguity_takes_precedence_over_a_separate_inversion():
         }
     )
 
-    assert review.status == "REVIEW"
+    assert review.status == "RETRY"
     assert review.ambiguous_pairs == (("EASY", "NORMAL"),)
     assert review.inverted_pairs == (("HARD", "EXPERT"),)
-    assert review.retry_difficulties == frozenset()
+    assert review.retry_difficulties == frozenset({"HARD", "EXPERT"})
 
 
 def test_monotonic_ratings_pass_and_serialize_in_label_order():

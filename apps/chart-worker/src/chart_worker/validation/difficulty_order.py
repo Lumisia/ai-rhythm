@@ -11,7 +11,7 @@ from chart_worker.schema.types import DIFFICULTIES
 
 @dataclass(frozen=True, slots=True)
 class DifficultyOrderReview:
-    status: Literal["PASS", "RETRY", "REVIEW"]
+    status: Literal["PASS", "RETRY"]
     ordered_ratings: tuple[tuple[str, float], ...]
     inverted_pairs: tuple[tuple[str, str], ...]
     ambiguous_pairs: tuple[tuple[str, str], ...]
@@ -48,11 +48,8 @@ def review_difficulty_order(
         elif harder_rating == easier_rating:
             ambiguous.append((easier, harder))
 
-    status: Literal["PASS", "RETRY", "REVIEW"]
-    if ambiguous:
-        status = "REVIEW"
-        retry_difficulties = frozenset()
-    elif inverted:
+    status: Literal["PASS", "RETRY"]
+    if inverted:
         status = "RETRY"
         retry_difficulties = frozenset(
             difficulty for pair in inverted for difficulty in pair
