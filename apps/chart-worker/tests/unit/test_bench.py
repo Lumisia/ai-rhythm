@@ -109,7 +109,7 @@ def test_benchmark_requires_review_when_timing_diagnostics_do(tmp_path: Path):
     assert not (output_dir / "benchmark-report.json").exists()
 
 
-def test_benchmark_requires_review_when_timing_diagnostics_are_insufficient(
+def test_benchmark_publishes_review_when_timing_diagnostics_are_insufficient(
     tmp_path: Path,
 ):
     source = tmp_path / "fixture.wav"
@@ -118,23 +118,24 @@ def test_benchmark_requires_review_when_timing_diagnostics_are_insufficient(
     analyzed = dependencies.analyze(Path("unused"))
 
     output_dir = tmp_path / "run"
-    with pytest.raises(WorkerError) as captured:
-        run_benchmark(
-            PipelineOptions(
-                source=source,
-                output_dir=output_dir,
-                title="fixture",
-                generator="fake",
-            ),
-            dependencies=replace(
-                dependencies,
-                analyze=lambda _path: replace(analyzed, onset_ms=()),
-            ),
-        )
+    result = run_benchmark(
+        PipelineOptions(
+            source=source,
+            output_dir=output_dir,
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(
+            dependencies,
+            analyze=lambda _path: replace(analyzed, onset_ms=()),
+        ),
+    )
 
     generation = json.loads((output_dir / "generation-report.json").read_text())
-    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    assert generation["publishable"] is False
-    assert generation["status"] == "REVIEW"
-    assert generation["error"]["context"]["gate_report"]["action"] == "REVIEW"
-    assert not (output_dir / "benchmark-report.json").exists()
+    assert generation["publishable"] is True
+    assert generation["status"] == "PASS"
+    assert generation["timingReviewRequired"] is True
+    assert all(chart["acceptanceStatus"] == "REVIEW" for chart in generation["charts"])
+    assert result.report.status == "REVIEW"
+    assert result.report_path == output_dir / "benchmark-report.json"
+    assert result.report_path.is_file()
