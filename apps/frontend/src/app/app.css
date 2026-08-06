@@ -1036,3 +1036,12 @@ button:disabled {
     transition-duration: 0.01ms !important;
   }
 }
+
+.approach-hint {
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.85em;
+}
+.approach-hint--ok { color: #5eead4; }
+.approach-hint--slow { color: #fde047; }
+.approach-hint--fast { color: #fb923c; }

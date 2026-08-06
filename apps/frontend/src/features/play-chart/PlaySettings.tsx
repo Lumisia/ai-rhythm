@@ -1,5 +1,19 @@
 import type { JudgmentPreset } from "../../game/core/types";
 
+/** IIDX 그린넘버 선호 대역 250~330 을 ms 로 옮긴 값.
+ *
+ * 그린넘버는 (노트가 보이는 프레임 수) × 10 이고 60fps 기준이다.
+ * 250 → 25프레임 → 417ms, 330 → 33프레임 → 550ms.
+ */
+const COMFORTABLE_MIN_MS = 417;
+const COMFORTABLE_MAX_MS = 550;
+
+function approachHint(approachMs: number): { label: string; tone: "ok" | "slow" | "fast" } {
+  if (approachMs > COMFORTABLE_MAX_MS) return { label: "느림", tone: "slow" };
+  if (approachMs < COMFORTABLE_MIN_MS) return { label: "빠름", tone: "fast" };
+  return { label: "권장", tone: "ok" };
+}
+
 export interface PlaySettingsValue {
   calibrationMs: number;
   scrollSpeed: number;
@@ -44,7 +58,18 @@ export function PlaySettings({
         <input max={4} min={0.6} onChange={(event) => update("scrollSpeed", event.currentTarget.valueAsNumber)} step={0.1} type="range" value={value.scrollSpeed} />
         {/* 배속보다 "노트가 몇 ms 흐르는가"가 실제로 읽는 값이다. */}
         <small>
-          {approachMsAt1x === null ? "시작 후 측정" : `${Math.round(approachMsAt1x / value.scrollSpeed)}ms`}
+          {approachMsAt1x === null
+            ? "시작 후 측정"
+            : (() => {
+                const approachMs = approachMsAt1x / value.scrollSpeed;
+                const hint = approachHint(approachMs);
+                return (
+                  <>
+                    {Math.round(approachMs)}ms{" "}
+                    <span className={`approach-hint approach-hint--${hint.tone}`}>{hint.label}</span>
+                  </>
+                );
+              })()}
         </small>
       </label>
       <label>
