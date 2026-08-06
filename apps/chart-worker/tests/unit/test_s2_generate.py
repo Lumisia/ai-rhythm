@@ -18,7 +18,7 @@ from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
 from chart_worker.validation.quality_gate import GateAction, evaluate_chart_candidate
 
 
-def _prepared(tmp_path: Path) -> PreparedAudio:
+def _prepared(tmp_path: Path, *, duration_ms: int = 2_000) -> PreparedAudio:
     audio_path = tmp_path / "audio" / "game.flac"
     audio_path.parent.mkdir(parents=True)
     audio_path.write_bytes(b"audio")
@@ -27,10 +27,10 @@ def _prepared(tmp_path: Path) -> PreparedAudio:
             audio_path,
             "audio-profile-v1",
             sha256_file(audio_path),
-            2_000,
+            duration_ms,
             48_000,
             2,
-            2_000,
+            duration_ms,
             0,
             0.0,
             -14.0,
@@ -851,6 +851,105 @@ def test_generated_structure_defects_exhaust_with_gate_evidence_before_stable_ra
         == ["STRUCTURE_INVALID"]
         for attempt in captured.value.context["attempts"]
     )
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
+def test_real_hold_overlap_retries_only_the_failed_variant(tmp_path: Path):
+    prepared = _prepared(tmp_path, duration_ms=150_000)
+    authority = _authority(prepared, tmp_path)
+
+    class FirstEasyAttemptHasObservedHoldOverlap(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if (
+                request.key_mode == 4
+                and request.difficulty == "EASY"
+                and request.seed == 0
+            ):
+                return GeneratedChart(
+                    notes=[
+                        NoteEvent(0, 0, kind="HOLD", duration_ms=134_204),
+                        NoteEvent(925, 0),
+                    ],
+                    key_mode=generated.key_mode,
+                    osu_text="",
+                    generator_name=generated.generator_name,
+                    seed=generated.seed,
+                    bpm_events=generated.bpm_events,
+                )
+            return generated
+
+    generator = FirstEasyAttemptHasObservedHoldOverlap()
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    easy_calls = [
+        call
+        for call in generator.map_calls
+        if call.key_mode == 4 and call.difficulty == "EASY"
+    ]
+    other_calls = [
+        call
+        for call in generator.map_calls
+        if not (call.key_mode == 4 and call.difficulty == "EASY")
+    ]
+    assert [call.seed for call in easy_calls] == [0, 12]
+    assert len(other_calls) == 11
+    assert len(variants) == 12
+    assert next(
+        variant
+        for variant in variants
+        if variant.key_mode == 4 and variant.difficulty == "EASY"
+    ).selected_seed == 12
+
+
+def test_observed_zero_ms_duplicates_exhaust_three_raw_attempts(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    monkeypatch.setattr(
+        s2_generate,
+        "evaluate_chart_candidate",
+        evaluate_chart_candidate,
+    )
+
+    class AlwaysDuplicatesAtZero(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            return GeneratedChart(
+                notes=[NoteEvent(0, 1), NoteEvent(0, 1)],
+                key_mode=generated.key_mode,
+                osu_text="",
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                bpm_events=generated.bpm_events,
+            )
+
+    generator = AlwaysDuplicatesAtZero()
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert [call.seed for call in generator.map_calls] == [0, 12, 24]
+    assert [attempt["workdir"] for attempt in captured.value.context["attempts"]] == [
+        "raw/work/4k-easy/attempt-1",
+        "raw/work/4k-easy/attempt-2",
+        "raw/work/4k-easy/attempt-3",
+    ]
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
