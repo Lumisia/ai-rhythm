@@ -17,7 +17,7 @@ REQUESTED_STAR: dict[str, float] = {
     "EASY": 1.0,
     "NORMAL": 1.5,
     "HARD": 2.0,
-    "EXPERT": 2.75,
+    "EXPERT": 3.0,
 }
 """기존 시험곡의 과생성을 반영한 직접 요청값.
 

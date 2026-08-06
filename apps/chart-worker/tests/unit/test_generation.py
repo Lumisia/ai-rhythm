@@ -79,7 +79,7 @@ def test_requested_stars_and_descriptors_are_explicit():
         "EASY": 1.0,
         "NORMAL": 1.5,
         "HARD": 2.0,
-        "EXPERT": 2.75,
+        "EXPERT": 3.0,
     }
     assert DESCRIPTORS == {
         "EASY": ("expression/simple",),
@@ -145,7 +145,7 @@ def test_map_command_requests_only_a_map_generation(config, tmp_path):
         "output_path": f"'{tmp_path.resolve()}'",
         "gamemode": "3",
         "keycount": "4",
-        "difficulty": "2.75",
+        "difficulty": "3.0",
         "year": "2023",
         "end_time": str(DURATION_MS),
         "cfg_scale": "1.0",
