@@ -43,6 +43,14 @@ const COMBO_PEAK_SIZE = 64;
 const COMBO_GOLD_FROM = 100;
 const GOLD = 0xfbbf24;
 
+/** rgba 문자열을 모듈 로드 시 한 번만 만든다.
+ *
+ * `Phaser.Display.Color.IntegerToColor()` 는 호출마다 `Color` 객체를 새로
+ * 할당한다. 매 프레임 부르면 그대로 GC 압력이 된다.
+ */
+const GOLD_RGBA = Phaser.Display.Color.IntegerToColor(GOLD).rgba;
+const INK_RGBA = Phaser.Display.Color.IntegerToColor(INK).rgba;
+
 interface ScopeMark {
   errMs: number;
   atMs: number;
@@ -122,6 +130,7 @@ export class HudRenderer implements EffectSubscriber {
   #statSignature = "";
   #comboPopAtMs = -Infinity;
   #lastCombo = 0;
+  #comboGold = false;
   #reduceMotion = false;
 
   constructor(scene: Phaser.Scene, options: HudRendererOptions) {
@@ -415,6 +424,7 @@ export class HudRenderer implements EffectSubscriber {
     const { combo } = this.#snapshot();
     if (combo < COMBO_MIN) {
       this.#lastCombo = 0;
+      this.#applyComboColor(false);
       return void this.#comboText.setVisible(false);
     }
 
@@ -426,16 +436,24 @@ export class HudRenderer implements EffectSubscriber {
         : 0;
     const size = Math.round(COMBO_BASE_SIZE + (COMBO_PEAK_SIZE - COMBO_BASE_SIZE) * pop);
 
+    this.#applyComboColor(combo >= COMBO_GOLD_FROM);
     this.#comboText
       .setVisible(true)
       .setAlpha(0.45)
       .setFontSize(size)
-      .setColor(
-        combo >= COMBO_GOLD_FROM
-          ? Phaser.Display.Color.IntegerToColor(GOLD).rgba
-          : Phaser.Display.Color.IntegerToColor(INK).rgba,
-      )
       .setText(String(combo));
+  }
+
+  /** 색이 실제로 바뀔 때만 setColor 를 부른다.
+   *
+   * `Text.setColor` 에는 동등성 가드가 없어서 값이 같아도 `updateText()` 로
+   * 캔버스를 통째로 다시 그린다. `setFontSize` 와 `setText` 는 내부 가드가
+   * 있어 매 프레임 불러도 안전하지만 색은 아니다.
+   */
+  #applyComboColor(gold: boolean): void {
+    if (gold === this.#comboGold) return;
+    this.#comboGold = gold;
+    this.#comboText.setColor(gold ? GOLD_RGBA : INK_RGBA);
   }
 
   #drawStats(songTimeMs: number): void {
