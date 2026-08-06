@@ -2,22 +2,25 @@
 
 Mapperatorinator V32로 4·6·7키 채보를 생성하고 브라우저에서 직접 연주하며
 검수하는 리듬게임 프로젝트다. 현재 기본 생성 방식은 Mapperatorinator의 timing과
-MAP을 그대로 내보내는 단일 후보 방식이다.
+공유 timing을 기준으로 MAP을 만들고, 구조 검증을 통과한 원본 노트를 그대로 내보내는
+선별 재시도 방식이다.
 
 ## 현재 생성 흐름
 
 ```text
 원본 오디오
   → 공유 FFmpeg로 game.flac 정규화
-  → Mapperatorinator V32 직접 추론 (4·6·7K × 4난이도, 각 1회)
-  → 원본 .osu의 timing·노트 파싱
+  → onset·활성도 분석과 곡 공통 timing authority 생성
+  → Mapperatorinator V32 MAP 추론 (4·6·7K × 4난이도)
+  → 구조·시간축·커버리지 검증과 필요한 조합만 선별 재시도
   → 노트 변경 없이 chart-v1과 검수 보고서 내보내기
 ```
 
-룰 기반 채보, Beat This timing 강제, super timing, 후보 재생성, 난이도 solver,
+룰 기반 채보, Beat This timing 강제, 난이도 solver,
 레인 재배치, 목표 롱노트 비율 보정과 Demucs 키음은 기본 생성 경로에서 사용하지
-않는다. librosa는 필요할 때 생성 뒤 실행하는 선택적 onset 진단일 뿐 채보를
-수정하지 않는다.
+않는다. Super Timing은 timing 구조 실패·tempo 증거 충돌처럼 필요한 경우에만 한 번
+사용하고, 명백한 MAP 결함이나 난이도 역전이 있는 조합만 최대 세 번까지 생성한다.
+librosa 분석은 검수 근거일 뿐 채보를 수정하지 않는다.
 
 ### 난이도 descriptor
 
@@ -25,10 +28,11 @@ MAP을 그대로 내보내는 단일 후보 방식이다.
 | --- | --- |
 | EASY | `expression/simple` |
 | NORMAL | `style/mixed rice` |
-| HARD | `style/generic hybrid` |
-| EXPERT | `tech/technical hybrid` |
+| HARD | `style/mixed rice` |
+| EXPERT | `style/mixed rice` |
 
-모든 조합은 `cfg_scale=1.0`, `output_type=[TIMING,MAP]`, `hitsounded=false`와
+timing 요청은 `output_type=[TIMING]`, MAP 요청은 `output_type=[MAP]`과
+`in_context=[TIMING]`을 사용한다. 모든 MAP은 `cfg_scale=1.0`, `hitsounded=false`와
 정규화 오디오의 `end_time`을 사용한다. 롱노트 비율은 강제하지 않는다. 로컬 RTX 2070 기본 정밀도는 `fp16`이며,
 지원 GPU를 쓰는 배포 환경은 `MAPPERATORINATOR_PRECISION=bf16`을 선택할 수 있다.
 
