@@ -411,7 +411,7 @@ def _write_generation_report(path: Path, report: dict[str, object]) -> None:
     temporary.replace(path)
 
 
-def _require_pass_acceptance(generated: tuple[GeneratedVariant, ...]) -> None:
+def _require_publishable_acceptance(generated: tuple[GeneratedVariant, ...]) -> None:
     rejected = [
         {
             "key_mode": variant.key_mode,
@@ -419,19 +419,12 @@ def _require_pass_acceptance(generated: tuple[GeneratedVariant, ...]) -> None:
             "gate_report": variant.acceptance.to_report(),
         }
         for variant in generated
-        if variant.acceptance.action is not GateAction.PASS
+        if variant.acceptance.action is GateAction.RETRY_MAP
     ]
     if not rejected:
         return
-    code = (
-        ErrorCode.CHART_CANDIDATES_EXHAUSTED
-        if any(
-            variant.acceptance.action is GateAction.RETRY_MAP for variant in generated
-        )
-        else ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    )
     raise WorkerError(
-        code,
+        ErrorCode.CHART_CANDIDATES_EXHAUSTED,
         "generation stage returned non-publishable chart candidates",
         context={"variants": rejected},
     )
@@ -497,7 +490,7 @@ def run_pipeline(
             generator,
             options.seed,
         )
-        _require_pass_acceptance(generated)
+        _require_publishable_acceptance(generated)
         difficulty_order_reports = _require_difficulty_order_reports(generated)
     except WorkerError as error:
         if error.code not in {

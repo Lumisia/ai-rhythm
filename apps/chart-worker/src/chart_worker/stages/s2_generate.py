@@ -223,18 +223,6 @@ def _generate_next_pass(
                 "workdir": workdir.relative_to(run_dir).as_posix(),
                 "gateReport": gate_report,
             }
-            if acceptance.action is GateAction.REVIEW:
-                raise WorkerError(
-                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-                    f"{state.key_mode}K {state.difficulty} requires timing review",
-                    context={
-                        "seed": attempt_seed,
-                        "workdir": evidence["workdir"],
-                        "key_mode": state.key_mode,
-                        "difficulty": state.difficulty,
-                        "gate_report": gate_report,
-                    },
-                )
             if acceptance.action is GateAction.RETRY_MAP:
                 state.attempt_evidence.append(evidence)
                 state.attempt_errors.append(

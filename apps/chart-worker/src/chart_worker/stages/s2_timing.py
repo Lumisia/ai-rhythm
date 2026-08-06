@@ -16,7 +16,21 @@ from chart_worker.validation.timing_authority import (
     validate_timing_events,
     validate_timing_identity,
 )
-from chart_worker.validation.timing_review import TimingAuthorityAction, review_timing_authority
+from chart_worker.validation.timing_review import (
+    TimingAuthorityAction,
+    TimingAuthorityReview,
+    review_timing_authority,
+)
+
+_SUPER_TIMING_REVIEW_REASONS = frozenset(
+    {"TEMPO_EVIDENCE_DISAGREES", "WEAK_BASE_TEMPO_SUPPORT"}
+)
+
+
+def _should_try_super_timing(review: TimingAuthorityReview) -> bool:
+    return review.action is TimingAuthorityAction.RETRY_TIMING or bool(
+        _SUPER_TIMING_REVIEW_REASONS.intersection(review.reasons)
+    )
 
 
 def _validate_candidate(generated: GeneratedTiming, prepared: PreparedAudio) -> None:
@@ -51,11 +65,7 @@ def run_timing_generation(
     generator: ChartGenerator,
     seed: int,
 ) -> SongTimingAuthority:
-    """Generate timing with one semantic Super Timing fallback.
-
-    It covers invalid timing structure/identity or a strongly corroborated
-    half/double tempo alternative.
-    """
+    """Generate one publishable timing authority with at most one Super fallback."""
     reference_path = run_dir / "audio" / "timing-reference.osu"
     errors: list[str] = []
     seeds: list[int] = []
@@ -85,7 +95,11 @@ def run_timing_generation(
                     "tempoMetrics": metrics.to_report(),
                 }
             )
-            if review.action is TimingAuthorityAction.PASS:
+            retry_with_super = not super_timing and _should_try_super_timing(review)
+            publishable_review = review.action is TimingAuthorityAction.REVIEW
+            if not retry_with_super and (
+                review.action is TimingAuthorityAction.PASS or publishable_review
+            ):
                 _promote(generated, prepared, reference_path)
         except TimingAuthorityValidationError as error:
             errors.append(str(error))
@@ -98,7 +112,10 @@ def run_timing_generation(
                 context={"errors": errors, "seeds": seeds},
             ) from error
 
-        if review.action is TimingAuthorityAction.PASS:
+        if review.action in {
+            TimingAuthorityAction.PASS,
+            TimingAuthorityAction.REVIEW,
+        } and not retry_with_super:
             return SongTimingAuthority(
                 reference_path=reference_path,
                 sha256=sha256_file(reference_path),
@@ -112,7 +129,7 @@ def run_timing_generation(
                 review=review,
             )
         reference_path.unlink(missing_ok=True)
-        if not super_timing and review.action is TimingAuthorityAction.RETRY_TIMING:
+        if retry_with_super:
             continue
         raise WorkerError(
             ErrorCode.CHART_TIMING_REVIEW_REQUIRED,

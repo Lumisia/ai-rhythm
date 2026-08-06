@@ -894,7 +894,7 @@ def test_retry_map_uses_next_seed_and_promotes_only_the_pass_candidate(
     )
 
 
-def test_review_quarantines_candidate_without_consuming_another_seed(
+def test_review_candidate_is_published_without_consuming_another_seed(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
@@ -903,7 +903,9 @@ def test_review_quarantines_candidate_without_consuming_another_seed(
     monkeypatch.setattr(
         s2_generate,
         "evaluate_chart_candidate",
-        lambda *args, **kwargs: review,
+        lambda *args, requested_difficulty, **kwargs: _acceptance_for_difficulty(
+            review, requested_difficulty
+        ),
     )
 
     class EvidenceGenerator(RecordingGenerator):
@@ -914,29 +916,22 @@ def test_review_quarantines_candidate_without_consuming_another_seed(
             return generated
 
     generator = EvidenceGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    assert [request.seed for request in generator.map_calls] == [0]
-    assert captured.value.context == {
-        "seed": 0,
-        "workdir": "raw/work/4k-easy/attempt-1",
-        "key_mode": 4,
-        "difficulty": "EASY",
-        "gate_report": review.to_report(),
-    }
+    assert len(variants) == 12
+    assert all(variant.acceptance.action is GateAction.REVIEW for variant in variants)
+    assert [request.seed for request in generator.map_calls] == list(range(12))
     assert (
         tmp_path / "raw" / "work" / "4k-easy" / "attempt-1" / "candidate.osu"
     ).is_file()
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    assert (tmp_path / "raw" / "4k-easy.osu").is_file()
 
 
 def test_three_retry_map_decisions_exhaust_with_structured_attempt_evidence(

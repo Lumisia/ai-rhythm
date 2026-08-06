@@ -378,24 +378,12 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
     assert not (output_dir / "playtest-run-v1.json").exists()
 
 
-@pytest.mark.parametrize(
-    ("action", "code", "status"),
-    [
-        (
-            GateAction.REVIEW,
-            ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-            "REVIEW",
-        ),
-        (
-            GateAction.RETRY_MAP,
-            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-            "EXHAUSTED",
-        ),
-    ],
-)
-def test_pipeline_rejects_non_pass_variants_returned_by_generation_stage(
-    action: GateAction, code: ErrorCode, status: str, tmp_path: Path
+def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
+    tmp_path: Path,
 ):
+    action = GateAction.RETRY_MAP
+    code = ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    status = "EXHAUSTED"
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     output_dir = tmp_path / "run"
@@ -467,6 +455,61 @@ def test_pipeline_rejects_non_pass_variants_returned_by_generation_stage(
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v1.json").exists()
+
+
+def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+    export_calls = []
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
+        variants = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+        )
+        first, *remaining = variants[0].acceptance.decisions
+        review = replace(
+            variants[0].acceptance,
+            action=GateAction.REVIEW,
+            decisions=(
+                replace(first, action=GateAction.REVIEW, reasons=("FIXTURE_REVIEW",)),
+                *remaining,
+            ),
+        )
+        return (replace(variants[0], acceptance=review), *variants[1:])
+
+    def export(prepared, generated, run_dir, worker_version):
+        export_calls.append(run_dir)
+        return dependencies.export(prepared, generated, run_dir, worker_version)
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=output_dir,
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(
+            dependencies,
+            generation=generation,
+            export=export,
+        ),
+    )
+
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    assert report["publishable"] is True
+    assert report["status"] == "PASS"
+    assert report["timingReviewRequired"] is True
+    assert report["charts"][0]["acceptanceStatus"] == "REVIEW"
+    assert "FIXTURE_REVIEW" in report["charts"][0]["acceptanceReasons"]
+    assert export_calls == [output_dir]
+    assert (output_dir / "playtest-run-v1.json").is_file()
 
 
 def test_generation_report_uses_recorded_acceptance_timing(tmp_path: Path):
@@ -697,27 +740,31 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
             ),
         )
 
-    with pytest.raises(WorkerError) as captured:
-        run_pipeline(
-            PipelineOptions(
-                source=source,
-                output_dir=tmp_path / "run",
-                title="fixture",
-                generator="fake",
-            ),
-            dependencies=replace(dependencies, analyze=analyze),
-        )
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, analyze=analyze),
+    )
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
-    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
-    assert report["publishable"] is False
-    assert report["status"] == "REVIEW"
-    gate_report = report["error"]["context"]["gate_report"]
-    assert gate_report["timing"]["activeOnsetCount"] == 0
-    assert "LOW_ACTIVE_ONSET_SUPPORT" in gate_report["decisions"][
-        "TIMING_ALIGNMENT"
-    ]["reasons"]
-    assert not (tmp_path / "run" / "charts").exists()
+    assert report["publishable"] is True
+    assert report["status"] == "PASS"
+    assert report["timingReviewRequired"] is True
+    assert len(report["charts"]) == 12
+    assert all(
+        chart["timingDiagnostics"]["activeOnsetCount"] == 0
+        for chart in report["charts"]
+    )
+    assert all(
+        "LOW_ACTIVE_ONSET_SUPPORT"
+        in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
+        for chart in report["charts"]
+    )
+    assert len(list((tmp_path / "run" / "charts").glob("*.json"))) == 12
 
 
 def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: Path):
