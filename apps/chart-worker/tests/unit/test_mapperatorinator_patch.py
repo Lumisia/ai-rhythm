@@ -56,7 +56,8 @@ def make_patch_set_fixture(
     _git(home, "config", "user.email", "chart-worker-tests@example.invalid")
     (home / "first.py").write_text("first-before\n", encoding="utf-8")
     (home / "second.py").write_text("second-before\n", encoding="utf-8")
-    _git(home, "add", "first.py", "second.py")
+    (home / "third.py").write_text("third-before\n", encoding="utf-8")
+    _git(home, "add", "first.py", "second.py", "third.py")
     _git(home, "commit", "-m", "fixture")
     head = _git(home, "rev-parse", "HEAD").stdout.strip()
 
@@ -64,6 +65,7 @@ def make_patch_set_fixture(
     for patch_id, filename, before, after in (
         ("first-v1", "first.py", "first-before", "first-after"),
         ("second-v1", "second.py", "second-before", "second-after"),
+        ("third-v1", "third.py", "third-before", "third-after"),
     ):
         patch = tmp_path / f"{patch_id}.patch"
         patch.write_text(
@@ -104,6 +106,7 @@ def test_required_patch_set_applies_every_patch(tmp_path: Path):
     assert required_patch_statuses(home, patches=patches, expected_head=head) == {
         "first-v1": "APPLICABLE",
         "second-v1": "APPLICABLE",
+        "third-v1": "APPLICABLE",
     }
     apply_required_mapperatorinator_patches(
         home,
@@ -114,20 +117,28 @@ def test_required_patch_set_applies_every_patch(tmp_path: Path):
     assert required_patch_statuses(home, patches=patches, expected_head=head) == {
         "first-v1": "APPLIED",
         "second-v1": "APPLIED",
+        "third-v1": "APPLIED",
     }
     assert (home / "first.py").read_text(encoding="utf-8") == "first-after\n"
     assert (home / "second.py").read_text(encoding="utf-8") == "second-after\n"
+    assert (home / "third.py").read_text(encoding="utf-8") == "third-after\n"
 
 
-def test_required_patch_set_rejects_a_partially_applied_checkout(tmp_path: Path):
+@pytest.mark.parametrize("missing_index", [1, 2])
+def test_required_patch_set_rejects_a_partially_applied_checkout(
+    tmp_path: Path,
+    missing_index: int,
+):
     home, head, patches = make_patch_set_fixture(tmp_path)
-    apply_mapperatorinator_patch(
-        home,
-        patch_path=patches[0][1],
-        expected_head=head,
-    )
+    for index, (_, patch) in enumerate(patches):
+        if index != missing_index:
+            apply_mapperatorinator_patch(
+                home,
+                patch_path=patch,
+                expected_head=head,
+            )
 
-    with pytest.raises(MapperatorinatorPatchError, match="second-v1"):
+    with pytest.raises(MapperatorinatorPatchError, match=patches[missing_index][0]):
         require_mapperatorinator_patch_set(
             home,
             patches=patches,

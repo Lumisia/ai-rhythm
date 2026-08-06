@@ -1,0 +1,216 @@
+diff --git a/inference.py b/inference.py
+--- a/inference.py
++++ b/inference.py
+@@ -533,29 +533,37 @@ def generate(
+             verbose=verbose,
+         )
+ 
+-        events, _ = reduce(merge_events, result)
++        events, event_times = reduce(merge_events, result)
+ 
+         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
+             timing = postprocessor.generate_timing(events)
+ 
+         # Resnap timing events
+         if args.resnap_events and timing is not None:
+-            events = postprocessor.resnap_events(events, timing)
++            events, event_times = postprocessor.resnap_events(
++                events,
++                event_times,
++                timing,
++            )
+     else:
+-        events = timing_events
++        events, event_times = timing_events, timing_times
+ 
+     # Generate positions with diffusion
+     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
+         diffusion_pipeline = DiffisionPipeline(args, diff_model, diff_tokenizer, refine_model)
+         events = diffusion_pipeline.generate(
+             events=events,
+             generation_config=generation_config,
+             timing=timing,
+             verbose=verbose,
+         )
++        # Diffusion may change the event stream. Preserve its previous token-derived
++        # timing behavior outside mania until it exposes matching event times.
++        event_times = None
+ 
+     result = postprocessor.generate(
+         events=events,
++        event_times=event_times,
+         beatmap_config=beatmap_config,
+         timing=timing,
+     )
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -146,6 +146,7 @@ class Postprocessor(object):
+             events: list[Event],
+             beatmap_config: BeatmapConfig,
+             timing: list[TimingPoint] = None,
++            event_times: list[int] = None,
+     ):
+         """Generate a beatmap file.
+ 
+@@ -154,6 +155,7 @@ class Postprocessor(object):
+             events: List of Event objects.
+             beatmap_config: BeatmapConfig object.
+             timing: List of TimingPoint objects.
++            event_times: Absolute timestamp for each event token.
+ 
+         Returns:
+             None. An .osu file will be generated.
+@@ -172,7 +174,14 @@ class Postprocessor(object):
+                 timedelta(milliseconds=self.offset), self.beat_length, 4, 2, -1, 100, None, False
+             )]
+ 
+-        groups, _ = get_groups(events, types_first=self.types_first)
++        if event_times is not None and len(events) != len(event_times):
++            raise ValueError("events and event_times must have equal length")
++
++        groups, _ = get_groups(
++            events,
++            event_times=event_times,
++            types_first=self.types_first,
++        )
+         last_x, last_y = 256, 192
+ 
+         if self.snap_near_perfect_overlaps_enabled:
+@@ -604,27 +613,45 @@ class Postprocessor(object):
+     def calc_length(self, sv, span_duration, redline, slider_multiplier):
+         return sv * span_duration * 100 / redline.ms_per_beat * slider_multiplier
+ 
+-    def resnap_events(self, events: list[Event], timing: list[TimingPoint]) -> list[Event]:
+-        """Resnap events to the designated beat snap divisors."""
++    def resnap_events(
++            self,
++            events: list[Event],
++            event_times: list[int],
++            timing: list[TimingPoint],
++    ) -> tuple[list[Event], list[int]]:
++        """Resnap events and their explicit times to the same beat ticks."""
++        if len(events) != len(event_times):
++            raise ValueError("events and event_times must have equal length")
++
+         timing = sort_timing_points(timing)
+         resnapped_events = []
++        snapped_by_time = {}
+         for i, event in enumerate(events):
+             if event.type != EventType.TIME_SHIFT:
+                 resnapped_events.append(event)
+                 continue
+ 
+-            time = event.value
++            original_time = event.value
++            time = original_time
+             snap_divisor = 0
+ 
+             if i + 1 < len(events) and events[i + 1].type == EventType.SNAPPING:
+                 snap_divisor = events[i + 1].value
+ 
+             if snap_divisor > 0:
+                 time = int(self.resnap(time, timing, snap_divisor))
+ 
++            previous = snapped_by_time.setdefault(original_time, time)
++            if previous != time:
++                raise ValueError(
++                    f"conflicting snap targets at {original_time}ms: {previous} and {time}"
++                )
+             resnapped_events.append(Event(EventType.TIME_SHIFT, time))
+ 
+-        return resnapped_events
++        return (
++            resnapped_events,
++            [snapped_by_time.get(time, time) for time in event_times],
++        )
+ 
+     def resnap(self, time: float, timing: list[TimingPoint], snap_divisor: int) -> float:
+         """Resnap a time to the nearest beat divisor."""
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mania_event_times.py
+@@ -0,0 +1,82 @@
++from datetime import timedelta
++from types import SimpleNamespace
++
++from slider import TimingPoint
++
++from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.postprocessor import BeatmapConfig, Postprocessor
++
++
++def make_postprocessor() -> Postprocessor:
++    args = SimpleNamespace(
++        offset=0,
++        bpm=120,
++        timing_leniency=0,
++        train=SimpleNamespace(data=SimpleNamespace(
++            types_first=False,
++            add_positions=True,
++            mania_bpm_normalized_scroll_speed=False,
++            add_sv=False,
++        )),
++        start_time=None,
++        end_time=3_000,
++        snap_near_perfect_overlaps=False,
++    )
++    return Postprocessor(args)
++
++
++def make_timing() -> list[TimingPoint]:
++    return [TimingPoint(
++        timedelta(milliseconds=0),
++        500,
++        4,
++        2,
++        -1,
++        100,
++        None,
++        False,
++    )]
++
++
++def test_explicit_event_times_preserve_a_same_timestamp_second_group():
++    events = [
++        Event(EventType.TIME_SHIFT, 1_000),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 2_000),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    result = make_postprocessor().generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++        event_times=[1_000] * 7 + [2_000] * 4,
++    )
++
++    assert "192,192,1000,128,0,2000:0:0:-1:0:" in result
++    assert "192,192,0,128" not in result
++
++
++def test_resnap_updates_event_tokens_and_explicit_times_together():
++    events = [
++        Event(EventType.TIME_SHIFT, 110),
++        Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++
++    snapped_events, snapped_times = make_postprocessor().resnap_events(
++        events,
++        [110, 110, 110, 110, 110],
++        make_timing(),
++    )
++
++    assert snapped_events[0].value == 125
++    assert snapped_times == [125, 125, 125, 125, 125]

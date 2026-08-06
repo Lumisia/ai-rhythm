@@ -10,7 +10,10 @@ from typing import Literal
 EXPECTED_MAPPERATORINATOR_HEAD = "2a70eb89004da20e39b0fcbaad2686b264d5a040"
 KEYCOUNT_PATCH_ID = "mania-keycount-v1"
 OUTPUT_SAFETY_PATCH_ID = "mania-output-safety-v1"
-CONSTRAINT_PATCH_ID = f"{KEYCOUNT_PATCH_ID}+{OUTPUT_SAFETY_PATCH_ID}"
+EVENT_TIMES_PATCH_ID = "mania-event-times-v1"
+CONSTRAINT_PATCH_ID = (
+    f"{KEYCOUNT_PATCH_ID}+{OUTPUT_SAFETY_PATCH_ID}+{EVENT_TIMES_PATCH_ID}"
+)
 DEFAULT_PATCH_PATH = (
     Path(__file__).resolve().parents[3]
     / "patches"
@@ -21,9 +24,15 @@ OUTPUT_SAFETY_PATCH_PATH = (
     / "patches"
     / "mapperatorinator-v32-output-safety.patch"
 )
+EVENT_TIMES_PATCH_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "patches"
+    / "mapperatorinator-v32-event-times.patch"
+)
 REQUIRED_PATCHES = (
     (KEYCOUNT_PATCH_ID, DEFAULT_PATCH_PATH),
     (OUTPUT_SAFETY_PATCH_ID, OUTPUT_SAFETY_PATCH_PATH),
+    (EVENT_TIMES_PATCH_ID, EVENT_TIMES_PATCH_PATH),
 )
 
 PatchStatus = Literal["APPLIED", "APPLICABLE"]

@@ -911,7 +911,7 @@ def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: P
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
     assert (
         report["mapperatorinatorConstraintPatch"]
-        == "mania-keycount-v1+mania-output-safety-v1"
+        == "mania-keycount-v1+mania-output-safety-v1+mania-event-times-v1"
     )
 
 
