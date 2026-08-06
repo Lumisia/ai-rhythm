@@ -3,6 +3,7 @@ import Phaser from "phaser";
 import type { LaneGeometry } from "../core/LaneLayout";
 import type { ChartNote } from "../core/types";
 import { NoteTimeline } from "../core/NoteTimeline";
+import { DEPTH } from "./renderDepth";
 
 export interface NoteRendererOptions {
   width: number;
@@ -28,7 +29,7 @@ export class NoteRenderer {
     lanes: readonly LaneGeometry[],
     options: NoteRendererOptions,
   ) {
-    this.#graphics = scene.add.graphics().setDepth(10);
+    this.#graphics = scene.add.graphics().setDepth(DEPTH.NOTE);
     this.#timeline = timeline;
     this.#lanes = lanes;
     this.#width = options.width;

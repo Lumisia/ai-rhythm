@@ -1,6 +1,7 @@
 import Phaser from "phaser";
 
 import type { LaneGeometry, StageGeometry } from "../core/LaneLayout";
+import { DEPTH } from "./renderDepth";
 
 const HAIRLINE = 0x31364d;
 const ACCENT = 0x5eead4;
@@ -33,8 +34,8 @@ export class StageRenderer {
     private judgeLineY: number,
     keyLabels: readonly string[],
   ) {
-    this.#background = scene.add.graphics().setDepth(0);
-    this.#receptors = scene.add.graphics().setDepth(2);
+    this.#background = scene.add.graphics().setDepth(DEPTH.STAGE_BACKGROUND);
+    this.#receptors = scene.add.graphics().setDepth(DEPTH.LANE_HIGHLIGHT);
     for (const label of keyLabels) {
       this.#keyTexts.push(
         scene.add
@@ -43,7 +44,7 @@ export class StageRenderer {
             fontSize: "12px",
             color: "#c5cbea",
           })
-          .setDepth(3)
+          .setDepth(DEPTH.KEY_LABEL)
           .setOrigin(0.5, 0),
       );
     }

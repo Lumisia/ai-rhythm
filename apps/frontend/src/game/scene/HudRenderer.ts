@@ -4,6 +4,7 @@ import type { JudgmentEvent } from "../core/JudgmentEngine";
 import type { StageGeometry } from "../core/LaneLayout";
 import type { ScoreSnapshot } from "../core/ScoreCalculator";
 import type { JudgmentName, JudgmentWindows } from "../core/types";
+import { DEPTH } from "./renderDepth";
 
 /** 계기판 색. app.css 의 CSS 변수와 같은 값을 쓴다. */
 const INK = 0xe8ecf8;
@@ -118,21 +119,21 @@ export class HudRenderer {
     this.#beatMs = options.beatMs;
     this.#snapshot = options.snapshot;
 
-    this.#graphics = scene.add.graphics().setDepth(20);
-    this.#scoreText = this.#text(DISPLAY, 26, INK).setDepth(24);
-    this.#scoreLabel = this.#text(MONO, 9, MUTED).setDepth(24);
-    this.#accuracyText = this.#text(DISPLAY, 26, INK).setDepth(24);
-    this.#accuracyLabel = this.#text(MONO, 9, MUTED).setDepth(24);
-    this.#maxComboText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(1, 0);
-    this.#maxComboLabel = this.#text(MONO, 9, MUTED).setDepth(24).setOrigin(1, 0);
-    this.#leftText = this.#text(MONO, 11, MUTED).setDepth(24);
-    this.#countsText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(1, 0);
-    this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(0.5, 0.5);
-    this.#errorText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(0.5, 0);
-    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(23).setOrigin(0.5, 0.5);
-    this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(24).setOrigin(0.5, 0);
-    this.#markerText = this.#text(MONO, 11, CORAL).setDepth(24).setOrigin(1, 0);
-    this.#countdownText = this.#text(DISPLAY, 84, ACCENT).setDepth(25).setOrigin(0.5, 0.5);
+    this.#graphics = scene.add.graphics().setDepth(DEPTH.HUD_GRAPHICS);
+    this.#scoreText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT);
+    this.#scoreLabel = this.#text(MONO, 9, MUTED).setDepth(DEPTH.HUD_TEXT);
+    this.#accuracyText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT);
+    this.#accuracyLabel = this.#text(MONO, 9, MUTED).setDepth(DEPTH.HUD_TEXT);
+    this.#maxComboText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#maxComboLabel = this.#text(MONO, 9, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#leftText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT);
+    this.#countsText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0.5);
+    this.#errorText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0);
+    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(DEPTH.HUD_TEXT - 1).setOrigin(0.5, 0.5);
+    this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0);
+    this.#markerText = this.#text(MONO, 11, CORAL).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#countdownText = this.#text(DISPLAY, 84, ACCENT).setDepth(DEPTH.OVERLAY).setOrigin(0.5, 0.5);
     this.#layout();
   }
 
