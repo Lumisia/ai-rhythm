@@ -12,8 +12,9 @@ Mapperatorinator V32로 4·6·7키 채보를 생성하고 브라우저에서 직
   → 공유 FFmpeg로 game.flac 정규화
   → onset·활성도 분석과 곡 공통 timing authority 생성
   → Mapperatorinator V32 MAP 추론 (4·6·7K × 4난이도)
+  → 최대 10ms 종료 경계 오차를 canonical 오디오 안으로 정규화
   → 구조·시간축·커버리지 검증과 필요한 조합만 선별 재시도
-  → 노트 변경 없이 chart-v1과 검수 보고서 내보내기
+  → 그 밖의 노트 변경 없이 chart-v1과 검수 보고서 내보내기
 ```
 
 룰 기반 채보, Beat This timing 강제, 난이도 solver,
@@ -28,8 +29,8 @@ librosa 분석은 검수 근거일 뿐 채보를 수정하지 않는다.
 | --- | --- |
 | EASY | `expression/simple` |
 | NORMAL | `style/mixed rice` |
-| HARD | `style/mixed rice` |
-| EXPERT | `style/mixed rice` |
+| HARD | `style/mixed rice`, `streams/bursts` |
+| EXPERT | `style/mixed rice`, `skillset/streams`, `skillset/tech` |
 
 timing 요청은 `output_type=[TIMING]`, MAP 요청은 `output_type=[MAP]`과
 `in_context=[TIMING]`을 사용한다. 모든 MAP은 `cfg_scale=1.0`, `hitsounded=false`와

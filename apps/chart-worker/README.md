@@ -19,17 +19,18 @@ tempo 대안이 강하게 지지되거나 진단 증거가 충돌·약화될 때
 명확한 `RETRY_MAP`만 다음 seed를 소비하며, 한 조합당 총 세 번까지 시도한다. 약하거나
 모호한 근거인 `REVIEW`는 새 seed를 소비하지 않고 경고와 함께 발행한다. 이미 성공한 조합은
 다시 만들지 않는다. 12개가 모두 만들어지면 키 모드별 측정 난이도가
-`EASY < NORMAL < HARD < EXPERT`인지 상대 순서만 검사한다. 뒤 라벨의 반올림된
+`EASY <= NORMAL <= HARD <= EXPERT`인지 상대 순서만 검사한다. 뒤 라벨의 반올림된
 측정값이 조금이라도 낮은 엄격한 역전이면 그 인접 쌍을 다른 seed로 선택 재생성하고,
-동일값처럼 우열 근거가 모호하면 `ambiguousPairs` 경고만 남긴다. 절대 난이도 라벨이나
+유효 후보가 추가될 때마다 기존 후보 조합을 즉시 다시 검사한다. 동일값처럼 우열 근거가
+모호하면 `ambiguousPairs` 경고만 남긴다. 절대 난이도 라벨이나
 사용자의 체감 난이도는 자동 보정하지 않는다.
 
 | 난이도 | 요청 별 | descriptor |
 | --- | ---: | --- |
 | EASY | 1.0 | `expression/simple` |
 | NORMAL | 1.5 | `style/mixed rice` |
-| HARD | 2.0 | `style/mixed rice` |
-| EXPERT | 2.75 | `style/mixed rice` |
+| HARD | 2.0 | `style/mixed rice`, `streams/bursts` |
+| EXPERT | 2.75 | `style/mixed rice`, `skillset/streams`, `skillset/tech` |
 
 timing 요청은 `output_type=[TIMING]`이고, MAP 요청은 `output_type=[MAP]`,
 `beatmap_path=audio/timing-reference.osu`, `in_context=[TIMING]`을 사용한다. MAP의 공통
@@ -41,13 +42,16 @@ timing 요청은 `output_type=[TIMING]`이고, MAP 요청은 `output_type=[MAP]`
 각 MAP 시도 직전에 timing reference SHA-256과 canonical audio SHA-256 identity를
 검사한다. 생성된 MAP의 BPM event가 reference와 하나라도 다르면 그 MAP만 재시도하고
 안정 경로로 승격하지 않는다. BPM event나 노트 시각·레인·종류·HOLD 길이를 reference에
-맞추기 위해 재작성하지 않는다. timing authority 검토는 full-beat 기준의 base·half·double
+맞추기 위해 재작성하지 않는다. 단, 최대 10ms 종료 경계 정규화는 구조 검증 전에
+Mapperatorinator 어댑터에서 수행한다. timing authority 검토는 full-beat 기준의 base·half·double
 pulse 증거와 onset-envelope autocorrelation이 같은 대안을 지지하는지 확인한다. 노트 행의
 grid subdivision 정렬은 이 tempo 검토와 별개의 검증 신호다.
 
 `end_time`에는 정규화 오디오 길이를 전달한다. Mapperatorinator가 패딩 구간에
 오디오 밖 노트를 만드는 것을 모델 자체 크롭 단계에서 막고, 내보내기 단계는
-그 결과를 다시 수정하지 않는다. Hydra 실행 로그도 각 조합 출력의 `.hydra-run`
+그 결과 중 오디오 종료를 최대 10ms 초과한 TAP은 제거하고 HOLD 종료는 canonical
+길이로 맞춘다. 10ms를 넘는 초과는 수정하지 않고 구조 오류로 재시도한다. 이 경계
+정규화 외에는 결과를 다시 수정하지 않는다. Hydra 실행 로그도 각 조합 출력의 `.hydra-run`
 아래에 두므로 Mapperatorinator 체크아웃이 읽기 전용이어도 실행할 수 있다.
 
 ## 실제 Mapperatorinator 실행 준비
