@@ -142,23 +142,46 @@ def test_shortfall_is_reported_on_peaky_material(config, paths):
     assert result.shortfall_lu == pytest.approx(10.14)
 
 
-def test_rejects_an_input_longer_than_the_defence_line(config, paths):
+def test_accepts_exactly_ten_minutes_as_audio_profile_v2(config, paths):
     source, target = paths
-    long_source = _probe_json(duration_ts=48_000 * 601)
-    fake = FakeFfmpeg(source_json=long_source)
+    ten_minutes = _probe_json(duration_ts=48_000 * 600)
+
+    result = normalize_audio(
+        source,
+        target,
+        config=config,
+        run=FakeFfmpeg(source_json=ten_minutes, target_json=ten_minutes),
+    )
+
+    assert result.source_duration_ms == 600_000
+    assert result.duration_ms == 600_000
+    assert result.profile_version == "audio-profile-v2"
+
+
+def test_rejects_input_one_millisecond_over_ten_minutes(config, paths):
+    source, target = paths
+    too_long = _probe_json(duration_ts=48_000 * 600 + 48)
+    fake = FakeFfmpeg(source_json=too_long)
     with pytest.raises(WorkerError) as caught:
         normalize_audio(source, target, config=config, run=fake)
     assert caught.value.code is ErrorCode.AUDIO_TOO_LONG
+    assert caught.value.context["duration_ms"] == 600_001
+    assert caught.value.context["limit_ms"] == 600_000
     assert source.exists(), "입력 파일은 우리 것이 아니다"
     assert [argv for argv in fake.calls if fake._stage(argv) == "measure"] == []
 
 
-def test_rejects_output_longer_than_the_profile_limit_and_removes_it(config, paths):
+def test_rejects_output_one_millisecond_over_ten_minutes_and_removes_it(
+    config, paths
+):
     source, target = paths
-    fake = FakeFfmpeg(target_json=_probe_json(duration_ts=48_000 * 185))
+    too_long = _probe_json(duration_ts=48_000 * 600 + 48)
+    fake = FakeFfmpeg(target_json=too_long)
     with pytest.raises(WorkerError) as caught:
         normalize_audio(source, target, config=config, run=fake)
     assert caught.value.code is ErrorCode.AUDIO_TOO_LONG
+    assert caught.value.context["duration_ms"] == 600_001
+    assert caught.value.context["limit_ms"] == 600_000
     assert not target.exists(), "남겨두면 다음 실행이 유효한 산출물로 오인한다"
 
 

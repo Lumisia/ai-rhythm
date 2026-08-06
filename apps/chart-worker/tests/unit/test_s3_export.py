@@ -18,7 +18,7 @@ def _prepared(tmp_path: Path) -> PreparedAudio:
     return PreparedAudio(
         normalized=NormalizedAudio(
             path=audio_path,
-            profile_version="audio-profile-v1",
+            profile_version="audio-profile-v2",
             sha256=SHA,
             duration_ms=4_000,
             sample_rate_hz=48_000,

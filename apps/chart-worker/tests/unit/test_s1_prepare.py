@@ -18,7 +18,7 @@ def test_prepare_only_normalizes_the_source_audio(tmp_path: Path):
         target_path.write_bytes(b"normalized")
         return NormalizedAudio(
             path=target_path,
-            profile_version="audio-profile-v1",
+            profile_version="audio-profile-v2",
             sha256=SHA,
             duration_ms=2_000,
             sample_rate_hz=48_000,

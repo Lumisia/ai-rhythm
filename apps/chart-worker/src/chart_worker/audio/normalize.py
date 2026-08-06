@@ -1,4 +1,4 @@
-"""audio-profile-v1 표준화 — 단계 조립.
+"""Canonical audio profile 표준화 — 단계 조립.
 
 프로브 -> 측정 -> 게인 계산 -> 인코딩 -> 결과 검증 순서로 돈다.
 각 단계의 실패를 Phase5 §1 오류 코드로 옮긴다.
@@ -104,7 +104,7 @@ def normalize_audio(
     config: WorkerConfig,
     run: RunCommand | None = None,
 ) -> NormalizedAudio:
-    """원본 오디오를 audio-profile-v1 FLAC 으로 굳힌다."""
+    """원본 오디오를 현재 canonical profile의 FLAC으로 굳힌다."""
     if _same_file(source, target):
         # 실패 경로가 target 을 지운다. 같은 경로면 그게 원본이다.
         raise ValueError(f"source and target are the same file: {source}")
