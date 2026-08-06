@@ -141,7 +141,7 @@ def _command_prefix(config: WorkerConfig, output_dir: Path) -> list[str]:
 def _common_generation_arguments(
     config: WorkerConfig,
     audio_path: Path,
-    duration_ms: int,
+    end_time_ms: int,
     year: int,
     output_dir: Path,
 ) -> list[str]:
@@ -151,7 +151,7 @@ def _common_generation_arguments(
         f"output_path={_hydra_path(output_dir)}",
         f"gamemode={GAMEMODE_MANIA}",
         f"year={year}",
-        f"end_time={duration_ms}",
+        f"end_time={end_time_ms}",
         f"precision={config.mapperatorinator_precision or PRECISION}",
         "export_osz=false",
         "hitsounded=false",
@@ -192,7 +192,7 @@ def build_map_command(
     argv = _common_generation_arguments(
         config,
         request.audio_path,
-        request.duration_ms,
+        request.partial_end_ms or request.duration_ms,
         request.year,
         output_dir,
     )
@@ -208,6 +208,13 @@ def build_map_command(
             "super_timing=false",
         ]
     )
+    if request.partial_start_ms is not None:
+        argv.extend(
+            [
+                f"start_time={request.partial_start_ms}",
+                "add_to_beatmap=true",
+            ]
+        )
     if request.seed is not None:
         argv.append(f"seed={request.seed}")
     return argv

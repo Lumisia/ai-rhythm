@@ -123,6 +123,43 @@ def test_map_command_reuses_the_timing_reference(config, tmp_path):
     assert "TIMING" not in pairs["output_type"]
 
 
+def test_partial_map_command_replaces_only_the_requested_window(config, tmp_path):
+    reference = tmp_path / "candidate.osu"
+    request = _request(
+        timing_reference_path=reference,
+        partial_start_ms=4_000,
+        partial_end_ms=12_000,
+        add_to_beatmap=True,
+    )
+
+    pairs = _pairs(build_map_command(config, request, tmp_path / "partial"))
+
+    assert pairs["beatmap_path"] == f"'{reference.resolve()}'"
+    assert pairs["start_time"] == "4000"
+    assert pairs["end_time"] == "12000"
+    assert pairs["add_to_beatmap"] == "true"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"partial_start_ms": 4_000},
+        {"partial_end_ms": 12_000},
+        {"partial_start_ms": 12_000, "partial_end_ms": 4_000},
+        {"partial_start_ms": -1, "partial_end_ms": 4_000},
+        {"partial_start_ms": 4_000, "partial_end_ms": DURATION_MS + 1},
+        {
+            "partial_start_ms": 4_000,
+            "partial_end_ms": 12_000,
+            "add_to_beatmap": False,
+        },
+    ],
+)
+def test_partial_map_request_rejects_incomplete_or_unsafe_ranges(overrides):
+    with pytest.raises(ValueError, match="partial|add_to_beatmap"):
+        _request(**overrides)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

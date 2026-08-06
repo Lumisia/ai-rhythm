@@ -63,18 +63,46 @@ class GenerationRequest:
     descriptors: tuple[str, ...] = ()
     requested_star: float = field(default=0.0)
     duration_ms: int = 0
+    partial_start_ms: int | None = None
+    partial_end_ms: int | None = None
+    add_to_beatmap: bool = False
     """표준화 단계가 이미 재놨다. fake 생성기와 start/end 지정에 쓴다."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "key_mode", coerce_int(self.key_mode, "key_mode"))
         object.__setattr__(self, "year", coerce_int(self.year, "year"))
         object.__setattr__(self, "duration_ms", coerce_int(self.duration_ms, "duration_ms"))
+        if self.partial_start_ms is not None:
+            object.__setattr__(
+                self,
+                "partial_start_ms",
+                coerce_int(self.partial_start_ms, "partial_start_ms"),
+            )
+        if self.partial_end_ms is not None:
+            object.__setattr__(
+                self,
+                "partial_end_ms",
+                coerce_int(self.partial_end_ms, "partial_end_ms"),
+            )
         if self.key_mode not in KEY_MODES:
             raise ValueError(f"unsupported key_mode: {self.key_mode}")
         if self.difficulty not in DIFFICULTIES:
             raise ValueError(f"unsupported difficulty: {self.difficulty}")
         if self.duration_ms <= 0:
             raise ValueError("duration_ms must be positive")
+        partial_values = (self.partial_start_ms, self.partial_end_ms)
+        if (partial_values[0] is None) != (partial_values[1] is None):
+            raise ValueError("partial start and end must be provided together")
+        if partial_values[0] is not None:
+            start_ms = partial_values[0]
+            end_ms = partial_values[1]
+            assert end_ms is not None
+            if not 0 <= start_ms < end_ms <= self.duration_ms:
+                raise ValueError("partial range must be within canonical audio duration")
+            if not self.add_to_beatmap:
+                raise ValueError("partial generation requires add_to_beatmap")
+        elif self.add_to_beatmap:
+            raise ValueError("add_to_beatmap requires a partial range")
         if not YEAR_RANGE[0] <= self.year <= YEAR_RANGE[1]:
             raise ValueError(f"year must be within {YEAR_RANGE}, got {self.year}")
 
