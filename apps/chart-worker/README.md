@@ -18,7 +18,10 @@ tempo 대안이 강하게 지지되거나 진단 증거가 충돌·약화될 때
 `RETRY_MAP > REVIEW > PASS`다. 구조 오류나 충분한 근거가 함께 있는 MAP 결함처럼
 명확한 `RETRY_MAP`만 다음 seed를 소비하며, 한 조합당 총 세 번까지 시도한다. 약하거나
 모호한 근거인 `REVIEW`는 새 seed를 소비하지 않고 경고와 함께 발행한다. 이미 성공한 조합은
-다시 만들지 않는다. 12개가 모두 만들어지면 키 모드별 측정 난이도가
+다시 만들지 않는다. 세 seed가 모두 소진된 조합은 다른 조합을 중단시키지 않는다. 활성
+coverage 누락만 있는 후보는 HOLD 경계를 보존한 좁은 구간을 한 번 부분 재생성하고,
+마지막 누락 조합은 공통 timing·onset·활성도 기반 안전 복구로 채운 뒤 동일 게이트를 다시
+적용한다. 12개가 모두 만들어지면 키 모드별 측정 난이도가
 `EASY <= NORMAL <= HARD <= EXPERT`인지 상대 순서만 검사한다. 뒤 라벨의 반올림된
 측정값이 조금이라도 낮은 엄격한 역전이면 그 인접 쌍을 다른 seed로 선택 재생성하고,
 유효 후보가 추가될 때마다 기존 후보 조합을 즉시 다시 검사한다. 동일값처럼 우열 근거가
@@ -30,7 +33,7 @@ tempo 대안이 강하게 지지되거나 진단 증거가 충돌·약화될 때
 | EASY | 1.0 | `expression/simple` |
 | NORMAL | 1.5 | `style/mixed rice` |
 | HARD | 2.0 | `style/mixed rice`, `streams/bursts` |
-| EXPERT | 2.75 | `style/mixed rice`, `skillset/streams`, `skillset/tech` |
+| EXPERT | 3.0 | `style/mixed rice`, `skillset/streams`, `skillset/tech` |
 
 timing 요청은 `output_type=[TIMING]`이고, MAP 요청은 `output_type=[MAP]`,
 `beatmap_path=audio/timing-reference.osu`, `in_context=[TIMING]`을 사용한다. MAP의 공통
