@@ -35,6 +35,14 @@ const COMBO_MIN = 5;
 const COUNTDOWN_LEAD_MS = 3200;
 const GUTTER_PADDING = 18;
 
+/** 마일스톤에서만 반응한다. 매 콤보마다 움직이면 활주로가 계속 흔들린다. */
+const COMBO_MILESTONES = [25, 50, 100, 200, 500];
+const COMBO_POP_MS = 140;
+const COMBO_BASE_SIZE = 54;
+const COMBO_PEAK_SIZE = 64;
+const COMBO_GOLD_FROM = 100;
+const GOLD = 0xfbbf24;
+
 interface ScopeMark {
   errMs: number;
   atMs: number;
@@ -112,6 +120,9 @@ export class HudRenderer implements EffectSubscriber {
   } | null = null;
   #markerShownAtMs = -Infinity;
   #statSignature = "";
+  #comboPopAtMs = -Infinity;
+  #lastCombo = 0;
+  #reduceMotion = false;
 
   constructor(scene: Phaser.Scene, options: HudRendererOptions) {
     this.#scene = scene;
@@ -151,11 +162,33 @@ export class HudRenderer implements EffectSubscriber {
         { judgment: event.judgment, errMs: event.errMs, phase: event.phase },
         event.songTimeMs,
       );
+      this.#noticeCombo(event.combo, event.songTimeMs);
+      return;
+    }
+    if (event.type === "HOLD_TICK") {
+      this.#noticeCombo(event.combo, event.songTimeMs);
       return;
     }
     if (event.type === "MARKER") {
       this.acceptMarker(event.label, event.songTimeMs);
     }
+  }
+
+  /** 마일스톤을 넘어섰는지 본다.
+   *
+   * FEVER 증폭으로 콤보가 2씩 오르면 마일스톤을 정확히 밟지 않고 건너뛴다.
+   * 등호가 아니라 구간 통과로 판정해야 한다.
+   */
+  #noticeCombo(combo: number, songTimeMs: number): void {
+    const crossed = COMBO_MILESTONES.some(
+      (milestone) => this.#lastCombo < milestone && combo >= milestone,
+    );
+    this.#lastCombo = combo;
+    if (crossed && !this.#reduceMotion) this.#comboPopAtMs = songTimeMs;
+  }
+
+  setReduceMotion(reduce: boolean): void {
+    this.#reduceMotion = reduce;
   }
 
   acceptJudgment(event: HudJudgment, songTimeMs: number): void {
@@ -184,7 +217,7 @@ export class HudRenderer implements EffectSubscriber {
     this.#drawProgressRail(songTimeMs);
     this.#drawScope(songTimeMs);
     this.#drawJudgment(songTimeMs);
-    this.#drawCombo();
+    this.#drawCombo(songTimeMs);
     this.#drawStats(songTimeMs);
     this.#drawCountdown(songTimeMs);
     this.#markerText.setAlpha(
@@ -378,10 +411,31 @@ export class HudRenderer implements EffectSubscriber {
       .setText(`${sign}${Math.abs(last.errMs).toFixed(0)}ms ${last.errMs >= 0 ? "LATE" : "EARLY"}`);
   }
 
-  #drawCombo(): void {
+  #drawCombo(songTimeMs: number): void {
     const { combo } = this.#snapshot();
-    if (combo < COMBO_MIN) return void this.#comboText.setVisible(false);
-    this.#comboText.setVisible(true).setAlpha(0.45).setText(String(combo));
+    if (combo < COMBO_MIN) {
+      this.#lastCombo = 0;
+      return void this.#comboText.setVisible(false);
+    }
+
+    const age = songTimeMs - this.#comboPopAtMs;
+    // 0 → 1 → 0 삼각파. 앞뒤 70ms 씩이다.
+    const pop =
+      age >= 0 && age <= COMBO_POP_MS
+        ? 1 - Math.abs(age / (COMBO_POP_MS / 2) - 1)
+        : 0;
+    const size = Math.round(COMBO_BASE_SIZE + (COMBO_PEAK_SIZE - COMBO_BASE_SIZE) * pop);
+
+    this.#comboText
+      .setVisible(true)
+      .setAlpha(0.45)
+      .setFontSize(size)
+      .setColor(
+        combo >= COMBO_GOLD_FROM
+          ? Phaser.Display.Color.IntegerToColor(GOLD).rgba
+          : Phaser.Display.Color.IntegerToColor(INK).rgba,
+      )
+      .setText(String(combo));
   }
 
   #drawStats(songTimeMs: number): void {
