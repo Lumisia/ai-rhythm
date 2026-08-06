@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { layoutLanes, layoutStage } from "./LaneLayout";
+import { NOTE_PX_PER_MS, approachMsAt1x, layoutLanes, layoutStage } from "./LaneLayout";
 
 const SEVEN = [
   "SIDE_LEFT",
@@ -71,5 +71,20 @@ describe("layoutStage", () => {
 describe("layoutLanes", () => {
   it("returns just the lanes of the stage", () => {
     expect(layoutLanes(1600, SEVEN)).toEqual(layoutStage(1600, SEVEN).lanes);
+  });
+});
+
+describe("approachMsAt1x", () => {
+  it("judgeLineY 에 비례한다", () => {
+    expect(approachMsAt1x(544)).toBeCloseTo(544 / NOTE_PX_PER_MS, 5);
+    expect(approachMsAt1x(1088)).toBeCloseTo(2 * approachMsAt1x(544), 5);
+  });
+
+  it("pxPerMs 를 넘기면 그 값을 쓴다", () => {
+    expect(approachMsAt1x(600, 1.2)).toBeCloseTo(500, 5);
+  });
+
+  it("기본 pxPerMs 는 0.6 이다", () => {
+    expect(NOTE_PX_PER_MS).toBe(0.6);
   });
 });

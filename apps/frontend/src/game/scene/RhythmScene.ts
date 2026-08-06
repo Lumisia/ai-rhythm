@@ -36,6 +36,12 @@ export interface RhythmSceneSession {
   /** 마커가 실제로 기록되면 화면에 띄울 이름을 돌려준다. */
   markerLabel?: (slot: number) => string | null;
   onComplete?: (score: ScoreSnapshot) => void;
+  /** 레이아웃이 잡히거나 바뀔 때 한 번 호출된다.
+   *
+   * 게임 루프가 아니라 레이아웃 시점에만 부른다. 프레임마다 React state 를
+   * 건드리면 렌더 루프가 흔들린다.
+   */
+  onLayout?: (geometry: { judgeLineY: number }) => void;
 }
 
 export class RhythmScene extends Phaser.Scene {
@@ -167,6 +173,7 @@ export class RhythmScene extends Phaser.Scene {
     } else {
       this.#hud.resize(geometry);
     }
+    this.#session.onLayout?.({ judgeLineY });
   }
 
   #judgmentWindows() {

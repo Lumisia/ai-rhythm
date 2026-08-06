@@ -1,6 +1,6 @@
 import Phaser from "phaser";
 
-import type { LaneGeometry } from "../core/LaneLayout";
+import { NOTE_PX_PER_MS, type LaneGeometry } from "../core/LaneLayout";
 import type { ChartNote } from "../core/types";
 import { NoteTimeline } from "../core/NoteTimeline";
 import { DEPTH } from "./renderDepth";
@@ -38,7 +38,7 @@ export class NoteRenderer {
     // 판정선이 85% 지점이라 활주로가 화면 높이의 0.85 다. 640px 캔버스면
     // 544px — 배속 1.0 에서 약 900ms 를 흐른다. VSRG 들이 편하다고 보는
     // 대역(대략 550~900ms)의 느린 쪽 끝이다.
-    this.#pxPerMs = options.pxPerMs ?? 0.6;
+    this.#pxPerMs = options.pxPerMs ?? NOTE_PX_PER_MS;
     // 레인이 80px 로 좁아졌으니 노트도 그에 맞게 두툼해야 한다. 10px 은
     // 좁은 레인에서 실 한 가닥처럼 보인다.
     this.#noteHeight = options.noteHeight ?? 18;

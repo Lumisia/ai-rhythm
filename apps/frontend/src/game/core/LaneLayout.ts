@@ -103,3 +103,19 @@ export function layoutLanes(
 ): readonly LaneGeometry[] {
   return layoutStage(totalWidth, semantics).lanes;
 }
+
+/** 배속 1.0 에서 노트가 1ms 동안 움직이는 픽셀 수.
+ *
+ * NoteRenderer 와 설정 화면이 같은 값을 봐야 표시되는 노출 시간이 실제와 맞는다.
+ */
+export const NOTE_PX_PER_MS = 0.6;
+
+/** 배속 1.0 에서 노트가 화면을 흐르는 시간(ms).
+ *
+ * 판정선 위 활주로 높이를 속도로 나눈 값이다. 창 크기가 바뀌면 같이 바뀐다.
+ * 상수로 박아 두면 창 높이가 다를 때 표시가 거짓말을 하고, 배속을 그 숫자로
+ * 맞추는 사용자의 입력 보정이 통째로 어긋난다.
+ */
+export function approachMsAt1x(judgeLineY: number, pxPerMs: number = NOTE_PX_PER_MS): number {
+  return judgeLineY / pxPerMs;
+}

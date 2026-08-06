@@ -5,6 +5,7 @@ import { KeysoundScheduler } from "../../game/audio/KeysoundScheduler";
 import { SongPlayer } from "../../game/audio/SongPlayer";
 import { InputRecorder } from "../../game/core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../../game/core/JudgmentEngine";
+import { approachMsAt1x } from "../../game/core/LaneLayout";
 import { ScoreCalculator, type ScoreSnapshot } from "../../game/core/ScoreCalculator";
 import type { ImportedChart, ImportedRun } from "../import-run/importRun";
 import type { RecordedInputEvent } from "../../game/core/InputRecorder";
@@ -55,6 +56,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
   });
   const [phase, setPhase] = useState<"READY" | "PREPARING" | "PLAYING" | "PAUSED">("READY");
   const [error, setError] = useState<string | null>(null);
+  const [judgeLineY, setJudgeLineY] = useState<number | null>(null);
   const [markers, setMarkers] = useState<ReviewMarker[]>([]);
   const markersRef = useRef<ReviewMarker[]>([]);
   const playfieldRef = useRef<HTMLDivElement>(null);
@@ -191,6 +193,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         },
         markerLabel: markerLabelForSlot,
         onComplete: () => queueMicrotask(finish),
+        onLayout: ({ judgeLineY: y }) => setJudgeLineY(y),
       });
       resourcesRef.current = { context, player, game, score, recorder, clock, judgments };
       player.play(rangeStart);
@@ -260,7 +263,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
               </dl>
             </div>
           ) : (
-            <PlaySettings disabled={phase !== "READY"} durationMs={chart.document.durationMs} keysoundAvailable={Boolean(run.keysoundManifest && run.audio.noDrums && run.audio.keys)} onChange={setSettings} value={settings} />
+            <PlaySettings approachMsAt1x={judgeLineY === null ? null : approachMsAt1x(judgeLineY)} disabled={phase !== "READY"} durationMs={chart.document.durationMs} keysoundAvailable={Boolean(run.keysoundManifest && run.audio.noDrums && run.audio.keys)} onChange={setSettings} value={settings} />
           )}
           {phase === "READY" ? (
             <>

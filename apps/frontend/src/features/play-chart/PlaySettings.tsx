@@ -1,8 +1,5 @@
 import type { JudgmentPreset } from "../../game/core/types";
 
-/** 배속 1.0 에서 노트가 화면을 흐르는 시간. 640px 플레이필드 기준값이다. */
-const APPROACH_MS_AT_1X = 907;
-
 export interface PlaySettingsValue {
   calibrationMs: number;
   scrollSpeed: number;
@@ -17,11 +14,20 @@ interface PlaySettingsProps {
   value: PlaySettingsValue;
   durationMs: number;
   keysoundAvailable: boolean;
+  /** 배속 1.0 기준 노출 시간. 씬이 아직 안 뜬 READY 상태에서는 null 이다. */
+  approachMsAt1x: number | null;
   disabled?: boolean;
   onChange: (value: PlaySettingsValue) => void;
 }
 
-export function PlaySettings({ value, durationMs, keysoundAvailable, disabled, onChange }: PlaySettingsProps) {
+export function PlaySettings({
+  value,
+  durationMs,
+  keysoundAvailable,
+  approachMsAt1x,
+  disabled,
+  onChange,
+}: PlaySettingsProps) {
   const update = <K extends keyof PlaySettingsValue>(key: K, next: PlaySettingsValue[K]) =>
     onChange({ ...value, [key]: next });
 
@@ -37,7 +43,9 @@ export function PlaySettings({ value, durationMs, keysoundAvailable, disabled, o
         <span>스크롤 속도</span>
         <input max={4} min={0.6} onChange={(event) => update("scrollSpeed", event.currentTarget.valueAsNumber)} step={0.1} type="range" value={value.scrollSpeed} />
         {/* 배속보다 "노트가 몇 ms 흐르는가"가 실제로 읽는 값이다. */}
-        <small>{Math.round(APPROACH_MS_AT_1X / value.scrollSpeed)}ms</small>
+        <small>
+          {approachMsAt1x === null ? "시작 후 측정" : `${Math.round(approachMsAt1x / value.scrollSpeed)}ms`}
+        </small>
       </label>
       <label>
         <span>판정 프리셋</span>
