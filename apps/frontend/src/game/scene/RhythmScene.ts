@@ -93,7 +93,10 @@ export class RhythmScene extends Phaser.Scene {
       typeof this.#session.scrollSpeed === "function"
         ? this.#session.scrollSpeed()
         : this.#session.scrollSpeed;
-    this.#renderer?.update(songTimeMs, scrollSpeed);
+    this.#renderer?.update(songTimeMs, scrollSpeed, {
+      missedHoldIds: this.#session.engine.missedHoldIds(),
+      activeHoldIds: this.#session.engine.activeHoldIds(),
+    });
     this.#stage?.setPressed(this.#held, this.#flashAtMs, songTimeMs, LANE_FLASH_MS);
     this.#hud?.update(songTimeMs);
 

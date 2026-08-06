@@ -13,6 +13,13 @@ export interface NoteRendererOptions {
   noteHeight?: number;
 }
 
+export interface NoteRenderState {
+  missedHoldIds: ReadonlySet<number>;
+  activeHoldIds: ReadonlySet<number>;
+}
+
+const MISSED_HOLD_COLOR = 0x4a4f66;
+
 export class NoteRenderer {
   readonly #graphics: Phaser.GameObjects.Graphics;
   readonly #timeline: NoteTimeline;
@@ -56,7 +63,7 @@ export class NoteRenderer {
     this.#lanes = lanes;
   }
 
-  update(songTimeMs: number, scrollSpeed: number): number {
+  update(songTimeMs: number, scrollSpeed: number, state: NoteRenderState): number {
     this.#graphics.clear();
     if (scrollSpeed <= 0 || !Number.isFinite(scrollSpeed)) return 0;
     const pixelsPerMs = this.#pxPerMs * scrollSpeed;
@@ -69,7 +76,7 @@ export class NoteRenderer {
     );
     let drawn = 0;
     for (const note of notes) {
-      if (this.#drawNote(note, songTimeMs, pixelsPerMs)) drawn += 1;
+      if (this.#drawNote(note, songTimeMs, pixelsPerMs, state)) drawn += 1;
     }
     return drawn;
   }
@@ -78,7 +85,12 @@ export class NoteRenderer {
     this.#graphics.destroy();
   }
 
-  #drawNote(note: ChartNote, songTimeMs: number, pixelsPerMs: number): boolean {
+  #drawNote(
+    note: ChartNote,
+    songTimeMs: number,
+    pixelsPerMs: number,
+    state: NoteRenderState,
+  ): boolean {
     const lane = this.#lanes[note.lane];
     if (!lane) return false;
     const headY = this.#judgeLineY - (note.timeMs - songTimeMs) * pixelsPerMs;
@@ -97,23 +109,32 @@ export class NoteRenderer {
       if (bottom <= 0 || top > floor) return false;
       const bodyTop = Math.max(0, top);
       const bodyHeight = bottom - bodyTop;
+      const missed = state.missedHoldIds.has(note.id);
+      const held = state.activeHoldIds.has(note.id);
+      // 놓친 롱노트가 살아 보이면 계속 잡게 되어 손이 묶인다.
+      const bodyColor = missed ? MISSED_HOLD_COLOR : lane.color;
+      const bodyAlpha = missed ? 0.2 : held ? 0.5 : 0.3;
       if (bodyHeight > 0) {
         // 몸통은 어둡게 깔고 양옆에 밝은 선을 세운다. 단노트와 같은 채움이면
         // 흐르는 중에 둘을 구분할 수 없다.
         const bodyInset = Math.max(3, width * 0.16);
-        this.#graphics.fillStyle(lane.color, 0.3);
+        this.#graphics.fillStyle(bodyColor, bodyAlpha);
         this.#graphics.fillRect(x + bodyInset, bodyTop, width - bodyInset * 2, bodyHeight);
-        this.#graphics.fillStyle(lane.color, 0.72);
-        this.#graphics.fillRect(x + bodyInset, bodyTop, 2, bodyHeight);
-        this.#graphics.fillRect(x + width - bodyInset - 2, bodyTop, 2, bodyHeight);
+        if (!missed) {
+          this.#graphics.fillStyle(lane.color, 0.72);
+          this.#graphics.fillRect(x + bodyInset, bodyTop, 2, bodyHeight);
+          this.#graphics.fillRect(x + width - bodyInset - 2, bodyTop, 2, bodyHeight);
+        }
       }
       // 꼬리 끝을 막아 어디서 떼야 하는지 보이게 한다.
-      this.#drawCap(lane.color, x, tailY, width, 0.9);
+      this.#drawCap(missed ? MISSED_HOLD_COLOR : lane.color, x, tailY, width, missed ? 0.4 : 0.9);
     } else if (headY - this.#noteHeight / 2 > floor || headY < -this.#noteHeight) {
       return false;
     }
 
-    this.#drawCap(lane.color, x, headY, width, 1);
+    const headColor =
+      note.type === "HOLD" && state.missedHoldIds.has(note.id) ? MISSED_HOLD_COLOR : lane.color;
+    this.#drawCap(headColor, x, headY, width, 1);
     return true;
   }
 
