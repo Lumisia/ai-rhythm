@@ -220,7 +220,16 @@ def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path
     assert all("candidates" not in workdir.parts for workdir in workdirs)
     assert all(request.duration_ms == 2_000 for request in requests)
     assert all(request.cfg_scale == 1.0 for request in requests)
-    assert all(len(request.descriptors) == 1 for request in requests)
+    assert {
+        request.difficulty: request.descriptors
+        for request in requests
+        if request.key_mode == 4
+    } == {
+        "EASY": ("expression/simple",),
+        "NORMAL": ("style/mixed rice",),
+        "HARD": ("style/mixed rice", "streams/bursts"),
+        "EXPERT": ("style/mixed rice", "skillset/streams", "skillset/tech"),
+    }
     assert [variant.raw_osu_path.name for variant in variants] == [
         f"{key_mode}k-{difficulty.lower()}.osu"
         for key_mode in (4, 6, 7)

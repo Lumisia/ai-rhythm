@@ -29,8 +29,8 @@ REQUESTED_STAR: dict[str, float] = {
 DESCRIPTORS: dict[str, tuple[str, ...]] = {
     "EASY": ("expression/simple",),
     "NORMAL": ("style/mixed rice",),
-    "HARD": ("style/mixed rice",),
-    "EXPERT": ("style/mixed rice",),
+    "HARD": ("style/mixed rice", "streams/bursts"),
+    "EXPERT": ("style/mixed rice", "skillset/streams", "skillset/tech"),
 }
 
 

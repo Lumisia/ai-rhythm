@@ -80,8 +80,8 @@ def test_requested_stars_and_descriptors_are_explicit():
     assert DESCRIPTORS == {
         "EASY": ("expression/simple",),
         "NORMAL": ("style/mixed rice",),
-        "HARD": ("style/mixed rice",),
-        "EXPERT": ("style/mixed rice",),
+        "HARD": ("style/mixed rice", "streams/bursts"),
+        "EXPERT": ("style/mixed rice", "skillset/streams", "skillset/tech"),
     }
 
 
@@ -145,7 +145,7 @@ def test_map_command_requests_only_a_map_generation(config, tmp_path):
         "year": "2023",
         "end_time": str(DURATION_MS),
         "cfg_scale": "1.0",
-        "descriptors": "[style/mixed rice]",
+        "descriptors": "[style/mixed rice,skillset/streams,skillset/tech]",
         "precision": "fp16",
         "export_osz": "false",
         "beatmap_path": f"'{Path('timing-reference.osu').resolve()}'",
