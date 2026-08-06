@@ -6,7 +6,10 @@ import pytest
 from chart_worker.generation.mapperatorinator_patch import (
     MapperatorinatorPatchError,
     apply_mapperatorinator_patch,
+    apply_required_mapperatorinator_patches,
     patch_status,
+    require_mapperatorinator_patch_set,
+    required_patch_statuses,
 )
 
 
@@ -43,6 +46,39 @@ def make_upstream_fixture(tmp_path: Path) -> tuple[Path, str, Path]:
     return home, head, patch
 
 
+def make_patch_set_fixture(
+    tmp_path: Path,
+) -> tuple[Path, str, tuple[tuple[str, Path], ...]]:
+    home = tmp_path / "upstream-set"
+    home.mkdir()
+    _git(home, "init")
+    _git(home, "config", "user.name", "Chart Worker Tests")
+    _git(home, "config", "user.email", "chart-worker-tests@example.invalid")
+    (home / "first.py").write_text("first-before\n", encoding="utf-8")
+    (home / "second.py").write_text("second-before\n", encoding="utf-8")
+    _git(home, "add", "first.py", "second.py")
+    _git(home, "commit", "-m", "fixture")
+    head = _git(home, "rev-parse", "HEAD").stdout.strip()
+
+    patches = []
+    for patch_id, filename, before, after in (
+        ("first-v1", "first.py", "first-before", "first-after"),
+        ("second-v1", "second.py", "second-before", "second-after"),
+    ):
+        patch = tmp_path / f"{patch_id}.patch"
+        patch.write_text(
+            f"diff --git a/{filename} b/{filename}\n"
+            f"--- a/{filename}\n"
+            f"+++ b/{filename}\n"
+            "@@ -1 +1 @@\n"
+            f"-{before}\n"
+            f"+{after}\n",
+            encoding="utf-8",
+        )
+        patches.append((patch_id, patch))
+    return home, head, tuple(patches)
+
+
 def test_patch_lifecycle_is_applicable_then_applied(tmp_path: Path):
     home, head, patch = make_upstream_fixture(tmp_path)
 
@@ -60,6 +96,43 @@ def test_patch_application_is_idempotent(tmp_path: Path):
     apply_mapperatorinator_patch(home, patch_path=patch, expected_head=head)
 
     assert (home / "module.py").read_text(encoding="utf-8") == "after\n"
+
+
+def test_required_patch_set_applies_every_patch(tmp_path: Path):
+    home, head, patches = make_patch_set_fixture(tmp_path)
+
+    assert required_patch_statuses(home, patches=patches, expected_head=head) == {
+        "first-v1": "APPLICABLE",
+        "second-v1": "APPLICABLE",
+    }
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=patches,
+        expected_head=head,
+    )
+
+    assert required_patch_statuses(home, patches=patches, expected_head=head) == {
+        "first-v1": "APPLIED",
+        "second-v1": "APPLIED",
+    }
+    assert (home / "first.py").read_text(encoding="utf-8") == "first-after\n"
+    assert (home / "second.py").read_text(encoding="utf-8") == "second-after\n"
+
+
+def test_required_patch_set_rejects_a_partially_applied_checkout(tmp_path: Path):
+    home, head, patches = make_patch_set_fixture(tmp_path)
+    apply_mapperatorinator_patch(
+        home,
+        patch_path=patches[0][1],
+        expected_head=head,
+    )
+
+    with pytest.raises(MapperatorinatorPatchError, match="second-v1"):
+        require_mapperatorinator_patch_set(
+            home,
+            patches=patches,
+            expected_head=head,
+        )
 
 
 def test_patch_rejects_an_unexpected_upstream_commit(tmp_path: Path):

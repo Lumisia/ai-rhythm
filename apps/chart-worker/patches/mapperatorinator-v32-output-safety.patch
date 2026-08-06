@@ -1,0 +1,176 @@
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -163,7 +163,7 @@ class Postprocessor(object):
+         slider_head = None
+         anchor_info = []
+         last_anchor = None
+-        hold_note_start = None
++        hold_note_starts = {}
+         drumroll_start = None
+         denden_start = None
+ 
+@@ -219,12 +219,20 @@ class Postprocessor(object):
+                     timing = self.set_sv(timedelta(milliseconds=int(round(group.time))), group.scroll_speed, timing)
+ 
+             elif hit_type == EventType.HOLD_NOTE:
+-                if hold_note_start is not None:
+-                    self.logger.warning(f"Warning: Incomplete hold note at {int(round(hold_note_start.time))}")
++                hold_lane = int(round(group.x))
++                if hold_lane in hold_note_starts:
++                    previous = hold_note_starts[hold_lane]
++                    self.logger.warning(f"Warning: Incomplete hold note at {int(round(previous.time))}")
++
++                hold_note_starts[hold_lane] = group
+ 
+-                hold_note_start = group
++            elif hit_type == EventType.HOLD_NOTE_END:
++                hold_lane = int(round(group.x))
++                hold_note_start = hold_note_starts.pop(hold_lane, None)
++                if hold_note_start is None:
++                    self.logger.warning(f"Warning: Hold note end without start at {int(round(group.time))}")
++                    continue
+ 
+-            elif hit_type == EventType.HOLD_NOTE_END and hold_note_start is not None:
+                 hitsound = hold_note_start.hitsounds[0] if len(hold_note_start.hitsounds) > 0 else 0
+                 sampleset = hold_note_start.samplesets[0] if len(hold_note_start.samplesets) > 0 else 0
+                 addition = hold_note_start.additions[0] if len(hold_note_start.additions) > 0 else 0
+@@ -236,7 +244,6 @@ class Postprocessor(object):
+                 if len(hold_note_start.volumes) > 0 and beatmap_config.mode != 3:
+                     timing = self.set_volume(timedelta(milliseconds=int(round(hold_note_start.time))),
+                                              hold_note_start.volumes[0], timing)
+-                hold_note_start = None
+ 
+             elif hit_type == EventType.DRUMROLL:
+                 if drumroll_start is not None:
+@@ -681,6 +688,7 @@ class Postprocessor(object):
+             after_ticks = {tick for tick in after_ticks if tick >= current_interval[1] - m}
+             ticks.update(after_ticks)
+ 
++        ticks = {max(0, tick) for tick in ticks}
+         if len(ticks) == 0:
+             # If we don't have any ticks, just return the original time
+             return time
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -1048,17 +1048,13 @@ class Processor:
+                 for descriptor in descriptors:
+                     if isinstance(descriptor, str):
+                         if descriptor not in self.tokenizer.descriptor_idx:
+-                            if verbose:
+-                                print(f"Descriptor class {descriptor} not found. Skipping.")
+-                            continue
++                            raise ValueError(f"Descriptor class {descriptor!r} not found.")
+                         cond_tokens.append(self.tokenizer.encode_descriptor_name(descriptor))
+                         descriptors_added += 1
+                     elif isinstance(descriptor, int):
+                         if descriptor < self.tokenizer.event_range[EventType.DESCRIPTOR].min_value or \
+                                 descriptor > self.tokenizer.event_range[EventType.DESCRIPTOR].max_value:
+-                            if verbose:
+-                                print(f"Descriptor idx {descriptor} out of range. Skipping.")
+-                            continue
++                            raise ValueError(f"Descriptor idx {descriptor} out of range.")
+                         cond_tokens.append(self.tokenizer.encode_descriptor_idx(descriptor))
+                         descriptors_added += 1
+             if descriptors is None or descriptors_added == 0:
+diff --git a/tests/test_mania_output_safety.py b/tests/test_mania_output_safety.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_mania_output_safety.py
+@@ -0,0 +1,95 @@
++from datetime import timedelta
++from types import SimpleNamespace
++
++import pytest
++from slider import TimingPoint
++
++from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.postprocessor import BeatmapConfig, Postprocessor
++from osuT5.osuT5.inference.processor import Processor
++
++
++def make_postprocessor():
++    args = SimpleNamespace(
++        offset=0,
++        bpm=120,
++        timing_leniency=0,
++        train=SimpleNamespace(data=SimpleNamespace(
++            types_first=False,
++            add_positions=True,
++            mania_bpm_normalized_scroll_speed=False,
++            add_sv=False,
++        )),
++        start_time=None,
++        end_time=2_000,
++        snap_near_perfect_overlaps=False,
++    )
++    return Postprocessor(args)
++
++
++def test_overlapping_mania_holds_are_paired_by_lane():
++    events = [
++        Event(EventType.TIME_SHIFT, 0),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++        Event(EventType.TIME_SHIFT, 600),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    result = make_postprocessor().generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++    )
++
++    hold_rows = [row for row in result.splitlines() if ",128," in row]
++    assert hold_rows == [
++        "64,192,0,128,0,500:0:0:-1:0:",
++        "192,192,100,128,0,600:0:0:-1:0:",
++    ]
++
++
++def test_resnap_never_returns_a_negative_tick():
++    timing = [
++        TimingPoint(
++            timedelta(milliseconds=120),
++            500,
++            4,
++            2,
++            -1,
++            100,
++            None,
++            False,
++        )
++    ]
++
++    assert make_postprocessor().resnap(0, timing, 4) == 0
++
++
++def test_unknown_descriptor_is_rejected_instead_of_becoming_unk():
++    processor = Processor.__new__(Processor)
++    for name in (
++        "add_gamemode_token", "add_style_token", "add_diff_token", "add_mapper_token",
++        "add_year_token", "add_hitsounded_token", "add_song_length_token",
++        "add_global_sv_token", "add_cs_token", "add_keycount_token",
++        "add_hold_note_ratio_token", "add_scroll_speed_ratio_token", "add_sv",
++    ):
++        setattr(processor, name, False)
++    processor.add_descriptors = True
++    processor.tokenizer = SimpleNamespace(descriptor_idx={}, descriptor_unk=77)
++
++    with pytest.raises(ValueError, match="missing"):
++        processor.get_class_vector(
++            SimpleNamespace(gamemode=0, descriptors=["missing"]),
++            1_000,
++        )

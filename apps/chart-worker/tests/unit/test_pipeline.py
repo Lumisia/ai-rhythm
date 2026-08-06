@@ -909,7 +909,10 @@ def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: P
     )
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
-    assert report["mapperatorinatorConstraintPatch"] == "mania-keycount-v1"
+    assert (
+        report["mapperatorinatorConstraintPatch"]
+        == "mania-keycount-v1+mania-output-safety-v1"
+    )
 
 
 def test_pipeline_rejects_canonical_audio_changed_after_prepare(tmp_path: Path):

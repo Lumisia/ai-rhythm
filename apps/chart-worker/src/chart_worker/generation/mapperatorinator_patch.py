@@ -1,4 +1,4 @@
-"""Verify and apply the project-owned Mapperatorinator compatibility patch."""
+"""Verify and apply the project-owned Mapperatorinator compatibility patches."""
 
 from __future__ import annotations
 
@@ -8,14 +8,26 @@ from pathlib import Path
 from typing import Literal
 
 EXPECTED_MAPPERATORINATOR_HEAD = "2a70eb89004da20e39b0fcbaad2686b264d5a040"
-CONSTRAINT_PATCH_ID = "mania-keycount-v1"
+KEYCOUNT_PATCH_ID = "mania-keycount-v1"
+OUTPUT_SAFETY_PATCH_ID = "mania-output-safety-v1"
+CONSTRAINT_PATCH_ID = f"{KEYCOUNT_PATCH_ID}+{OUTPUT_SAFETY_PATCH_ID}"
 DEFAULT_PATCH_PATH = (
     Path(__file__).resolve().parents[3]
     / "patches"
     / "mapperatorinator-v32-mania-keycount.patch"
 )
+OUTPUT_SAFETY_PATCH_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "patches"
+    / "mapperatorinator-v32-output-safety.patch"
+)
+REQUIRED_PATCHES = (
+    (KEYCOUNT_PATCH_ID, DEFAULT_PATCH_PATH),
+    (OUTPUT_SAFETY_PATCH_ID, OUTPUT_SAFETY_PATCH_PATH),
+)
 
 PatchStatus = Literal["APPLIED", "APPLICABLE"]
+PatchSpec = tuple[str, Path]
 
 
 class MapperatorinatorPatchError(RuntimeError):
@@ -85,14 +97,57 @@ def apply_mapperatorinator_patch(
         raise MapperatorinatorPatchError("Mapperatorinator patch did not reach APPLIED state")
 
 
-@cache
-def _require_cached(home: str) -> None:
-    status = patch_status(Path(home), DEFAULT_PATCH_PATH, EXPECTED_MAPPERATORINATOR_HEAD)
-    if status != "APPLIED":
+def required_patch_statuses(
+    home: Path,
+    *,
+    patches: tuple[PatchSpec, ...] = REQUIRED_PATCHES,
+    expected_head: str = EXPECTED_MAPPERATORINATOR_HEAD,
+) -> dict[str, PatchStatus]:
+    """Return each required patch status for the pinned checkout."""
+    return {
+        patch_id: patch_status(home, patch_path, expected_head)
+        for patch_id, patch_path in patches
+    }
+
+
+def apply_required_mapperatorinator_patches(
+    home: Path,
+    *,
+    patches: tuple[PatchSpec, ...] = REQUIRED_PATCHES,
+    expected_head: str = EXPECTED_MAPPERATORINATOR_HEAD,
+) -> None:
+    """Apply every project-owned patch without reapplying completed patches."""
+    for _, patch_path in patches:
+        apply_mapperatorinator_patch(
+            home,
+            patch_path=patch_path,
+            expected_head=expected_head,
+        )
+
+
+def require_mapperatorinator_patch_set(
+    home: Path,
+    *,
+    patches: tuple[PatchSpec, ...] = REQUIRED_PATCHES,
+    expected_head: str = EXPECTED_MAPPERATORINATOR_HEAD,
+) -> None:
+    """Fail unless every project-owned patch is already applied."""
+    statuses = required_patch_statuses(
+        home,
+        patches=patches,
+        expected_head=expected_head,
+    )
+    missing = [patch_id for patch_id, status in statuses.items() if status != "APPLIED"]
+    if missing:
         raise MapperatorinatorPatchError(
-            f"required Mapperatorinator patch {CONSTRAINT_PATCH_ID} is not applied; "
+            f"required Mapperatorinator patches are not applied: {', '.join(missing)}; "
             "run scripts/apply_mapperatorinator_patch.py first"
         )
+
+
+@cache
+def _require_cached(home: str) -> None:
+    require_mapperatorinator_patch_set(Path(home))
 
 
 def require_mapperatorinator_patch(home: Path) -> None:
