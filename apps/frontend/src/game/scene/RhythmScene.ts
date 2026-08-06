@@ -13,6 +13,7 @@ import { loadJudgmentConfig } from "../core/judgment-config";
 import type { ChartDocument, JudgmentPreset } from "../core/types";
 import { bindingsFor, keyLabelsFor } from "../input/KeyBindings";
 import { KeyboardInput } from "../input/KeyboardInput";
+import { HitEffectLayer } from "./HitEffectLayer";
 import { HudRenderer } from "./HudRenderer";
 import { NoteRenderer } from "./NoteRenderer";
 import { JUDGE_LINE_RATIO, StageRenderer } from "./StageRenderer";
@@ -51,6 +52,7 @@ export class RhythmScene extends Phaser.Scene {
   readonly #unsubscribes: Array<() => void> = [];
   #stage: StageRenderer | null = null;
   #renderer: NoteRenderer | null = null;
+  #effectLayer: HitEffectLayer | null = null;
   #hud: HudRenderer | null = null;
   #keyboardInput: KeyboardInput | null = null;
   #finished = false;
@@ -105,6 +107,7 @@ export class RhythmScene extends Phaser.Scene {
       activeHoldIds: this.#session.engine.activeHoldIds(),
     });
     this.#stage?.setPressed(this.#held, this.#flashAtMs, songTimeMs, LANE_FLASH_MS);
+    this.#effectLayer?.update(songTimeMs);
     this.#hud?.update(songTimeMs);
 
     if (!this.#session.loop && !this.#finished && songTimeMs > this.#session.chart.durationMs + 500) {
@@ -180,6 +183,12 @@ export class RhythmScene extends Phaser.Scene {
     } else {
       this.#renderer.resize(width, height, judgeLineY, stage.lanes);
     }
+    if (!this.#effectLayer) {
+      this.#effectLayer = new HitEffectLayer(this, stage.lanes, judgeLineY);
+      this.#unsubscribes.push(this.#effects.subscribe(this.#effectLayer));
+    } else {
+      this.#effectLayer.resize(stage.lanes, judgeLineY);
+    }
     const geometry = { width, height, judgeLineY, stage };
     if (!this.#hud) {
       this.#hud = new HudRenderer(this, {
@@ -222,6 +231,8 @@ export class RhythmScene extends Phaser.Scene {
     this.#keyboardInput = null;
     this.#renderer?.destroy();
     this.#renderer = null;
+    this.#effectLayer?.destroy();
+    this.#effectLayer = null;
     this.#hud?.destroy();
     this.#hud = null;
     this.#stage?.destroy();
