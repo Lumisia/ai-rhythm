@@ -88,3 +88,37 @@ describe("approachMsAt1x", () => {
     expect(NOTE_PX_PER_MS).toBe(0.6);
   });
 });
+
+/** sRGB 상대 휘도. WCAG 대비 계산과 같은 식이다. */
+function luminance(color: number): number {
+  const channels = [(color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff].map((value) => {
+    const normalized = value / 255;
+    return normalized <= 0.03928
+      ? normalized / 12.92
+      : ((normalized + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+describe("레인 색 구분", () => {
+  it("7키에서 이웃한 레인의 휘도가 충분히 벌어진다", () => {
+    const { lanes } = layoutStage(1280, SEVEN);
+
+    for (let index = 1; index < lanes.length; index += 1) {
+      const previous = luminance(lanes[index - 1].color);
+      const current = luminance(lanes[index].color);
+      const ratio =
+        (Math.max(previous, current) + 0.05) / (Math.min(previous, current) + 0.05);
+      expect(ratio).toBeGreaterThan(1.2);
+    }
+  });
+
+  it("같은 손가락 역할은 같은 색을 쓴다", () => {
+    const { lanes } = layoutStage(1280, SEVEN);
+    const bySemantic = new Map(lanes.map((lane) => [lane.semantic, lane.color]));
+
+    expect(bySemantic.get("SIDE_LEFT")).toBe(bySemantic.get("SIDE_RIGHT"));
+    expect(bySemantic.get("MAIN_1")).toBe(bySemantic.get("MAIN_4"));
+    expect(bySemantic.get("MAIN_2")).toBe(bySemantic.get("MAIN_3"));
+  });
+});

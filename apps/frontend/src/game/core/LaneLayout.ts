@@ -39,12 +39,17 @@ function widthFor(semantic: LaneSemantic): number {
   return COLUMN_WIDTH;
 }
 
-/** 손가락으로 색을 나눈다. 레인 번호가 아니라 어느 손가락인지가 읽는 단위다. */
+/** 손가락으로 색을 나눈다. 레인 번호가 아니라 어느 손가락인지가 읽는 단위다.
+ *
+ * 색상만으로 나누면 시안과 민트, 인디고와 보라가 주변시에서 붙어 보인다.
+ * 7키 배열 SIDE ‖ M1 M2 CENTER M3 M4 ‖ SIDE 에서 이웃이 구분되지 않으면
+ * 읽기가 무너지므로 명도까지 벌린다.
+ */
 function colorFor(semantic: LaneSemantic): number {
-  if (semantic.startsWith("SIDE_")) return 0x67e8f9;
-  if (semantic === "CENTER") return 0xa78bfa;
-  if (semantic === "MAIN_2" || semantic === "MAIN_3") return 0x8b9cf6;
-  return 0x5eead4;
+  if (semantic.startsWith("SIDE_")) return 0x67e8f9;          // 시안   밝음
+  if (semantic === "CENTER") return 0xc4a2ff;                 // 연보라 밝게
+  if (semantic === "MAIN_2" || semantic === "MAIN_3") return 0x8b9cf6;  // 인디고 중간
+  return 0x2dd4a7;                                            // 청록   어둡게
 }
 
 function backgroundFor(semantic: LaneSemantic): number {
