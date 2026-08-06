@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.timing_diagnostics import TimingCoverageGap
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedChart
@@ -15,7 +16,11 @@ from chart_worker.schema.note import NoteEvent
 from chart_worker.stages import s2_generate
 from chart_worker.stages.s2_generate import run_generation
 from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
-from chart_worker.validation.quality_gate import GateAction, evaluate_chart_candidate
+from chart_worker.validation.quality_gate import (
+    GateAction,
+    GateAxis,
+    evaluate_chart_candidate,
+)
 
 
 def _prepared(tmp_path: Path, *, duration_ms: int = 2_000) -> PreparedAudio:
@@ -110,6 +115,34 @@ def _acceptance_with_action(authority: SongTimingAuthority, action: GateAction):
             replace(first, action=action, reasons=(f"FIXTURE_{action.value}",)),
             *remaining,
         ),
+    )
+
+
+def _coverage_retry_acceptance(authority: SongTimingAuthority):
+    accepted = _pass_acceptance(authority)
+    gap = TimingCoverageGap(
+        start_ms=10_000,
+        end_ms=20_000,
+        onset_count=20,
+        active_onset_count=20,
+        active_frame_ratio=1.0,
+        position="MIDDLE",
+    )
+    decisions = tuple(
+        replace(
+            decision,
+            action=GateAction.RETRY_MAP,
+            reasons=("ACTIVE_MIDDLE_GAP",),
+        )
+        if decision.axis is GateAxis.COVERAGE
+        else decision
+        for decision in accepted.decisions
+    )
+    return replace(
+        accepted,
+        action=GateAction.RETRY_MAP,
+        decisions=decisions,
+        timing=replace(accepted.timing, coverage_gaps=(gap,)),
     )
 
 
@@ -1308,6 +1341,105 @@ def test_one_exhausted_variant_recovers_without_regenerating_successes(tmp_path:
         if variant is not recovered
     )
     assert len(generator.map_calls) == 14
+
+
+def test_localized_coverage_failure_remaps_only_the_exhausted_variant(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path, duration_ms=60_000)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.generator_name == "partial-repair":
+            return _acceptance_for_difficulty(accepted, requested_difficulty)
+        if requested_difficulty == "EASY" and generated.key_mode == 4:
+            return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class PartialRepairGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if request.add_to_beatmap:
+                return replace(generated, generator_name="partial-repair")
+            return generated
+
+    generator = PartialRepairGenerator()
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    repaired = next(
+        variant
+        for variant in variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    partial_requests = [
+        request for request in generator.map_calls if request.add_to_beatmap
+    ]
+    assert len(generator.map_calls) == 15
+    assert len(partial_requests) == 1
+    assert partial_requests[0].partial_start_ms == 8_000
+    assert partial_requests[0].partial_end_ms == 22_000
+    assert partial_requests[0].timing_reference_path.is_file()
+    assert partial_requests[0].timing_reference_path != authority.reference_path
+    assert repaired.provenance == "PARTIAL_REMAP"
+    assert repaired.recovery_reason == "ACTIVE_COVERAGE_GAP"
+    assert all(
+        variant.provenance == "PRIMARY"
+        for variant in variants
+        if variant is not repaired
+    )
+
+
+def test_rejected_partial_remap_falls_back_without_regenerating_other_variants(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path, duration_ms=60_000)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.generator_name == "adaptive-recovery-v1":
+            return _acceptance_for_difficulty(accepted, requested_difficulty)
+        if requested_difficulty == "EASY" and generated.key_mode == 4:
+            return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+
+    variants = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    recovered = next(
+        variant
+        for variant in variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert len(generator.map_calls) == 15
+    assert sum(request.add_to_beatmap for request in generator.map_calls) == 1
+    assert recovered.provenance == "RECOVERY_FALLBACK"
+    assert recovered.recovery_reason == "PARTIAL_REMAP_FAILED"
+    assert recovered.generation_attempt_count == 4
+    assert recovered.attempt_evidence[-1]["reason"] == "PARTIAL_REMAP_REJECTED"
 
 
 def test_normal_generation_marks_every_variant_primary(tmp_path: Path):

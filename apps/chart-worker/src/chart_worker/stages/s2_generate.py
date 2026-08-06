@@ -11,6 +11,7 @@ from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedCh
 from chart_worker.generation.osu_parser import parse_osu_mania
 from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
+from chart_worker.generation.partial_remap import build_partial_remap_window
 from chart_worker.generation.recovery import build_recovery_chart
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
@@ -31,6 +32,7 @@ from chart_worker.validation.generated_chart import (
 from chart_worker.validation.quality_gate import (
     ChartAcceptance,
     GateAction,
+    GateAxis,
     evaluate_chart_candidate,
 )
 from chart_worker.validation.timing_authority import (
@@ -164,6 +166,8 @@ class _VariantState:
     attempt_evidence: list[dict[str, object]] = field(default_factory=list)
     attempted_seeds: list[int] = field(default_factory=list)
     pool: list[_Candidate] = field(default_factory=list)
+    partial_sources: list[_Candidate] = field(default_factory=list)
+    partial_attempted: bool = False
     exhausted_error: WorkerError | None = None
 
 
@@ -179,6 +183,42 @@ def _exhausted_error(state: _VariantState) -> WorkerError:
             "attempts": list(state.attempt_evidence),
         },
     )
+
+
+def _serialized_candidate_text(
+    generated: GeneratedChart,
+    *,
+    authority: SongTimingAuthority,
+    prepared: PreparedAudio,
+    key_mode: int,
+) -> str:
+    first_timing = generated.bpm_events[0]
+    osu_text = generated.osu_text or notes_to_osu_mania(
+        generated.notes,
+        key_mode=key_mode,
+        bpm=first_timing.bpm,
+        offset_ms=first_timing.time_ms,
+        audio_filename=prepared.normalized.path.name,
+        title=prepared.normalized.path.stem,
+        bpm_events=generated.bpm_events,
+    )
+    _validate_serialized_candidate(
+        osu_text,
+        generated,
+        authority,
+        prepared,
+        key_mode,
+    )
+    return osu_text
+
+
+def _is_localized_coverage_failure(acceptance: ChartAcceptance) -> bool:
+    retry_axes = {
+        decision.axis
+        for decision in acceptance.decisions
+        if decision.action is GateAction.RETRY_MAP
+    }
+    return retry_axes == {GateAxis.COVERAGE} and bool(acceptance.timing.coverage_gaps)
 
 
 def _generate_next_pass(
@@ -242,6 +282,25 @@ def _generate_next_pass(
                         separators=(",", ":"),
                     )
                 )
+                if _is_localized_coverage_failure(acceptance):
+                    osu_text = _serialized_candidate_text(
+                        generated,
+                        authority=authority,
+                        prepared=prepared,
+                        key_mode=state.key_mode,
+                    )
+                    state.partial_sources.append(
+                        _Candidate(
+                            request=request,
+                            generated=generated,
+                            acceptance=acceptance,
+                            osu_text=osu_text,
+                            workdir=workdir,
+                            attempt=attempt,
+                            seed=attempt_seed,
+                            provenance="RETRY",
+                        )
+                    )
                 continue
 
             validate_timing_identity(generated.bpm_events, authority.bpm_events)
@@ -250,22 +309,11 @@ def _generate_next_pass(
                 key_mode=state.key_mode,
                 duration_ms=prepared.normalized.duration_ms,
             )
-            first_timing = generated.bpm_events[0]
-            osu_text = generated.osu_text or notes_to_osu_mania(
-                generated.notes,
-                key_mode=state.key_mode,
-                bpm=first_timing.bpm,
-                offset_ms=first_timing.time_ms,
-                audio_filename=prepared.normalized.path.name,
-                title=prepared.normalized.path.stem,
-                bpm_events=generated.bpm_events,
-            )
-            _validate_serialized_candidate(
-                osu_text,
+            osu_text = _serialized_candidate_text(
                 generated,
-                authority,
-                prepared,
-                state.key_mode,
+                authority=authority,
+                prepared=prepared,
+                key_mode=state.key_mode,
             )
             return _Candidate(
                 request=request,
@@ -291,6 +339,122 @@ def _generate_next_pass(
     if last_error is not None:
         raise error from last_error
     raise error
+
+
+def _try_partial_repair(
+    state: _VariantState,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    generator: ChartGenerator,
+    base_seed: int,
+) -> _Candidate | None:
+    if state.partial_attempted or not state.partial_sources:
+        return None
+
+    planned_sources = []
+    for source in state.partial_sources:
+        window = build_partial_remap_window(
+            source.generated.notes,
+            source.acceptance.timing.coverage_gaps,
+            authority.bpm_events,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+        if window is not None:
+            planned_sources.append((window.end_ms - window.start_ms, source, window))
+    if not planned_sources:
+        return None
+    state.partial_attempted = True
+    _, source, window = min(
+        planned_sources,
+        key=lambda item: (item[0], item[1].attempt, item[1].seed),
+    )
+
+    reference_path = (
+        run_dir
+        / "raw"
+        / "partial-references"
+        / f"{state.key_mode}k-{state.difficulty.lower()}-attempt-{source.attempt}.osu"
+    )
+    reference_path.parent.mkdir(parents=True, exist_ok=True)
+    reference_path.write_text(source.osu_text, encoding="utf-8")
+    partial_seed = base_seed + state.flat_index + MAX_VARIANT_ATTEMPTS * _VARIANT_COUNT
+    request = GenerationRequest(
+        audio_path=prepared.normalized.path,
+        timing_reference_path=reference_path,
+        key_mode=state.key_mode,
+        difficulty=state.difficulty,
+        seed=partial_seed,
+        duration_ms=prepared.normalized.duration_ms,
+        partial_start_ms=window.start_ms,
+        partial_end_ms=window.end_ms,
+        add_to_beatmap=True,
+    )
+    workdir = (
+        run_dir
+        / "raw"
+        / "work"
+        / f"{state.key_mode}k-{state.difficulty.lower()}"
+        / "partial-remap"
+    )
+    try:
+        _require_timing_authority(prepared, authority)
+        try:
+            generated = generator.generate_map(request, workdir)
+        finally:
+            _require_timing_authority(prepared, authority)
+        acceptance = evaluate_chart_candidate(
+            generated,
+            authority,
+            onset_analysis,
+            requested_key_mode=state.key_mode,
+            requested_difficulty=state.difficulty,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+        if acceptance.action is GateAction.RETRY_MAP:
+            evidence = {
+                "seed": partial_seed,
+                "workdir": workdir.relative_to(run_dir).as_posix(),
+                "reason": "PARTIAL_REMAP_REJECTED",
+                "partialWindow": {
+                    "startMs": window.start_ms,
+                    "endMs": window.end_ms,
+                },
+                "gateReport": acceptance.to_report(),
+            }
+            state.attempt_evidence.append(evidence)
+            state.attempt_errors.append(
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+            return None
+        osu_text = _serialized_candidate_text(
+            generated,
+            authority=authority,
+            prepared=prepared,
+            key_mode=state.key_mode,
+        )
+        return _Candidate(
+            request=request,
+            generated=generated,
+            acceptance=acceptance,
+            osu_text=osu_text,
+            workdir=workdir,
+            attempt=MAX_VARIANT_ATTEMPTS + 1,
+            seed=partial_seed,
+            provenance="PARTIAL_REMAP",
+            recovery_reason="ACTIVE_COVERAGE_GAP",
+        )
+    except (
+        GeneratedChartValidationError,
+        TimingAuthorityValidationError,
+        WorkerError,
+    ) as error:
+        if not _should_retry(error):
+            raise
+        state.attempt_errors.append(str(error))
+        return None
 
 
 def _build_recovery_candidate(
@@ -360,7 +524,11 @@ def _build_recovery_candidate(
         attempt=state.next_attempt - 1,
         seed=seed,
         provenance="RECOVERY_FALLBACK",
-        recovery_reason="MODEL_CANDIDATES_EXHAUSTED",
+        recovery_reason=(
+            "PARTIAL_REMAP_FAILED"
+            if state.partial_attempted
+            else "MODEL_CANDIDATES_EXHAUSTED"
+        ),
     )
 
 
@@ -559,14 +727,26 @@ def run_generation(
 
         for state in states.values():
             if not state.pool:
-                _ensure_recovery_candidate(
+                repaired = _try_partial_repair(
                     state,
                     prepared=prepared,
                     authority=authority,
                     onset_analysis=onset_analysis,
                     run_dir=run_dir,
+                    generator=generator,
                     base_seed=seed,
                 )
+                if repaired is not None:
+                    state.pool.append(repaired)
+                else:
+                    _ensure_recovery_candidate(
+                        state,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                        run_dir=run_dir,
+                        base_seed=seed,
+                    )
 
         while True:
             selected = _select_earliest_monotonic(states)
@@ -658,7 +838,9 @@ def run_generation(
                     timing_authority_sha256=authority.sha256,
                     acceptance=candidate.acceptance,
                     candidate_count=len(state.pool),
-                    generation_attempt_count=state.next_attempt - 1,
+                    generation_attempt_count=(
+                        state.next_attempt - 1 + int(state.partial_attempted)
+                    ),
                     selected_seed=candidate.seed,
                     difficulty_order=order_review,
                     provenance=candidate.provenance,

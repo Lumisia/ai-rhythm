@@ -16,7 +16,9 @@ if TYPE_CHECKING:
     from chart_worker.validation.difficulty_order import DifficultyOrderReview
     from chart_worker.validation.quality_gate import ChartAcceptance
 
-GenerationProvenance = Literal["PRIMARY", "RETRY", "RECOVERY_FALLBACK"]
+GenerationProvenance = Literal[
+    "PRIMARY", "RETRY", "PARTIAL_REMAP", "RECOVERY_FALLBACK"
+]
 
 
 @dataclass(frozen=True, slots=True)
