@@ -46,17 +46,27 @@ def test_reports_hand_checked_note_metrics():
     notes = [
         NoteEvent(time_ms=0, lane=0, kind="HOLD", duration_ms=250),
         NoteEvent(time_ms=0, lane=1),
+        NoteEvent(time_ms=250, lane=0),
         NoteEvent(time_ms=500, lane=0),
-        NoteEvent(time_ms=1000, lane=0),
     ]
     metrics = measure_rating(notes, duration_ms=2000)
     assert metrics.note_count == 4
     assert metrics.hold_count == 1
     assert metrics.avg_nps == 2.0
-    assert metrics.peak_nps == 3.0
+    assert metrics.peak_nps == 4.0
     assert metrics.chord_ratio == 0.5
     assert metrics.max_jack == 3
     assert metrics.hold_ratio == 0.25
+
+
+def test_jack_run_stops_after_250ms_gap():
+    notes = [
+        NoteEvent(time_ms=0, lane=0),
+        NoteEvent(time_ms=250, lane=0),
+        NoteEvent(time_ms=501, lane=0),
+    ]
+
+    assert measure_rating(notes, duration_ms=1000).max_jack == 2
 
 
 @pytest.mark.parametrize(

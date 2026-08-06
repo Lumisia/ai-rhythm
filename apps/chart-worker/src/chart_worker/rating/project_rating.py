@@ -12,6 +12,7 @@ TARGET_RATING: dict[str, float] = {
     "EXPERT": 5.0,
 }
 _TIERS = ((2.0, "EASY"), (3.2, "NORMAL"), (4.5, "HARD"))
+MAX_JACK_GAP_MS = 250
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +51,12 @@ def _max_jack(notes: Chart) -> int:
     lanes_at_time: set[int] = set()
     for note in notes:
         if last_time is not None and note.time_ms != last_time:
-            for lane in list(run):
-                if lane not in lanes_at_time:
-                    run[lane] = 0
+            if note.time_ms - last_time > MAX_JACK_GAP_MS:
+                run.clear()
+            else:
+                for lane in list(run):
+                    if lane not in lanes_at_time:
+                        run[lane] = 0
             lanes_at_time = set()
         run[note.lane] = run.get(note.lane, 0) + 1
         lanes_at_time.add(note.lane)
