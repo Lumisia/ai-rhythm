@@ -1,6 +1,7 @@
 import Phaser from "phaser";
 
-import type { JudgmentEvent } from "../core/JudgmentEngine";
+import type { EffectEvent, EffectSubscriber } from "../core/EffectBus";
+import type { JudgmentPhase } from "../core/JudgmentEngine";
 import type { StageGeometry } from "../core/LaneLayout";
 import type { ScoreSnapshot } from "../core/ScoreCalculator";
 import type { JudgmentName, JudgmentWindows } from "../core/types";
@@ -55,6 +56,12 @@ export interface HudRendererOptions extends HudGeometry {
   snapshot: () => ScoreSnapshot;
 }
 
+export interface HudJudgment {
+  judgment: JudgmentName;
+  errMs: number;
+  phase: JudgmentPhase;
+}
+
 /** 플레이 중 계기 판독부.
  *
  * 무대가 좁아지면서 좌우에 여백이 생겼다. 수치는 거기 둔다 — 무대 위에
@@ -65,7 +72,7 @@ export interface HudRendererOptions extends HudGeometry {
  * VSRG 들이 hit error bar 를 두는 자리다. 입력 보정을 맞출 수 있는 유일한
  * 물건이고, 없으면 "채보 오프셋이 틀렸나 내가 못 친 건가"를 구분할 수 없다.
  */
-export class HudRenderer {
+export class HudRenderer implements EffectSubscriber {
   readonly #scene: Phaser.Scene;
   readonly #graphics: Phaser.GameObjects.Graphics;
   readonly #judgmentText: Phaser.GameObjects.Text;
@@ -137,7 +144,21 @@ export class HudRenderer {
     this.#layout();
   }
 
-  acceptJudgment(event: JudgmentEvent, songTimeMs: number): void {
+  /** EffectBus 어댑터. 기존 메서드를 그대로 부른다. */
+  handleEffect(event: EffectEvent): void {
+    if (event.type === "JUDGED") {
+      this.acceptJudgment(
+        { judgment: event.judgment, errMs: event.errMs, phase: event.phase },
+        event.songTimeMs,
+      );
+      return;
+    }
+    if (event.type === "MARKER") {
+      this.acceptMarker(event.label, event.songTimeMs);
+    }
+  }
+
+  acceptJudgment(event: HudJudgment, songTimeMs: number): void {
     this.#lastJudgment = {
       judgment: event.judgment,
       errMs: event.errMs,

@@ -3,6 +3,7 @@ import Phaser from "phaser";
 import type { Clock } from "../audio/Clock";
 import type { KeysoundScheduler } from "../audio/KeysoundScheduler";
 import type { SongPlayer } from "../audio/SongPlayer";
+import { EffectBus } from "../core/EffectBus";
 import { InputRecorder } from "../core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../core/JudgmentEngine";
 import { layoutStage, type StageGeometry } from "../core/LaneLayout";
@@ -46,6 +47,8 @@ export interface RhythmSceneSession {
 
 export class RhythmScene extends Phaser.Scene {
   readonly #session: RhythmSceneSession;
+  readonly #effects = new EffectBus();
+  readonly #unsubscribes: Array<() => void> = [];
   #stage: StageRenderer | null = null;
   #renderer: NoteRenderer | null = null;
   #hud: HudRenderer | null = null;
@@ -70,8 +73,12 @@ export class RhythmScene extends Phaser.Scene {
       onLaneDown: (lane, timeMs) => {
         this.#held.add(lane);
         this.#flashAtMs.set(lane, timeMs);
+        this.#effects.emit({ type: "LANE_DOWN", lane, songTimeMs: timeMs });
       },
-      onLaneUp: (lane) => this.#held.delete(lane),
+      onLaneUp: (lane, timeMs) => {
+        this.#held.delete(lane);
+        this.#effects.emit({ type: "LANE_UP", lane, songTimeMs: timeMs });
+      },
     });
     this.#keyboardInput.attach();
     window.addEventListener("keydown", this.#handleControlKey);
@@ -107,11 +114,22 @@ export class RhythmScene extends Phaser.Scene {
   }
 
   #acceptJudgment(event: JudgmentEvent): void {
+    const songTimeMs = this.#session.clock.songTimeMs();
     this.#session.score.accept(event);
-    this.#hud?.acceptJudgment(event, this.#session.clock.songTimeMs());
+    // 키음은 연출이 아니라 게임 규칙이다. MISS 시 미재생이 감산 구조의
+    // 핵심이고 오디오 스케줄링은 지연에 민감해 구독자 순회 뒤로 미루지 않는다.
     if (event.phase === "HEAD" && event.judgment !== "MISS") {
       this.#session.keysoundScheduler?.playHit(event.noteTimeMs);
     }
+    this.#effects.emit({
+      type: "JUDGED",
+      judgment: event.judgment,
+      lane: event.lane,
+      errMs: event.errMs,
+      phase: event.phase,
+      combo: this.#session.score.snapshot().combo,
+      songTimeMs,
+    });
     this.#session.onJudgment?.(event);
   }
 
@@ -130,7 +148,7 @@ export class RhythmScene extends Phaser.Scene {
       this.#session.onMarkerSlot?.(slot, songTimeMs);
       // 눌러도 화면에 아무 일이 없으면 기록됐는지 몰라 다시 누르게 된다.
       const label = this.#session.markerLabel?.(slot);
-      if (label) this.#hud?.acceptMarker(label, songTimeMs);
+      if (label) this.#effects.emit({ type: "MARKER", label, songTimeMs });
     }
   };
 
@@ -173,6 +191,7 @@ export class RhythmScene extends Phaser.Scene {
         beatMs: this.#beatMs(),
         snapshot: () => this.#session.score.snapshot(),
       });
+      this.#unsubscribes.push(this.#effects.subscribe(this.#hud));
     } else {
       this.#hud.resize(geometry);
     }
@@ -195,6 +214,8 @@ export class RhythmScene extends Phaser.Scene {
   }
 
   #shutdown(): void {
+    for (const unsubscribe of this.#unsubscribes) unsubscribe();
+    this.#unsubscribes.length = 0;
     window.removeEventListener("keydown", this.#handleControlKey);
     this.scale.off(Phaser.Scale.Events.RESIZE, this.#layoutPlayfield, this);
     this.#keyboardInput?.detach();
