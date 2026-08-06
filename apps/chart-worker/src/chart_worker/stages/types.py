@@ -9,6 +9,7 @@ from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.chart import ChartDocument
+from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.timing_review import TimingAuthorityReview
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ class SongTimingAuthority:
     attempt_count: int
     tempo_metrics: TempoCandidateMetrics | None = None
     review: TimingAuthorityReview | None = None
+    leading_coverage: LeadingTimingCoverage | None = None
 
 
 @dataclass(frozen=True, slots=True)

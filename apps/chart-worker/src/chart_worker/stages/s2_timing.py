@@ -11,6 +11,10 @@ from chart_worker.generation.osu_writer import timing_to_osu_mania
 from chart_worker.generation.params import TimingGenerationRequest
 from chart_worker.hashing import sha256_file
 from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
+from chart_worker.validation.leading_timing_coverage import (
+    LeadingTimingCoverage,
+    review_leading_timing_coverage,
+)
 from chart_worker.validation.timing_authority import (
     TimingAuthorityValidationError,
     validate_timing_events,
@@ -31,6 +35,23 @@ def _should_try_super_timing(review: TimingAuthorityReview) -> bool:
     return review.action is TimingAuthorityAction.RETRY_TIMING or bool(
         _SUPER_TIMING_REVIEW_REASONS.intersection(review.reasons)
     )
+
+
+def _merge_reviews(
+    tempo: TimingAuthorityReview,
+    leading: LeadingTimingCoverage,
+) -> TimingAuthorityReview:
+    priority = {
+        TimingAuthorityAction.PASS: 0,
+        TimingAuthorityAction.REVIEW: 1,
+        TimingAuthorityAction.RETRY_TIMING: 2,
+    }
+    action = max((tempo.action, leading.action), key=priority.__getitem__)
+    leading_reasons = (
+        () if leading.action is TimingAuthorityAction.PASS else leading.reasons
+    )
+    reasons = tuple(dict.fromkeys((*tempo.reasons, *leading_reasons)))
+    return TimingAuthorityReview(action, reasons)
 
 
 def _validate_candidate(generated: GeneratedTiming, prepared: PreparedAudio) -> None:
@@ -83,8 +104,13 @@ def run_timing_generation(
         try:
             generated = generator.generate_timing(request, workdir)
             _validate_candidate(generated, prepared)
+            leading = review_leading_timing_coverage(
+                generated.bpm_events,
+                analysis,
+                duration_ms=prepared.normalized.duration_ms,
+            )
             metrics = measure_tempo_candidates(generated.bpm_events, analysis)
-            review = review_timing_authority(metrics)
+            review = _merge_reviews(review_timing_authority(metrics), leading)
             attempt_reviews.append(
                 {
                     "attempt": attempt_count,
@@ -92,9 +118,20 @@ def run_timing_generation(
                     "mode": generated.mode,
                     "workdir": workdir.relative_to(run_dir).as_posix(),
                     "review": review.to_report(),
+                    "leadingCoverage": leading.to_report(),
                     "tempoMetrics": metrics.to_report(),
                 }
             )
+            if (
+                super_timing
+                and leading.action is TimingAuthorityAction.RETRY_TIMING
+            ):
+                reference_path.unlink(missing_ok=True)
+                raise WorkerError(
+                    ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+                    "standard and Super Timing candidates missed active leading audio",
+                    context={"seeds": seeds, "attempts": attempt_reviews},
+                )
             retry_with_super = not super_timing and _should_try_super_timing(review)
             publishable_review = review.action is TimingAuthorityAction.REVIEW
             if not retry_with_super and (
@@ -109,7 +146,7 @@ def run_timing_generation(
             raise WorkerError(
                 ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
                 "standard and Super Timing candidates failed structural validation",
-                context={"errors": errors, "seeds": seeds},
+                context={"errors": errors, "seeds": seeds, "attempts": attempt_reviews},
             ) from error
 
         if review.action in {
@@ -127,6 +164,7 @@ def run_timing_generation(
                 attempt_count=attempt_count,
                 tempo_metrics=metrics,
                 review=review,
+                leading_coverage=leading,
             )
         reference_path.unlink(missing_ok=True)
         if retry_with_super:

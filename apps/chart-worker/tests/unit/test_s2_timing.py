@@ -3,8 +3,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedTiming
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.hashing import sha256_file
@@ -18,7 +20,7 @@ from chart_worker.validation.timing_review import (
 )
 
 
-def _prepared(tmp_path: Path) -> PreparedAudio:
+def _prepared(tmp_path: Path, *, duration_ms: int = 2_000) -> PreparedAudio:
     audio_path = tmp_path / "audio" / "game.flac"
     audio_path.parent.mkdir(parents=True)
     audio_path.write_bytes(b"canonical-audio")
@@ -27,10 +29,10 @@ def _prepared(tmp_path: Path) -> PreparedAudio:
             path=audio_path,
             profile_version="audio-profile-v1",
             sha256=sha256_file(audio_path),
-            duration_ms=2_000,
+            duration_ms=duration_ms,
             sample_rate_hz=48_000,
             channels=2,
-            source_duration_ms=2_000,
+            source_duration_ms=duration_ms,
             trimmed_ms=0,
             gain_db=0.0,
             achieved_lufs=-14.0,
@@ -80,12 +82,36 @@ class InvalidThenSuperGenerator(RecordingGenerator):
         )
 
 
-class PositiveFirstThenSuperGenerator(RecordingGenerator):
+class LongActiveThenSuperGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
         return GeneratedTiming(
             osu_text="",
-            bpm_events=(OsuBpmEvent(250 if request.super_timing else 501, 120.0),),
+            bpm_events=(OsuBpmEvent(0 if request.super_timing else 95_645, 120.0),),
+            generator_name="recording-generator",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+
+class ShortActiveIntroGenerator(RecordingGenerator):
+    def generate_timing(self, request, workdir):
+        self.timing_calls.append(request)
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(OsuBpmEvent(2_678, 120.0),),
+            generator_name="recording-generator",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+
+class AlwaysLongActiveGapGenerator(RecordingGenerator):
+    def generate_timing(self, request, workdir):
+        self.timing_calls.append(request)
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(OsuBpmEvent(95_645, 120.0),),
             generator_name="recording-generator",
             seed=request.seed,
             mode="SUPER_TIMING" if request.super_timing else "STANDARD",
@@ -115,6 +141,28 @@ def _base_tempo_analysis(*, offset_ms: int = 0) -> OnsetAnalysis:
         band_strength=np.zeros((3, strength.size)),
         onset_ms=(),
         n_fft=1,
+    )
+
+
+def _active_analysis(duration_ms: int) -> OnsetAnalysis:
+    frame_ms = 100.0
+    frame_count = duration_ms // 100 + 1
+    strength = np.zeros(frame_count)
+    strength[::5] = 1.0
+    onsets = tuple(range(0, duration_ms, 250))
+    return OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.zeros((3, frame_count)),
+        onset_ms=onsets,
+        n_fft=1,
+        activity=AudioActivity(
+            frame_ms=frame_ms,
+            rms_db=np.full(frame_count, -10.0),
+            floor_db=-60.0,
+            active_onset_ms=onsets,
+        ),
     )
 
 
@@ -170,12 +218,12 @@ def test_structural_standard_failure_uses_super_timing_once(tmp_path):
     assert authority.attempt_count == 2
 
 
-def test_standard_first_event_beyond_one_beat_uses_super_timing_once(tmp_path):
-    generator = PositiveFirstThenSuperGenerator()
+def test_long_active_standard_gap_uses_super_timing_once(tmp_path):
+    generator = LongActiveThenSuperGenerator()
 
     authority = run_timing_generation(
-        _prepared(tmp_path),
-        _base_tempo_analysis(offset_ms=250),
+        _prepared(tmp_path, duration_ms=150_000),
+        _active_analysis(150_000),
         tmp_path,
         generator=generator,
         seed=9,
@@ -184,6 +232,49 @@ def test_standard_first_event_beyond_one_beat_uses_super_timing_once(tmp_path):
     assert [call.super_timing for call in generator.timing_calls] == [False, True]
     assert authority.mode == "SUPER_TIMING"
     assert authority.attempt_count == 2
+    assert authority.bpm_events[0].time_ms == 0
+    assert authority.leading_coverage is not None
+    assert authority.leading_coverage.action is TimingAuthorityAction.PASS
+
+
+def test_short_active_intro_is_promoted_without_event_mutation(tmp_path):
+    generator = ShortActiveIntroGenerator()
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=150_000),
+        _active_analysis(150_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False]
+    assert authority.mode == "STANDARD"
+    assert authority.bpm_events[0].time_ms == 2_678
+    assert authority.leading_coverage is not None
+    assert authority.leading_coverage.action is TimingAuthorityAction.REVIEW
+
+
+def test_two_long_active_gaps_fail_with_attempt_evidence(tmp_path):
+    generator = AlwaysLongActiveGapGenerator()
+
+    with pytest.raises(WorkerError) as captured:
+        run_timing_generation(
+            _prepared(tmp_path, duration_ms=150_000),
+            _active_analysis(150_000),
+            tmp_path,
+            generator=generator,
+            seed=9,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_CANDIDATE_FAILED
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    attempts = captured.value.context["attempts"]
+    assert len(attempts) == 2
+    assert all(
+        attempt["leadingCoverage"]["action"] == "RETRY_TIMING"
+        for attempt in attempts
+    )
 
 
 def test_retry_worthy_standard_accepts_structurally_valid_super_review(tmp_path):

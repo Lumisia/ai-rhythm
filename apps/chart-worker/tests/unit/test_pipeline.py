@@ -80,6 +80,15 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         "action": "PASS",
         "reasons": ["TEMPO_CANDIDATE_AMBIGUOUS"],
     }
+    assert report["timingAuthorityLeadingCoverage"] == {
+        "action": "PASS",
+        "reasons": [],
+        "firstEventTimeMs": 0,
+        "leadingDurationMs": 0,
+        "onsetCount": 0,
+        "activeOnsetCount": 0,
+        "activeFrameRatio": 0.0,
+    }
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
     assert report["attemptsPerChartMax"] == 3
@@ -163,7 +172,9 @@ def test_success_report_uses_null_for_unavailable_optional_timing_evidence(
 
     def timing(prepared, analysis, run_dir, generator, seed):
         authority = dependencies.timing(prepared, analysis, run_dir, generator, seed)
-        return replace(authority, tempo_metrics=None, review=None)
+        return replace(
+            authority, tempo_metrics=None, review=None, leading_coverage=None
+        )
 
     run_pipeline(
         PipelineOptions(
@@ -178,6 +189,7 @@ def test_success_report_uses_null_for_unavailable_optional_timing_evidence(
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
     assert report["timingAuthorityTempoMetrics"] is None
     assert report["timingAuthorityReview"] is None
+    assert report["timingAuthorityLeadingCoverage"] is None
 
 
 @pytest.mark.parametrize(

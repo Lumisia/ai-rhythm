@@ -342,6 +342,11 @@ def _generation_report(
         "timingAuthorityReview": (
             authority.review.to_report() if authority.review is not None else None
         ),
+        "timingAuthorityLeadingCoverage": (
+            authority.leading_coverage.to_report()
+            if authority.leading_coverage is not None
+            else None
+        ),
         "noteMutationEnabled": False,
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
