@@ -13,6 +13,11 @@ from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.schema.playtest_run import PlaytestRunManifest
+from chart_worker.stages.s2_timing import run_timing_generation
+from chart_worker.stages.timing_feedback import (
+    MapTimingFailureSignature,
+    RetryTimingSignal,
+)
 from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.quality_gate import GateAction
 from chart_worker.validation.timing_review import (
@@ -107,6 +112,17 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["publishable"] is True
     assert report["status"] == "PASS"
     assert report["timingReviewRequired"] is False
+    assert report["selectedAuthorityEpoch"] == 1
+    assert report["timingCandidates"] == [
+        {
+            "epoch": 1,
+            "authoritySha256": report["timingAuthoritySha256"],
+            "mode": "STANDARD",
+            "status": "SELECTED",
+            "escalation": None,
+        }
+    ]
+    assert report["mapTimingEscalations"] == []
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
     assert set(report["difficultyOrder"]) == {"4K", "6K", "7K"}
@@ -1127,3 +1143,141 @@ def test_pipeline_rejects_a_nonempty_output_without_deleting_existing_files(tmp_
         )
 
     assert (output_dir / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def _retry_timing_signal(authority_sha256: str) -> RetryTimingSignal:
+    return RetryTimingSignal(
+        tuple(
+            MapTimingFailureSignature(
+                authority_sha256=authority_sha256,
+                key_mode=4,
+                difficulty="NORMAL",
+                seed=seed,
+                timing_segment_id=3,
+                failure_family="DUPLICATE_NOTE",
+                time_ms=4_000,
+                grid_aligned=True,
+            )
+            for seed in (7, 19)
+        )
+    )
+
+
+def test_map_timing_feedback_replaces_authority_and_regenerates_all_variants(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    generation_modes: list[str] = []
+    stable_raw_counts: list[int] = []
+    super_calls: list[int] = []
+
+    def super_timing(prepared, analysis, run_dir, generator, seed):
+        super_calls.append(seed)
+        return run_timing_generation(
+            prepared,
+            analysis,
+            run_dir,
+            generator=generator,
+            seed=seed,
+            force_super=True,
+        )
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
+        generation_modes.append(authority.mode)
+        stable_raw_counts.append(len(list((run_dir / "raw").glob("*.osu"))))
+        if len(generation_modes) == 1:
+            raise _retry_timing_signal(authority.sha256)
+        variants = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+        )
+        assert len(variants) == 12
+        assert all(
+            variant.timing_authority_sha256 == authority.sha256
+            for variant in variants
+        )
+        return variants
+
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(
+            dependencies,
+            super_timing=super_timing,
+            generation=generation,
+        ),
+    )
+
+    assert generation_modes == ["STANDARD", "SUPER_TIMING"]
+    assert stable_raw_counts == [0, 0]
+    assert super_calls == [7]
+    assert len(result.raw_osu_paths) == 12
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["selectedAuthorityEpoch"] == 2
+    assert [candidate["status"] for candidate in report["timingCandidates"]] == [
+        "REJECTED_MAP_TIMING_FEEDBACK",
+        "SELECTED",
+    ]
+    assert report["timingGenerationMode"] == "SUPER_TIMING"
+    assert len(report["mapTimingEscalations"]) == 1
+    assert report["mapTimingEscalations"][0]["failureFamily"] == "DUPLICATE_NOTE"
+
+
+def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    generation_modes: list[str] = []
+
+    def super_timing(prepared, analysis, run_dir, generator, seed):
+        return run_timing_generation(
+            prepared,
+            analysis,
+            run_dir,
+            generator=generator,
+            seed=seed,
+            force_super=True,
+        )
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed):
+        del prepared, analysis, run_dir, generator, seed
+        generation_modes.append(authority.mode)
+        raise _retry_timing_signal(authority.sha256)
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(
+                dependencies,
+                super_timing=super_timing,
+                generation=generation,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert generation_modes == ["STANDARD", "SUPER_TIMING"]
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["selectedAuthorityEpoch"] is None
+    assert [candidate["status"] for candidate in report["timingCandidates"]] == [
+        "REJECTED_MAP_TIMING_FEEDBACK",
+        "FAILED",
+    ]
+    assert len(report["mapTimingEscalations"]) == 2
+    assert report["failureStage"] == "GENERATION"

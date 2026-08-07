@@ -25,10 +25,12 @@ from chart_worker.schema.playtest_run import (
     RunChartRef,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
+from chart_worker.stages.authority_epoch import AuthorityEpochRecord
 from chart_worker.stages.s1_prepare import run_prepare
 from chart_worker.stages.s2_generate import MAX_VARIANT_ATTEMPTS, run_generation
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.s3_export import run_export
+from chart_worker.stages.timing_feedback import RetryTimingSignal
 from chart_worker.stages.types import (
     ExportedVariant,
     GeneratedVariant,
@@ -92,6 +94,23 @@ def _timing_stage(
     )
 
 
+def _super_timing_stage(
+    prepared: PreparedAudio,
+    analysis: OnsetAnalysis,
+    run_dir: Path,
+    generator: ChartGenerator,
+    seed: int,
+) -> SongTimingAuthority:
+    return run_timing_generation(
+        prepared,
+        analysis,
+        run_dir,
+        generator=generator,
+        seed=seed,
+        force_super=True,
+    )
+
+
 def _analysis_stage(path: Path) -> OnsetAnalysis:
     return analyze_canonical_audio(path)
 
@@ -127,6 +146,7 @@ class PipelineDependencies:
     analyze: AnalysisStage = _analysis_stage
     select_generator: Callable[[GeneratorName, WorkerConfig], ChartGenerator] = _select_generator
     timing: TimingStage = _timing_stage
+    super_timing: TimingStage = _super_timing_stage
     generation: GenerationStage = _generation_stage
     export: ExportStage = _export_stage
     now: Callable[[], datetime] = _utc_now
@@ -227,6 +247,18 @@ def _timing_authority_report(
     }
 
 
+def _authority_epoch_report(
+    records: list[AuthorityEpochRecord],
+    escalations: list[dict[str, object]],
+    selected_epoch: int | None,
+) -> dict[str, object]:
+    return {
+        "selectedAuthorityEpoch": selected_epoch,
+        "timingCandidates": [record.to_report() for record in records],
+        "mapTimingEscalations": escalations,
+    }
+
+
 def _elapsed_ms(started_ns: int) -> int:
     return max(0, (perf_counter_ns() - started_ns) // 1_000_000)
 
@@ -315,6 +347,9 @@ def _generation_report(
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
     difficulty_order_reports: dict[str, dict[str, object]],
+    authority_epochs: list[AuthorityEpochRecord],
+    map_timing_escalations: list[dict[str, object]],
+    selected_authority_epoch: int,
 ) -> dict[str, object]:
     charts = []
     for variant, result in zip(generated, exported, strict=True):
@@ -382,6 +417,11 @@ def _generation_report(
         "generator": options.generator,
         "strategy": "MAPPERATORINATOR_SHARED_TIMING",
         **_timing_authority_report(authority, run_dir),
+        **_authority_epoch_report(
+            authority_epochs,
+            map_timing_escalations,
+            selected_authority_epoch,
+        ),
         "noteMutationEnabled": False,
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
@@ -412,6 +452,8 @@ def _failure_generation_report(
     error: WorkerError,
     *,
     failure_stage: str | None = None,
+    authority_epochs: list[AuthorityEpochRecord] | None = None,
+    map_timing_escalations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     status = {
         ErrorCode.CHART_TIMING_REVIEW_REQUIRED: "REVIEW",
@@ -433,6 +475,11 @@ def _failure_generation_report(
             "context": error.context,
         },
         **_timing_authority_report(authority, run_dir),
+        **_authority_epoch_report(
+            authority_epochs or [],
+            map_timing_escalations or [],
+            None,
+        ),
         "canonicalAudioSha256": prepared.normalized.sha256,
         "elapsedMsByStage": elapsed,
         "charts": [],
@@ -523,41 +570,163 @@ def run_pipeline(
     _require_canonical_audio_hash(prepared)
     elapsed["timing"] = _elapsed_ms(started)
 
-    started = perf_counter_ns()
-    try:
-        generated = dependencies.generation(
-            prepared,
-            authority,
-            onsets,
-            run_dir,
-            generator,
-            options.seed,
-        )
-        _require_publishable_acceptance(generated)
-        difficulty_order_reports = _require_difficulty_order_reports(generated)
-    except WorkerError as error:
-        if error.code not in {
-            ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-            ErrorCode.CHART_VALIDATION_FAILED,
-        }:
-            raise
-        elapsed["generation"] = _elapsed_ms(started)
-        _write_generation_report(
-            run_dir / "generation-report.json",
-            _failure_generation_report(
-                options,
-                run_id,
-                elapsed,
-                run_dir,
+    authority_epochs: list[AuthorityEpochRecord] = []
+    map_timing_escalations: list[dict[str, object]] = []
+    generation_elapsed_ms = 0
+    selected_authority_epoch: int | None = None
+
+    for epoch in (1, 2):
+        started = perf_counter_ns()
+        try:
+            generated = dependencies.generation(
                 prepared,
                 authority,
-                error,
-            ),
-        )
-        raise
+                onsets,
+                run_dir,
+                generator,
+                options.seed,
+            )
+            _require_publishable_acceptance(generated)
+            difficulty_order_reports = _require_difficulty_order_reports(generated)
+        except RetryTimingSignal as signal:
+            generation_elapsed_ms += _elapsed_ms(started)
+            escalation = {"epoch": epoch, **signal.to_context()}
+            map_timing_escalations.append(escalation)
+            if epoch == 2 or authority.mode == "SUPER_TIMING":
+                authority_epochs.append(
+                    AuthorityEpochRecord(
+                        epoch=epoch,
+                        authority_sha256=authority.sha256,
+                        mode=authority.mode,
+                        status="FAILED",
+                        escalation=escalation,
+                    )
+                )
+                error = WorkerError(
+                    ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+                    "Super timing authority also failed corroborated MAP timing checks",
+                    context={
+                        "reason": "SUPER_TIMING_MAP_FEEDBACK_EXHAUSTED",
+                        "epochs": [
+                            record.to_report() for record in authority_epochs
+                        ],
+                        "mapTimingEscalations": map_timing_escalations,
+                    },
+                )
+                elapsed["generation"] = generation_elapsed_ms
+                _write_generation_report(
+                    run_dir / "generation-report.json",
+                    _failure_generation_report(
+                        options,
+                        run_id,
+                        elapsed,
+                        run_dir,
+                        prepared,
+                        authority,
+                        error,
+                        failure_stage="GENERATION",
+                        authority_epochs=authority_epochs,
+                        map_timing_escalations=map_timing_escalations,
+                    ),
+                )
+                raise error from signal
+
+            authority_epochs.append(
+                AuthorityEpochRecord(
+                    epoch=epoch,
+                    authority_sha256=authority.sha256,
+                    mode=authority.mode,
+                    status="REJECTED_MAP_TIMING_FEEDBACK",
+                    escalation=escalation,
+                )
+            )
+            started = perf_counter_ns()
+            try:
+                authority = dependencies.super_timing(
+                    prepared,
+                    onsets,
+                    run_dir,
+                    generator,
+                    options.seed,
+                )
+            except WorkerError as error:
+                if error.code not in {
+                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                    ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+                }:
+                    raise
+                elapsed["timing"] += _elapsed_ms(started)
+                elapsed["generation"] = generation_elapsed_ms
+                _write_generation_report(
+                    run_dir / "generation-report.json",
+                    _failure_generation_report(
+                        options,
+                        run_id,
+                        elapsed,
+                        run_dir,
+                        prepared,
+                        None,
+                        error,
+                        failure_stage="TIMING",
+                        authority_epochs=authority_epochs,
+                        map_timing_escalations=map_timing_escalations,
+                    ),
+                )
+                raise
+            elapsed["timing"] += _elapsed_ms(started)
+            _require_canonical_audio_hash(prepared)
+            continue
+        except WorkerError as error:
+            if error.code not in {
+                ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+                ErrorCode.CHART_VALIDATION_FAILED,
+            }:
+                raise
+            generation_elapsed_ms += _elapsed_ms(started)
+            authority_epochs.append(
+                AuthorityEpochRecord(
+                    epoch=epoch,
+                    authority_sha256=authority.sha256,
+                    mode=authority.mode,
+                    status="FAILED",
+                )
+            )
+            elapsed["generation"] = generation_elapsed_ms
+            _write_generation_report(
+                run_dir / "generation-report.json",
+                _failure_generation_report(
+                    options,
+                    run_id,
+                    elapsed,
+                    run_dir,
+                    prepared,
+                    authority,
+                    error,
+                    failure_stage="GENERATION",
+                    authority_epochs=authority_epochs,
+                    map_timing_escalations=map_timing_escalations,
+                ),
+            )
+            raise
+        else:
+            generation_elapsed_ms += _elapsed_ms(started)
+            authority_epochs.append(
+                AuthorityEpochRecord(
+                    epoch=epoch,
+                    authority_sha256=authority.sha256,
+                    mode=authority.mode,
+                    status="SELECTED",
+                )
+            )
+            selected_authority_epoch = epoch
+            break
+    else:
+        raise AssertionError("authority epoch attempts were unexpectedly exhausted")
+
     _require_canonical_audio_hash(prepared)
-    elapsed["generation"] = _elapsed_ms(started)
+    elapsed["generation"] = generation_elapsed_ms
+    assert selected_authority_epoch is not None
 
     started = perf_counter_ns()
     exported = dependencies.export(
@@ -582,6 +751,9 @@ def run_pipeline(
             prepared,
             authority,
             difficulty_order_reports,
+            authority_epochs,
+            map_timing_escalations,
+            selected_authority_epoch,
         ),
     )
     manifest = PlaytestRunManifest(
