@@ -58,7 +58,7 @@ export class FeverGauge {
 
   advance(songTimeMs: number): FeverTransition {
     if (!this.#active) return null;
-    if (songTimeMs - this.#startedAtMs <= this.#durationMs) return null;
+    if (songTimeMs - this.#startedAtMs < this.#durationMs) return null;
     // 발동 중에도 `accept` 는 게이지를 계속 채운다. 여기서 0 으로 되돌리지
     // 않으면 만충인 채로 끝나 다음 판정 한 번에 곧바로 재발동한다 —
     // FEVER 가 사실상 영구화되고 maxCombo 와 rawMaxCombo 의 구분이 무너진다.

@@ -1,6 +1,7 @@
 import Phaser from "phaser";
 
 import type { EffectEvent, EffectSubscriber } from "../core/EffectBus";
+import { feverGaugeVisible } from "../core/feverPresentation";
 import type { JudgmentPhase } from "../core/JudgmentEngine";
 import type { StageGeometry } from "../core/LaneLayout";
 import type { ScoreSnapshot } from "../core/ScoreCalculator";
@@ -79,6 +80,7 @@ export interface HudRendererOptions extends HudGeometry {
   firstNoteTimeMs: number;
   beatMs: number;
   snapshot: () => ScoreSnapshot;
+  feverEnabled: boolean;
 }
 
 export interface HudJudgment {
@@ -121,6 +123,7 @@ export class HudRenderer implements EffectSubscriber {
   readonly #firstNoteTimeMs: number;
   readonly #beatMs: number;
   readonly #snapshot: () => ScoreSnapshot;
+  readonly #feverEnabled: boolean;
 
   #stage: StageGeometry;
   #width: number;
@@ -157,6 +160,7 @@ export class HudRenderer implements EffectSubscriber {
     this.#firstNoteTimeMs = options.firstNoteTimeMs;
     this.#beatMs = options.beatMs;
     this.#snapshot = options.snapshot;
+    this.#feverEnabled = options.feverEnabled;
 
     this.#graphics = scene.add.graphics().setDepth(DEPTH.HUD_GRAPHICS);
     this.#scoreText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT);
@@ -241,7 +245,7 @@ export class HudRenderer implements EffectSubscriber {
   update(songTimeMs: number): void {
     this.#graphics.clear();
     this.#drawProgressRail(songTimeMs);
-    this.#drawFever();
+    if (feverGaugeVisible(this.#feverEnabled)) this.#drawFever();
     this.#drawScope(songTimeMs);
     this.#drawJudgment(songTimeMs);
     this.#drawCombo(songTimeMs);

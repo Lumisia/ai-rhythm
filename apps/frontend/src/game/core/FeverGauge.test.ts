@@ -67,8 +67,9 @@ describe("FeverGauge", () => {
 
     expect(gauge.advance(14_999)).toBeNull();
     expect(gauge.active).toBe(true);
-    expect(gauge.advance(15_001)).toBe("END");
+    expect(gauge.advance(15_000)).toBe("END");
     expect(gauge.active).toBe(false);
+    expect(gauge.advance(15_001)).toBeNull();
   });
 
   it("MISS 시 게이지가 감소하고 발동 중이면 즉시 종료된다", () => {

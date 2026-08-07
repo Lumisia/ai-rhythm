@@ -6,6 +6,7 @@
  */
 export const DEPTH = {
   STAGE_BACKGROUND: 0,
+  FEVER_GLOW: 1,
   LANE_HIGHLIGHT: 2,
   KEY_LABEL: 4,
   NOTE: 10,

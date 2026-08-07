@@ -5,6 +5,7 @@ import {
   type EffectEvent,
   type EffectSubscriber,
 } from "../core/EffectBus";
+import { feverGlowAlpha } from "../core/feverPresentation";
 import type { LaneGeometry, StageGeometry } from "../core/LaneLayout";
 import { DEPTH } from "./renderDepth";
 
@@ -29,9 +30,13 @@ export const JUDGE_LINE_RATIO = 0.85;
  */
 export class StageRenderer implements EffectSubscriber {
   readonly #background: Phaser.GameObjects.Graphics;
+  readonly #feverOverlay: Phaser.GameObjects.Graphics;
   readonly #receptors: Phaser.GameObjects.Graphics;
   readonly #keyTexts: Phaser.GameObjects.Text[] = [];
   #feverActive = false;
+  #feverEndedAtMs: number | null = null;
+  #feverAlpha = 0;
+  #reduceMotion = false;
 
   constructor(
     scene: Phaser.Scene,
@@ -42,6 +47,7 @@ export class StageRenderer implements EffectSubscriber {
     keyLabels: readonly string[],
   ) {
     this.#background = scene.add.graphics().setDepth(DEPTH.STAGE_BACKGROUND);
+    this.#feverOverlay = scene.add.graphics().setDepth(DEPTH.FEVER_GLOW);
     this.#receptors = scene.add.graphics().setDepth(DEPTH.LANE_HIGHLIGHT);
     for (const label of keyLabels) {
       this.#keyTexts.push(
@@ -72,6 +78,7 @@ export class StageRenderer implements EffectSubscriber {
 
   destroy(): void {
     this.#background.destroy();
+    this.#feverOverlay.destroy();
     this.#receptors.destroy();
     for (const text of this.#keyTexts) text.destroy();
   }
@@ -100,11 +107,12 @@ export class StageRenderer implements EffectSubscriber {
     graphics.lineBetween(this.stage.right, 0, this.stage.right, this.judgeLineY);
 
     // 무대 좌우 테두리. 바깥 어둠과 무대를 가르는 선이다.
-    graphics.lineStyle(this.#feverActive ? 3 : 2, this.#feverActive ? FEVER_EDGE : HAIRLINE, 1);
+    graphics.lineStyle(2, HAIRLINE, 1);
     graphics.lineBetween(this.stage.left - 1, 0, this.stage.left - 1, this.height);
     graphics.lineBetween(this.stage.right + 1, 0, this.stage.right + 1, this.height);
 
     this.#drawReceptorBase(graphics);
+    this.#drawFeverOverlay(this.#feverAlpha);
     this.#layoutKeyLabels();
     this.setPressed(new Set(), new Map(), 0);
   }
@@ -113,15 +121,32 @@ export class StageRenderer implements EffectSubscriber {
    *
    * 전이 시점에만 부른다. 매 프레임 redraw 하면 배경까지 다시 그린다.
    */
-  setFeverActive(active: boolean): void {
+  setFeverActive(active: boolean, songTimeMs = 0): void {
     if (this.#feverActive === active) return;
     this.#feverActive = active;
-    this.redraw();
+    this.#feverEndedAtMs = active ? null : songTimeMs;
+    this.updateFever(songTimeMs);
   }
 
   handleEffect(event: EffectEvent): void {
     const active = feverActiveFromEffect(event);
-    if (active !== null) this.setFeverActive(active);
+    if (active !== null) this.setFeverActive(active, event.songTimeMs);
+  }
+
+  setReduceMotion(reduce: boolean): void {
+    this.#reduceMotion = reduce;
+    if (reduce && !this.#feverActive) this.#drawFeverOverlay(0);
+  }
+
+  updateFever(songTimeMs: number): void {
+    const alpha = feverGlowAlpha(
+      this.#feverActive,
+      this.#feverEndedAtMs,
+      songTimeMs,
+      this.#reduceMotion,
+    );
+    if (alpha === this.#feverAlpha) return;
+    this.#drawFeverOverlay(alpha);
   }
 
   /** 눌린 레인을 밝힌다. 판정과 무관하게 반응해야 입력이 먹은 걸 안다. */
@@ -173,11 +198,29 @@ export class StageRenderer implements EffectSubscriber {
       graphics.strokeRect(lane.x + 1.5, top + 0.5, lane.width - 3, RECEPTOR_HEIGHT - 1);
     }
     // 판정선. 무대 폭만큼만 긋는다 — 화면을 가로지르면 무대가 안 보인다.
-    if (this.#feverActive) {
-      graphics.fillGradientStyle(FEVER_EDGE, 0xffffff, FEVER_EDGE, 0xffffff, 1, 1, 1, 1);
-    } else {
-      graphics.fillGradientStyle(ACCENT, 0xa78bfa, ACCENT, 0xa78bfa, 1, 1, 1, 1);
-    }
+    graphics.fillGradientStyle(ACCENT, 0xa78bfa, ACCENT, 0xa78bfa, 1, 1, 1, 1);
+    graphics.fillRect(this.stage.left, this.judgeLineY - 2, this.stage.width, 3);
+  }
+
+  #drawFeverOverlay(alpha: number): void {
+    this.#feverAlpha = alpha;
+    const graphics = this.#feverOverlay;
+    graphics.clear();
+    if (alpha <= 0) return;
+
+    graphics.lineStyle(3, FEVER_EDGE, alpha);
+    graphics.lineBetween(this.stage.left - 1, 0, this.stage.left - 1, this.height);
+    graphics.lineBetween(this.stage.right + 1, 0, this.stage.right + 1, this.height);
+    graphics.fillGradientStyle(
+      FEVER_EDGE,
+      0xffffff,
+      FEVER_EDGE,
+      0xffffff,
+      alpha,
+      alpha,
+      alpha,
+      alpha,
+    );
     graphics.fillRect(this.stage.left, this.judgeLineY - 2, this.stage.width, 3);
   }
 

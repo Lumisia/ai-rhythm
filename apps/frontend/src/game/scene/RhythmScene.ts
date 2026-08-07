@@ -128,6 +128,7 @@ export class RhythmScene extends Phaser.Scene {
       activeHoldIds: this.#session.engine.activeHoldIds(),
     });
     this.#stage?.setPressed(this.#held, this.#flashAtMs, songTimeMs, LANE_FLASH_MS);
+    this.#stage?.updateFever(songTimeMs);
     this.#effectLayer?.update(songTimeMs);
     const feverTick = this.#session.fever?.advance(songTimeMs) ?? null;
     if (feverTick) this.#applyFever(feverTick, songTimeMs);
@@ -251,12 +252,14 @@ export class RhythmScene extends Phaser.Scene {
         firstNoteTimeMs: this.#firstNoteTimeMs(),
         beatMs: this.#beatMs(),
         snapshot: () => this.#session.score.snapshot(),
+        feverEnabled: Boolean(this.#session.fever),
       });
       this.#unsubscribes.push(this.#effects.subscribe(this.#hud));
     } else {
       this.#hud.resize(geometry);
     }
     const reduceMotion = this.#session.reduceMotion ?? false;
+    this.#stage.setReduceMotion(reduceMotion);
     this.#effectLayer.setReduceMotion(reduceMotion);
     this.#hud.setReduceMotion(reduceMotion);
     this.#session.onLayout?.({ judgeLineY });
