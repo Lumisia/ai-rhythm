@@ -1,23 +1,64 @@
-# 설계·운영 문서는 코드와 함께 버전 관리한다.
+# 로컬 문서·AI 작업 도구
+docs/
 .understand-anything/
-
-# 로컬 개발 도구 설정
 .claude/
+.codex/
+.agents/
+.superpowers/
 
 # git worktree 전용 경로 (산출물 청소 대상 아님 — 절대 일괄 삭제 금지)
 .worktrees/
 
-# 로컬 데이터 (StoragePort 로컬 구현체)
+# 로컬 데이터·실행 산출물
 .data/
+apps/chart-worker/sdd-*/
 out/
 reports/
+artifacts/
+tmp/
+temp/
+.cache/
+*.log
+*.out
+*.err
+*.tmp
+*.temp
+*.bak
+*.pid
+*.swp
+*~
 
-# 오디오·채보 산출물
+# 오디오·영상·채보 산출물
 *.wav
 *.flac
 !apps/frontend/src/test/fixtures/playtest-run/audio/game.flac
 *.mp3
+*.ogg
+*.opus
+*.m4a
+*.aac
+*.wma
+*.mp4
+*.webm
+*.mov
+*.mkv
+*.osu
+!apps/chart-worker/tests/fixtures/*.osu
 *.osz
+*.mid
+*.midi
+
+# ML 모델·실험 산출물
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.tflite
+*.h5
+checkpoints/
+wandb/
+.huggingface/
 
 # Java / Gradle
 .gradle/
@@ -30,27 +71,70 @@ hs_err_pid*
 node_modules/
 dist/
 .vite/
+.turbo/
+.next/
+.nuxt/
+.npm/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.eslintcache
+.nyc_output/
+coverage/
+playwright-report/
+test-results/
+blob-report/
 *.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+__pypackages__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
 *.egg-info/
+pip-wheel-metadata/
+.ipynb_checkpoints/
 
 # 비밀정보
 .env
-.env.local
+.env.*
+!.env.example
+!.env.*.example
 *.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
 *-service-account.json
+service-account*.json
+credentials*.json
+secrets*.json
+.npmrc
+.pypirc
 
 # IDE / OS
 .idea/
 .vscode/
+.fleet/
+.vs/
 *.iml
+*.suo
+*.user
 .DS_Store
 Thumbs.db
+Desktop.ini
