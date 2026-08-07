@@ -12,6 +12,10 @@ from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.generation.osu_writer import timing_to_osu_mania
+from chart_worker.generation.resnap_diagnostics import (
+    ResnapCollision,
+    ResnapDiagnostics,
+)
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages import s2_generate
@@ -1149,6 +1153,70 @@ def test_timing_feedback_two_duplicate_seeds_escalate_before_third_attempt(
     assert captured.value.to_context()["timingSegmentId"] == 0
     assert captured.value.to_context()["failureFamily"] == "DUPLICATE_NOTE"
     assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
+def test_observed_resnap_duplicate_is_classified_and_escalated_separately(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    monkeypatch.setattr(
+        s2_generate,
+        "evaluate_chart_candidate",
+        evaluate_chart_candidate,
+    )
+
+    class AlwaysObservedResnapCollision(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            return replace(
+                generated,
+                notes=[NoteEvent(0, 1), NoteEvent(0, 1)],
+                osu_text="",
+                resnap_diagnostics=ResnapDiagnostics(
+                    status="OBSERVED",
+                    collisions=(
+                        ResnapCollision(
+                            seed=request.seed,
+                            lane=1,
+                            note_kind="TAP",
+                            pre_time_ms=-10,
+                            post_time_ms=0,
+                            snap_divisor=4,
+                        ),
+                        ResnapCollision(
+                            seed=request.seed,
+                            lane=1,
+                            note_kind="TAP",
+                            pre_time_ms=10,
+                            post_time_ms=0,
+                            snap_divisor=4,
+                        ),
+                    ),
+                ),
+            )
+
+    with pytest.raises(RetryTimingSignal) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=AlwaysObservedResnapCollision(),
+            seed=0,
+        )
+
+    context = captured.value.to_context()
+    assert context["failureFamily"] == "RESNAP_COLLISION"
+    assert context["seeds"] == [0, 12]
+    assert context["signatures"][0]["evidence"]["resnapCollisions"][0] == {
+        "seed": 0,
+        "lane": 1,
+        "noteKind": "TAP",
+        "preTimeMs": -10,
+        "postTimeMs": 0,
+        "snapDivisor": 4,
+    }
 
 
 def test_timing_feedback_duplicates_in_different_segments_remain_map_retries(

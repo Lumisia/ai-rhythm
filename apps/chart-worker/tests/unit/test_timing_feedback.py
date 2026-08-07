@@ -1,10 +1,17 @@
+from typing import get_args
+
 import pytest
 
 from chart_worker.stages.timing_feedback import (
     MapTimingFailureSignature,
     RetryTimingSignal,
+    TimingFailureFamily,
     record_timing_failure,
 )
+
+
+def test_timing_failure_families_include_observed_resnap_collision():
+    assert "RESNAP_COLLISION" in get_args(TimingFailureFamily)
 
 
 def _signature(
@@ -74,4 +81,18 @@ def test_two_active_middle_gaps_follow_the_same_distinct_seed_rule():
         record_timing_failure(
             signatures,
             _signature(12, family="ACTIVE_MIDDLE_GAP"),
+        )
+
+
+def test_two_resnap_collisions_follow_the_same_distinct_seed_rule():
+    signatures = []
+    record_timing_failure(
+        signatures,
+        _signature(0, family="RESNAP_COLLISION"),
+    )
+
+    with pytest.raises(RetryTimingSignal):
+        record_timing_failure(
+            signatures,
+            _signature(12, family="RESNAP_COLLISION"),
         )

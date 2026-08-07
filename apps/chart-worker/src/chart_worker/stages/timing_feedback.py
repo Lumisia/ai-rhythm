@@ -3,7 +3,11 @@
 from dataclasses import dataclass
 from typing import Literal
 
-TimingFailureFamily = Literal["DUPLICATE_NOTE", "ACTIVE_MIDDLE_GAP"]
+TimingFailureFamily = Literal[
+    "DUPLICATE_NOTE",
+    "ACTIVE_MIDDLE_GAP",
+    "RESNAP_COLLISION",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +20,7 @@ class MapTimingFailureSignature:
     failure_family: TimingFailureFamily
     time_ms: int
     grid_aligned: bool
+    evidence: dict[str, object] | None = None
 
     @property
     def corroboration_key(self) -> tuple[str, int, str, int, str]:
@@ -37,6 +42,7 @@ class MapTimingFailureSignature:
             "failureFamily": self.failure_family,
             "timeMs": self.time_ms,
             "gridAligned": self.grid_aligned,
+            "evidence": self.evidence,
         }
 
 

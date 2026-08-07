@@ -251,6 +251,7 @@ def _timing_failure_signature(
     family: TimingFailureFamily,
     time_ms: int,
     alignment_time_ms: int | None = None,
+    evidence: dict[str, object] | None = None,
 ) -> MapTimingFailureSignature | None:
     segment_id = _timing_segment_id(authority, time_ms)
     if segment_id is None:
@@ -268,6 +269,7 @@ def _timing_failure_signature(
         failure_family=family,
         time_ms=time_ms,
         grid_aligned=alignment.clean_rate == 1.0,
+        evidence=evidence,
     )
 
 
@@ -284,6 +286,7 @@ def _local_segment_has_grid_damage(
 def _acceptance_timing_failures(
     state: _VariantState,
     authority: SongTimingAuthority,
+    generated: GeneratedChart,
     acceptance: ChartAcceptance,
     *,
     seed: int,
@@ -293,13 +296,35 @@ def _acceptance_timing_failures(
     if structure_error is not None and structure_error["reasonCode"] == "DUPLICATE_NOTE":
         context = structure_error["context"]
         time_ms = context.get("timeMs") if isinstance(context, dict) else None
-        if isinstance(time_ms, int):
+        lane = context.get("lane") if isinstance(context, dict) else None
+        if isinstance(time_ms, int) and isinstance(lane, int):
+            matching_collisions = tuple(
+                collision.lane == lane and collision.post_time_ms == time_ms
+                for collision in generated.resnap_diagnostics.collisions
+            )
+            observed_resnap = any(matching_collisions)
+            collision_evidence = [
+                collision.to_report()
+                for collision, matches in zip(
+                    generated.resnap_diagnostics.collisions,
+                    matching_collisions,
+                    strict=True,
+                )
+                if matches
+            ]
             signature = _timing_failure_signature(
                 state,
                 authority,
                 seed=seed,
-                family="DUPLICATE_NOTE",
+                family=(
+                    "RESNAP_COLLISION" if observed_resnap else "DUPLICATE_NOTE"
+                ),
                 time_ms=time_ms,
+                evidence=(
+                    {"resnapCollisions": collision_evidence}
+                    if collision_evidence
+                    else None
+                ),
             )
             if signature is not None:
                 signatures.append(signature)
@@ -373,10 +398,15 @@ def _generate_next_pass(
                 "workdir": workdir.relative_to(run_dir).as_posix(),
                 "gateReport": gate_report,
             }
+            if generated.resnap_diagnostics.status != "UNOBSERVED":
+                evidence["resnapDiagnostics"] = (
+                    generated.resnap_diagnostics.to_report()
+                )
             if acceptance.action is GateAction.RETRY_MAP:
                 timing_failures = _acceptance_timing_failures(
                     state,
                     authority,
+                    generated,
                     acceptance,
                     seed=attempt_seed,
                 )
@@ -537,6 +567,10 @@ def _try_partial_repair(
                 },
                 "gateReport": acceptance.to_report(),
             }
+            if generated.resnap_diagnostics.status != "UNOBSERVED":
+                evidence["resnapDiagnostics"] = (
+                    generated.resnap_diagnostics.to_report()
+                )
             state.attempt_evidence.append(evidence)
             state.attempt_errors.append(
                 json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
