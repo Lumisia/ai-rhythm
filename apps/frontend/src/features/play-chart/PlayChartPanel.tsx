@@ -185,7 +185,10 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         void context.close();
         return;
       }
-      const game = createGame(playfieldRef.current, {
+      // 씬은 아래에서 만들어지고 restart 는 그 뒤에야 불린다(씬의 update 에서
+      // 호출된다). Phaser 타입을 React 로 끌어오지 않으려고 구조적 타입만 쓴다.
+      let scene: { resetFever(): void } | null = null;
+      const created = createGame(playfieldRef.current, {
         chart: { ...chart.document, notes },
         clock,
         engine,
@@ -205,8 +208,9 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
               restart: () => {
                 engine.reset();
                 holdTicks.reset();
-                fever?.reset();
-                score.setFeverActive(false);
+                // 게이지만 되돌리면 무대 테두리와 판정선이 보라로 남는다.
+                // 렌더러는 씬이 소유하므로 씬에게 통째로 맡긴다.
+                scene?.resetFever();
                 keysoundScheduler?.resetAutoPlay();
                 player?.seek(rangeStart);
               },
@@ -225,7 +229,8 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         onComplete: () => queueMicrotask(finish),
         onLayout: ({ judgeLineY: y }) => setJudgeLineY(y),
       });
-      resourcesRef.current = { context, player, game, score, recorder, clock, judgments };
+      scene = created.scene;
+      resourcesRef.current = { context, player, game: created.game, score, recorder, clock, judgments };
       player.play(rangeStart);
       setPhase("PLAYING");
     } catch (caught) {

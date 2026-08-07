@@ -139,6 +139,23 @@ export class RhythmScene extends Phaser.Scene {
     }
   }
 
+  /** 구간 반복으로 되감을 때 FEVER 상태를 한 번에 되돌린다.
+   *
+   * 게이지만 리셋하면 `advance()` 가 더는 END 를 내보내지 않아 무대 테두리와
+   * 판정선이 보라로 남고 파티클도 1.6배로 유지된다 — 콤보는 이미 ×1 로
+   * 돌아갔는데 연출만 거짓말을 한다. 게다가 다음 진짜 발동 때
+   * `StageRenderer.setFeverActive(true)` 의 동등성 가드에 걸려 연출이 아예
+   * 뜨지 않는다. 렌더러는 씬이 소유하므로 React 가 아니라 씬이 끈다.
+   *
+   * `HudRenderer` 는 매 프레임 게이지 값을 받아 가므로 손댈 게 없다.
+   */
+  resetFever(): void {
+    this.#session.fever?.reset();
+    this.#session.score.setFeverActive(false);
+    this.#effectLayer?.setFeverActive(false);
+    this.#stage?.setFeverActive(false);
+  }
+
   #acceptJudgment(event: JudgmentEvent): void {
     const songTimeMs = this.#session.clock.songTimeMs();
     this.#session.score.accept(event);
