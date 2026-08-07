@@ -3,12 +3,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GameClock } from "../../game/audio/GameClock";
 import { KeysoundScheduler } from "../../game/audio/KeysoundScheduler";
 import { SongPlayer } from "../../game/audio/SongPlayer";
+import { FeverGauge } from "../../game/core/FeverGauge";
+import { HoldTickTracker } from "../../game/core/HoldTickTracker";
 import { InputRecorder } from "../../game/core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../../game/core/JudgmentEngine";
+import { loadJudgmentConfig } from "../../game/core/judgment-config";
+import { approachMsAt1x } from "../../game/core/LaneLayout";
 import { ScoreCalculator, type ScoreSnapshot } from "../../game/core/ScoreCalculator";
 import type { ImportedChart, ImportedRun } from "../import-run/importRun";
 import type { RecordedInputEvent } from "../../game/core/InputRecorder";
 import { keyLabelsFor } from "../../game/input/KeyBindings";
+import { JUDGE_LINE_RATIO } from "../../game/scene/StageRenderer";
 import {
   MarkerControls,
   createReviewMarker,
@@ -17,6 +22,13 @@ import {
 } from "../review-chart/MarkerControls";
 import type { ReviewMarker, ReviewMarkerKind } from "../review-chart/review";
 import { PlaySettings, type PlaySettingsValue } from "./PlaySettings";
+
+/** 시스템 설정을 초기값으로 삼는다. 사용자가 설정에서 바꿀 수 있다. */
+function prefersReducedMotion(): boolean {
+  return typeof matchMedia === "function"
+    ? matchMedia("(prefers-reduced-motion: reduce)").matches
+    : false;
+}
 
 export interface PlaySessionResult {
   score: ScoreSnapshot;
@@ -49,12 +61,16 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
     scrollSpeed: 1,
     judgmentPreset: "lenient",
     keysound: false,
+    fever: true,
     loopEnabled: false,
     loopStartMs: 0,
     loopEndMs: chart.document.durationMs,
+    reduceMotion: prefersReducedMotion(),
   });
   const [phase, setPhase] = useState<"READY" | "PREPARING" | "PLAYING" | "PAUSED">("READY");
   const [error, setError] = useState<string | null>(null);
+  const [judgeLineY, setJudgeLineY] = useState<number | null>(null);
+  const [estimatedJudgeLineY, setEstimatedJudgeLineY] = useState<number | null>(null);
   const [markers, setMarkers] = useState<ReviewMarker[]>([]);
   const markersRef = useRef<ReviewMarker[]>([]);
   const playfieldRef = useRef<HTMLDivElement>(null);
@@ -78,6 +94,36 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
       cleanup();
     };
   }, [cleanup]);
+
+  /** 시작 전 노출 시간 추정값.
+   *
+   * 씬이 뜨기 전에는 실측할 대상이 없다. READY 상태의 `.playfield` 를 재면
+   * 안 된다 — `app.css` 의 `.playfield` 규칙이 그때는 고정 `535px` 이고,
+   * 플레이 중에는 `.play-panel--live .playfield { height: 100vh }` 가 더 높은
+   * 특이도로 이겨서 씬이 뷰포트 높이로 돌아간다. 두 값이 크게 달라 READY 에서
+   * 요소를 재면 배속 캘리브레이션이 통째로 어긋난다.
+   *
+   * 그래서 씬이 결국 따를 규칙을 한 단계 앞서 읽어 뷰포트 높이에서 추정한다.
+   * **이 계산은 `apps/frontend/src/app/app.css` 의
+   * `.play-panel--live .playfield` 높이 규칙(`100vh`)과 묶여 있다. 그 규칙이
+   * 바뀌면 여기도 같이 고쳐야 한다.**
+   *
+   * 어디까지나 시작 전 추정이다. 씬이 뜨면 `onLayout` 이 올려 주는 실제
+   * `judgeLineY` 가 이긴다.
+   */
+  useEffect(() => {
+    if (phase !== "READY") return;
+    const measure = () => {
+      const height = typeof window === "undefined" ? 0 : window.innerHeight;
+      // 레이아웃 전이거나 jsdom 이면 높이를 못 믿는다. 그때는 `시작 후 측정` 이 맞다.
+      setEstimatedJudgeLineY(
+        Number.isFinite(height) && height > 0 ? Math.round(height * JUDGE_LINE_RATIO) : null,
+      );
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [phase]);
 
   const finish = useCallback(() => {
     const resources = resourcesRef.current;
@@ -137,7 +183,19 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         return note.timeMs >= rangeStart && tail <= rangeEnd;
       });
       const engine = new JudgmentEngine(notes, settings.judgmentPreset);
+      const judgmentConfig = loadJudgmentConfig();
+      const windows = judgmentConfig.presets[settings.judgmentPreset];
+      const bpm = chart.document.bpmEvents[0]?.bpm;
+      const beatMs = bpm && bpm > 0 ? 60_000 / bpm : 500;
+      // 16분음표. ms 고정값이 아니라 박자 기준이라 곡이 빠를수록 촘촘해진다.
+      const holdTicks = new HoldTickTracker(
+        notes,
+        windows,
+        beatMs / 4,
+        judgmentConfig.holdReleaseScale,
+      );
       const score = new ScoreCalculator();
+      const fever = settings.fever ? new FeverGauge() : undefined;
       const recorder = new InputRecorder();
       const judgments: JudgmentEvent[] = [];
       let keysoundScheduler: KeysoundScheduler | undefined;
@@ -159,7 +217,10 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         void context.close();
         return;
       }
-      const game = createGame(playfieldRef.current, {
+      // 씬은 아래에서 만들어지고 restart 는 그 뒤에야 불린다(씬의 update 에서
+      // 호출된다). Phaser 타입을 React 로 끌어오지 않으려고 구조적 타입만 쓴다.
+      let scene: { resetFever(): void } | null = null;
+      const created = createGame(playfieldRef.current, {
         chart: { ...chart.document, notes },
         clock,
         engine,
@@ -169,12 +230,19 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         judgmentPreset: settings.judgmentPreset,
         keysoundScheduler,
         songPlayer: player,
+        holdTicks,
+        fever,
+        reduceMotion: settings.reduceMotion,
         loop: settings.loopEnabled
           ? {
               startMs: rangeStart,
               endMs: rangeEnd,
               restart: () => {
                 engine.reset();
+                holdTicks.reset();
+                // 게이지만 되돌리면 무대 테두리와 판정선이 보라로 남는다.
+                // 렌더러는 씬이 소유하므로 씬에게 통째로 맡긴다.
+                scene?.resetFever();
                 keysoundScheduler?.resetAutoPlay();
                 player?.seek(rangeStart);
               },
@@ -191,8 +259,10 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         },
         markerLabel: markerLabelForSlot,
         onComplete: () => queueMicrotask(finish),
+        onLayout: ({ judgeLineY: y }) => setJudgeLineY(y),
       });
-      resourcesRef.current = { context, player, game, score, recorder, clock, judgments };
+      scene = created.scene;
+      resourcesRef.current = { context, player, game: created.game, score, recorder, clock, judgments };
       player.play(rangeStart);
       setPhase("PLAYING");
     } catch (caught) {
@@ -226,6 +296,8 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
 
   const live = phase === "PLAYING" || phase === "PAUSED";
   const keyLabels = keyLabelsFor(chart.document.keyMode);
+  // 씬이 보고한 실측값이 있으면 그것이 이긴다. 없을 때만 뷰포트 추정값을 쓴다.
+  const approachJudgeLineY = judgeLineY ?? estimatedJudgeLineY;
 
   return (
     <section
@@ -260,7 +332,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
               </dl>
             </div>
           ) : (
-            <PlaySettings disabled={phase !== "READY"} durationMs={chart.document.durationMs} keysoundAvailable={Boolean(run.keysoundManifest && run.audio.noDrums && run.audio.keys)} onChange={setSettings} value={settings} />
+            <PlaySettings approachMsAt1x={approachJudgeLineY === null ? null : approachMsAt1x(approachJudgeLineY)} disabled={phase !== "READY"} durationMs={chart.document.durationMs} keysoundAvailable={Boolean(run.keysoundManifest && run.audio.noDrums && run.audio.keys)} onChange={setSettings} value={settings} />
           )}
           {phase === "READY" ? (
             <>

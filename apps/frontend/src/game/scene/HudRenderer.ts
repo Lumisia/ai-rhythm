@@ -1,9 +1,11 @@
 import Phaser from "phaser";
 
-import type { JudgmentEvent } from "../core/JudgmentEngine";
+import type { EffectEvent, EffectSubscriber } from "../core/EffectBus";
+import type { JudgmentPhase } from "../core/JudgmentEngine";
 import type { StageGeometry } from "../core/LaneLayout";
 import type { ScoreSnapshot } from "../core/ScoreCalculator";
 import type { JudgmentName, JudgmentWindows } from "../core/types";
+import { DEPTH } from "./renderDepth";
 
 /** 계기판 색. app.css 의 CSS 변수와 같은 값을 쓴다. */
 const INK = 0xe8ecf8;
@@ -32,6 +34,31 @@ const SCOPE_TRAIL_MAX = 200;
 const COMBO_MIN = 5;
 const COUNTDOWN_LEAD_MS = 3200;
 const GUTTER_PADDING = 18;
+const FEVER_GAUGE_WIDTH = 6;
+const FEVER_GAUGE_HEIGHT_RATIO = 0.42;
+
+/** 마일스톤에서만 반응한다. 매 콤보마다 움직이면 활주로가 계속 흔들린다. */
+const COMBO_MILESTONES = [25, 50, 100, 200, 500];
+const COMBO_POP_MS = 140;
+const COMBO_BASE_SIZE = 54;
+const COMBO_PEAK_SIZE = 64;
+const COMBO_GOLD_FROM = 100;
+const GOLD = 0xfbbf24;
+
+/** rgba 문자열을 모듈 로드 시 한 번만 만든다.
+ *
+ * `Phaser.Display.Color.IntegerToColor()` 는 호출마다 `Color` 객체를 새로
+ * 할당한다. 매 프레임 부르면 그대로 GC 압력이 된다.
+ */
+const GOLD_RGBA = Phaser.Display.Color.IntegerToColor(GOLD).rgba;
+const INK_RGBA = Phaser.Display.Color.IntegerToColor(INK).rgba;
+const JUDGMENT_RGBA: Record<JudgmentName, string> = {
+  PERFECT: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.PERFECT).rgba,
+  GREAT: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.GREAT).rgba,
+  GOOD: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.GOOD).rgba,
+  BAD: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.BAD).rgba,
+  MISS: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.MISS).rgba,
+};
 
 interface ScopeMark {
   errMs: number;
@@ -54,6 +81,12 @@ export interface HudRendererOptions extends HudGeometry {
   snapshot: () => ScoreSnapshot;
 }
 
+export interface HudJudgment {
+  judgment: JudgmentName;
+  errMs: number;
+  phase: JudgmentPhase;
+}
+
 /** 플레이 중 계기 판독부.
  *
  * 무대가 좁아지면서 좌우에 여백이 생겼다. 수치는 거기 둔다 — 무대 위에
@@ -64,7 +97,7 @@ export interface HudRendererOptions extends HudGeometry {
  * VSRG 들이 hit error bar 를 두는 자리다. 입력 보정을 맞출 수 있는 유일한
  * 물건이고, 없으면 "채보 오프셋이 틀렸나 내가 못 친 건가"를 구분할 수 없다.
  */
-export class HudRenderer {
+export class HudRenderer implements EffectSubscriber {
   readonly #scene: Phaser.Scene;
   readonly #graphics: Phaser.GameObjects.Graphics;
   readonly #judgmentText: Phaser.GameObjects.Text;
@@ -104,6 +137,13 @@ export class HudRenderer {
   } | null = null;
   #markerShownAtMs = -Infinity;
   #statSignature = "";
+  #comboPopAtMs = -Infinity;
+  #lastCombo = 0;
+  #comboGold = false;
+  #judgmentColor: JudgmentName | null = null;
+  #reduceMotion = false;
+  #feverValue = 0;
+  #feverActive = false;
 
   constructor(scene: Phaser.Scene, options: HudRendererOptions) {
     this.#scene = scene;
@@ -118,25 +158,66 @@ export class HudRenderer {
     this.#beatMs = options.beatMs;
     this.#snapshot = options.snapshot;
 
-    this.#graphics = scene.add.graphics().setDepth(20);
-    this.#scoreText = this.#text(DISPLAY, 26, INK).setDepth(24);
-    this.#scoreLabel = this.#text(MONO, 9, MUTED).setDepth(24);
-    this.#accuracyText = this.#text(DISPLAY, 26, INK).setDepth(24);
-    this.#accuracyLabel = this.#text(MONO, 9, MUTED).setDepth(24);
-    this.#maxComboText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(1, 0);
-    this.#maxComboLabel = this.#text(MONO, 9, MUTED).setDepth(24).setOrigin(1, 0);
-    this.#leftText = this.#text(MONO, 11, MUTED).setDepth(24);
-    this.#countsText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(1, 0);
-    this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(24).setOrigin(0.5, 0.5);
-    this.#errorText = this.#text(MONO, 11, MUTED).setDepth(24).setOrigin(0.5, 0);
-    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(23).setOrigin(0.5, 0.5);
-    this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(24).setOrigin(0.5, 0);
-    this.#markerText = this.#text(MONO, 11, CORAL).setDepth(24).setOrigin(1, 0);
-    this.#countdownText = this.#text(DISPLAY, 84, ACCENT).setDepth(25).setOrigin(0.5, 0.5);
+    this.#graphics = scene.add.graphics().setDepth(DEPTH.HUD_GRAPHICS);
+    this.#scoreText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT);
+    this.#scoreLabel = this.#text(MONO, 9, MUTED).setDepth(DEPTH.HUD_TEXT);
+    this.#accuracyText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT);
+    this.#accuracyLabel = this.#text(MONO, 9, MUTED).setDepth(DEPTH.HUD_TEXT);
+    this.#maxComboText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#maxComboLabel = this.#text(MONO, 9, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#leftText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT);
+    this.#countsText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0.5);
+    this.#errorText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0);
+    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(DEPTH.HUD_TEXT - 1).setOrigin(0.5, 0.5);
+    this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0);
+    this.#markerText = this.#text(MONO, 11, CORAL).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
+    this.#countdownText = this.#text(DISPLAY, 84, ACCENT).setDepth(DEPTH.OVERLAY).setOrigin(0.5, 0.5);
     this.#layout();
   }
 
-  acceptJudgment(event: JudgmentEvent, songTimeMs: number): void {
+  /** EffectBus 어댑터. 기존 메서드를 그대로 부른다. */
+  handleEffect(event: EffectEvent): void {
+    if (event.type === "JUDGED") {
+      this.acceptJudgment(
+        { judgment: event.judgment, errMs: event.errMs, phase: event.phase },
+        event.songTimeMs,
+      );
+      this.#noticeCombo(event.combo, event.songTimeMs);
+      return;
+    }
+    if (event.type === "HOLD_TICK") {
+      this.#noticeCombo(event.combo, event.songTimeMs);
+      return;
+    }
+    if (event.type === "MARKER") {
+      this.acceptMarker(event.label, event.songTimeMs);
+    }
+  }
+
+  /** 마일스톤을 넘어섰는지 본다.
+   *
+   * FEVER 증폭으로 콤보가 2씩 오르면 마일스톤을 정확히 밟지 않고 건너뛴다.
+   * 등호가 아니라 구간 통과로 판정해야 한다.
+   */
+  #noticeCombo(combo: number, songTimeMs: number): void {
+    const crossed = COMBO_MILESTONES.some(
+      (milestone) => this.#lastCombo < milestone && combo >= milestone,
+    );
+    this.#lastCombo = combo;
+    if (crossed && !this.#reduceMotion) this.#comboPopAtMs = songTimeMs;
+  }
+
+  setReduceMotion(reduce: boolean): void {
+    this.#reduceMotion = reduce;
+  }
+
+  setFeverState(value: number, active: boolean): void {
+    this.#feverValue = value;
+    this.#feverActive = active;
+  }
+
+  acceptJudgment(event: HudJudgment, songTimeMs: number): void {
     this.#lastJudgment = {
       judgment: event.judgment,
       errMs: event.errMs,
@@ -160,9 +241,10 @@ export class HudRenderer {
   update(songTimeMs: number): void {
     this.#graphics.clear();
     this.#drawProgressRail(songTimeMs);
+    this.#drawFever();
     this.#drawScope(songTimeMs);
     this.#drawJudgment(songTimeMs);
-    this.#drawCombo();
+    this.#drawCombo(songTimeMs);
     this.#drawStats(songTimeMs);
     this.#drawCountdown(songTimeMs);
     this.#markerText.setAlpha(
@@ -264,6 +346,27 @@ export class HudRenderer {
     }
   }
 
+  /** 무대 좌측 세로 게이지. 주변시로 보는 자리다. */
+  #drawFever(): void {
+    const height = this.#height * FEVER_GAUGE_HEIGHT_RATIO;
+    const top = this.#judgeLineY - height;
+    const x = this.#stage.left - GUTTER_PADDING;
+
+    this.#graphics.fillStyle(SLATE, 0.9);
+    this.#graphics.fillRect(x, top, FEVER_GAUGE_WIDTH, height);
+
+    if (this.#feverActive) {
+      // 발동 중에는 게이지를 가득 채운 채 색으로 상태를 알린다.
+      this.#graphics.fillStyle(VIOLET, 0.95);
+      this.#graphics.fillRect(x, top, FEVER_GAUGE_WIDTH, height);
+      return;
+    }
+
+    const filled = height * Phaser.Math.Clamp(this.#feverValue / 100, 0, 1);
+    this.#graphics.fillGradientStyle(ACCENT, VIOLET, ACCENT, VIOLET, 1, 1, 1, 1);
+    this.#graphics.fillRect(x, top + height - filled, FEVER_GAUGE_WIDTH, filled);
+  }
+
   /** 타이밍 오차 스코프. 리셉터 바로 아래, VSRG 의 hit error bar 자리다.
    *
    * 가운데가 0ms. 최근 타격이 오차 위치에 점으로 남고 서서히 지워진다.
@@ -337,13 +440,12 @@ export class HudRenderer {
       return;
     }
     const alpha = 1 - (age / JUDGMENT_HOLD_MS) ** 3;
-    const color = Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR[last.judgment]).rgba;
     // 롱노트를 뗀 판정은 완화 배율이 붙어 머리 판정과 기준이 다르다.
     // 표시가 같으면 검수 중에 둘을 섞어 읽는다.
+    this.#applyJudgmentColor(last.judgment);
     this.#judgmentText
       .setVisible(true)
       .setAlpha(alpha)
-      .setColor(color)
       .setText(last.isTail ? `${last.judgment} ⌐떼기` : last.judgment);
     if (last.judgment === "MISS") {
       this.#errorText.setVisible(false);
@@ -356,10 +458,52 @@ export class HudRenderer {
       .setText(`${sign}${Math.abs(last.errMs).toFixed(0)}ms ${last.errMs >= 0 ? "LATE" : "EARLY"}`);
   }
 
-  #drawCombo(): void {
+  /** 판정이 바뀔 때만 setColor 를 부른다. `#applyComboColor` 와 같은 이유다.
+   *
+   * 판정 표시는 460ms 유지되므로 촘촘한 채보에서는 사실상 끊기지 않는다.
+   * 가드가 없으면 그 내내 매 프레임 `Color` 객체를 새로 할당하고 텍스트
+   * 캔버스를 다시 래스터라이즈한다.
+   */
+  #applyJudgmentColor(judgment: JudgmentName): void {
+    if (judgment === this.#judgmentColor) return;
+    this.#judgmentColor = judgment;
+    this.#judgmentText.setColor(JUDGMENT_RGBA[judgment]);
+  }
+
+  #drawCombo(songTimeMs: number): void {
     const { combo } = this.#snapshot();
-    if (combo < COMBO_MIN) return void this.#comboText.setVisible(false);
-    this.#comboText.setVisible(true).setAlpha(0.45).setText(String(combo));
+    if (combo < COMBO_MIN) {
+      this.#lastCombo = 0;
+      this.#applyComboColor(false);
+      return void this.#comboText.setVisible(false);
+    }
+
+    const age = songTimeMs - this.#comboPopAtMs;
+    // 0 → 1 → 0 삼각파. 앞뒤 70ms 씩이다.
+    const pop =
+      age >= 0 && age <= COMBO_POP_MS
+        ? 1 - Math.abs(age / (COMBO_POP_MS / 2) - 1)
+        : 0;
+    const size = Math.round(COMBO_BASE_SIZE + (COMBO_PEAK_SIZE - COMBO_BASE_SIZE) * pop);
+
+    this.#applyComboColor(combo >= COMBO_GOLD_FROM);
+    this.#comboText
+      .setVisible(true)
+      .setAlpha(0.45)
+      .setFontSize(size)
+      .setText(String(combo));
+  }
+
+  /** 색이 실제로 바뀔 때만 setColor 를 부른다.
+   *
+   * `Text.setColor` 에는 동등성 가드가 없어서 값이 같아도 `updateText()` 로
+   * 캔버스를 통째로 다시 그린다. `setFontSize` 와 `setText` 는 내부 가드가
+   * 있어 매 프레임 불러도 안전하지만 색은 아니다.
+   */
+  #applyComboColor(gold: boolean): void {
+    if (gold === this.#comboGold) return;
+    this.#comboGold = gold;
+    this.#comboText.setColor(gold ? GOLD_RGBA : INK_RGBA);
   }
 
   #drawStats(songTimeMs: number): void {

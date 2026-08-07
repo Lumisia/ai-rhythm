@@ -39,12 +39,17 @@ function widthFor(semantic: LaneSemantic): number {
   return COLUMN_WIDTH;
 }
 
-/** 손가락으로 색을 나눈다. 레인 번호가 아니라 어느 손가락인지가 읽는 단위다. */
+/** 손가락으로 색을 나눈다. 레인 번호가 아니라 어느 손가락인지가 읽는 단위다.
+ *
+ * 색상만으로 나누면 시안과 민트, 인디고와 보라가 주변시에서 붙어 보인다.
+ * 7키 배열 SIDE ‖ M1 M2 CENTER M3 M4 ‖ SIDE 에서 이웃이 구분되지 않으면
+ * 읽기가 무너지므로 명도까지 벌린다.
+ */
 function colorFor(semantic: LaneSemantic): number {
-  if (semantic.startsWith("SIDE_")) return 0x67e8f9;
-  if (semantic === "CENTER") return 0xa78bfa;
-  if (semantic === "MAIN_2" || semantic === "MAIN_3") return 0x8b9cf6;
-  return 0x5eead4;
+  if (semantic.startsWith("SIDE_")) return 0x67e8f9;          // 시안   밝음
+  if (semantic === "CENTER") return 0xc4a2ff;                 // 연보라 밝게
+  if (semantic === "MAIN_2" || semantic === "MAIN_3") return 0x8b9cf6;  // 인디고 중간
+  return 0x2dd4a7;                                            // 청록   어둡게
 }
 
 function backgroundFor(semantic: LaneSemantic): number {
@@ -102,4 +107,20 @@ export function layoutLanes(
   semantics: readonly LaneSemantic[],
 ): readonly LaneGeometry[] {
   return layoutStage(totalWidth, semantics).lanes;
+}
+
+/** 배속 1.0 에서 노트가 1ms 동안 움직이는 픽셀 수.
+ *
+ * NoteRenderer 와 설정 화면이 같은 값을 봐야 표시되는 노출 시간이 실제와 맞는다.
+ */
+export const NOTE_PX_PER_MS = 0.6;
+
+/** 배속 1.0 에서 노트가 화면을 흐르는 시간(ms).
+ *
+ * 판정선 위 활주로 높이를 속도로 나눈 값이다. 창 크기가 바뀌면 같이 바뀐다.
+ * 상수로 박아 두면 창 높이가 다를 때 표시가 거짓말을 하고, 배속을 그 숫자로
+ * 맞추는 사용자의 입력 보정이 통째로 어긋난다.
+ */
+export function approachMsAt1x(judgeLineY: number, pxPerMs: number = NOTE_PX_PER_MS): number {
+  return judgeLineY / pxPerMs;
 }

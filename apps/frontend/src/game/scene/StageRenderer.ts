@@ -1,10 +1,12 @@
 import Phaser from "phaser";
 
 import type { LaneGeometry, StageGeometry } from "../core/LaneLayout";
+import { DEPTH } from "./renderDepth";
 
 const HAIRLINE = 0x31364d;
 const ACCENT = 0x5eead4;
 const OUTSIDE = 0x07080f;
+const FEVER_EDGE = 0xa78bfa;
 
 /** 리셉터 높이. 노트가 여기 겹치면 친다. */
 export const RECEPTOR_HEIGHT = 26;
@@ -24,6 +26,7 @@ export class StageRenderer {
   readonly #background: Phaser.GameObjects.Graphics;
   readonly #receptors: Phaser.GameObjects.Graphics;
   readonly #keyTexts: Phaser.GameObjects.Text[] = [];
+  #feverActive = false;
 
   constructor(
     scene: Phaser.Scene,
@@ -33,8 +36,8 @@ export class StageRenderer {
     private judgeLineY: number,
     keyLabels: readonly string[],
   ) {
-    this.#background = scene.add.graphics().setDepth(0);
-    this.#receptors = scene.add.graphics().setDepth(2);
+    this.#background = scene.add.graphics().setDepth(DEPTH.STAGE_BACKGROUND);
+    this.#receptors = scene.add.graphics().setDepth(DEPTH.LANE_HIGHLIGHT);
     for (const label of keyLabels) {
       this.#keyTexts.push(
         scene.add
@@ -43,7 +46,7 @@ export class StageRenderer {
             fontSize: "12px",
             color: "#c5cbea",
           })
-          .setDepth(3)
+          .setDepth(DEPTH.KEY_LABEL)
           .setOrigin(0.5, 0),
       );
     }
@@ -92,13 +95,23 @@ export class StageRenderer {
     graphics.lineBetween(this.stage.right, 0, this.stage.right, this.judgeLineY);
 
     // 무대 좌우 테두리. 바깥 어둠과 무대를 가르는 선이다.
-    graphics.lineStyle(2, HAIRLINE, 1);
+    graphics.lineStyle(this.#feverActive ? 3 : 2, this.#feverActive ? FEVER_EDGE : HAIRLINE, 1);
     graphics.lineBetween(this.stage.left - 1, 0, this.stage.left - 1, this.height);
     graphics.lineBetween(this.stage.right + 1, 0, this.stage.right + 1, this.height);
 
     this.#drawReceptorBase(graphics);
     this.#layoutKeyLabels();
     this.setPressed(new Set(), new Map(), 0);
+  }
+
+  /** FEVER 중에는 무대 테두리와 판정선이 보라로 물든다.
+   *
+   * 전이 시점에만 부른다. 매 프레임 redraw 하면 배경까지 다시 그린다.
+   */
+  setFeverActive(active: boolean): void {
+    if (this.#feverActive === active) return;
+    this.#feverActive = active;
+    this.redraw();
   }
 
   /** 눌린 레인을 밝힌다. 판정과 무관하게 반응해야 입력이 먹은 걸 안다. */
@@ -150,7 +163,11 @@ export class StageRenderer {
       graphics.strokeRect(lane.x + 1.5, top + 0.5, lane.width - 3, RECEPTOR_HEIGHT - 1);
     }
     // 판정선. 무대 폭만큼만 긋는다 — 화면을 가로지르면 무대가 안 보인다.
-    graphics.fillGradientStyle(ACCENT, 0xa78bfa, ACCENT, 0xa78bfa, 1, 1, 1, 1);
+    if (this.#feverActive) {
+      graphics.fillGradientStyle(FEVER_EDGE, 0xffffff, FEVER_EDGE, 0xffffff, 1, 1, 1, 1);
+    } else {
+      graphics.fillGradientStyle(ACCENT, 0xa78bfa, ACCENT, 0xa78bfa, 1, 1, 1, 1);
+    }
     graphics.fillRect(this.stage.left, this.judgeLineY - 2, this.stage.width, 3);
   }
 

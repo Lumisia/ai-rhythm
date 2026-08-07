@@ -29,6 +29,9 @@ function makeReview(): PlaytestReview {
     judgmentPreset: "lenient",
     perceivedDifficulty: "TOO_HARD",
     verdict: "NEEDS_CHANGES",
+    feverEnabled: false,
+    maxCombo: 12,
+    rawMaxCombo: 12,
     events: [{ action: "DOWN", lane: 2, code: "KeyS", timeMs: 988 }],
     judgments: [judgment],
     markers: [
@@ -76,5 +79,36 @@ describe("serializeReview", () => {
       rangeEndMs: 5200,
     });
     expect(serialized.judgments[0].errMs).toBe(-12);
+  });
+});
+
+describe("FEVER 지표 기록", () => {
+  it("feverEnabled 와 두 콤보 값이 직렬화된다", () => {
+    const json = JSON.parse(
+      serializeReview({
+        version: 1,
+        runId: "run",
+        chartId: "chart",
+        chartSha256: "a",
+        audioSha256: "b",
+        keyMode: 4,
+        difficulty: "NORMAL",
+        calibrationMs: 0,
+        judgmentPreset: "lenient",
+        perceivedDifficulty: "APPROPRIATE",
+        verdict: "PASS",
+        feverEnabled: true,
+        maxCombo: 1842,
+        rawMaxCombo: 1103,
+        events: [],
+        judgments: [],
+        markers: [],
+        comment: "",
+      }),
+    );
+
+    expect(json.feverEnabled).toBe(true);
+    expect(json.maxCombo).toBe(1842);
+    expect(json.rawMaxCombo).toBe(1103);
   });
 });

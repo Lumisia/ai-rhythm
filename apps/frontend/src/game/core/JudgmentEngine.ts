@@ -53,6 +53,8 @@ export class JudgmentEngine {
   readonly #runtimeNotes: RuntimeNote[];
   readonly #config: JudgmentConfig;
   readonly #preset: JudgmentPreset;
+  readonly #missedHolds = new Set<number>();
+  readonly #activeHolds = new Set<number>();
 
   constructor(
     notes: readonly ChartNote[],
@@ -95,6 +97,7 @@ export class JudgmentEngine {
     const errorMs = timeMs - candidate.note.timeMs;
     const event = this.#event(candidate.note, "HEAD", classifyError(errorMs, this.#preset, this.#config), errorMs, timeMs);
     candidate.state = candidate.note.type === "HOLD" ? "ACTIVE" : "DONE";
+    if (candidate.state === "ACTIVE") this.#activeHolds.add(candidate.note.id);
     return event;
   }
 
@@ -108,6 +111,7 @@ export class JudgmentEngine {
     const errorMs = timeMs - targetTimeMs;
     const judgment = classifyScaledError(errorMs, windows, this.#config.holdReleaseScale);
     candidate.state = "DONE";
+    this.#activeHolds.delete(candidate.note.id);
     return this.#event(candidate.note, "TAIL", judgment, errorMs, timeMs, targetTimeMs);
   }
 
@@ -120,11 +124,14 @@ export class JudgmentEngine {
       const { note, state } = runtimeNote;
       if (state === "PENDING" && timeMs > note.timeMs + this.#config.missAfterMs) {
         runtimeNote.state = "DONE";
+        if (note.type === "HOLD") this.#missedHolds.add(note.id);
         events.push(this.#event(note, "HEAD", "MISS", timeMs - note.timeMs, timeMs));
       } else if (state === "ACTIVE") {
         const targetTimeMs = tailTime(note);
         if (timeMs > targetTimeMs + releaseWindowMs) {
           runtimeNote.state = "DONE";
+          this.#activeHolds.delete(note.id);
+          this.#missedHolds.add(note.id);
           events.push(
             this.#event(note, "TAIL", "MISS", timeMs - targetTimeMs, timeMs, targetTimeMs),
           );
@@ -135,10 +142,22 @@ export class JudgmentEngine {
     return events.sort((left, right) => left.noteTimeMs - right.noteTimeMs || left.noteId - right.noteId);
   }
 
+  /** 헤드나 꼬리를 놓친 롱노트. 렌더러가 회색으로 눕히는 근거다. */
+  missedHoldIds(): ReadonlySet<number> {
+    return this.#missedHolds;
+  }
+
+  /** 현재 잡고 있는 롱노트. */
+  activeHoldIds(): ReadonlySet<number> {
+    return this.#activeHolds;
+  }
+
   reset(): void {
     for (const runtimeNote of this.#runtimeNotes) {
       runtimeNote.state = "PENDING";
     }
+    this.#missedHolds.clear();
+    this.#activeHolds.clear();
   }
 
   #nearest(

@@ -38,6 +38,12 @@ export interface PlaytestReview {
   judgmentPreset: JudgmentPreset;
   perceivedDifficulty: PerceivedDifficulty;
   verdict: ReviewVerdict;
+  /** FEVER 를 켜고 플레이했는지. maxCombo 를 다른 기록과 비교할 때 필요하다. */
+  feverEnabled: boolean;
+  /** FEVER 증폭이 반영된 표시 콤보 최대값. */
+  maxCombo: number;
+  /** 증폭 없는 콤보 최대값. 채보 간 비교는 이 값으로 한다. */
+  rawMaxCombo: number;
   events: readonly RecordedInputEvent[];
   judgments: readonly JudgmentEvent[];
   markers: readonly ReviewMarker[];
@@ -83,6 +89,9 @@ export function serializeReview(review: PlaytestReview): string {
     judgmentPreset: review.judgmentPreset,
     perceivedDifficulty: review.perceivedDifficulty,
     verdict: review.verdict,
+    feverEnabled: review.feverEnabled,
+    maxCombo: review.maxCombo,
+    rawMaxCombo: review.rawMaxCombo,
     events: review.events.map(serializeInput),
     judgments: review.judgments.map(serializeJudgment),
     markers: review.markers.map(serializeMarker),

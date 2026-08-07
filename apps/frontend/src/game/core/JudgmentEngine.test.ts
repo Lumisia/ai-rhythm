@@ -83,3 +83,71 @@ describe("JudgmentEngine", () => {
     expect(engine.keyDown(0, 1000)?.noteId).toBe(1);
   });
 });
+
+describe("놓친 롱노트 추적", () => {
+  const holdNote = { id: 7, lane: 0, timeMs: 1000, type: "HOLD" as const, durationMs: 500 };
+
+  it("초기에는 비어 있다", () => {
+    const engine = new JudgmentEngine([holdNote], "lenient");
+
+    expect([...engine.missedHoldIds()]).toEqual([]);
+  });
+
+  it("헤드를 놓치면 missedHoldIds 에 들어간다", () => {
+    const engine = new JudgmentEngine([holdNote], "lenient");
+
+    engine.advance(5000);
+
+    expect([...engine.missedHoldIds()]).toEqual([7]);
+  });
+
+  it("꼬리를 놓치면 missedHoldIds 에 들어간다", () => {
+    const engine = new JudgmentEngine([holdNote], "lenient");
+    engine.keyDown(0, 1000);
+
+    engine.advance(5000);
+
+    expect([...engine.missedHoldIds()]).toEqual([7]);
+  });
+
+  it("정상 처리된 롱노트는 들어가지 않는다", () => {
+    const engine = new JudgmentEngine([holdNote], "lenient");
+    engine.keyDown(0, 1000);
+    engine.keyUp(0, 1500);
+
+    engine.advance(5000);
+
+    expect([...engine.missedHoldIds()]).toEqual([]);
+  });
+
+  it("잡고 있는 동안 activeHoldIds 에 들어간다", () => {
+    const engine = new JudgmentEngine([holdNote], "lenient");
+
+    engine.keyDown(0, 1000);
+    expect([...engine.activeHoldIds()]).toEqual([7]);
+
+    engine.keyUp(0, 1500);
+    expect([...engine.activeHoldIds()]).toEqual([]);
+  });
+
+  it("reset 이 두 집합을 비운다", () => {
+    const engine = new JudgmentEngine([holdNote], "lenient");
+    engine.advance(5000);
+
+    engine.reset();
+
+    expect([...engine.missedHoldIds()]).toEqual([]);
+    expect([...engine.activeHoldIds()]).toEqual([]);
+  });
+
+  it("TAP 노트를 놓쳐도 missedHoldIds 에 들어가지 않는다", () => {
+    const engine = new JudgmentEngine(
+      [{ id: 3, lane: 0, timeMs: 1000, type: "TAP" as const }],
+      "lenient",
+    );
+
+    engine.advance(5000);
+
+    expect([...engine.missedHoldIds()]).toEqual([]);
+  });
+});
