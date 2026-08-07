@@ -86,11 +86,12 @@ export class ScoreCalculator {
    * FEVER 증폭도 적용하지 않는다. BPM 180 에서 롱노트 4개 동시 홀드면
    * 초당 48틱이라 ×2 가 붙으면 숫자가 의미를 잃는다.
    */
-  acceptHoldTick(_lane: number): void {
+  acceptHoldTick(): number {
     this.#combo += 1;
     this.#rawCombo += 1;
     this.#maxCombo = Math.max(this.#maxCombo, this.#combo);
     this.#rawMaxCombo = Math.max(this.#rawMaxCombo, this.#rawCombo);
+    return this.#combo;
   }
 
   snapshot(): ScoreSnapshot {

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GameClock } from "../../game/audio/GameClock";
 import { KeysoundScheduler } from "../../game/audio/KeysoundScheduler";
 import { SongPlayer } from "../../game/audio/SongPlayer";
+import { beatDurationMs } from "../../game/core/beat";
 import { FeverGauge } from "../../game/core/FeverGauge";
 import { HoldTickTracker } from "../../game/core/HoldTickTracker";
 import { InputRecorder } from "../../game/core/InputRecorder";
@@ -186,7 +187,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
       const judgmentConfig = loadJudgmentConfig();
       const windows = judgmentConfig.presets[settings.judgmentPreset];
       const bpm = chart.document.bpmEvents[0]?.bpm;
-      const beatMs = bpm && bpm > 0 ? 60_000 / bpm : 500;
+      const beatMs = beatDurationMs(bpm);
       // 16분음표. ms 고정값이 아니라 박자 기준이라 곡이 빠를수록 촘촘해진다.
       const holdTicks = new HoldTickTracker(
         notes,

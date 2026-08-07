@@ -169,7 +169,7 @@ export class HudRenderer implements EffectSubscriber {
     this.#countsText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
     this.#judgmentText = this.#text(DISPLAY, 26, INK).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0.5);
     this.#errorText = this.#text(MONO, 11, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0);
-    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(DEPTH.HUD_TEXT - 1).setOrigin(0.5, 0.5);
+    this.#comboText = this.#text(DISPLAY, 54, INK).setDepth(DEPTH.HUD_COMBO_TEXT).setOrigin(0.5, 0.5);
     this.#scopeText = this.#text(MONO, 10, MUTED).setDepth(DEPTH.HUD_TEXT).setOrigin(0.5, 0);
     this.#markerText = this.#text(MONO, 11, CORAL).setDepth(DEPTH.HUD_TEXT).setOrigin(1, 0);
     this.#countdownText = this.#text(DISPLAY, 84, ACCENT).setDepth(DEPTH.OVERLAY).setOrigin(0.5, 0.5);

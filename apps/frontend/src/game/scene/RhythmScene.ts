@@ -4,6 +4,7 @@ import type { Clock } from "../audio/Clock";
 import type { KeysoundScheduler } from "../audio/KeysoundScheduler";
 import type { SongPlayer } from "../audio/SongPlayer";
 import { EffectBus } from "../core/EffectBus";
+import { beatDurationMs } from "../core/beat";
 import type { FeverGauge } from "../core/FeverGauge";
 import { HoldTickTracker } from "../core/HoldTickTracker";
 import { InputRecorder } from "../core/InputRecorder";
@@ -20,7 +21,6 @@ import { HudRenderer } from "./HudRenderer";
 import { NoteRenderer } from "./NoteRenderer";
 import { JUDGE_LINE_RATIO, StageRenderer } from "./StageRenderer";
 
-const DEFAULT_BEAT_MS = 500;
 const LANE_FLASH_MS = 130;
 
 export interface RhythmSceneSession {
@@ -109,11 +109,11 @@ export class RhythmScene extends Phaser.Scene {
     const ticks = this.#session.holdTicks?.advance(songTimeMs, this.#held);
     if (ticks) {
       for (const tick of ticks) {
-        this.#session.score.acceptHoldTick(tick.lane);
+        const combo = this.#session.score.acceptHoldTick();
         this.#effects.emit({
           type: "HOLD_TICK",
           lane: tick.lane,
-          combo: this.#session.score.snapshot().combo,
+          combo,
           songTimeMs,
         });
       }
@@ -274,7 +274,7 @@ export class RhythmScene extends Phaser.Scene {
 
   #beatMs(): number {
     const bpm = this.#session.chart.bpmEvents[0]?.bpm;
-    return bpm && bpm > 0 ? 60_000 / bpm : DEFAULT_BEAT_MS;
+    return beatDurationMs(bpm);
   }
 
   #shutdown(): void {

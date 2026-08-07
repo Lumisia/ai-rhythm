@@ -7,11 +7,11 @@
 export const DEPTH = {
   STAGE_BACKGROUND: 0,
   LANE_HIGHLIGHT: 2,
-  RECEPTOR: 3,
   KEY_LABEL: 4,
   NOTE: 10,
   HIT_EFFECT: 15,
   HUD_GRAPHICS: 20,
+  HUD_COMBO_TEXT: 23,
   HUD_TEXT: 24,
   OVERLAY: 30,
 } as const;

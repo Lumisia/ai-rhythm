@@ -75,7 +75,7 @@ describe("ScoreCalculator 홀드 틱과 FEVER", () => {
     score.accept(hit());
     const before = score.snapshot();
 
-    score.acceptHoldTick(0);
+    score.acceptHoldTick();
     const after = score.snapshot();
 
     expect(after.accuracy).toBe(before.accuracy);
@@ -87,9 +87,10 @@ describe("ScoreCalculator 홀드 틱과 FEVER", () => {
     const score = new ScoreCalculator();
     score.accept(hit());
 
-    score.acceptHoldTick(0);
+    const combo = score.acceptHoldTick();
 
     const snapshot = score.snapshot();
+    expect(combo).toBe(2);
     expect(snapshot.combo).toBe(2);
     expect(snapshot.rawCombo).toBe(2);
     expect(snapshot.maxCombo).toBe(2);
@@ -113,7 +114,7 @@ describe("ScoreCalculator 홀드 틱과 FEVER", () => {
     const score = new ScoreCalculator();
     score.setFeverActive(true);
 
-    score.acceptHoldTick(0);
+    score.acceptHoldTick();
 
     const snapshot = score.snapshot();
     expect(snapshot.combo).toBe(1);
@@ -136,7 +137,7 @@ describe("ScoreCalculator 홀드 틱과 FEVER", () => {
     const score = new ScoreCalculator();
     score.setFeverActive(true);
     score.accept(hit());
-    score.acceptHoldTick(0);
+    score.acceptHoldTick();
 
     score.accept(hit("MISS"));
 
@@ -151,7 +152,7 @@ describe("ScoreCalculator 홀드 틱과 FEVER", () => {
     const score = new ScoreCalculator();
     score.accept(hit());
 
-    score.acceptHoldTick(0);
+    score.acceptHoldTick();
 
     expect(score.snapshot().lanes[0]).toEqual({ judgments: 1, misses: 0 });
   });
