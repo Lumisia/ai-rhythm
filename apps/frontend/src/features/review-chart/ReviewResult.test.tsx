@@ -49,6 +49,7 @@ function sessionWithMisses(): ReviewSession {
         loopEnabled: false,
         loopStartMs: 0,
         loopEndMs: 8000,
+        reduceMotion: false,
       },
     },
   };
