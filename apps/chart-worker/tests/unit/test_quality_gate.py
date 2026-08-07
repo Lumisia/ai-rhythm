@@ -388,6 +388,20 @@ def test_structural_invalidity_is_a_machine_retry_reason_not_exception_prose():
     assert decision.reasons == ("STRUCTURE_INVALID",)
 
 
+def test_duplicate_structure_failure_preserves_machine_context():
+    result = _evaluate(
+        _chart((500, 500), lane=1),
+        (500,),
+        duration_ms=1_000,
+    )
+
+    assert result.structure_error == {
+        "reasonCode": "DUPLICATE_NOTE",
+        "context": {"lane": 1, "timeMs": 500, "noteKind": "TAP"},
+    }
+    assert result.to_report()["structureError"] == result.structure_error
+
+
 @pytest.mark.parametrize(
     ("rows", "expected_action", "expected_reason"),
     [
@@ -460,6 +474,7 @@ def test_report_is_complete_and_stable_without_exception_text():
         "reasons": ["STRUCTURE_INVALID"],
     }
     assert report["timing"] == result.timing.to_report()
+    assert report["structureError"]["reasonCode"] == "NOTE_LANE_OUT_OF_RANGE"
     assert set(report["noteGrid"]) == {
         "uniqueRowCount",
         "cleanRowCount",

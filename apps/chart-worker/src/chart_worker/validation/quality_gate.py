@@ -57,6 +57,7 @@ class ChartAcceptance:
     timing: TimingDiagnostics
     note_grid: NoteGridMetrics
     profile: ChartQualityProfile | None = None
+    structure_error: dict[str, object] | None = None
 
     def decision(self, axis: GateAxis) -> GateDecision:
         """Return the independently recorded decision for one acceptance axis."""
@@ -84,19 +85,23 @@ class ChartAcceptance:
                 "absoluteP95Beats": self.note_grid.absolute_p95_beats,
             },
             "qualityProfile": self.profile.to_report() if self.profile is not None else None,
+            "structureError": self.structure_error,
         }
 
 
 def _structure_decision(
     chart: GeneratedChart, *, key_mode: int, duration_ms: int
-) -> GateDecision:
+) -> tuple[GateDecision, dict[str, object] | None]:
     try:
         validate_generated_chart(chart, key_mode=key_mode, duration_ms=duration_ms)
-    except GeneratedChartValidationError:
-        return GateDecision(
-            GateAxis.STRUCTURE, GateAction.RETRY_MAP, ("STRUCTURE_INVALID",)
+    except GeneratedChartValidationError as error:
+        return (
+            GateDecision(
+                GateAxis.STRUCTURE, GateAction.RETRY_MAP, ("STRUCTURE_INVALID",)
+            ),
+            {"reasonCode": error.reason_code, "context": error.context},
         )
-    return GateDecision(GateAxis.STRUCTURE, GateAction.PASS, ())
+    return GateDecision(GateAxis.STRUCTURE, GateAction.PASS, ()), None
 
 
 def _timing_identity_decision(
@@ -238,7 +243,7 @@ def evaluate_chart_candidate(
     if requested_difficulty not in DIFFICULTIES:
         raise ValueError(f"unsupported difficulty: {requested_difficulty}")
 
-    structure = _structure_decision(
+    structure, structure_error = _structure_decision(
         chart, key_mode=requested_key_mode, duration_ms=duration_ms
     )
     timing = diagnose_chart_timing(
@@ -291,4 +296,5 @@ def evaluate_chart_candidate(
         timing=timing,
         note_grid=note_grid,
         profile=profile,
+        structure_error=structure_error,
     )

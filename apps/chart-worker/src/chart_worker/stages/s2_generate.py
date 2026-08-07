@@ -1,10 +1,12 @@
 """S2: generate each map and retry only invalid Mapperatorinator output."""
 
 import json
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 
+from chart_worker.analysis.grid_alignment import measure_note_grid_alignment
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedChart
@@ -15,6 +17,11 @@ from chart_worker.generation.partial_remap import build_partial_remap_window
 from chart_worker.generation.recovery import build_recovery_chart
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
+from chart_worker.stages.timing_feedback import (
+    MapTimingFailureSignature,
+    TimingFailureFamily,
+    record_timing_failure,
+)
 from chart_worker.stages.types import (
     GeneratedVariant,
     GenerationProvenance,
@@ -171,6 +178,7 @@ class _VariantState:
     attempt_errors: list[str] = field(default_factory=list)
     attempt_evidence: list[dict[str, object]] = field(default_factory=list)
     attempted_seeds: list[int] = field(default_factory=list)
+    timing_failures: list[MapTimingFailureSignature] = field(default_factory=list)
     pool: list[_Candidate] = field(default_factory=list)
     partial_sources: list[_Candidate] = field(default_factory=list)
     partial_attempted: bool = False
@@ -227,6 +235,93 @@ def _is_localized_coverage_failure(acceptance: ChartAcceptance) -> bool:
     return retry_axes == {GateAxis.COVERAGE} and bool(acceptance.timing.coverage_gaps)
 
 
+def _timing_segment_id(authority: SongTimingAuthority, time_ms: int) -> int | None:
+    index = bisect_right(
+        [event.time_ms for event in authority.bpm_events],
+        time_ms,
+    ) - 1
+    return index if index >= 0 else None
+
+
+def _timing_failure_signature(
+    state: _VariantState,
+    authority: SongTimingAuthority,
+    *,
+    seed: int,
+    family: TimingFailureFamily,
+    time_ms: int,
+    alignment_time_ms: int | None = None,
+) -> MapTimingFailureSignature | None:
+    segment_id = _timing_segment_id(authority, time_ms)
+    if segment_id is None:
+        return None
+    alignment = measure_note_grid_alignment(
+        (alignment_time_ms if alignment_time_ms is not None else time_ms,),
+        authority.bpm_events,
+    )
+    return MapTimingFailureSignature(
+        authority_sha256=authority.sha256,
+        key_mode=state.key_mode,
+        difficulty=state.difficulty,
+        seed=seed,
+        timing_segment_id=segment_id,
+        failure_family=family,
+        time_ms=time_ms,
+        grid_aligned=alignment.clean_rate == 1.0,
+    )
+
+
+def _local_segment_has_grid_damage(
+    authority: SongTimingAuthority,
+    segment_id: int,
+) -> bool:
+    return authority.local_review is not None and any(
+        segment.metrics.index == segment_id and segment.grid_damage
+        for segment in authority.local_review.segments
+    )
+
+
+def _acceptance_timing_failures(
+    state: _VariantState,
+    authority: SongTimingAuthority,
+    acceptance: ChartAcceptance,
+    *,
+    seed: int,
+) -> tuple[MapTimingFailureSignature, ...]:
+    signatures = []
+    structure_error = acceptance.structure_error
+    if structure_error is not None and structure_error["reasonCode"] == "DUPLICATE_NOTE":
+        context = structure_error["context"]
+        time_ms = context.get("timeMs") if isinstance(context, dict) else None
+        if isinstance(time_ms, int):
+            signature = _timing_failure_signature(
+                state,
+                authority,
+                seed=seed,
+                family="DUPLICATE_NOTE",
+                time_ms=time_ms,
+            )
+            if signature is not None:
+                signatures.append(signature)
+    for gap in acceptance.timing.coverage_gaps:
+        if gap.position != "MIDDLE":
+            continue
+        signature = _timing_failure_signature(
+            state,
+            authority,
+            seed=seed,
+            family="ACTIVE_MIDDLE_GAP",
+            time_ms=(gap.start_ms + gap.end_ms) // 2,
+            alignment_time_ms=gap.start_ms,
+        )
+        if signature is not None and _local_segment_has_grid_damage(
+            authority,
+            signature.timing_segment_id,
+        ):
+            signatures.append(signature)
+    return tuple(signatures)
+
+
 def _generate_next_pass(
     state: _VariantState,
     *,
@@ -279,6 +374,16 @@ def _generate_next_pass(
                 "gateReport": gate_report,
             }
             if acceptance.action is GateAction.RETRY_MAP:
+                timing_failures = _acceptance_timing_failures(
+                    state,
+                    authority,
+                    acceptance,
+                    seed=attempt_seed,
+                )
+                if timing_failures:
+                    evidence["timingFailureSignatures"] = [
+                        signature.to_report() for signature in timing_failures
+                    ]
                 state.attempt_evidence.append(evidence)
                 state.attempt_errors.append(
                     json.dumps(
@@ -288,6 +393,8 @@ def _generate_next_pass(
                         separators=(",", ":"),
                     )
                 )
+                for signature in timing_failures:
+                    record_timing_failure(state.timing_failures, signature)
                 if _is_localized_coverage_failure(acceptance):
                     osu_text = _serialized_candidate_text(
                         generated,

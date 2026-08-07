@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from chart_worker.hashing import sha256_file
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages import s2_generate
 from chart_worker.stages.s2_generate import run_generation
+from chart_worker.stages.timing_feedback import RetryTimingSignal
 from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
 from chart_worker.validation.quality_gate import (
     GateAction,
@@ -1079,7 +1081,7 @@ def test_real_hold_overlap_retries_only_the_failed_variant(tmp_path: Path):
     ).selected_seed == 12
 
 
-def test_observed_zero_ms_duplicates_exhaust_three_raw_attempts(
+def test_timing_feedback_two_duplicate_seeds_escalate_before_third_attempt(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
@@ -1103,6 +1105,50 @@ def test_observed_zero_ms_duplicates_exhaust_three_raw_attempts(
             )
 
     generator = AlwaysDuplicatesAtZero()
+    with pytest.raises(RetryTimingSignal) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert [call.seed for call in generator.map_calls] == [0, 12]
+    assert captured.value.to_context()["timingSegmentId"] == 0
+    assert captured.value.to_context()["failureFamily"] == "DUPLICATE_NOTE"
+    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+
+
+def test_timing_feedback_duplicates_in_different_segments_remain_map_retries(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(
+        prepared,
+        tmp_path,
+        (
+            OsuBpmEvent(0, 120.0),
+            OsuBpmEvent(500, 120.0),
+            OsuBpmEvent(1_000, 120.0),
+        ),
+    )
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate_chart_candidate)
+
+    class DuplicatesMoveAcrossSegments(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if request.key_mode == 4 and request.difficulty == "EASY":
+                time_ms = {0: 0, 12: 500, 24: 1_000}[request.seed]
+                return replace(
+                    generated,
+                    notes=[NoteEvent(time_ms, 1), NoteEvent(time_ms, 1)],
+                    osu_text="",
+                )
+            return generated
+
+    generator = DuplicatesMoveAcrossSegments()
     variants = run_generation(
         prepared,
         authority,
@@ -1112,15 +1158,54 @@ def test_observed_zero_ms_duplicates_exhaust_three_raw_attempts(
         seed=0,
     )
 
-    recovered = variants[0]
-    assert len(generator.map_calls) == 36
+    recovered = next(
+        variant
+        for variant in variants
+        if variant.key_mode == 4 and variant.difficulty == "EASY"
+    )
     assert recovered.provenance == "RECOVERY_FALLBACK"
-    assert [attempt["workdir"] for attempt in recovered.attempt_evidence] == [
-        "raw/work/4k-easy/attempt-1",
-        "raw/work/4k-easy/attempt-2",
-        "raw/work/4k-easy/attempt-3",
-    ]
-    assert (tmp_path / "raw" / "4k-easy.osu").is_file()
+    assert [call.seed for call in generator.map_calls[:3]] == [0, 12, 24]
+
+
+def test_timing_feedback_two_active_middle_gaps_escalate(monkeypatch, tmp_path: Path):
+    prepared = _prepared(tmp_path, duration_ms=30_000)
+    authority = _authority(prepared, tmp_path)
+    authority = replace(
+        authority,
+        local_review=SimpleNamespace(
+            segments=(
+                SimpleNamespace(
+                    metrics=SimpleNamespace(index=0),
+                    grid_damage=True,
+                ),
+            ),
+        ),
+    )
+    calls = 0
+
+    def coverage_then_pass(generated, authority, analysis, **kwargs):
+        nonlocal calls
+        del generated, analysis, kwargs
+        calls += 1
+        accepted = _coverage_retry_acceptance(authority)
+        return _acceptance_for_difficulty(accepted, "EASY")
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", coverage_then_pass)
+    generator = RecordingGenerator()
+
+    with pytest.raises(RetryTimingSignal) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=generator,
+            seed=0,
+        )
+
+    assert calls == 2
+    assert [call.seed for call in generator.map_calls] == [0, 12]
+    assert captured.value.to_context()["failureFamily"] == "ACTIVE_MIDDLE_GAP"
 
 
 def test_retries_only_the_failed_variant_with_the_next_seed(tmp_path: Path):
