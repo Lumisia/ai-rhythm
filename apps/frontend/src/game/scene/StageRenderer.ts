@@ -1,5 +1,10 @@
 import Phaser from "phaser";
 
+import {
+  feverActiveFromEffect,
+  type EffectEvent,
+  type EffectSubscriber,
+} from "../core/EffectBus";
 import type { LaneGeometry, StageGeometry } from "../core/LaneLayout";
 import { DEPTH } from "./renderDepth";
 
@@ -22,7 +27,7 @@ export const JUDGE_LINE_RATIO = 0.85;
  *
  * 매 프레임 다시 그리지 않는다. 눌림 표시만 따로 올린다.
  */
-export class StageRenderer {
+export class StageRenderer implements EffectSubscriber {
   readonly #background: Phaser.GameObjects.Graphics;
   readonly #receptors: Phaser.GameObjects.Graphics;
   readonly #keyTexts: Phaser.GameObjects.Text[] = [];
@@ -112,6 +117,11 @@ export class StageRenderer {
     if (this.#feverActive === active) return;
     this.#feverActive = active;
     this.redraw();
+  }
+
+  handleEffect(event: EffectEvent): void {
+    const active = feverActiveFromEffect(event);
+    if (active !== null) this.setFeverActive(active);
   }
 
   /** 눌린 레인을 밝힌다. 판정과 무관하게 반응해야 입력이 먹은 걸 안다. */

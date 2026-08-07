@@ -11,11 +11,15 @@ export type EffectEvent =
       songTimeMs: number;
     }
   | { type: "HOLD_TICK"; lane: number; combo: number; songTimeMs: number }
-  | { type: "LANE_DOWN"; lane: number; songTimeMs: number }
-  | { type: "LANE_UP"; lane: number; songTimeMs: number }
   | { type: "FEVER_START"; songTimeMs: number }
   | { type: "FEVER_END"; songTimeMs: number }
   | { type: "MARKER"; label: string; songTimeMs: number };
+
+export function feverActiveFromEffect(event: EffectEvent): boolean | null {
+  if (event.type === "FEVER_START") return true;
+  if (event.type === "FEVER_END") return false;
+  return null;
+}
 
 export interface EffectSubscriber {
   handleEffect(event: EffectEvent): void;

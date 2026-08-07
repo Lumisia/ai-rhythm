@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { EffectBus, type EffectEvent, type EffectSubscriber } from "./EffectBus";
+import {
+  EffectBus,
+  feverActiveFromEffect,
+  type EffectEvent,
+  type EffectSubscriber,
+} from "./EffectBus";
 
 function judged(combo: number): EffectEvent {
   return {
@@ -27,6 +32,12 @@ describe("EffectBus", () => {
     bus.emit(judged(1));
 
     expect(seen).toEqual([judged(1)]);
+  });
+
+  it("FEVER 시작과 종료 이벤트를 활성 상태로 해석한다", () => {
+    expect(feverActiveFromEffect({ type: "FEVER_START", songTimeMs: 1000 })).toBe(true);
+    expect(feverActiveFromEffect({ type: "FEVER_END", songTimeMs: 2000 })).toBe(false);
+    expect(feverActiveFromEffect(judged(1))).toBeNull();
   });
 
   it("해제 후 emit 이 전달되지 않는다", () => {
@@ -82,3 +93,8 @@ describe("EffectBus", () => {
     expect(seen).toHaveLength(1);
   });
 });
+
+// 레인 입력은 StageRenderer의 기능 경로로 전달되며 EffectBus 장식 이벤트가 아니다.
+// @ts-expect-error LANE_DOWN은 EffectEvent 계약에 존재하지 않아야 한다.
+const removedLaneEvent: EffectEvent = { type: "LANE_DOWN", lane: 0, songTimeMs: 0 };
+void removedLaneEvent;

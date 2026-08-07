@@ -1,6 +1,10 @@
 import Phaser from "phaser";
 
-import type { EffectEvent, EffectSubscriber } from "../core/EffectBus";
+import {
+  feverActiveFromEffect,
+  type EffectEvent,
+  type EffectSubscriber,
+} from "../core/EffectBus";
 import type { LaneGeometry } from "../core/LaneLayout";
 import { ParticleField } from "../core/ParticleField";
 import type { JudgmentName } from "../core/types";
@@ -60,6 +64,11 @@ export class HitEffectLayer implements EffectSubscriber {
   }
 
   handleEffect(event: EffectEvent): void {
+    const feverActive = feverActiveFromEffect(event);
+    if (feverActive !== null) {
+      this.setFeverActive(feverActive);
+      return;
+    }
     if (event.type === "JUDGED") {
       this.#pulseAtMs.set(event.lane, event.songTimeMs);
       if (event.judgment === "MISS") {

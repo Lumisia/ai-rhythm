@@ -86,11 +86,9 @@ export class RhythmScene extends Phaser.Scene {
       onLaneDown: (lane, timeMs) => {
         this.#held.add(lane);
         this.#flashAtMs.set(lane, timeMs);
-        this.#effects.emit({ type: "LANE_DOWN", lane, songTimeMs: timeMs });
       },
       onLaneUp: (lane, timeMs) => {
         this.#held.delete(lane);
-        this.#effects.emit({ type: "LANE_UP", lane, songTimeMs: timeMs });
       },
     });
     this.#keyboardInput.attach();
@@ -155,8 +153,7 @@ export class RhythmScene extends Phaser.Scene {
   resetFever(): void {
     this.#session.fever?.reset();
     this.#session.score.setFeverActive(false);
-    this.#effectLayer?.setFeverActive(false);
-    this.#stage?.setFeverActive(false);
+    this.#effects.emit({ type: "FEVER_END", songTimeMs: this.#session.clock.songTimeMs() });
   }
 
   #acceptJudgment(event: JudgmentEvent): void {
@@ -184,8 +181,6 @@ export class RhythmScene extends Phaser.Scene {
   #applyFever(transition: "START" | "END", songTimeMs: number): void {
     const active = transition === "START";
     this.#session.score.setFeverActive(active);
-    this.#effectLayer?.setFeverActive(active);
-    this.#stage?.setFeverActive(active);
     this.#effects.emit({
       type: active ? "FEVER_START" : "FEVER_END",
       songTimeMs,
@@ -226,6 +221,7 @@ export class RhythmScene extends Phaser.Scene {
         judgeLineY,
         keyLabelsFor(this.#session.chart.keyMode),
       );
+      this.#unsubscribes.push(this.#effects.subscribe(this.#stage));
     } else {
       this.#stage.resize(stage, width, height, judgeLineY);
     }
