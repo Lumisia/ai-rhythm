@@ -52,6 +52,13 @@ const GOLD = 0xfbbf24;
  */
 const GOLD_RGBA = Phaser.Display.Color.IntegerToColor(GOLD).rgba;
 const INK_RGBA = Phaser.Display.Color.IntegerToColor(INK).rgba;
+const JUDGMENT_RGBA: Record<JudgmentName, string> = {
+  PERFECT: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.PERFECT).rgba,
+  GREAT: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.GREAT).rgba,
+  GOOD: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.GOOD).rgba,
+  BAD: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.BAD).rgba,
+  MISS: Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR.MISS).rgba,
+};
 
 interface ScopeMark {
   errMs: number;
@@ -133,6 +140,7 @@ export class HudRenderer implements EffectSubscriber {
   #comboPopAtMs = -Infinity;
   #lastCombo = 0;
   #comboGold = false;
+  #judgmentColor: JudgmentName | null = null;
   #reduceMotion = false;
   #feverValue = 0;
   #feverActive = false;
@@ -432,13 +440,12 @@ export class HudRenderer implements EffectSubscriber {
       return;
     }
     const alpha = 1 - (age / JUDGMENT_HOLD_MS) ** 3;
-    const color = Phaser.Display.Color.IntegerToColor(JUDGMENT_COLOR[last.judgment]).rgba;
     // 롱노트를 뗀 판정은 완화 배율이 붙어 머리 판정과 기준이 다르다.
     // 표시가 같으면 검수 중에 둘을 섞어 읽는다.
+    this.#applyJudgmentColor(last.judgment);
     this.#judgmentText
       .setVisible(true)
       .setAlpha(alpha)
-      .setColor(color)
       .setText(last.isTail ? `${last.judgment} ⌐떼기` : last.judgment);
     if (last.judgment === "MISS") {
       this.#errorText.setVisible(false);
@@ -449,6 +456,18 @@ export class HudRenderer implements EffectSubscriber {
       .setVisible(true)
       .setAlpha(alpha * 0.85)
       .setText(`${sign}${Math.abs(last.errMs).toFixed(0)}ms ${last.errMs >= 0 ? "LATE" : "EARLY"}`);
+  }
+
+  /** 판정이 바뀔 때만 setColor 를 부른다. `#applyComboColor` 와 같은 이유다.
+   *
+   * 판정 표시는 460ms 유지되므로 촘촘한 채보에서는 사실상 끊기지 않는다.
+   * 가드가 없으면 그 내내 매 프레임 `Color` 객체를 새로 할당하고 텍스트
+   * 캔버스를 다시 래스터라이즈한다.
+   */
+  #applyJudgmentColor(judgment: JudgmentName): void {
+    if (judgment === this.#judgmentColor) return;
+    this.#judgmentColor = judgment;
+    this.#judgmentText.setColor(JUDGMENT_RGBA[judgment]);
   }
 
   #drawCombo(songTimeMs: number): void {
