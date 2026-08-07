@@ -352,10 +352,20 @@ def _generation_report(
     selected_authority_epoch: int,
 ) -> dict[str, object]:
     charts = []
+    resnap_collisions = []
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
         acceptance = variant.acceptance.to_report()
         quality_profile = acceptance["qualityProfile"]
+        resnap_diagnostics = variant.generated.resnap_diagnostics.to_report()
+        resnap_collisions.extend(
+            {
+                "keyMode": variant.key_mode,
+                "difficulty": variant.difficulty,
+                **collision,
+            }
+            for collision in resnap_diagnostics["collisions"]
+        )
         charts.append(
             {
                 "keyMode": variant.key_mode,
@@ -405,6 +415,7 @@ def _generation_report(
                 "maxGapMs": _max_gap_ms(variant),
                 "rawOsuPath": _relative(variant.raw_osu_path, run_dir),
                 "chartPath": _relative(result.path, run_dir),
+                "resnapDiagnostics": resnap_diagnostics,
             }
         )
     return {
@@ -422,6 +433,7 @@ def _generation_report(
             map_timing_escalations,
             selected_authority_epoch,
         ),
+        "resnapCollisions": resnap_collisions,
         "noteMutationEnabled": False,
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
@@ -480,6 +492,7 @@ def _failure_generation_report(
             map_timing_escalations or [],
             None,
         ),
+        "resnapCollisions": [],
         "canonicalAudioSha256": prepared.normalized.sha256,
         "elapsedMsByStage": elapsed,
         "charts": [],

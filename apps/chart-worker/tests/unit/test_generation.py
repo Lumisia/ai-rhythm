@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,7 @@ def _pairs(argv):
     return dict(item.split("=", 1) for item in argv if "=" in item)
 
 
-def _fake_run(osu_text=MINI_OSU, fail=False):
+def _fake_run(osu_text=MINI_OSU, fail=False, resnap_sidecar=None):
     def run(argv):
         if fail:
             raise CommandError(argv, "exited with 1", returncode=1, stderr="cuda oom")
@@ -68,7 +69,13 @@ def _fake_run(osu_text=MINI_OSU, fail=False):
             next(item for item in argv if item.startswith("output_path=")).split("=", 1)[1]
             .strip("'")
         )
-        (output_dir / "out.osu").write_text(osu_text, encoding="utf-8")
+        osu_path = output_dir / "out.osu"
+        osu_path.write_text(osu_text, encoding="utf-8")
+        if resnap_sidecar is not None:
+            osu_path.with_suffix(".resnap.json").write_text(
+                json.dumps(resnap_sidecar),
+                encoding="utf-8",
+            )
         return CommandResult(argv, 0, "", "")
 
     return run
@@ -384,6 +391,33 @@ def test_generator_generates_timing_without_hit_objects(config, tmp_path):
     )
     assert result.bpm_events == (OsuBpmEvent(time_ms=0, bpm=120.0),)
     assert result.mode == "STANDARD"
+
+
+def test_generator_retains_optional_resnap_collision_evidence(config, tmp_path):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(
+            resnap_sidecar={
+                "version": "resnap-collisions-v1",
+                "seed": 11,
+                "collisions": [
+                    {
+                        "lane": 1,
+                        "noteKind": "TAP",
+                        "preTimeMs": 1_190,
+                        "postTimeMs": 1_200,
+                        "snapDivisor": 4,
+                    }
+                ],
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    generated = generator.generate_map(_request(seed=11), tmp_path / "work")
+
+    assert generated.resnap_diagnostics.status == "OBSERVED"
+    assert generated.resnap_diagnostics.collisions[0].post_time_ms == 1_200
 
 
 def test_fake_generator_generates_standard_timing():

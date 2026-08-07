@@ -6,7 +6,7 @@
 
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -21,6 +21,10 @@ from chart_worker.generation.params import (
     PRECISION,
     GenerationRequest,
     TimingGenerationRequest,
+)
+from chart_worker.generation.resnap_diagnostics import (
+    ResnapDiagnostics,
+    read_resnap_diagnostics,
 )
 from chart_worker.schema.note import Chart
 
@@ -39,6 +43,9 @@ class GeneratedChart:
     generator_name: str
     seed: int | None
     bpm_events: tuple[OsuBpmEvent, ...] = ()
+    resnap_diagnostics: ResnapDiagnostics = field(
+        default_factory=ResnapDiagnostics.unobserved
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +264,9 @@ class MapperatorinatorGenerator:
     run: RunCommand | None = None
     verify_patch: PatchVerifier = require_mapperatorinator_patch
 
-    def _run_and_parse(self, argv: list[str], workdir: Path) -> tuple[str, OsuBeatmap]:
+    def _run_and_parse(
+        self, argv: list[str], workdir: Path
+    ) -> tuple[str, OsuBeatmap, Path]:
         if self.config.mapperatorinator_home is None:
             raise ValueError("mapperatorinator_home must be configured")
         self.verify_patch(self.config.mapperatorinator_home)
@@ -289,12 +298,12 @@ class MapperatorinatorGenerator:
                 f"could not parse the generated beatmap: {error}",
                 context={"path": str(osu_path)},
             ) from error
-        return osu_path.read_text(encoding="utf-8-sig"), beatmap
+        return osu_path.read_text(encoding="utf-8-sig"), beatmap, osu_path
 
     def generate_timing(
         self, request: TimingGenerationRequest, workdir: Path
     ) -> GeneratedTiming:
-        osu_text, beatmap = self._run_and_parse(
+        osu_text, beatmap, _ = self._run_and_parse(
             build_timing_command(self.config, request, workdir), workdir
         )
         if not beatmap.bpm_events:
@@ -313,7 +322,7 @@ class MapperatorinatorGenerator:
     def generate_map(
         self, request: GenerationRequest, workdir: Path
     ) -> GeneratedChart:
-        osu_text, beatmap = self._run_and_parse(
+        osu_text, beatmap, osu_path = self._run_and_parse(
             build_map_command(self.config, request, workdir), workdir
         )
         if beatmap.key_mode != request.key_mode:
@@ -348,4 +357,5 @@ class MapperatorinatorGenerator:
             generator_name="mapperatorinator-v32",
             seed=request.seed,
             bpm_events=beatmap.bpm_events,
+            resnap_diagnostics=read_resnap_diagnostics(osu_path),
         )

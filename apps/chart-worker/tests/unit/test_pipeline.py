@@ -123,6 +123,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         }
     ]
     assert report["mapTimingEscalations"] == []
+    assert report["resnapCollisions"] == []
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
     assert set(report["difficultyOrder"]) == {"4K", "6K", "7K"}
@@ -185,6 +186,12 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert "activeOnsetCount" in chart_report["timingDiagnostics"]
         assert "quietCoverageGaps" in chart_report["timingDiagnostics"]
         assert chart_report["cfgScale"] == 1.0
+        assert chart_report["resnapDiagnostics"] == {
+            "version": "resnap-collisions-v1",
+            "status": "UNOBSERVED",
+            "collisions": [],
+            "error": None,
+        }
         assert chart_report["descriptors"] == {
             "EASY": ["expression/simple"],
             "NORMAL": ["style/mixed rice"],
