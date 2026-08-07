@@ -45,6 +45,7 @@ function sessionWithMisses(): ReviewSession {
         scrollSpeed: 1,
         judgmentPreset: "lenient",
         keysound: false,
+        fever: true,
         loopEnabled: false,
         loopStartMs: 0,
         loopEndMs: 8000,
