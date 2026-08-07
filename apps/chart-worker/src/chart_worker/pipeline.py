@@ -180,6 +180,41 @@ def _relative(path: Path, run_dir: Path) -> str:
         raise ValueError(f"pipeline asset is outside the output directory: {path}") from None
 
 
+def _timing_authority_report(
+    authority: SongTimingAuthority | None,
+    run_dir: Path,
+) -> dict[str, object]:
+    if authority is None:
+        return {
+            "timingAuthority": None,
+            "timingAuthoritySha256": None,
+            "timingGenerationMode": None,
+            "timingAttemptCount": None,
+            "timingAuthorityTempoMetrics": None,
+            "timingAuthorityReview": None,
+            "timingAuthorityLeadingCoverage": None,
+        }
+    return {
+        "timingAuthority": _relative(authority.reference_path, run_dir),
+        "timingAuthoritySha256": authority.sha256,
+        "timingGenerationMode": authority.mode,
+        "timingAttemptCount": authority.attempt_count,
+        "timingAuthorityTempoMetrics": (
+            authority.tempo_metrics.to_report()
+            if authority.tempo_metrics is not None
+            else None
+        ),
+        "timingAuthorityReview": (
+            authority.review.to_report() if authority.review is not None else None
+        ),
+        "timingAuthorityLeadingCoverage": (
+            authority.leading_coverage.to_report()
+            if authority.leading_coverage is not None
+            else None
+        ),
+    }
+
+
 def _elapsed_ms(started_ns: int) -> int:
     return max(0, (perf_counter_ns() - started_ns) // 1_000_000)
 
@@ -334,23 +369,7 @@ def _generation_report(
         "sourceName": options.source.name,
         "generator": options.generator,
         "strategy": "MAPPERATORINATOR_SHARED_TIMING",
-        "timingAuthority": _relative(authority.reference_path, run_dir),
-        "timingAuthoritySha256": authority.sha256,
-        "timingGenerationMode": authority.mode,
-        "timingAttemptCount": authority.attempt_count,
-        "timingAuthorityTempoMetrics": (
-            authority.tempo_metrics.to_report()
-            if authority.tempo_metrics is not None
-            else None
-        ),
-        "timingAuthorityReview": (
-            authority.review.to_report() if authority.review is not None else None
-        ),
-        "timingAuthorityLeadingCoverage": (
-            authority.leading_coverage.to_report()
-            if authority.leading_coverage is not None
-            else None
-        ),
+        **_timing_authority_report(authority, run_dir),
         "noteMutationEnabled": False,
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
@@ -401,12 +420,7 @@ def _failure_generation_report(
             "code": error.code.value,
             "context": error.context,
         },
-        "timingAuthority": (
-            _relative(authority.reference_path, run_dir) if authority is not None else None
-        ),
-        "timingAuthoritySha256": authority.sha256 if authority is not None else None,
-        "timingGenerationMode": authority.mode if authority is not None else None,
-        "timingAttemptCount": authority.attempt_count if authority is not None else None,
+        **_timing_authority_report(authority, run_dir),
         "canonicalAudioSha256": prepared.normalized.sha256,
         "elapsedMsByStage": elapsed,
         "charts": [],

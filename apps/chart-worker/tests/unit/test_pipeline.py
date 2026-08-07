@@ -313,6 +313,20 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
     assert report["timingAuthoritySha256"] == sha256_file(
         output_dir / "audio" / "timing-reference.osu"
     )
+    assert report["timingAuthorityTempoMetrics"]["basePulseSupport"] == 1.0
+    assert report["timingAuthorityReview"] == {
+        "action": "PASS",
+        "reasons": ["TEMPO_CANDIDATE_AMBIGUOUS"],
+    }
+    assert report["timingAuthorityLeadingCoverage"] == {
+        "action": "PASS",
+        "reasons": [],
+        "firstEventTimeMs": 0,
+        "leadingDurationMs": 0,
+        "onsetCount": 0,
+        "activeOnsetCount": 0,
+        "activeFrameRatio": 0.0,
+    }
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v1.json").exists()
