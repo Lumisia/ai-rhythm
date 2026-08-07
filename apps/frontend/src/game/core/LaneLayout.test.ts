@@ -12,6 +12,9 @@ const SEVEN = [
   "SIDE_RIGHT",
 ] as const;
 
+const FOUR = ["MAIN_1", "MAIN_2", "MAIN_3", "MAIN_4"] as const;
+const SIX = ["SIDE_LEFT", "MAIN_1", "MAIN_2", "MAIN_3", "MAIN_4", "SIDE_RIGHT"] as const;
+
 describe("layoutStage", () => {
   it("keeps columns at a fixed width instead of filling the container", () => {
     // 컨테이너를 채우려고 늘리면 레인이 100px 을 넘어 노트가 판때기가 된다.
@@ -101,15 +104,26 @@ function luminance(color: number): number {
 }
 
 describe("레인 색 구분", () => {
-  it("7키에서 이웃한 레인의 휘도가 충분히 벌어진다", () => {
-    const { lanes } = layoutStage(1280, SEVEN);
+  it.each([[FOUR], [SIX], [SEVEN]])("모든 키 모드에서 이웃한 레인의 명도 대비가 3:1 이상이다", (semantics) => {
+    const { lanes } = layoutStage(1280, semantics);
 
     for (let index = 1; index < lanes.length; index += 1) {
       const previous = luminance(lanes[index - 1].color);
       const current = luminance(lanes[index].color);
       const ratio =
         (Math.max(previous, current) + 0.05) / (Math.min(previous, current) + 0.05);
-      expect(ratio).toBeGreaterThan(1.2);
+      expect(ratio).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it.each([[FOUR], [SIX], [SEVEN]])("모든 노트가 레인 배경과 3:1 이상 대비된다", (semantics) => {
+    const { lanes } = layoutStage(1280, semantics);
+
+    for (const lane of lanes) {
+      const note = luminance(lane.color);
+      const background = luminance(lane.backgroundColor);
+      const ratio = (Math.max(note, background) + 0.05) / (Math.min(note, background) + 0.05);
+      expect(ratio).toBeGreaterThanOrEqual(3);
     }
   });
 
