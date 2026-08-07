@@ -4,6 +4,7 @@ import type { Clock } from "../audio/Clock";
 import type { KeysoundScheduler } from "../audio/KeysoundScheduler";
 import type { SongPlayer } from "../audio/SongPlayer";
 import { EffectBus } from "../core/EffectBus";
+import type { FeverGauge } from "../core/FeverGauge";
 import { HoldTickTracker } from "../core/HoldTickTracker";
 import { InputRecorder } from "../core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../core/JudgmentEngine";
@@ -35,6 +36,8 @@ export interface RhythmSceneSession {
   loop?: { startMs: number; endMs: number; restart: () => void };
   /** 롱노트 홀드 틱. 없으면 홀드 콤보가 붙지 않는다. */
   holdTicks?: HoldTickTracker;
+  /** FEVER 게이지. 없으면 FEVER 가 발동하지 않는다. */
+  fever?: FeverGauge;
   onJudgment?: (event: JudgmentEvent) => void;
   onPause?: () => void;
   onMarkerSlot?: (slot: number, timeMs: number) => void;
@@ -123,6 +126,9 @@ export class RhythmScene extends Phaser.Scene {
     });
     this.#stage?.setPressed(this.#held, this.#flashAtMs, songTimeMs, LANE_FLASH_MS);
     this.#effectLayer?.update(songTimeMs);
+    const feverTick = this.#session.fever?.advance(songTimeMs) ?? null;
+    if (feverTick) this.#applyFever(feverTick, songTimeMs);
+    this.#hud?.setFeverState(this.#session.fever?.value ?? 0, this.#session.fever?.active ?? false);
     this.#hud?.update(songTimeMs);
 
     if (!this.#session.loop && !this.#finished && songTimeMs > this.#session.chart.durationMs + 500) {
@@ -134,6 +140,8 @@ export class RhythmScene extends Phaser.Scene {
   #acceptJudgment(event: JudgmentEvent): void {
     const songTimeMs = this.#session.clock.songTimeMs();
     this.#session.score.accept(event);
+    const feverTransition = this.#session.fever?.accept(event.judgment, songTimeMs) ?? null;
+    if (feverTransition) this.#applyFever(feverTransition, songTimeMs);
     // 키음은 연출이 아니라 게임 규칙이다. MISS 시 미재생이 감산 구조의
     // 핵심이고 오디오 스케줄링은 지연에 민감해 구독자 순회 뒤로 미루지 않는다.
     if (event.phase === "HEAD" && event.judgment !== "MISS") {
@@ -149,6 +157,17 @@ export class RhythmScene extends Phaser.Scene {
       songTimeMs,
     });
     this.#session.onJudgment?.(event);
+  }
+
+  #applyFever(transition: "START" | "END", songTimeMs: number): void {
+    const active = transition === "START";
+    this.#session.score.setFeverActive(active);
+    this.#effectLayer?.setFeverActive(active);
+    this.#stage?.setFeverActive(active);
+    this.#effects.emit({
+      type: active ? "FEVER_START" : "FEVER_END",
+      songTimeMs,
+    });
   }
 
   readonly #handleControlKey = (event: KeyboardEvent): void => {

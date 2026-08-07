@@ -34,6 +34,8 @@ const SCOPE_TRAIL_MAX = 200;
 const COMBO_MIN = 5;
 const COUNTDOWN_LEAD_MS = 3200;
 const GUTTER_PADDING = 18;
+const FEVER_GAUGE_WIDTH = 6;
+const FEVER_GAUGE_HEIGHT_RATIO = 0.42;
 
 /** 마일스톤에서만 반응한다. 매 콤보마다 움직이면 활주로가 계속 흔들린다. */
 const COMBO_MILESTONES = [25, 50, 100, 200, 500];
@@ -132,6 +134,8 @@ export class HudRenderer implements EffectSubscriber {
   #lastCombo = 0;
   #comboGold = false;
   #reduceMotion = false;
+  #feverValue = 0;
+  #feverActive = false;
 
   constructor(scene: Phaser.Scene, options: HudRendererOptions) {
     this.#scene = scene;
@@ -200,6 +204,11 @@ export class HudRenderer implements EffectSubscriber {
     this.#reduceMotion = reduce;
   }
 
+  setFeverState(value: number, active: boolean): void {
+    this.#feverValue = value;
+    this.#feverActive = active;
+  }
+
   acceptJudgment(event: HudJudgment, songTimeMs: number): void {
     this.#lastJudgment = {
       judgment: event.judgment,
@@ -224,6 +233,7 @@ export class HudRenderer implements EffectSubscriber {
   update(songTimeMs: number): void {
     this.#graphics.clear();
     this.#drawProgressRail(songTimeMs);
+    this.#drawFever();
     this.#drawScope(songTimeMs);
     this.#drawJudgment(songTimeMs);
     this.#drawCombo(songTimeMs);
@@ -326,6 +336,27 @@ export class HudRenderer implements EffectSubscriber {
       const x = width * Phaser.Math.Clamp(markerTimeMs / this.#durationMs, 0, 1);
       this.#graphics.fillRect(x - 1, top - 5, 2, 8);
     }
+  }
+
+  /** 무대 좌측 세로 게이지. 주변시로 보는 자리다. */
+  #drawFever(): void {
+    const height = this.#height * FEVER_GAUGE_HEIGHT_RATIO;
+    const top = this.#judgeLineY - height;
+    const x = this.#stage.left - GUTTER_PADDING;
+
+    this.#graphics.fillStyle(SLATE, 0.9);
+    this.#graphics.fillRect(x, top, FEVER_GAUGE_WIDTH, height);
+
+    if (this.#feverActive) {
+      // 발동 중에는 게이지를 가득 채운 채 색으로 상태를 알린다.
+      this.#graphics.fillStyle(VIOLET, 0.95);
+      this.#graphics.fillRect(x, top, FEVER_GAUGE_WIDTH, height);
+      return;
+    }
+
+    const filled = height * Phaser.Math.Clamp(this.#feverValue / 100, 0, 1);
+    this.#graphics.fillGradientStyle(ACCENT, VIOLET, ACCENT, VIOLET, 1, 1, 1, 1);
+    this.#graphics.fillRect(x, top + height - filled, FEVER_GAUGE_WIDTH, filled);
   }
 
   /** 타이밍 오차 스코프. 리셉터 바로 아래, VSRG 의 hit error bar 자리다.

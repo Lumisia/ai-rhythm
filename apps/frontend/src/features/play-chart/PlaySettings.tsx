@@ -19,6 +19,7 @@ export interface PlaySettingsValue {
   scrollSpeed: number;
   judgmentPreset: JudgmentPreset;
   keysound: boolean;
+  fever: boolean;
   loopEnabled: boolean;
   loopStartMs: number;
   loopEndMs: number;
@@ -82,6 +83,11 @@ export function PlaySettings({
         <input checked={value.keysound && keysoundAvailable} disabled={!keysoundAvailable || disabled} onChange={(event) => update("keysound", event.currentTarget.checked)} type="checkbox" />
         <span>키음 stem 사용</span>
         <small>{keysoundAvailable ? "DRUMS READY" : "UNAVAILABLE"}</small>
+      </label>
+      <label className="check-setting">
+        <input checked={value.fever} onChange={(event) => update("fever", event.currentTarget.checked)} type="checkbox" />
+        <span>FEVER</span>
+        <small>콤보 ×2 · 정확도 불변</small>
       </label>
       <label className="check-setting">
         <input checked={value.loopEnabled} onChange={(event) => update("loopEnabled", event.currentTarget.checked)} type="checkbox" />

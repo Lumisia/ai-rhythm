@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GameClock } from "../../game/audio/GameClock";
 import { KeysoundScheduler } from "../../game/audio/KeysoundScheduler";
 import { SongPlayer } from "../../game/audio/SongPlayer";
+import { FeverGauge } from "../../game/core/FeverGauge";
 import { HoldTickTracker } from "../../game/core/HoldTickTracker";
 import { InputRecorder } from "../../game/core/InputRecorder";
 import { JudgmentEngine, type JudgmentEvent } from "../../game/core/JudgmentEngine";
@@ -52,6 +53,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
     scrollSpeed: 1,
     judgmentPreset: "lenient",
     keysound: false,
+    fever: true,
     loopEnabled: false,
     loopStartMs: 0,
     loopEndMs: chart.document.durationMs,
@@ -153,6 +155,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         judgmentConfig.holdReleaseScale,
       );
       const score = new ScoreCalculator();
+      const fever = settings.fever ? new FeverGauge() : undefined;
       const recorder = new InputRecorder();
       const judgments: JudgmentEvent[] = [];
       let keysoundScheduler: KeysoundScheduler | undefined;
@@ -185,6 +188,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         keysoundScheduler,
         songPlayer: player,
         holdTicks,
+        fever,
         loop: settings.loopEnabled
           ? {
               startMs: rangeStart,
@@ -192,6 +196,8 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
               restart: () => {
                 engine.reset();
                 holdTicks.reset();
+                fever?.reset();
+                score.setFeverActive(false);
                 keysoundScheduler?.resetAutoPlay();
                 player?.seek(rangeStart);
               },
