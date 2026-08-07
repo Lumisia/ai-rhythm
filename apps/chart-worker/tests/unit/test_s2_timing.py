@@ -132,6 +132,43 @@ class AlwaysLongActiveGapGenerator(RecordingGenerator):
         )
 
 
+class LocalOutlierThenSuperGenerator(RecordingGenerator):
+    def generate_timing(self, request, workdir):
+        self.timing_calls.append(request)
+        events = (
+            (OsuBpmEvent(0, 120.0),)
+            if request.super_timing
+            else (
+                OsuBpmEvent(0, 80.0),
+                OsuBpmEvent(10_000, 5.6),
+                OsuBpmEvent(21_000, 165.0),
+            )
+        )
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=events,
+            generator_name="recording-generator",
+            seed=request.seed,
+            mode="SUPER_TIMING" if request.super_timing else "STANDARD",
+        )
+
+
+class AlwaysLocalOutlierGenerator(LocalOutlierThenSuperGenerator):
+    def generate_timing(self, request, workdir):
+        generated = super().generate_timing(request, workdir)
+        return GeneratedTiming(
+            osu_text="",
+            bpm_events=(
+                OsuBpmEvent(0, 80.0),
+                OsuBpmEvent(10_000, 5.6),
+                OsuBpmEvent(21_000, 165.0),
+            ),
+            generator_name=generated.generator_name,
+            seed=generated.seed,
+            mode=generated.mode,
+        )
+
+
 def _half_tempo_analysis() -> OnsetAnalysis:
     strength = np.zeros(401)
     strength[::10] = 1.0
@@ -307,6 +344,78 @@ def test_two_long_active_gaps_fail_with_attempt_evidence(tmp_path):
         attempt["leadingCoverage"]["action"] == "RETRY_TIMING"
         for attempt in attempts
     )
+
+
+def test_local_timing_damage_uses_super_once_before_map(monkeypatch, tmp_path):
+    generator = LocalOutlierThenSuperGenerator()
+    monkeypatch.setattr(
+        s2_timing,
+        "review_timing_authority",
+        lambda metrics: TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+    )
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=30_000),
+        _active_analysis(30_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "SUPER_TIMING"
+    assert authority.local_review is not None
+    assert authority.local_review.action is TimingAuthorityAction.PASS
+    assert authority.recovery_preflight is not None
+
+
+def test_two_locally_damaged_timing_candidates_fail_with_segment_evidence(
+    monkeypatch, tmp_path
+):
+    generator = AlwaysLocalOutlierGenerator()
+    monkeypatch.setattr(
+        s2_timing,
+        "review_timing_authority",
+        lambda metrics: TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+    )
+
+    with pytest.raises(WorkerError) as captured:
+        run_timing_generation(
+            _prepared(tmp_path, duration_ms=30_000),
+            _active_analysis(30_000),
+            tmp_path,
+            generator=generator,
+            seed=9,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_CANDIDATE_FAILED
+    attempts = captured.value.context["attempts"]
+    assert len(attempts) == 2
+    assert all(
+        attempt["localTimingReview"]["action"] == "RETRY_TIMING"
+        for attempt in attempts
+    )
+
+
+def test_healthy_local_timing_keeps_single_standard_inference(monkeypatch, tmp_path):
+    generator = RecordingGenerator()
+    monkeypatch.setattr(
+        s2_timing,
+        "review_timing_authority",
+        lambda metrics: TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+    )
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=30_000),
+        _active_analysis(30_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False]
+    assert authority.local_review is not None
+    assert authority.local_review.action is TimingAuthorityAction.PASS
 
 
 def test_retry_worthy_standard_accepts_structurally_valid_super_review(tmp_path):

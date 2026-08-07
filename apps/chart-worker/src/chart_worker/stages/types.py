@@ -14,7 +14,9 @@ from chart_worker.validation.timing_review import TimingAuthorityReview
 
 if TYPE_CHECKING:
     from chart_worker.validation.difficulty_order import DifficultyOrderReview
+    from chart_worker.validation.local_timing_review import LocalTimingAuthorityReview
     from chart_worker.validation.quality_gate import ChartAcceptance
+    from chart_worker.validation.recovery_preflight import RecoveryPreflight
 
 GenerationProvenance = Literal[
     "PRIMARY", "RETRY", "PARTIAL_REMAP", "RECOVERY_FALLBACK"
@@ -39,6 +41,8 @@ class SongTimingAuthority:
     tempo_metrics: TempoCandidateMetrics | None = None
     review: TimingAuthorityReview | None = None
     leading_coverage: LeadingTimingCoverage | None = None
+    local_review: "LocalTimingAuthorityReview | None" = None
+    recovery_preflight: "RecoveryPreflight | None" = None
 
 
 @dataclass(frozen=True, slots=True)

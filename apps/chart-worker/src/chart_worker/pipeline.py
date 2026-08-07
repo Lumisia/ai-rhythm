@@ -193,6 +193,8 @@ def _timing_authority_report(
             "timingAuthorityTempoMetrics": None,
             "timingAuthorityReview": None,
             "timingAuthorityLeadingCoverage": None,
+            "timingAuthorityLocalReview": None,
+            "timingAuthorityRecoveryPreflight": None,
         }
     return {
         "timingAuthority": _relative(authority.reference_path, run_dir),
@@ -210,6 +212,16 @@ def _timing_authority_report(
         "timingAuthorityLeadingCoverage": (
             authority.leading_coverage.to_report()
             if authority.leading_coverage is not None
+            else None
+        ),
+        "timingAuthorityLocalReview": (
+            authority.local_review.to_report()
+            if authority.local_review is not None
+            else None
+        ),
+        "timingAuthorityRecoveryPreflight": (
+            authority.recovery_preflight.to_report()
+            if authority.recovery_preflight is not None
             else None
         ),
     }

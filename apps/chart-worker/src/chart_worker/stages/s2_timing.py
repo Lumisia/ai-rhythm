@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from chart_worker.analysis.grid_alignment import measure_tempo_candidates
+from chart_worker.analysis.local_timing import measure_local_timing
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedTiming
@@ -15,6 +16,8 @@ from chart_worker.validation.leading_timing_coverage import (
     LeadingTimingCoverage,
     review_leading_timing_coverage,
 )
+from chart_worker.validation.local_timing_review import review_local_timing_authority
+from chart_worker.validation.recovery_preflight import review_recovery_preflight
 from chart_worker.validation.timing_authority import (
     TimingAuthorityValidationError,
     validate_timing_events,
@@ -56,6 +59,23 @@ def _merge_reviews(
 
 def _validate_candidate(generated: GeneratedTiming, prepared: PreparedAudio) -> None:
     validate_timing_events(generated.bpm_events, prepared.normalized.duration_ms)
+
+
+def _candidate_authority(
+    generated: GeneratedTiming,
+    prepared: PreparedAudio,
+    reference_path: Path,
+) -> SongTimingAuthority:
+    return SongTimingAuthority(
+        reference_path=reference_path,
+        sha256="",
+        audio_sha256=prepared.normalized.sha256,
+        bpm_events=generated.bpm_events,
+        generator_name=generated.generator_name,
+        seed=generated.seed,
+        mode=generated.mode,
+        attempt_count=0,
+    )
 
 
 def _promote(generated: GeneratedTiming, prepared: PreparedAudio, reference_path: Path) -> None:
@@ -111,6 +131,20 @@ def run_timing_generation(
             )
             metrics = measure_tempo_candidates(generated.bpm_events, analysis)
             review = _merge_reviews(review_timing_authority(metrics), leading)
+            recovery_preflight = review_recovery_preflight(
+                _candidate_authority(generated, prepared, reference_path),
+                analysis,
+                duration_ms=prepared.normalized.duration_ms,
+            )
+            local_metrics = measure_local_timing(
+                generated.bpm_events,
+                analysis,
+                duration_ms=prepared.normalized.duration_ms,
+            )
+            local_review = review_local_timing_authority(
+                local_metrics,
+                recovery_preflight,
+            )
             attempt_reviews.append(
                 {
                     "attempt": attempt_count,
@@ -120,19 +154,24 @@ def run_timing_generation(
                     "review": review.to_report(),
                     "leadingCoverage": leading.to_report(),
                     "tempoMetrics": metrics.to_report(),
+                    "localTimingReview": local_review.to_report(),
+                    "recoveryPreflight": recovery_preflight.to_report(),
                 }
             )
-            if (
-                super_timing
-                and leading.action is TimingAuthorityAction.RETRY_TIMING
+            if super_timing and (
+                leading.action is TimingAuthorityAction.RETRY_TIMING
+                or local_review.action is TimingAuthorityAction.RETRY_TIMING
             ):
                 reference_path.unlink(missing_ok=True)
                 raise WorkerError(
                     ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
-                    "standard and Super Timing candidates missed active leading audio",
+                    "standard and Super Timing candidates failed musical timing validation",
                     context={"seeds": seeds, "attempts": attempt_reviews},
                 )
-            retry_with_super = not super_timing and _should_try_super_timing(review)
+            retry_with_super = not super_timing and (
+                _should_try_super_timing(review)
+                or local_review.action is TimingAuthorityAction.RETRY_TIMING
+            )
             publishable_review = review.action is TimingAuthorityAction.REVIEW
             if not retry_with_super and (
                 review.action is TimingAuthorityAction.PASS or publishable_review
@@ -165,6 +204,8 @@ def run_timing_generation(
                 tempo_metrics=metrics,
                 review=review,
                 leading_coverage=leading,
+                local_review=local_review,
+                recovery_preflight=recovery_preflight,
             )
         reference_path.unlink(missing_ok=True)
         if retry_with_super:

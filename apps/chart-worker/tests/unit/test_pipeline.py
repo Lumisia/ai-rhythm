@@ -94,6 +94,11 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         "activeOnsetCount": 0,
         "activeFrameRatio": 0.0,
     }
+    assert report["timingAuthorityLocalReview"]["version"] == "local-timing-review-v1"
+    assert report["timingAuthorityLocalReview"]["action"] == "PASS"
+    assert report["timingAuthorityRecoveryPreflight"]["version"] == (
+        "recovery-preflight-v1"
+    )
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
     assert report["attemptsPerChartMax"] == 3
@@ -327,6 +332,10 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
         "activeOnsetCount": 0,
         "activeFrameRatio": 0.0,
     }
+    assert report["timingAuthorityLocalReview"]["version"] == "local-timing-review-v1"
+    assert report["timingAuthorityRecoveryPreflight"]["version"] == (
+        "recovery-preflight-v1"
+    )
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v1.json").exists()
