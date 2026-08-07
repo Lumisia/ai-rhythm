@@ -130,6 +130,23 @@ describe("놓친 롱노트 추적", () => {
     expect([...engine.activeHoldIds()]).toEqual([]);
   });
 
+  it("판정창보다 일찍 놓으면 즉시 tail MISS 로 종료한다", () => {
+    const engine = new JudgmentEngine(
+      [{ id: 8, lane: 0, timeMs: 1000, type: "HOLD" as const, durationMs: 2000 }],
+      "lenient",
+    );
+    engine.keyDown(0, 1000);
+
+    expect(engine.keyUp(0, 1200)).toMatchObject({
+      noteId: 8,
+      phase: "TAIL",
+      judgment: "MISS",
+      noteTimeMs: 3000,
+    });
+    expect([...engine.activeHoldIds()]).toEqual([]);
+    expect([...engine.missedHoldIds()]).toEqual([8]);
+  });
+
   it("reset 이 두 집합을 비운다", () => {
     const engine = new JudgmentEngine([holdNote], "lenient");
     engine.advance(5000);

@@ -104,14 +104,21 @@ export class JudgmentEngine {
   keyUp(lane: number, timeMs: number): JudgmentEvent | null {
     const windows = this.#config.presets[this.#preset];
     const releaseWindowMs = windows.BAD * this.#config.holdReleaseScale;
-    const candidate = this.#nearest(lane, timeMs, "ACTIVE", ({ note }) => tailTime(note), releaseWindowMs);
+    const candidate = (this.#notesByLane.get(lane) ?? []).find(
+      (runtimeNote) => runtimeNote.state === "ACTIVE",
+    );
     if (!candidate) return null;
 
     const targetTimeMs = tailTime(candidate.note);
     const errorMs = timeMs - targetTimeMs;
-    const judgment = classifyScaledError(errorMs, windows, this.#config.holdReleaseScale);
+    if (errorMs > releaseWindowMs) return null;
+    const judgment =
+      errorMs < -releaseWindowMs
+        ? "MISS"
+        : classifyScaledError(errorMs, windows, this.#config.holdReleaseScale);
     candidate.state = "DONE";
     this.#activeHolds.delete(candidate.note.id);
+    if (judgment === "MISS") this.#missedHolds.add(candidate.note.id);
     return this.#event(candidate.note, "TAIL", judgment, errorMs, timeMs, targetTimeMs);
   }
 
