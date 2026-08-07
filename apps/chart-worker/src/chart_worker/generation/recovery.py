@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 
 from chart_worker.analysis.onset import OnsetAnalysis
@@ -22,6 +22,12 @@ class RecoveryBudget:
     min_row_gap_ms: int
     chord_every: int | None
     hold_every: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryRowPlan:
+    rows: tuple[int, ...]
+    subdivisions: int
 
 
 RECOVERY_BUDGETS: dict[str, RecoveryBudget] = {
@@ -92,6 +98,23 @@ def _tempo_rows(
     return tuple(rows)
 
 
+def plan_recovery_rows(
+    request: GenerationRequest,
+    authority: SongTimingAuthority,
+    onsets: OnsetAnalysis,
+    *,
+    subdivisions: int | None = None,
+) -> RecoveryRowPlan:
+    """Plan deterministic recovery rows without building note patterns."""
+    budget = RECOVERY_BUDGETS[request.difficulty]
+    if subdivisions is not None:
+        if subdivisions <= 0:
+            raise ValueError("recovery subdivisions must be positive")
+        budget = replace(budget, subdivisions=subdivisions)
+    rows = _tempo_rows(request, authority, budget, _active_onsets(onsets))
+    return RecoveryRowPlan(rows=rows, subdivisions=budget.subdivisions)
+
+
 def _is_sustained(
     onsets: OnsetAnalysis,
     active_onsets: tuple[int, ...],
@@ -158,11 +181,14 @@ def build_recovery_chart(
     request: GenerationRequest,
     authority: SongTimingAuthority,
     onsets: OnsetAnalysis,
+    *,
+    plan: RecoveryRowPlan | None = None,
 ) -> GeneratedChart:
     """Build a bounded fallback only after model candidates are exhausted."""
     budget = RECOVERY_BUDGETS[request.difficulty]
     active_onsets = _active_onsets(onsets)
-    rows = _tempo_rows(request, authority, budget, active_onsets)
+    row_plan = plan or plan_recovery_rows(request, authority, onsets)
+    rows = row_plan.rows
     if not rows:
         raise ValueError("recovery timing grid produced no playable rows")
     notes = _build_notes(request, rows, onsets, active_onsets, budget)

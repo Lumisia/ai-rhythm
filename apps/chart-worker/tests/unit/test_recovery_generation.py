@@ -9,7 +9,10 @@ from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.generation.params import GenerationRequest
-from chart_worker.generation.recovery import build_recovery_chart
+from chart_worker.generation.recovery import (
+    build_recovery_chart,
+    plan_recovery_rows,
+)
 from chart_worker.rating.project_rating import measure_rating
 from chart_worker.schema.types import DIFFICULTIES
 from chart_worker.stages.types import SongTimingAuthority
@@ -85,6 +88,25 @@ def test_recovery_uses_every_tempo_segment_and_audio_bounds():
     assert any(note.time_ms < 10_000 for note in chart.notes)
     assert any(note.time_ms >= 10_000 for note in chart.notes)
     assert chart.bpm_events == authority((0, 120.0), (10_000, 180.0)).bpm_events
+
+
+@pytest.mark.parametrize("difficulty", DIFFICULTIES)
+def test_recovery_row_plan_preserves_existing_output(difficulty: str):
+    generation_request = request(difficulty=difficulty)
+    timing_authority = authority((0, 120.0), (10_000, 180.0))
+    analysis = onsets()
+
+    original = build_recovery_chart(generation_request, timing_authority, analysis)
+    plan = plan_recovery_rows(generation_request, timing_authority, analysis)
+    planned = build_recovery_chart(
+        generation_request,
+        timing_authority,
+        analysis,
+        plan=plan,
+    )
+
+    assert plan.rows == tuple(sorted({note.time_ms for note in original.notes}))
+    assert planned == original
 
 
 @pytest.mark.parametrize("key_mode", [4, 6, 7])
