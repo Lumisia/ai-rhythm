@@ -71,6 +71,9 @@ export function ReviewResult({
       judgmentPreset: session.result.settings.judgmentPreset,
       perceivedDifficulty,
       verdict,
+      feverEnabled: session.result.settings.fever,
+      maxCombo: session.result.score.maxCombo,
+      rawMaxCombo: session.result.score.rawMaxCombo,
       events: session.result.inputs,
       judgments: session.result.judgments,
       markers: session.result.markers,
@@ -102,6 +105,13 @@ export function ReviewResult({
           <h3 id="timing-stat-title">판정과 타이밍</h3>
           <dl className="stat-list">
             {Object.entries(score.counts).map(([name, count]) => <div key={name}><dt>{name}</dt><dd>{count}</dd></div>)}
+            <div>
+              <dt>최대 콤보</dt>
+              <dd>
+                {score.maxCombo}
+                {session.result.settings.fever ? ` (원시 ${score.rawMaxCombo})` : null}
+              </dd>
+            </div>
             <div><dt>평균 오차</dt><dd>{score.meanErrMs.toFixed(1)} ms</dd></div>
             <div><dt>평균 절대 오차</dt><dd>{score.meanAbsoluteErrMs.toFixed(1)} ms</dd></div>
           </dl>
