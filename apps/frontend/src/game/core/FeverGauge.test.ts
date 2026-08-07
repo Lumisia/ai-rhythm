@@ -38,6 +38,29 @@ describe("FeverGauge", () => {
     expect(gauge.value).toBe(0);
   });
 
+  it("종료 시 게이지가 0 으로 리셋된다", () => {
+    const gauge = new FeverGauge({ durationMs: 1_000 });
+    fill(gauge, 0);
+    expect(gauge.active).toBe(true);
+
+    // 발동 중에도 축적은 계속된다. 상한을 넘지 않는지 함께 본다.
+    let peak = 0;
+    for (let index = 0; index < 200; index += 1) {
+      gauge.accept("PERFECT", 100);
+      peak = Math.max(peak, gauge.value);
+    }
+    expect(peak).toBe(100);
+
+    expect(gauge.advance(1_001)).toBe("END");
+    expect(gauge.active).toBe(false);
+    expect(gauge.value).toBe(0);
+
+    // 종료 직후 판정 한 번으로 다시 발동하면 FEVER 가 영구화된다.
+    // value 만 보면 부분 수정을 놓치므로 재발동 여부까지 못박는다.
+    expect(gauge.accept("PERFECT", 1_100)).toBeNull();
+    expect(gauge.active).toBe(false);
+  });
+
   it("15초 경과 시 자동 종료된다", () => {
     const gauge = new FeverGauge();
     fill(gauge, 0);
