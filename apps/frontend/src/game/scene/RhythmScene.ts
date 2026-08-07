@@ -38,7 +38,10 @@ export interface RhythmSceneSession {
   holdTicks?: HoldTickTracker;
   /** FEVER 게이지. 없으면 FEVER 가 발동하지 않는다. */
   fever?: FeverGauge;
-  /** 파티클·펄스·콤보 반응을 끈다. 레인 플래시는 기능이라 영향받지 않는다. */
+  /** 파티클·판정선 펄스·콤보 pop 을 끈다.
+   *
+   * 레인 플래시와 MISS 표시는 영향받지 않는다 — 입력이 먹었는지, 놓쳤는지는
+   * 장식이 아니라 기능이다. */
   reduceMotion?: boolean;
   onJudgment?: (event: JudgmentEvent) => void;
   onPause?: () => void;

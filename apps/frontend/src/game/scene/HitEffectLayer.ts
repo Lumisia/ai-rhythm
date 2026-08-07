@@ -77,9 +77,11 @@ export class HitEffectLayer implements EffectSubscriber {
   update(songTimeMs: number): void {
     const graphics = this.#graphics;
     graphics.clear();
+    // MISS 기운은 모션 감소에서도 남긴다. 움직이지 않는 레인 국소 착색이고,
+    // 무엇보다 놓쳤다는 **정보**다. 펄스는 장식이라 가드 뒤로 내린다.
     this.#drawMissGlow(songTimeMs);
-    this.#drawPulse(songTimeMs);
     if (this.#reduceMotion) return;
+    this.#drawPulse(songTimeMs);
 
     for (const particle of this.#field.activeAt(songTimeMs)) {
       if (particle.y < this.#judgeLineY - RISE_LIMIT_PX) continue;

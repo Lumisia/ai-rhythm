@@ -101,7 +101,7 @@ export function PlaySettings({
           type="checkbox"
         />
         <span>모션 감소</span>
-        <small>파티클·펄스·콤보 반응 끔</small>
+        <small>파티클·판정선 펄스·콤보 pop 끔 · 레인 플래시와 MISS 표시는 유지</small>
       </label>
       <label>
         <span>구간 시작</span>
