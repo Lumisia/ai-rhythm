@@ -40,8 +40,17 @@ def test_accepts_zero_millisecond_rows_and_a_note_before_audio_end():
 
 def test_rejects_duplicate_lane_and_time():
     chart = generated([tap(0, 1), tap(0, 1)])
-    with pytest.raises(GeneratedChartValidationError, match=r"duplicate.*lane 1.*0ms"):
+    with pytest.raises(
+        GeneratedChartValidationError, match=r"duplicate.*lane 1.*0ms"
+    ) as captured:
         validate_generated_chart(chart, key_mode=4, duration_ms=10_000)
+
+    assert captured.value.reason_code == "DUPLICATE_NOTE"
+    assert captured.value.context == {
+        "lane": 1,
+        "timeMs": 0,
+        "noteKind": "TAP",
+    }
 
 
 def test_allows_a_chord_across_different_lanes():
@@ -51,8 +60,18 @@ def test_allows_a_chord_across_different_lanes():
 
 def test_rejects_a_note_inside_an_active_hold_in_the_same_lane():
     chart = generated([hold(100, 1, 500), tap(400, 1)])
-    with pytest.raises(GeneratedChartValidationError, match=r"overlap.*lane 1"):
+    with pytest.raises(
+        GeneratedChartValidationError, match=r"overlap.*lane 1"
+    ) as captured:
         validate_generated_chart(chart, key_mode=4, duration_ms=10_000)
+
+    assert captured.value.reason_code == "HOLD_OVERLAP"
+    assert captured.value.context == {
+        "lane": 1,
+        "timeMs": 400,
+        "noteKind": "TAP",
+        "holdEndMs": 600,
+    }
 
 
 def test_allows_the_next_note_exactly_when_a_hold_ends():

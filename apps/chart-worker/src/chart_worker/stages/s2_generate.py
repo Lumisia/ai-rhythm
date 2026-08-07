@@ -135,11 +135,17 @@ def _validate_serialized_candidate(
     )
     if parsed.key_mode != generated.key_mode:
         raise GeneratedChartValidationError(
-            "serialized MAP key mode differs from generated object"
+            "serialized MAP key mode differs from generated object",
+            reason_code="SERIALIZED_KEY_MODE_MISMATCH",
+            context={
+                "serializedKeyMode": parsed.key_mode,
+                "generatedKeyMode": generated.key_mode,
+            },
         )
     if _note_projection(parsed_chart) != _note_projection(generated):
         raise GeneratedChartValidationError(
-            "serialized MAP note fields differ from generated object"
+            "serialized MAP note fields differ from generated object",
+            reason_code="SERIALIZED_NOTE_MISMATCH",
         )
 
 
