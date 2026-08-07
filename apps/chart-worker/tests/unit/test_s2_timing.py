@@ -418,6 +418,55 @@ def test_healthy_local_timing_keeps_single_standard_inference(monkeypatch, tmp_p
     assert authority.local_review.action is TimingAuthorityAction.PASS
 
 
+def test_force_super_timing_skips_standard_and_runs_once(monkeypatch, tmp_path):
+    generator = RecordingGenerator()
+    monkeypatch.setattr(
+        s2_timing,
+        "review_timing_authority",
+        lambda metrics: TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+    )
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=30_000),
+        _active_analysis(30_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+        force_super=True,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [True]
+    assert authority.mode == "SUPER_TIMING"
+    assert authority.attempt_count == 1
+
+
+def test_force_super_timing_failure_does_not_fall_back_to_standard(
+    monkeypatch, tmp_path
+):
+    generator = AlwaysLocalOutlierGenerator()
+    monkeypatch.setattr(
+        s2_timing,
+        "review_timing_authority",
+        lambda metrics: TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+    )
+
+    with pytest.raises(WorkerError) as captured:
+        run_timing_generation(
+            _prepared(tmp_path, duration_ms=30_000),
+            _active_analysis(30_000),
+            tmp_path,
+            generator=generator,
+            seed=9,
+            force_super=True,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_CANDIDATE_FAILED
+    assert [call.super_timing for call in generator.timing_calls] == [True]
+    assert captured.value.context["attempts"][0]["localTimingReview"]["action"] == (
+        "RETRY_TIMING"
+    )
+
+
 def test_retry_worthy_standard_accepts_structurally_valid_super_review(tmp_path):
     generator = RetryThenReviewGenerator()
 

@@ -105,14 +105,16 @@ def run_timing_generation(
     *,
     generator: ChartGenerator,
     seed: int,
+    force_super: bool = False,
 ) -> SongTimingAuthority:
-    """Generate one publishable timing authority with at most one Super fallback."""
+    """Generate one authority, optionally using only the bounded Super attempt."""
     reference_path = run_dir / "audio" / "timing-reference.osu"
     errors: list[str] = []
     seeds: list[int] = []
     attempt_reviews: list[dict[str, object]] = []
 
-    for attempt_count, super_timing in enumerate((False, True), start=1):
+    attempt_modes = (True,) if force_super else (False, True)
+    for attempt_count, super_timing in enumerate(attempt_modes, start=1):
         request = TimingGenerationRequest(
             audio_path=prepared.normalized.path,
             duration_ms=prepared.normalized.duration_ms,
