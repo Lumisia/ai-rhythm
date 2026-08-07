@@ -23,6 +23,7 @@ export interface PlaySettingsValue {
   loopEnabled: boolean;
   loopStartMs: number;
   loopEndMs: number;
+  reduceMotion: boolean;
 }
 
 interface PlaySettingsProps {
@@ -92,6 +93,15 @@ export function PlaySettings({
       <label className="check-setting">
         <input checked={value.loopEnabled} onChange={(event) => update("loopEnabled", event.currentTarget.checked)} type="checkbox" />
         <span>구간 반복</span>
+      </label>
+      <label className="check-setting">
+        <input
+          checked={value.reduceMotion}
+          onChange={(event) => update("reduceMotion", event.currentTarget.checked)}
+          type="checkbox"
+        />
+        <span>모션 감소</span>
+        <small>파티클·펄스·콤보 반응 끔</small>
       </label>
       <label>
         <span>구간 시작</span>

@@ -38,6 +38,8 @@ export interface RhythmSceneSession {
   holdTicks?: HoldTickTracker;
   /** FEVER 게이지. 없으면 FEVER 가 발동하지 않는다. */
   fever?: FeverGauge;
+  /** 파티클·펄스·콤보 반응을 끈다. 레인 플래시는 기능이라 영향받지 않는다. */
+  reduceMotion?: boolean;
   onJudgment?: (event: JudgmentEvent) => void;
   onPause?: () => void;
   onMarkerSlot?: (slot: number, timeMs: number) => void;
@@ -238,6 +240,9 @@ export class RhythmScene extends Phaser.Scene {
     } else {
       this.#hud.resize(geometry);
     }
+    const reduceMotion = this.#session.reduceMotion ?? false;
+    this.#effectLayer.setReduceMotion(reduceMotion);
+    this.#hud.setReduceMotion(reduceMotion);
     this.#session.onLayout?.({ judgeLineY });
   }
 

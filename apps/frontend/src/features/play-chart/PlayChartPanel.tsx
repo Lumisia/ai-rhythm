@@ -22,6 +22,13 @@ import {
 import type { ReviewMarker, ReviewMarkerKind } from "../review-chart/review";
 import { PlaySettings, type PlaySettingsValue } from "./PlaySettings";
 
+/** 시스템 설정을 초기값으로 삼는다. 사용자가 설정에서 바꿀 수 있다. */
+function prefersReducedMotion(): boolean {
+  return typeof matchMedia === "function"
+    ? matchMedia("(prefers-reduced-motion: reduce)").matches
+    : false;
+}
+
 export interface PlaySessionResult {
   score: ScoreSnapshot;
   judgments: JudgmentEvent[];
@@ -57,6 +64,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
     loopEnabled: false,
     loopStartMs: 0,
     loopEndMs: chart.document.durationMs,
+    reduceMotion: prefersReducedMotion(),
   });
   const [phase, setPhase] = useState<"READY" | "PREPARING" | "PLAYING" | "PAUSED">("READY");
   const [error, setError] = useState<string | null>(null);
@@ -189,6 +197,7 @@ export function PlayChartPanel({ run, chart, onBack, onComplete }: PlayChartPane
         songPlayer: player,
         holdTicks,
         fever,
+        reduceMotion: settings.reduceMotion,
         loop: settings.loopEnabled
           ? {
               startMs: rangeStart,
