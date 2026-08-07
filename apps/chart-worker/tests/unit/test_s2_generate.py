@@ -794,6 +794,36 @@ def test_partial_stable_promotion_is_cleaned_and_normalized(
     assert not any((tmp_path / "raw").glob("4k-*.osu"))
 
 
+def test_atomic_family_promotion_leaves_no_stable_raw_when_6k_selection_fails(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+
+    def reject_6k(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        action = GateAction.RETRY_MAP if generated.key_mode == 6 else GateAction.PASS
+        return _acceptance_for_difficulty(
+            _acceptance_with_action(authority, action),
+            requested_difficulty,
+        )
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", reject_6k)
+
+    with pytest.raises(WorkerError) as captured:
+        run_generation(
+            prepared,
+            authority,
+            _analysis(),
+            tmp_path,
+            generator=RecordingGenerator(),
+            seed=0,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert not list((tmp_path / "raw").glob("*k-*.osu"))
+
+
 def test_stable_raw_reparse_rejects_text_with_different_timing_identity(
     tmp_path: Path,
 ):

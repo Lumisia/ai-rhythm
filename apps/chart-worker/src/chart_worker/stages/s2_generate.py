@@ -809,7 +809,13 @@ def run_generation(
     seed: int,
 ) -> tuple[GeneratedVariant, ...]:
     """Generate key-mode pools and retry only failed or inverted labels."""
-    variants: list[GeneratedVariant] = []
+    selections: list[
+        tuple[
+            dict[str, _VariantState],
+            tuple[_Candidate, ...],
+            DifficultyOrderReview,
+        ]
+    ] = []
     for key_index, key_mode in enumerate(KEY_MODES):
         states = {
             difficulty: _VariantState(
@@ -923,41 +929,52 @@ def run_generation(
                     raise exhausted_errors[0]
                 raise RuntimeError("recovery candidates did not form a monotonic family")
 
-        raw_paths = _promote_key_mode(
-            candidates,
-            prepared=prepared,
-            authority=authority,
-            run_dir=run_dir,
-        )
-        for candidate, raw_path in zip(candidates, raw_paths, strict=True):
-            state = states[candidate.request.difficulty]
-            _record_unselected_candidates(
-                state,
-                candidate,
-                order_review,
+        selections.append((states, candidates, order_review))
+
+    variants: list[GeneratedVariant] = []
+    promoted_paths: list[Path] = []
+    try:
+        for states, candidates, order_review in selections:
+            raw_paths = _promote_key_mode(
+                candidates,
+                prepared=prepared,
+                authority=authority,
                 run_dir=run_dir,
             )
-            variants.append(
-                GeneratedVariant(
-                    key_mode=key_mode,
-                    difficulty=candidate.request.difficulty,
-                    requested_star=candidate.request.requested_star,
-                    raw_osu_path=raw_path,
-                    generated=candidate.generated,
-                    cfg_scale=candidate.request.cfg_scale,
-                    attempt=candidate.attempt,
-                    attempt_errors=tuple(state.attempt_errors),
-                    attempt_evidence=tuple(state.attempt_evidence),
-                    timing_authority_sha256=authority.sha256,
-                    acceptance=candidate.acceptance,
-                    candidate_count=len(state.pool),
-                    generation_attempt_count=(
-                        state.next_attempt - 1 + int(state.partial_attempted)
-                    ),
-                    selected_seed=candidate.seed,
-                    difficulty_order=order_review,
-                    provenance=candidate.provenance,
-                    recovery_reason=candidate.recovery_reason,
+            promoted_paths.extend(raw_paths)
+            for candidate, raw_path in zip(candidates, raw_paths, strict=True):
+                state = states[candidate.request.difficulty]
+                _record_unselected_candidates(
+                    state,
+                    candidate,
+                    order_review,
+                    run_dir=run_dir,
                 )
-            )
+                variants.append(
+                    GeneratedVariant(
+                        key_mode=candidate.request.key_mode,
+                        difficulty=candidate.request.difficulty,
+                        requested_star=candidate.request.requested_star,
+                        raw_osu_path=raw_path,
+                        generated=candidate.generated,
+                        cfg_scale=candidate.request.cfg_scale,
+                        attempt=candidate.attempt,
+                        attempt_errors=tuple(state.attempt_errors),
+                        attempt_evidence=tuple(state.attempt_evidence),
+                        timing_authority_sha256=authority.sha256,
+                        acceptance=candidate.acceptance,
+                        candidate_count=len(state.pool),
+                        generation_attempt_count=(
+                            state.next_attempt - 1 + int(state.partial_attempted)
+                        ),
+                        selected_seed=candidate.seed,
+                        difficulty_order=order_review,
+                        provenance=candidate.provenance,
+                        recovery_reason=candidate.recovery_reason,
+                    )
+                )
+    except Exception:
+        for raw_path in promoted_paths:
+            raw_path.unlink(missing_ok=True)
+        raise
     return tuple(variants)
