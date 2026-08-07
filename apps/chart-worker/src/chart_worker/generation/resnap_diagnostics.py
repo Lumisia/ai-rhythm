@@ -76,8 +76,8 @@ def _collision(payload: object, *, seed: int) -> ResnapCollision:
         raise ValueError("noteKind must be TAP or HOLD")
     if post_time_ms < 0:
         raise ValueError("postTimeMs must not be negative")
-    if snap_divisor <= 0:
-        raise ValueError("snapDivisor must be positive")
+    if snap_divisor < 0:
+        raise ValueError("snapDivisor must not be negative")
     return ResnapCollision(
         seed=seed,
         lane=lane,

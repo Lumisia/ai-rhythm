@@ -82,3 +82,30 @@ def test_malformed_sidecar_is_non_blocking_and_invalid(tmp_path):
     assert diagnostics.status == "INVALID"
     assert diagnostics.collisions == ()
     assert diagnostics.error
+
+
+def test_unsnapped_member_of_a_collision_allows_zero_divisor(tmp_path):
+    osu_path = tmp_path / "beatmap.osu"
+    osu_path.with_suffix(".resnap.json").write_text(
+        json.dumps(
+            {
+                "version": "resnap-collisions-v1",
+                "seed": 5,
+                "collisions": [
+                    {
+                        "lane": 0,
+                        "noteKind": "TAP",
+                        "preTimeMs": 125,
+                        "postTimeMs": 125,
+                        "snapDivisor": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    diagnostics = read_resnap_diagnostics(osu_path)
+
+    assert diagnostics.status == "OBSERVED"
+    assert diagnostics.collisions[0].snap_divisor == 0

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from chart_worker.generation.mapperatorinator_patch import (
+    REQUIRED_PATCHES,
     MapperatorinatorPatchError,
     apply_mapperatorinator_patch,
     apply_required_mapperatorinator_patches,
@@ -11,6 +12,15 @@ from chart_worker.generation.mapperatorinator_patch import (
     require_mapperatorinator_patch_set,
     required_patch_statuses,
 )
+
+
+def test_required_patch_manifest_includes_resnap_collision_sidecar():
+    assert [patch_id for patch_id, _ in REQUIRED_PATCHES] == [
+        "mania-keycount-v1",
+        "mania-output-safety-v1",
+        "mania-event-times-v1",
+        "mania-resnap-collisions-v1",
+    ]
 
 
 def _git(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -81,6 +91,41 @@ def make_patch_set_fixture(
     return home, head, tuple(patches)
 
 
+def make_layered_patch_set_fixture(
+    tmp_path: Path,
+) -> tuple[Path, str, tuple[tuple[str, Path], ...]]:
+    home = tmp_path / "upstream-layered"
+    home.mkdir()
+    _git(home, "init")
+    _git(home, "config", "user.name", "Chart Worker Tests")
+    _git(home, "config", "user.email", "chart-worker-tests@example.invalid")
+    (home / "module.py").write_text("before\n", encoding="utf-8")
+    _git(home, "add", "module.py")
+    _git(home, "commit", "-m", "fixture")
+    head = _git(home, "rev-parse", "HEAD").stdout.strip()
+    first = tmp_path / "first-layer.patch"
+    first.write_text(
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+middle\n",
+        encoding="utf-8",
+    )
+    second = tmp_path / "second-layer.patch"
+    second.write_text(
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-middle\n"
+        "+after\n",
+        encoding="utf-8",
+    )
+    return home, head, (("first-v1", first), ("second-v1", second))
+
+
 def test_patch_lifecycle_is_applicable_then_applied(tmp_path: Path):
     home, head, patch = make_upstream_fixture(tmp_path)
 
@@ -122,6 +167,27 @@ def test_required_patch_set_applies_every_patch(tmp_path: Path):
     assert (home / "first.py").read_text(encoding="utf-8") == "first-after\n"
     assert (home / "second.py").read_text(encoding="utf-8") == "second-after\n"
     assert (home / "third.py").read_text(encoding="utf-8") == "third-after\n"
+
+
+def test_required_patch_set_recognizes_overlapping_layered_patches(tmp_path: Path):
+    home, head, patches = make_layered_patch_set_fixture(tmp_path)
+
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=patches,
+        expected_head=head,
+    )
+
+    assert required_patch_statuses(
+        home,
+        patches=patches,
+        expected_head=head,
+    ) == {"first-v1": "APPLIED", "second-v1": "APPLIED"}
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=patches,
+        expected_head=head,
+    )
 
 
 @pytest.mark.parametrize("missing_index", [1, 2])

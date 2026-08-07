@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from functools import cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 EXPECTED_MAPPERATORINATOR_HEAD = "2a70eb89004da20e39b0fcbaad2686b264d5a040"
 KEYCOUNT_PATCH_ID = "mania-keycount-v1"
 OUTPUT_SAFETY_PATCH_ID = "mania-output-safety-v1"
 EVENT_TIMES_PATCH_ID = "mania-event-times-v1"
+RESNAP_COLLISIONS_PATCH_ID = "mania-resnap-collisions-v1"
 CONSTRAINT_PATCH_ID = (
     f"{KEYCOUNT_PATCH_ID}+{OUTPUT_SAFETY_PATCH_ID}+{EVENT_TIMES_PATCH_ID}"
+    f"+{RESNAP_COLLISIONS_PATCH_ID}"
 )
 DEFAULT_PATCH_PATH = (
     Path(__file__).resolve().parents[3]
@@ -29,10 +32,16 @@ EVENT_TIMES_PATCH_PATH = (
     / "patches"
     / "mapperatorinator-v32-event-times.patch"
 )
+RESNAP_COLLISIONS_PATCH_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "patches"
+    / "mapperatorinator-v32-resnap-collisions.patch"
+)
 REQUIRED_PATCHES = (
     (KEYCOUNT_PATCH_ID, DEFAULT_PATCH_PATH),
     (OUTPUT_SAFETY_PATCH_ID, OUTPUT_SAFETY_PATCH_PATH),
     (EVENT_TIMES_PATCH_ID, EVENT_TIMES_PATCH_PATH),
+    (RESNAP_COLLISIONS_PATCH_ID, RESNAP_COLLISIONS_PATCH_PATH),
 )
 
 PatchStatus = Literal["APPLIED", "APPLICABLE"]
@@ -43,7 +52,10 @@ class MapperatorinatorPatchError(RuntimeError):
     """The configured Mapperatorinator checkout cannot use the required patch."""
 
 
-def _git(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(
+    home: Path,
+    *args: str,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         cwd=home,
@@ -52,6 +64,82 @@ def _git(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
     )
+
+
+def _patch_stack_matches_worktree(
+    home: Path,
+    patches: tuple[PatchSpec, ...],
+) -> bool:
+    """Compare the worktree with the complete layered patch result."""
+    with tempfile.TemporaryDirectory(prefix="mapperatorinator-patch-index-") as temp_dir:
+        expected_root = Path(temp_dir)
+        touched_paths: set[PurePosixPath] = set()
+        for patch_id, patch_path in patches:
+            result = _git(
+                home,
+                "apply",
+                "--numstat",
+                "-z",
+                str(Path(patch_path).resolve()),
+            )
+            if result.returncode != 0:
+                raise MapperatorinatorPatchError(
+                    f"could not inspect patch {patch_id}: {result.stderr.strip()}"
+                )
+            for entry in result.stdout.split("\0"):
+                if not entry:
+                    continue
+                fields = entry.split("\t", 2)
+                if len(fields) != 3:
+                    raise MapperatorinatorPatchError(
+                        f"could not parse paths from patch {patch_id}"
+                    )
+                relative = PurePosixPath(fields[2])
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise MapperatorinatorPatchError(
+                        f"patch {patch_id} contains an unsafe path: {relative}"
+                    )
+                touched_paths.add(relative)
+
+        for relative in touched_paths:
+            source = subprocess.run(
+                [
+                    "git",
+                    "cat-file",
+                    "--filters",
+                    f"--path={relative.as_posix()}",
+                    f"HEAD:{relative.as_posix()}",
+                ],
+                cwd=home,
+                check=False,
+                capture_output=True,
+            )
+            if source.returncode == 0:
+                destination = expected_root.joinpath(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(source.stdout)
+
+        for patch_id, patch_path in patches:
+            result = subprocess.run(
+                ["git", "apply", str(Path(patch_path).resolve())],
+                cwd=expected_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            if result.returncode != 0:
+                raise MapperatorinatorPatchError(
+                    f"patch stack is invalid at {patch_id}: {result.stderr.strip()}"
+                )
+
+        return all(
+            expected_root.joinpath(*relative.parts).is_file()
+            and home.joinpath(*relative.parts).is_file()
+            and expected_root.joinpath(*relative.parts).read_bytes()
+            == home.joinpath(*relative.parts).read_bytes()
+            for relative in touched_paths
+        )
 
 
 def patch_status(home: Path, patch_path: Path, expected_head: str) -> PatchStatus:
@@ -113,6 +201,19 @@ def required_patch_statuses(
     expected_head: str = EXPECTED_MAPPERATORINATOR_HEAD,
 ) -> dict[str, PatchStatus]:
     """Return each required patch status for the pinned checkout."""
+    home = Path(home).resolve()
+    head_result = _git(home, "rev-parse", "HEAD")
+    if head_result.returncode != 0:
+        raise MapperatorinatorPatchError(
+            f"could not read Mapperatorinator commit: {head_result.stderr.strip()}"
+        )
+    actual_head = head_result.stdout.strip()
+    if actual_head != expected_head:
+        raise MapperatorinatorPatchError(
+            f"unexpected Mapperatorinator commit: expected {expected_head}, got {actual_head}"
+        )
+    if _patch_stack_matches_worktree(home, patches):
+        return dict.fromkeys((patch_id for patch_id, _ in patches), "APPLIED")
     return {
         patch_id: patch_status(home, patch_path, expected_head)
         for patch_id, patch_path in patches
@@ -126,6 +227,19 @@ def apply_required_mapperatorinator_patches(
     expected_head: str = EXPECTED_MAPPERATORINATOR_HEAD,
 ) -> None:
     """Apply every project-owned patch without reapplying completed patches."""
+    home = Path(home).resolve()
+    head_result = _git(home, "rev-parse", "HEAD")
+    if head_result.returncode != 0:
+        raise MapperatorinatorPatchError(
+            f"could not read Mapperatorinator commit: {head_result.stderr.strip()}"
+        )
+    actual_head = head_result.stdout.strip()
+    if actual_head != expected_head:
+        raise MapperatorinatorPatchError(
+            f"unexpected Mapperatorinator commit: expected {expected_head}, got {actual_head}"
+        )
+    if _patch_stack_matches_worktree(home, patches):
+        return
     for _, patch_path in patches:
         apply_mapperatorinator_patch(
             home,

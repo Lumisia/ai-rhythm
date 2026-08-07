@@ -1,0 +1,254 @@
+diff --git a/inference.py b/inference.py
+index 41943dd..2d899df 100644
+--- a/inference.py
++++ b/inference.py
+@@ -488,6 +488,7 @@ def generate(
+     sequences = preprocessor.segment(audio)
+     extra_in_context = {}
+     output_type = args.output_type.copy()
++    resnap_collisions = []
+     timing_model = model if timing_model is None else timing_model
+     timing_tokenizer = tokenizer if timing_tokenizer is None else timing_tokenizer
+ 
+@@ -540,11 +541,19 @@ def generate(
+ 
+         # Resnap timing events
+         if args.resnap_events and timing is not None:
+-            events, event_times = postprocessor.resnap_events(
+-                events,
+-                event_times,
+-                timing,
+-            )
++            if args.gamemode == 3 and ContextType.MAP in output_type:
++                events, event_times, resnap_collisions = postprocessor.resnap_events(
++                    events,
++                    event_times,
++                    timing,
++                    key_count=round(beatmap_config.circle_size),
++                )
++            else:
++                events, event_times = postprocessor.resnap_events(
++                    events,
++                    event_times,
++                    timing,
++                )
+     else:
+         events, event_times = timing_events, timing_times
+ 
+@@ -588,6 +597,12 @@ def generate(
+     else:
+         result_path = output_osu_path
+         postprocessor.write_result(result_path, result)
++        if args.gamemode == 3 and ContextType.MAP in output_type and args.resnap_events:
++            postprocessor.write_resnap_diagnostics(
++                result_path,
++                seed=args.seed,
++                collisions=resnap_collisions,
++            )
+         if verbose:
+             logger.info(f"Generated beatmap saved to {result_path}")
+ 
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index 9e192ce..2de6b48 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -1,10 +1,12 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import json
+ import logging
+ import os
+ import zipfile
+ from datetime import timedelta
++from pathlib import Path
+ from string import Template
+ from typing import Optional
+ 
+@@ -528,6 +530,29 @@ class Postprocessor(object):
+         with open(output_path, "w", encoding='utf-8-sig') as osu_file:
+             osu_file.write(result)
+ 
++    def write_resnap_diagnostics(
++            self,
++            output_path: str | Path,
++            *,
++            seed: int,
++            collisions: list[dict],
++    ) -> Path:
++        sidecar_path = Path(output_path).with_suffix(".resnap.json")
++        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
++        sidecar_path.write_text(
++            json.dumps(
++                {
++                    "version": "resnap-collisions-v1",
++                    "seed": seed,
++                    "collisions": collisions,
++                },
++                ensure_ascii=False,
++                indent=2,
++            ) + "\n",
++            encoding="utf-8",
++        )
++        return sidecar_path
++
+     def export_osz(self, output_path: str, osu_content: str, osu_filename: str, audio_path: str, background_path: str = None):
+         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+ 
+@@ -618,12 +643,14 @@ class Postprocessor(object):
+             events: list[Event],
+             event_times: list[int],
+             timing: list[TimingPoint],
+-    ) -> tuple[list[Event], list[int]]:
++            key_count: int = None,
++    ):
+         """Resnap events and their explicit times to the same beat ticks."""
+         if len(events) != len(event_times):
+             raise ValueError("events and event_times must have equal length")
+ 
+         timing = sort_timing_points(timing)
++        original_event_times = list(event_times)
+         resnapped_events = []
+         snapped_by_time = {}
+         for i, event in enumerate(events):
+@@ -648,10 +675,75 @@ class Postprocessor(object):
+                 )
+             resnapped_events.append(Event(EventType.TIME_SHIFT, time))
+ 
+-        return (
++        snapped_event_times = [
++            snapped_by_time.get(time, time) for time in event_times
++        ]
++        if key_count is None:
++            return resnapped_events, snapped_event_times
++        if key_count <= 0:
++            raise ValueError("key_count must be positive")
++
++        before_groups, group_indices = get_groups(
++            events,
++            event_times=original_event_times,
++            types_first=self.types_first,
++        )
++        after_groups, _ = get_groups(
+             resnapped_events,
+-            [snapped_by_time.get(time, time) for time in event_times],
++            event_times=snapped_event_times,
++            types_first=self.types_first,
+         )
++        observations = []
++        note_kinds = {
++            EventType.CIRCLE: "TAP",
++            EventType.HOLD_NOTE: "HOLD",
++        }
++        for before, after, indices in zip(
++                before_groups,
++                after_groups,
++                group_indices,
++        ):
++            note_kind = note_kinds.get(before.event_type)
++            if note_kind is None or before.x is None:
++                continue
++            lane = min(
++                key_count - 1,
++                max(0, int(before.x * key_count / 512)),
++            )
++            snap_divisor = next(
++                (
++                    events[index].value
++                    for index in indices
++                    if events[index].type == EventType.SNAPPING
++                ),
++                0,
++            )
++            observations.append({
++                "lane": lane,
++                "noteKind": note_kind,
++                "preTimeMs": before.time,
++                "postTimeMs": after.time,
++                "snapDivisor": snap_divisor,
++            })
++
++        pre_times_by_target = {}
++        for observation in observations:
++            target = (observation["lane"], observation["postTimeMs"])
++            pre_times_by_target.setdefault(target, set()).add(
++                observation["preTimeMs"]
++            )
++        collision_targets = {
++            target
++            for target, pre_times in pre_times_by_target.items()
++            if len(pre_times) >= 2
++        }
++        collisions = [
++            observation
++            for observation in observations
++            if (observation["lane"], observation["postTimeMs"])
++            in collision_targets
++        ]
++        return resnapped_events, snapped_event_times, collisions
+ 
+     def resnap(self, time: float, timing: list[TimingPoint], snap_divisor: int) -> float:
+         """Resnap a time to the nearest beat divisor."""
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index 183e530..b4a610f 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -1,3 +1,4 @@
++import json
+ from datetime import timedelta
+ from types import SimpleNamespace
+ 
+@@ -80,3 +81,53 @@ def test_resnap_updates_event_tokens_and_explicit_times_together():
+ 
+     assert snapped_events[0].value == 125
+     assert snapped_times == [125, 125, 125, 125, 125]
++
++
++def test_resnap_reports_distinct_pre_times_collapsed_to_same_mania_lane():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 140),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++    ]
++    _, _, collisions = make_postprocessor().resnap_events(
++        events, [110] * 5 + [140] * 5, make_timing(), key_count=4,
++    )
++    assert collisions == [
++        {"lane": 0, "noteKind": "TAP", "preTimeMs": 110,
++         "postTimeMs": 125, "snapDivisor": 4},
++        {"lane": 0, "noteKind": "HOLD", "preTimeMs": 140,
++         "postTimeMs": 125, "snapDivisor": 4},
++    ]
++
++
++def test_resnap_does_not_report_same_time_on_different_mania_lanes():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 140),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++    ]
++    _, _, collisions = make_postprocessor().resnap_events(
++        events, [110] * 5 + [140] * 5, make_timing(), key_count=4,
++    )
++    assert collisions == []
++
++
++def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
++    osu_path = tmp_path / "beatmap.osu"
++    collisions = [
++        {"lane": 0, "noteKind": "TAP", "preTimeMs": 110,
++         "postTimeMs": 125, "snapDivisor": 4}
++    ]
++    sidecar_path = make_postprocessor().write_resnap_diagnostics(
++        osu_path, seed=31, collisions=collisions,
++    )
++    assert sidecar_path == osu_path.with_suffix(".resnap.json")
++    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {
++        "version": "resnap-collisions-v1",
++        "seed": 31,
++        "collisions": collisions,
++    }
