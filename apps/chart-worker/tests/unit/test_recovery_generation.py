@@ -1,4 +1,5 @@
 from collections import Counter
+from dataclasses import replace
 from itertools import pairwise
 from pathlib import Path
 
@@ -10,13 +11,19 @@ from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.generation.params import GenerationRequest
 from chart_worker.generation.recovery import (
+    RECOVERY_BUDGETS,
     build_recovery_chart,
     plan_recovery_rows,
+    select_recovery_plan,
 )
 from chart_worker.rating.project_rating import measure_rating
 from chart_worker.schema.types import DIFFICULTIES
 from chart_worker.stages.types import SongTimingAuthority
 from chart_worker.validation.generated_chart import validate_generated_chart
+from chart_worker.validation.recovery_preflight import (
+    RecoveryPreflightAction,
+    review_recovery_preflight,
+)
 
 DURATION_MS = 20_000
 
@@ -142,3 +149,69 @@ def test_recovery_adds_hold_only_with_sustained_activity():
 
     assert not any(note.kind == "HOLD" for note in dry.notes)
     assert any(note.kind == "HOLD" for note in sustained.notes)
+
+
+def test_healthy_recovery_grid_keeps_the_difficulty_default():
+    generation_request = request(difficulty="NORMAL")
+    timing_authority = authority()
+    analysis = onsets()
+    preflight = review_recovery_preflight(
+        timing_authority,
+        analysis,
+        duration_ms=DURATION_MS,
+    )
+    timing_authority = replace(timing_authority, recovery_preflight=preflight)
+
+    plan = select_recovery_plan(generation_request, timing_authority, analysis)
+
+    assert plan.subdivisions == RECOVERY_BUDGETS["NORMAL"].subdivisions
+    assert plan.selection_reason == "DEFAULT"
+
+
+def test_damaged_default_uses_the_nearest_preflight_viable_divisor():
+    generation_request = request(difficulty="EASY")
+    timing_authority = authority((0, 5.0))
+    analysis = onsets()
+    preflight = review_recovery_preflight(
+        timing_authority,
+        analysis,
+        duration_ms=DURATION_MS,
+    )
+    easy = preflight.for_difficulty("EASY")
+    assert easy.action is RecoveryPreflightAction.REVIEW
+    assert easy.viable_divisors
+    timing_authority = replace(timing_authority, recovery_preflight=preflight)
+
+    plan = select_recovery_plan(generation_request, timing_authority, analysis)
+
+    expected = min(
+        easy.viable_divisors,
+        key=lambda divisor: (
+            abs(divisor - RECOVERY_BUDGETS["EASY"].subdivisions),
+            divisor,
+        ),
+    )
+    assert plan.subdivisions == expected
+    assert plan.subdivisions != RECOVERY_BUDGETS["EASY"].subdivisions
+    assert plan.selection_reason == "PREFLIGHT_ALTERNATE"
+    assert plan.viable_divisors == easy.viable_divisors
+
+
+def test_no_viable_alternate_keeps_default_for_final_gate_decision():
+    generation_request = request(difficulty="EASY")
+    timing_authority = authority((0, 0.25))
+    analysis = onsets()
+    preflight = review_recovery_preflight(
+        timing_authority,
+        analysis,
+        duration_ms=DURATION_MS,
+    )
+    easy = preflight.for_difficulty("EASY")
+    assert easy.action is RecoveryPreflightAction.DAMAGED
+    timing_authority = replace(timing_authority, recovery_preflight=preflight)
+
+    plan = select_recovery_plan(generation_request, timing_authority, analysis)
+
+    assert plan.subdivisions == RECOVERY_BUDGETS["EASY"].subdivisions
+    assert plan.selection_reason == "NO_VIABLE_ALTERNATE"
+    assert plan.viable_divisors == ()

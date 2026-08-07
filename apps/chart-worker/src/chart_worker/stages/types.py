@@ -13,6 +13,7 @@ from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverag
 from chart_worker.validation.timing_review import TimingAuthorityReview
 
 if TYPE_CHECKING:
+    from chart_worker.generation.recovery import RecoveryRowPlan
     from chart_worker.validation.difficulty_order import DifficultyOrderReview
     from chart_worker.validation.local_timing_review import LocalTimingAuthorityReview
     from chart_worker.validation.quality_gate import ChartAcceptance
@@ -64,6 +65,7 @@ class GeneratedVariant:
     difficulty_order: "DifficultyOrderReview | None" = None
     provenance: GenerationProvenance = "PRIMARY"
     recovery_reason: str | None = None
+    recovery_plan: "RecoveryRowPlan | None" = None
 
 
 @dataclass(frozen=True, slots=True)

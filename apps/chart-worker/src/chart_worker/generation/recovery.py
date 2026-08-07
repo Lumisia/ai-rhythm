@@ -5,6 +5,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from math import ceil
+from typing import Literal
 
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.generation.mapperatorinator import GeneratedChart
@@ -28,6 +29,20 @@ class RecoveryBudget:
 class RecoveryRowPlan:
     rows: tuple[int, ...]
     subdivisions: int
+    selection_reason: Literal[
+        "DEFAULT",
+        "PREFLIGHT_ALTERNATE",
+        "NO_VIABLE_ALTERNATE",
+    ] = "DEFAULT"
+    viable_divisors: tuple[int, ...] = ()
+
+    def to_report(self) -> dict[str, object]:
+        return {
+            "subdivisions": self.subdivisions,
+            "selectionReason": self.selection_reason,
+            "viableDivisors": list(self.viable_divisors),
+            "rowCount": len(self.rows),
+        }
 
 
 RECOVERY_BUDGETS: dict[str, RecoveryBudget] = {
@@ -113,6 +128,45 @@ def plan_recovery_rows(
         budget = replace(budget, subdivisions=subdivisions)
     rows = _tempo_rows(request, authority, budget, _active_onsets(onsets))
     return RecoveryRowPlan(rows=rows, subdivisions=budget.subdivisions)
+
+
+def select_recovery_plan(
+    request: GenerationRequest,
+    authority: SongTimingAuthority,
+    onsets: OnsetAnalysis,
+) -> RecoveryRowPlan:
+    """Select one bounded recovery grid from timing-stage preflight evidence."""
+    default_plan = plan_recovery_rows(request, authority, onsets)
+    preflight = authority.recovery_preflight
+    if preflight is None:
+        return default_plan
+    difficulty = preflight.for_difficulty(request.difficulty)
+    viable_divisors = difficulty.viable_divisors
+    if difficulty.action.value == "REVIEW" and viable_divisors:
+        selected_divisor = min(
+            viable_divisors,
+            key=lambda divisor: (
+                abs(divisor - default_plan.subdivisions),
+                divisor,
+            ),
+        )
+        return replace(
+            plan_recovery_rows(
+                request,
+                authority,
+                onsets,
+                subdivisions=selected_divisor,
+            ),
+            selection_reason="PREFLIGHT_ALTERNATE",
+            viable_divisors=viable_divisors,
+        )
+    if difficulty.action.value == "DAMAGED":
+        return replace(
+            default_plan,
+            selection_reason="NO_VIABLE_ALTERNATE",
+            viable_divisors=viable_divisors,
+        )
+    return replace(default_plan, viable_divisors=viable_divisors)
 
 
 def _is_sustained(

@@ -14,7 +14,11 @@ from chart_worker.generation.osu_parser import parse_osu_mania
 from chart_worker.generation.osu_writer import notes_to_osu_mania
 from chart_worker.generation.params import GenerationRequest
 from chart_worker.generation.partial_remap import build_partial_remap_window
-from chart_worker.generation.recovery import build_recovery_chart
+from chart_worker.generation.recovery import (
+    RecoveryRowPlan,
+    build_recovery_chart,
+    select_recovery_plan,
+)
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.timing_feedback import (
@@ -167,6 +171,7 @@ class _Candidate:
     seed: int
     provenance: GenerationProvenance
     recovery_reason: str | None = None
+    recovery_plan: RecoveryRowPlan | None = None
 
 
 @dataclass(slots=True)
@@ -622,7 +627,13 @@ def _build_recovery_candidate(
         seed=seed,
         duration_ms=prepared.normalized.duration_ms,
     )
-    generated = build_recovery_chart(request, authority, onset_analysis)
+    recovery_plan = select_recovery_plan(request, authority, onset_analysis)
+    generated = build_recovery_chart(
+        request,
+        authority,
+        onset_analysis,
+        plan=recovery_plan,
+    )
     acceptance = evaluate_chart_candidate(
         generated,
         authority,
@@ -643,6 +654,7 @@ def _build_recovery_candidate(
                 "difficulty": state.difficulty,
                 "gateReport": acceptance.to_report(),
                 "modelFailure": model_failure,
+                "recoveryPlan": recovery_plan.to_report(),
             },
         )
     first_timing = generated.bpm_events[0]
@@ -676,6 +688,7 @@ def _build_recovery_candidate(
             if state.partial_attempted
             else "MODEL_CANDIDATES_EXHAUSTED"
         ),
+        recovery_plan=recovery_plan,
     )
 
 
@@ -1005,6 +1018,7 @@ def run_generation(
                         difficulty_order=order_review,
                         provenance=candidate.provenance,
                         recovery_reason=candidate.recovery_reason,
+                        recovery_plan=candidate.recovery_plan,
                     )
                 )
     except Exception:

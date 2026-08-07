@@ -9,6 +9,7 @@ from chart_worker import pipeline
 from chart_worker.analysis.activity import AudioActivity
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.fake import FakeGenerator
+from chart_worker.generation.recovery import RecoveryRowPlan
 from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
@@ -145,6 +146,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["generationAttemptCount"] == 1
         assert chart_report["provenance"] == "PRIMARY"
         assert chart_report["recoveryReason"] is None
+        assert chart_report["recoveryPlan"] is None
         assert chart_report["selectedSeed"] == chart_report["seed"]
         assert chart_report["attemptErrors"] == []
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
@@ -844,6 +846,12 @@ def test_generation_report_records_recovery_provenance(tmp_path: Path):
             variants[0],
             provenance="RECOVERY_FALLBACK",
             recovery_reason="MODEL_CANDIDATES_EXHAUSTED",
+            recovery_plan=RecoveryRowPlan(
+                rows=(0, 500, 1_000),
+                subdivisions=4,
+                selection_reason="PREFLIGHT_ALTERNATE",
+                viable_divisors=(4, 6, 8),
+            ),
         )
         return (recovered, *variants[1:])
 
@@ -863,6 +871,12 @@ def test_generation_report_records_recovery_provenance(tmp_path: Path):
     )["charts"][0]
     assert first["provenance"] == "RECOVERY_FALLBACK"
     assert first["recoveryReason"] == "MODEL_CANDIDATES_EXHAUSTED"
+    assert first["recoveryPlan"] == {
+        "subdivisions": 4,
+        "selectionReason": "PREFLIGHT_ALTERNATE",
+        "viableDivisors": [4, 6, 8],
+        "rowCount": 3,
+    }
 
 
 def test_pipeline_analyzes_only_the_canonical_game_audio_once(tmp_path: Path):

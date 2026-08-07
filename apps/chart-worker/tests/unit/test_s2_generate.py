@@ -1518,8 +1518,10 @@ def test_one_exhausted_variant_recovers_without_regenerating_successes(tmp_path:
     )
     assert recovered.provenance == "RECOVERY_FALLBACK"
     assert recovered.recovery_reason == "MODEL_CANDIDATES_EXHAUSTED"
+    assert recovered.recovery_plan is not None
+    assert recovered.recovery_plan.selection_reason == "DEFAULT"
     assert all(
-        variant.provenance == "PRIMARY"
+        variant.provenance == "PRIMARY" and variant.recovery_plan is None
         for variant in variants
         if variant is not recovered
     )
@@ -1577,6 +1579,7 @@ def test_localized_coverage_failure_remaps_only_the_exhausted_variant(
     assert partial_requests[0].timing_reference_path != authority.reference_path
     assert repaired.provenance == "PARTIAL_REMAP"
     assert repaired.recovery_reason == "ACTIVE_COVERAGE_GAP"
+    assert repaired.recovery_plan is None
     assert all(
         variant.provenance == "PRIMARY"
         for variant in variants
@@ -1621,6 +1624,7 @@ def test_rejected_partial_remap_falls_back_without_regenerating_other_variants(
     assert sum(request.add_to_beatmap for request in generator.map_calls) == 1
     assert recovered.provenance == "RECOVERY_FALLBACK"
     assert recovered.recovery_reason == "PARTIAL_REMAP_FAILED"
+    assert recovered.recovery_plan is not None
     assert recovered.generation_attempt_count == 4
     assert recovered.attempt_evidence[-1]["reason"] == "PARTIAL_REMAP_REJECTED"
 
@@ -1642,6 +1646,7 @@ def test_normal_generation_marks_every_variant_primary(tmp_path: Path):
     assert len(generator.map_calls) == 12
     assert all(variant.provenance == "PRIMARY" for variant in variants)
     assert all(variant.recovery_reason is None for variant in variants)
+    assert all(variant.recovery_plan is None for variant in variants)
 
 
 def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(

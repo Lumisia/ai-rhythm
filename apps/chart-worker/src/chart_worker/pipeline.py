@@ -382,6 +382,11 @@ def _generation_report(
                 "generationAttemptCount": variant.generation_attempt_count,
                 "provenance": variant.provenance,
                 "recoveryReason": variant.recovery_reason,
+                "recoveryPlan": (
+                    variant.recovery_plan.to_report()
+                    if variant.recovery_plan is not None
+                    else None
+                ),
                 "attemptErrors": list(variant.attempt_errors),
                 "attemptEvidence": list(variant.attempt_evidence),
                 "acceptanceStatus": acceptance["action"],
