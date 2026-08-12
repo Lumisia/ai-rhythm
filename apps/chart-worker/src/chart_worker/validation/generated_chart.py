@@ -39,6 +39,8 @@ def validate_generated_chart(
     *,
     key_mode: int,
     duration_ms: int,
+    max_note_start_ms: int | None = None,
+    max_hold_end_ms: int | None = None,
 ) -> None:
     """Validate key, timing, bounds, duplicates and same-lane hold overlap."""
     if chart.key_mode != key_mode:
@@ -93,6 +95,34 @@ def validate_generated_chart(
                     "noteKind": note.kind,
                     "noteEndMs": _end_ms(note),
                     "durationMs": duration_ms,
+                },
+            )
+        if max_note_start_ms is not None and note.time_ms > max_note_start_ms:
+            raise GeneratedChartValidationError(
+                f"note start at {note.time_ms}ms exceeds music attack boundary "
+                f"{max_note_start_ms}ms",
+                reason_code="NOTE_START_AFTER_MUSIC",
+                context={
+                    "lane": note.lane,
+                    "timeMs": note.time_ms,
+                    "noteKind": note.kind,
+                    "maxNoteStartMs": max_note_start_ms,
+                },
+            )
+        if (
+            max_hold_end_ms is not None
+            and note.kind == "HOLD"
+            and note.time_ms + (note.duration_ms or 0) > max_hold_end_ms
+        ):
+            raise GeneratedChartValidationError(
+                f"hold end at {note.time_ms + (note.duration_ms or 0)}ms exceeds "
+                f"release boundary {max_hold_end_ms}ms",
+                reason_code="HOLD_END_AFTER_RELEASE",
+                context={
+                    "lane": note.lane,
+                    "startTimeMs": note.time_ms,
+                    "endTimeMs": note.time_ms + (note.duration_ms or 0),
+                    "maxHoldEndMs": max_hold_end_ms,
                 },
             )
         by_lane[note.lane].append(note)

@@ -41,6 +41,8 @@ class LocalTimingSegmentMetrics:
     pulse_conflict: bool
     phase_conflict: bool
     evidence_status: str
+    boundary_onset_distance_ms: float | None = None
+    boundary_supported: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +128,11 @@ def measure_local_timing(
             continue
         onsets = _range(analysis.onset_ms, start_ms, end_ms)
         active_onsets = _range(active_source, start_ms, end_ms)
+        boundary_onset_distance_ms = (
+            min(abs(onset_ms - start_ms) for onset_ms in active_source)
+            if index > 0 and active_source
+            else None
+        )
         active_frame_ratio = (
             (1.0 if active_onsets else 0.0)
             if analysis.activity is None
@@ -190,6 +197,12 @@ def measure_local_timing(
                 pulse_conflict=pulse_conflict,
                 phase_conflict=phase_conflict,
                 evidence_status="SUFFICIENT" if active_confident else "INSUFFICIENT",
+                boundary_onset_distance_ms=boundary_onset_distance_ms,
+                boundary_supported=(
+                    boundary_onset_distance_ms <= GRID_SUPPORT_WINDOW_MS
+                    if boundary_onset_distance_ms is not None
+                    else None
+                ),
             )
         )
     return LocalTimingMetrics(segments=tuple(segments))

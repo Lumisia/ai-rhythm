@@ -1,0 +1,74 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 88ba319..ee94f06 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -347,7 +347,35 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     initial_open_columns=self.initial_open_columns,
+                 )
+ 
+-            open_columns = set(replay_signatures(seen_groups))
++            try:
++                open_columns = set(replay_signatures(seen_groups))
++            except ValueError as error:
++                parsed_extra = seen_groups - self.prompt_group_signatures
++
++                def signature_tail(signatures):
++                    return sorted(
++                        (
++                            (time_token, lane, event_type.value)
++                            for time_token, lane, event_type in signatures
++                        ),
++                        key=lambda item: (
++                            item[0] is None,
++                            -1 if item[0] is None else item[0],
++                            item[1],
++                            item[2],
++                        ),
++                    )[-8:]
++
++                raise ValueError(
++                    f"{error}; initialOpen={sorted(self.initial_open_columns)}; "
++                    f"promptCurrentTimeToken={self.prompt_current_time_token}; "
++                    f"promptLength={self.prompt_length}; "
++                    f"inputLength={tokens.shape[0]}; "
++                    f"promptCanonicalCount={len(self.prompt_group_signatures)}; "
++                    f"promptCanonicalTail={signature_tail(self.prompt_group_signatures)}; "
++                    f"parsedExtraCount={len(parsed_extra)}; "
++                    f"parsedExtraTail={signature_tail(parsed_extra)}"
++                ) from error
+ 
+             if current_lane is None:
+                 self._telemetry["missingColumnSteps"] += 1
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index 289b4e6..db01afd 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -133,6 +133,28 @@ def test_canonical_append_boundary_overrides_older_prompt_timeshift():
+     assert not torch.isneginf(result[0, 30:40]).all()
+ 
+ 
++def test_invalid_prompt_replay_reports_canonical_and_parsed_sources():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_group_signatures=(
++            (30, 2, EventType.HOLD_NOTE_END.value),
++        ),
++        prompt_current_time_token=None,
++    )
++
++    with pytest.raises(
++        ValueError,
++        match=(
++            r"initialOpen=\[\]; promptCurrentTimeToken=None; "
++            r"promptLength=2; inputLength=2; promptCanonicalCount=1; "
++            r"promptCanonicalTail=\[\(30, 2, 'hold_note_end'\)\]; "
++            r"parsedExtraCount=0; parsedExtraTail=\[\]"
++        ),
++    ):
++        processor(torch.tensor([[keycount_token(4), 1]]), scores())
++
++
+ def test_final_hold_closure_budget_includes_missing_timeshift():
+     processor = ManiaHoldStateLogitsProcessor(
+         FakeTokenizer(),

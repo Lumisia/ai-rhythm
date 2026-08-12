@@ -1,0 +1,71 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 5236429..3857f67 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -530,10 +530,12 @@ class Processor(object):
+                     ),
+                 )
+ 
+-    @staticmethod
+-    def _mania_prompt_start_time(frame_time: float) -> float:
+-        """Return the boundary immediately before the current output frame."""
+-        return frame_time
++    def _mania_prompt_start_time(self, frame_time: float) -> float:
++        """Return the earliest time represented by the prompt contract."""
++        timeshift_range = self.tokenizer.event_range[EventType.TIME_SHIFT]
++        return frame_time + (
++            timeshift_range.min_value * MILISECONDS_PER_STEP
++        )
+ 
+     def _mania_prompt_open_hold_columns(
+             self,
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index 47eaef9..5caeede 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -11,7 +11,16 @@ from osuT5.osuT5.tokenizer import ContextType
+ 
+ def make_processor() -> Processor:
+     processor = Processor.__new__(Processor)
+-    processor.tokenizer = SimpleNamespace(eos_id=999, context_eos={})
++    processor.tokenizer = SimpleNamespace(
++        eos_id=999,
++        context_eos={},
++        event_range={
++            EventType.TIME_SHIFT: SimpleNamespace(
++                min_value=-512,
++                max_value=512,
++            )
++        },
++    )
+     processor.types_first = False
+     processor.eos_time = 1_000
+     processor.lookahead_time_range = set()
+@@ -202,14 +211,14 @@ def test_cumulative_replay_error_reports_window_and_frame_boundary():
+ 
+ def test_mania_state_boundary_matches_the_prompt_start():
+     processor = make_processor()
+-    processor.miliseconds_per_sequence = 5_000
++    processor.tokenizer.event_range[EventType.TIME_SHIFT].min_value = -100
+ 
+-    assert processor._mania_prompt_start_time(5_000) == 5_000
++    assert processor._mania_prompt_start_time(5_000) == 4_000
+ 
+ 
+-def test_mania_prompt_state_folds_only_groups_before_prompt_start():
++def test_mania_prompt_state_folds_only_groups_before_addressable_prompt_start():
+     processor = make_processor()
+-    processor.miliseconds_per_sequence = 1_000
++    processor.tokenizer.event_range[EventType.TIME_SHIFT].min_value = -40
+     context = {
+         "events": [
+             Event(EventType.TIME_SHIFT, 100),
+@@ -222,7 +231,7 @@ def test_mania_prompt_state_folds_only_groups_before_prompt_start():
+         "event_times": [100, 100, 100, 900, 900, 900],
+     }
+ 
+-    assert processor._mania_prompt_open_hold_columns(context, 500, 4) == (1,)
++    assert processor._mania_prompt_open_hold_columns(context, 500, 4) == ()
+ 
+ 
+ def test_mania_prompt_group_contract_includes_complete_current_frame():

@@ -20,6 +20,43 @@
       "title": "AudioFileRef",
       "type": "object"
     },
+    "MissingChartRef": {
+      "additionalProperties": false,
+      "description": "이번 실행에서 발행하지 못한 조합. 프론트가 목록에서 빠지는 근거다.",
+      "properties": {
+        "keyMode": {
+          "enum": [
+            4,
+            6,
+            7
+          ],
+          "title": "Keymode",
+          "type": "integer"
+        },
+        "difficulty": {
+          "enum": [
+            "EASY",
+            "NORMAL",
+            "HARD",
+            "EXPERT"
+          ],
+          "title": "Difficulty",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "keyMode",
+        "difficulty",
+        "reason"
+      ],
+      "title": "MissingChartRef",
+      "type": "object"
+    },
     "RunAudioRefs": {
       "additionalProperties": false,
       "properties": {
@@ -132,7 +169,15 @@
       "items": {
         "$ref": "#/$defs/RunChartRef"
       },
+      "minItems": 1,
       "title": "Charts",
+      "type": "array"
+    },
+    "missingCharts": {
+      "items": {
+        "$ref": "#/$defs/MissingChartRef"
+      },
+      "title": "Missingcharts",
       "type": "array"
     },
     "keysoundManifestPath": {

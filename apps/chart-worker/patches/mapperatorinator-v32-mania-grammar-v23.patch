@@ -1,0 +1,157 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -177,6 +177,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             prompt_current_time_token: int | None | object = _PROMPT_TIME_UNSET,
+             require_closed_holds_at_eos: bool = False,
+             max_sequence_length: int | None = None,
++            max_note_start_time_token: int | None = None,
+     ):
+         self.initial_open_columns = (
+             None
+@@ -203,6 +204,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+         )
+         self.require_closed_holds_at_eos = require_closed_holds_at_eos
+         self.max_sequence_length = max_sequence_length
++        self.max_note_start_time_token = max_note_start_time_token
+         self.prompt_length: int | None = None
+         self.keycount_start = tokenizer.event_start[EventType.MANIA_KEYCOUNT]
+         self.keycount_end = tokenizer.event_end[EventType.MANIA_KEYCOUNT]
+@@ -245,6 +247,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             "unclosableHoldStartSteps": 0,
+             "forcedGroupCompletionSteps": 0,
+             "impossibleGroupCompletionSteps": 0,
++            "startBoundaryColumnRestrictionSteps": 0,
+         }
+ 
+     def telemetry(self) -> dict[str, int]:
+@@ -434,6 +437,22 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 if self.require_closed_holds_at_eos and open_columns:
+                     self._telemetry["finalEosClosureSteps"] += 1
+                     scores_processed[row, list(self.eos_ids)] = -torch.inf
++                if (
++                        self.max_note_start_time_token is not None
++                        and current_time_token is not None
++                        and current_time_token > self.max_note_start_time_token
++                ):
++                    # The separate start-boundary processor masks TAP/HOLD_START,
++                    # but it runs after this grammar. Prevent it from receiving a
++                    # pending closed-lane column that would leave every note type
++                    # masked and produce an invalid multinomial distribution.
++                    self._telemetry["startBoundaryColumnRestrictionSteps"] += 1
++                    scores_processed[
++                        row, self.column_start:self.column_end
++                    ] = -torch.inf
++                    for lane in open_columns:
++                        token = self.column_start + lane
++                        scores_processed[row, token] = scores[row, token]
+                 continue
+             if not 0 <= current_lane < keycount:
+                 raise ValueError(
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -111,6 +111,11 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+         raise ValueError(
+             "mania HOLD state grammar does not support types_first generation"
+         )
++    start_boundary_processor = (
++        None
++        if max_note_start_time is None
++        else ManiaStartBoundaryLogitsProcessor(tokenizer, max_note_start_time)
++    )
+     logits_processor_list = LogitsProcessorList()
+     if cfg_scale > 1.0:
+         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
+@@ -130,12 +135,15 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                     prompt_current_time_token=mania_prompt_current_time_token,
+                     require_closed_holds_at_eos=mania_require_closed_holds_at_eos,
+                     max_sequence_length=mania_max_sequence_length,
++                    max_note_start_time_token=(
++                        None
++                        if start_boundary_processor is None
++                        else start_boundary_processor.max_time_token
++                    ),
+                 )
+             )
+-    if max_note_start_time is not None:
+-        logits_processor_list.append(
+-            ManiaStartBoundaryLogitsProcessor(tokenizer, max_note_start_time)
+-        )
++    if start_boundary_processor is not None:
++        logits_processor_list.append(start_boundary_processor)
+ 
+     if timeshift_bias != 0:
+         logits_processor_list.append(
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -114,6 +114,25 @@ def test_group_without_prompt_or_generated_timeshift_requires_time_before_column
+     assert not torch.isneginf(after_time[0, 10:14]).any()
+ 
+ 
++def test_start_boundary_allows_only_open_hold_lanes_to_form_a_new_group():
++    closed = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), max_note_start_time_token=30
++    )
++    one_open = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (2,), max_note_start_time_token=30
++    )
++    after_boundary = torch.tensor([[keycount_token(4), 1, 31]])
++
++    closed_result = closed(after_boundary, scores())
++    open_result = one_open(after_boundary, scores())
++
++    assert torch.isneginf(closed_result[0, 10:28]).all()
++    assert not torch.isneginf(closed_result[0, 2])
++    assert torch.isneginf(open_result[0, 10:28][[0, 1, *range(3, 18)]]).all()
++    assert not torch.isneginf(open_result[0, 12])
++    assert closed.telemetry()["startBoundaryColumnRestrictionSteps"] == 1
++
++
+ def test_canonical_append_boundary_overrides_older_prompt_timeshift():
+     processor = ManiaHoldStateLogitsProcessor(
+         FakeTokenizer(),
+@@ -415,6 +434,7 @@ def test_hold_state_processor_reports_intervention_counts():
+         "unclosableHoldStartSteps": 0,
+         "forcedGroupCompletionSteps": 0,
+         "impossibleGroupCompletionSteps": 0,
++        "startBoundaryColumnRestrictionSteps": 0,
+     }
+     assert get_mania_hold_grammar_telemetry([processor]) == processor.telemetry()
+ 
+@@ -632,6 +652,34 @@ def test_processor_stack_propagates_final_window_hold_closure_contract():
+     assert processor.prompt_current_time_token == 30
+ 
+ 
++def test_processor_stack_propagates_start_boundary_into_hold_grammar():
++    FakeTokenizer.event_range[EventType.TIME_SHIFT] = SimpleNamespace(min_value=0)
++    try:
++        processors = build_logits_processors(
++            FakeTokenizer(),
++            cfg_scale=1.0,
++            timeshift_bias=0,
++            types_first=False,
++            temperature=1.0,
++            timing_temperature=1.0,
++            mania_column_temperature=1.0,
++            taiko_hit_temperature=1.0,
++            lookback_time=0,
++            device="cpu",
++            max_note_start_time=10,
++            mania_open_hold_columns=(),
++        )
++    finally:
++        del FakeTokenizer.event_range[EventType.TIME_SHIFT]
++
++    processor = next(
++        item
++        for item in processors
++        if isinstance(item, ManiaHoldStateLogitsProcessor)
++    )
++    assert processor.max_note_start_time_token == 31
++
++
+ def test_hold_state_contract_rejects_unsupported_types_first_grammar():
+     with pytest.raises(ValueError, match="types_first"):
+         build_logits_processors(

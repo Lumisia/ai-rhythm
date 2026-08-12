@@ -4,6 +4,7 @@ from chart_worker.analysis.chart_profile import (
     HoldProfile,
     PatternProfile,
 )
+from chart_worker.analysis.difficulty_vector import DifficultyVectorV2
 from chart_worker.validation.profile_review import review_profile
 from chart_worker.validation.quality_gate import GateAction, GateAxis
 
@@ -55,6 +56,7 @@ def _profile(
             max_jack=1,
             section_peak_nps=(2.0,) * section_count,
         ),
+        difficulty_vector_v2=DifficultyVectorV2.empty(section_count),
         active_section_mask=active or (True,) * section_count,
     )
 

@@ -11,6 +11,12 @@ class WorkerConfig(BaseSettings):
     mapperatorinator_home: Path | None = None
     mapperatorinator_python: Path | None = None
     mapperatorinator_precision: Literal["fp16", "bf16"] = "fp16"
+    difficulty_selector_mode: Literal["CURRENT", "SHADOW_V2", "V2"] = "V2"
+    boundary_policy_mode: Literal["SHADOW", "EXPERIMENTAL_ENFORCED"] = "SHADOW"
+    beat_this_enabled: bool = True
+    beat_this_checkpoint: str = "final0"
+    beat_this_device: Literal["cpu", "cuda"] = "cpu"
+    beat_this_float16: bool = False
     ffmpeg_bin: Path = Path("ffmpeg")
     ffmpeg_shared_bin_dir: Path | None = None
     storage_local_root: Path = Path(".data/storage")

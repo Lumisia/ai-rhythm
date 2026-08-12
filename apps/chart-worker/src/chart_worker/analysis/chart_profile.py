@@ -11,6 +11,13 @@ from types import MappingProxyType
 import numpy as np
 
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.chart_events import ChartEventIndex
+from chart_worker.analysis.difficulty_vector import (
+    DifficultyVectorV2,
+    measure_difficulty_vector,
+)
+from chart_worker.analysis.song_context import LocalTempoMap
+from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.postprocess.patterns import detect_patterns, rows_of
 from chart_worker.rating.project_rating import measure_rating
 from chart_worker.schema.note import Chart
@@ -104,6 +111,7 @@ class ChartQualityProfile:
     hold: HoldProfile
     pattern: PatternProfile
     difficulty: DifficultyProfile
+    difficulty_vector_v2: DifficultyVectorV2
     active_section_mask: tuple[bool, ...]
 
     def to_report(self) -> dict[str, object]:
@@ -111,6 +119,7 @@ class ChartQualityProfile:
             "holdProfile": self.hold.to_report(),
             "patternProfile": self.pattern.to_report(),
             "difficultyProfile": self.difficulty.to_report(),
+            "difficultyVectorV2": self.difficulty_vector_v2.to_report(),
             "activeSectionMask": list(self.active_section_mask),
         }
 
@@ -355,20 +364,34 @@ def build_chart_quality_profile(
     *,
     key_mode: int,
     duration_ms: int,
-    beat_ms: float,
+    beat_ms: float | None = None,
+    bpm_events: tuple[OsuBpmEvent, ...] | None = None,
     activity: AudioActivity | None,
+    event_index: ChartEventIndex | None = None,
 ) -> ChartQualityProfile:
     """Build non-mutating whole-chart and 15-second section evidence."""
     if key_mode <= 0:
         raise ValueError("key_mode must be positive")
     if duration_ms <= 0:
         raise ValueError("duration_ms must be positive")
+    if bpm_events is None:
+        if beat_ms is None or beat_ms <= 0:
+            raise ValueError("beat_ms must be positive when bpm_events are absent")
+        bpm_events = (OsuBpmEvent(time_ms=0, bpm=60_000.0 / beat_ms),)
+    tempo_map = LocalTempoMap(bpm_events)
+    if beat_ms is None:
+        beat_ms = 60_000.0 / tempo_map.at(0).bpm
     if beat_ms <= 0:
         raise ValueError("beat_ms must be positive")
     if any(note.lane >= key_mode for note in notes):
         raise ValueError("note lane must be less than key_mode")
 
     sections = _section_bounds(duration_ms)
+    event_index = event_index or ChartEventIndex.build(
+        notes,
+        key_mode,
+        duration_ms,
+    )
     active_section_mask = tuple(
         activity.active_frame_ratio(start_ms, end_ms) >= ACTIVE_FRAME_RATIO
         if activity is not None
@@ -402,5 +425,6 @@ def build_chart_quality_profile(
             sections=sections,
         ),
         difficulty=_difficulty_profile(notes, duration_ms=duration_ms, sections=sections),
+        difficulty_vector_v2=measure_difficulty_vector(event_index, tempo_map),
         active_section_mask=active_section_mask,
     )

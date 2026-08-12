@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from chart_worker.generation import mapperatorinator_patch
 from chart_worker.generation.mapperatorinator_patch import (
     REQUIRED_PATCHES,
     MapperatorinatorPatchError,
@@ -14,13 +15,140 @@ from chart_worker.generation.mapperatorinator_patch import (
 )
 
 
-def test_required_patch_manifest_includes_resnap_collision_sidecar():
+def test_required_patch_manifest_includes_hold_state_grammar():
     assert [patch_id for patch_id, _ in REQUIRED_PATCHES] == [
         "mania-keycount-v1",
         "mania-output-safety-v1",
-        "mania-event-times-v1",
-        "mania-resnap-collisions-v1",
+        (
+            "mania-event-times-v2-group-indexed+"
+            "mania-resnap-v3-hold-pairs"
+        ),
+        "mania-origin-v3-hold-ir-column-boundary",
+        "mania-sidecar-v4-osu-bound",
+        "mania-hold-state-v1-window-context",
+        "mania-grammar-v2-atomic-groups",
+        "mania-grammar-v3-budget-trim-resnap-order",
+        "mania-grammar-v4-prompt-end-state",
+        "mania-grammar-v5-serialization-boundaries",
+        "mania-grammar-v6-effective-generation-limit",
+        "mania-grammar-v7-last-slot-atomic-completion",
+        "mania-grammar-v8-transition-evidence",
+        "mania-grammar-v9-prompt-timeline-state",
+        "mania-grammar-v10-full-prompt-groups",
+        "mania-grammar-v11-window-failure-evidence",
+        "mania-grammar-v12-addressable-negative-time",
+        "mania-grammar-v13-prompt-append-time",
+        "mania-grammar-v14-prompt-boundary-evidence",
+        "mania-grammar-v15-require-addressable-time",
+        "mania-grammar-v16-canonical-append-authority",
+        "mania-grammar-v17-addressable-prompt-boundary",
+        "mania-grammar-v18-prompt-source-evidence",
+        "mania-grammar-v19-negative-bucket-boundary",
+        "mania-grammar-v20-token-domain-initial-state",
+        "mania-grammar-v21-lane-timeline-evidence",
+        "mania-grammar-v22-canonical-column-authority",
+        "mania-grammar-v23-start-boundary-feasibility",
+        "mania-grammar-v24-resnap-boundary-contract",
     ]
+    assert all(path.is_file() for _, path in REQUIRED_PATCHES)
+    assert mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES == REQUIRED_PATCHES[:-1]
+    assert (
+        mapperatorinator_patch.LEGACY_V23_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V22_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V23_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V21_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V22_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V20_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V21_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V19_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V20_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V18_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V19_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V17_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V18_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V16_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V17_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V15_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V16_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V14_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V15_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V13_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V14_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V12_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V13_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V11_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V12_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V10_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V11_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V9_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V10_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V8_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V9_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V7_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V8_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V6_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V7_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V5_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V6_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V4_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V5_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[0]
+        == mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES
+    )
+
+
+def test_required_patch_files_are_syntactically_valid():
+    for patch_id, patch_path in REQUIRED_PATCHES:
+        result = subprocess.run(
+            ["git", "apply", "--numstat", str(patch_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"{patch_id} is not a valid git patch: {result.stderr.strip()}"
+        )
 
 
 def _git(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -126,6 +254,59 @@ def make_layered_patch_set_fixture(
     return home, head, (("first-v1", first), ("second-v1", second))
 
 
+def make_legacy_migration_fixture(
+    tmp_path: Path,
+) -> tuple[
+    Path,
+    str,
+    tuple[tuple[str, Path], ...],
+    tuple[tuple[str, Path], ...],
+]:
+    home = tmp_path / "upstream-migration"
+    home.mkdir()
+    _git(home, "init")
+    _git(home, "config", "user.name", "Chart Worker Tests")
+    _git(home, "config", "user.email", "chart-worker-tests@example.invalid")
+    (home / "module.py").write_text("before\n", encoding="utf-8")
+    _git(home, "add", "module.py")
+    _git(home, "commit", "-m", "fixture")
+    head = _git(home, "rev-parse", "HEAD").stdout.strip()
+
+    common = tmp_path / "common.patch"
+    common.write_text(
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-before\n"
+        "+common\n",
+        encoding="utf-8",
+    )
+    legacy = tmp_path / "legacy.patch"
+    legacy.write_text(
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-common\n"
+        "+legacy\n",
+        encoding="utf-8",
+    )
+    replacement = tmp_path / "replacement.patch"
+    replacement.write_text(
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-common\n"
+        "+replacement\n",
+        encoding="utf-8",
+    )
+    legacy_patches = (("common-v1", common), ("legacy-v1", legacy))
+    replacement_patches = (("common-v1", common), ("replacement-v2", replacement))
+    return home, head, legacy_patches, replacement_patches
+
+
 def test_patch_lifecycle_is_applicable_then_applied(tmp_path: Path):
     home, head, patch = make_upstream_fixture(tmp_path)
 
@@ -178,6 +359,86 @@ def test_required_patch_set_recognizes_overlapping_layered_patches(tmp_path: Pat
         expected_head=head,
     )
 
+
+def test_layered_patch_verification_ignores_parent_git_repository_of_tempdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home, head, patches = make_layered_patch_set_fixture(tmp_path)
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=patches,
+        expected_head=head,
+    )
+
+    temp_parent = tmp_path / "unrelated-parent"
+    temp_parent.mkdir()
+    _git(temp_parent, "init")
+    _git(temp_parent, "config", "user.name", "Chart Worker Tests")
+    _git(temp_parent, "config", "user.email", "chart-worker-tests@example.invalid")
+    sentinel = temp_parent / "sentinel.txt"
+    sentinel.write_text("must-not-change\n", encoding="utf-8")
+    _git(temp_parent, "add", "sentinel.txt")
+    _git(temp_parent, "commit", "-m", "unrelated fixture")
+    temp_root = temp_parent / "runtime-temp"
+    temp_root.mkdir()
+    monkeypatch.setattr(mapperatorinator_patch.tempfile, "tempdir", str(temp_root))
+
+    assert required_patch_statuses(
+        home,
+        patches=patches,
+        expected_head=head,
+    ) == {
+        "first-v1": "APPLIED",
+        "second-v1": "APPLIED",
+    }
+    assert sentinel.read_text(encoding="utf-8") == "must-not-change\n"
+
+
+def test_required_patch_set_appends_to_an_exact_layered_legacy_stack(tmp_path: Path):
+    home, head, legacy = make_layered_patch_set_fixture(tmp_path)
+    third = tmp_path / "third-layer.patch"
+    third.write_text(
+        "diff --git a/module.py b/module.py\n"
+        "--- a/module.py\n"
+        "+++ b/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-after\n"
+        "+final\n",
+        encoding="utf-8",
+    )
+    replacement = (*legacy, ("third-v1", third))
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=legacy,
+        expected_head=head,
+    )
+
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=replacement,
+        legacy_patches=legacy,
+        expected_head=head,
+    )
+
+    assert (home / "module.py").read_text(encoding="utf-8") == "final\n"
+
+
+def test_required_patch_set_ignores_only_crlf_representation(tmp_path: Path):
+    home, head, patches = make_layered_patch_set_fixture(tmp_path)
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=patches,
+        expected_head=head,
+    )
+    (home / "module.py").write_bytes(b"after\r\n")
+
+    assert required_patch_statuses(
+        home,
+        patches=patches,
+        expected_head=head,
+    ) == {"first-v1": "APPLIED", "second-v1": "APPLIED"}
+
     assert required_patch_statuses(
         home,
         patches=patches,
@@ -188,6 +449,51 @@ def test_required_patch_set_recognizes_overlapping_layered_patches(tmp_path: Pat
         patches=patches,
         expected_head=head,
     )
+
+
+def test_required_patch_set_migrates_an_exact_legacy_stack(tmp_path: Path):
+    home, head, legacy_patches, replacement_patches = make_legacy_migration_fixture(
+        tmp_path
+    )
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=legacy_patches,
+        expected_head=head,
+    )
+
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=replacement_patches,
+        legacy_patches=legacy_patches,
+        expected_head=head,
+    )
+
+    assert (home / "module.py").read_text(encoding="utf-8") == "replacement\n"
+    assert required_patch_statuses(
+        home,
+        patches=replacement_patches,
+        expected_head=head,
+    ) == {"common-v1": "APPLIED", "replacement-v2": "APPLIED"}
+
+
+def test_required_patch_set_tries_each_known_legacy_stack(tmp_path: Path):
+    home, head, legacy_patches, replacement_patches = make_legacy_migration_fixture(
+        tmp_path
+    )
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=legacy_patches,
+        expected_head=head,
+    )
+
+    apply_required_mapperatorinator_patches(
+        home,
+        patches=replacement_patches,
+        legacy_patch_sets=(replacement_patches, legacy_patches),
+        expected_head=head,
+    )
+
+    assert (home / "module.py").read_text(encoding="utf-8") == "replacement\n"
 
 
 @pytest.mark.parametrize("missing_index", [1, 2])

@@ -1,7 +1,12 @@
 import { useState } from "react";
 
 import { ImportRunPanel } from "../features/import-run/ImportRunPanel";
-import { importRun, type ImportedChart, type ImportedRun } from "../features/import-run/importRun";
+import { BoundaryLabelPanel } from "../features/boundary-label/BoundaryLabelPanel";
+import {
+  importPlaytestRun,
+  type ImportedChart,
+  type ImportedRun,
+} from "../features/import-run/importRun";
 import { PlayChartPanel, type PlaySessionResult } from "../features/play-chart/PlayChartPanel";
 import { ChartSelector } from "../features/select-chart/ChartSelector";
 import { ReviewResult } from "../features/review-chart/ReviewResult";
@@ -13,11 +18,12 @@ interface LocalPlaytestPageProps {
   importer?: Importer;
 }
 
-export function LocalPlaytestPage({ importer = importRun }: LocalPlaytestPageProps) {
+export function LocalPlaytestPage({ importer = importPlaytestRun }: LocalPlaytestPageProps) {
   const [run, setRun] = useState<ImportedRun | null>(null);
   const [selectedChart, setSelectedChart] = useState<ImportedChart | null>(null);
   const [result, setResult] = useState<PlaySessionResult | null>(null);
   const [lastReviews, setLastReviews] = useState<Record<string, string>>({});
+  const [reviewingBoundary, setReviewingBoundary] = useState(false);
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -34,6 +40,9 @@ export function LocalPlaytestPage({ importer = importRun }: LocalPlaytestPagePro
   };
 
   if (!run) return <ImportRunPanel error={error} importing={importing} onFiles={(files) => void handleFiles(files)} />;
+  if (reviewingBoundary) {
+    return <BoundaryLabelPanel onBack={() => setReviewingBoundary(false)} run={run} />;
+  }
   if (result && selectedChart) {
     return (
       <ReviewResult
@@ -56,5 +65,18 @@ export function LocalPlaytestPage({ importer = importRun }: LocalPlaytestPagePro
   if (selectedChart) {
     return <PlayChartPanel chart={selectedChart} onBack={() => setSelectedChart(null)} onComplete={setResult} run={run} />;
   }
-  return <ChartSelector lastReviews={lastReviews} onReset={() => { setRun(null); setError(null); setLastReviews({}); }} onSelect={setSelectedChart} run={run} />;
+  return (
+    <ChartSelector
+      lastReviews={lastReviews}
+      onBoundaryReview={() => setReviewingBoundary(true)}
+      onReset={() => {
+        setRun(null);
+        setError(null);
+        setLastReviews({});
+        setReviewingBoundary(false);
+      }}
+      onSelect={setSelectedChart}
+      run={run}
+    />
+  );
 }

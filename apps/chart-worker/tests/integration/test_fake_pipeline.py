@@ -6,7 +6,7 @@ import numpy as np
 
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
-from chart_worker.schema.playtest_run import PlaytestRunManifest
+from chart_worker.schema.playtest_run import PlaytestRunManifestV2
 from tests.support import contract_fixture_dependencies
 
 
@@ -38,7 +38,7 @@ def test_fake_pipeline_writes_twelve_hash_verified_charts(tmp_path: Path):
         dependencies=contract_fixture_dependencies(),
     )
 
-    manifest = PlaytestRunManifest.model_validate_json(
+    manifest = PlaytestRunManifestV2.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     assert len(manifest.charts) == 12
@@ -47,6 +47,12 @@ def test_fake_pipeline_writes_twelve_hash_verified_charts(tmp_path: Path):
         ChartDocument.model_validate_json(path.read_text(encoding="utf-8"))
         assert hashlib.sha256(path.read_bytes()).hexdigest() == reference.sha256
     assert (output_dir / manifest.audio.game.path).is_file()
+    report_path = output_dir / manifest.generation_report.path
+    assert report_path.is_file()
+    assert hashlib.sha256(report_path.read_bytes()).hexdigest() == manifest.generation_report.sha256
+    assert manifest.strict_blockers == ["BOUNDARY_POLICY_UNCALIBRATED"]
+    assert manifest.publication.decision == "PLAYTEST_ONLY"
+    assert manifest.publication.reason_codes == ["BOUNDARY_POLICY_UNCALIBRATED"]
     assert not (output_dir / "analysis").exists()
     assert set(result.elapsed_ms_by_stage) == {
         "prepare",

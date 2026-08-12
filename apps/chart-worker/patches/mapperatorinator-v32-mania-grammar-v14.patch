@@ -1,0 +1,62 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 5cac55e..5236429 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -524,6 +524,10 @@ class Processor(object):
+                         if context["context_type"] == ContextType.MAP
+                         else None
+                     ),
++                    mania_prompt_current_time_token=mania_prompt_current_time_token,
++                    mania_prompt_token_tail=tuple(
++                        int(token) for token in prompt[0, -32:].tolist()
++                    ),
+                 )
+ 
+     @staticmethod
+@@ -1290,6 +1294,8 @@ class Processor(object):
+             trim_lookahead: bool = False,
+             source_window_id: int | None = None,
+             mania_keycount: int | None = None,
++            mania_prompt_current_time_token: int | None = None,
++            mania_prompt_token_tail: tuple[int, ...] = (),
+     ):
+         # Trim prompt and eos tokens
+         while len(predicted_tokens) > 0 and (
+@@ -1369,7 +1375,10 @@ class Processor(object):
+                     f"{error}; sourceWindow={window_id},"
+                     f"frameTime={frame_time},"
+                     f"existingGroups={len(existing_groups)},"
+-                    f"generatedGroups={len(generated_groups)}"
++                    f"generatedGroups={len(generated_groups)}; "
++                    f"promptCurrentTimeToken={mania_prompt_current_time_token}; "
++                    f"promptTail={list(mania_prompt_token_tail)}; "
++                    f"generatedSignatures={[(group.time_ms, group.lane, group.event_type.value) for group in generated_groups]}"
+                 ) from error
+ 
+         context["events"] = candidate_events
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index 0302137..47eaef9 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -183,7 +183,11 @@ def test_cumulative_replay_error_reports_window_and_frame_boundary():
+ 
+     with pytest.raises(
+         ValueError,
+-        match=r"sourceWindow=7,frameTime=62\.0,existingGroups=1,generatedGroups=1",
++        match=(
++            r"sourceWindow=7,frameTime=62\.0,existingGroups=1,generatedGroups=1; "
++            r"promptCurrentTimeToken=30; promptTail=\[1, 30, 12\]; "
++            r"generatedSignatures=\[\(100, 1, 'circle'\)\]"
++        ),
+     ):
+         processor.add_predicted_tokens_to_context(
+             context,
+@@ -191,6 +195,8 @@ def test_cumulative_replay_error_reports_window_and_frame_boundary():
+             62.0,
+             source_window_id=7,
+             mania_keycount=4,
++            mania_prompt_current_time_token=30,
++            mania_prompt_token_tail=(1, 30, 12),
+         )
+ 
+ 

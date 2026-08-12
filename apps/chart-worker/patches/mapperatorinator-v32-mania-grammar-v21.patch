@@ -1,0 +1,69 @@
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -703,6 +703,33 @@ class Postprocessor(object):
+                 group_id,
+             ),
+         )
++
++        def describe_lane_timeline(lane: int, center_group_id: int) -> list[dict]:
++            lane_group_ids = [
++                group_id
++                for group_id in ordered_group_ids
++                if groups[group_id].event_type in note_types
++                and groups[group_id].x is not None
++                and self._mania_lane(groups[group_id].x, key_count) == lane
++            ]
++            center = lane_group_ids.index(center_group_id)
++            selected = lane_group_ids[max(0, center - 6):center + 7]
++            return [
++                {
++                    "groupId": group_id,
++                    "type": groups[group_id].event_type.name,
++                    "timeMs": int(round(groups[group_id].time)),
++                    "x": groups[group_id].x,
++                    "sourceWindows": sorted({
++                        origin.source_window_id
++                        for origin in group_origins[group_id]
++                        if origin.kind == "GENERATED"
++                        and origin.source_window_id is not None
++                    }),
++                }
++                for group_id in selected
++            ]
++
+         for group_id in ordered_group_ids:
+             group = groups[group_id]
+             if group_id in duplicate_group_ids or group.event_type not in note_types:
+@@ -714,7 +741,8 @@ class Postprocessor(object):
+                     raise ValueError(
+                         f"TAP while HOLD is active in lane {lane}: "
+                         f"start={describe_group(start_id)}, "
+-                        f"tap={describe_group(group_id)}"
++                        f"tap={describe_group(group_id)}, "
++                        f"laneTimeline={describe_lane_timeline(lane, group_id)}"
+                     )
+                 objects.append(ManiaObject(
+                     object_id=-1,
+diff --git a/tests/test_mania_output_safety.py b/tests/test_mania_output_safety.py
+--- a/tests/test_mania_output_safety.py
++++ b/tests/test_mania_output_safety.py
+@@ -264,13 +264,17 @@ def test_tap_during_active_hold_is_rejected_by_canonical_builder():
+         Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
+     ]
+ 
+-    with pytest.raises(ValueError, match="TAP while HOLD is active"):
++    with pytest.raises(ValueError, match="TAP while HOLD is active") as exc_info:
+         make_postprocessor().generate(
+             events,
+             BeatmapConfig(mode=3, circle_size=4),
+             event_origins=_origins_for_groups(events, [0, 0, 0]),
+         )
+ 
++    message = str(exc_info.value)
++    assert "laneTimeline=" in message
++    assert "HOLD_NOTE_END" in message
++
+ 
+ def test_resnap_validates_canonical_objects_before_changing_times():
+     events = [

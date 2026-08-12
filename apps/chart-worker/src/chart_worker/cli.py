@@ -1,13 +1,16 @@
 """로컬 chart-worker 명령줄 인터페이스."""
 
 import json
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
+from chart_worker.analysis.difficulty_shadow import recalculate_batch
 from chart_worker.bench import run_benchmark
+from chart_worker.boundary_review_migration import migrate_boundary_review
 from chart_worker.errors import WorkerError
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 
@@ -100,6 +103,42 @@ def bench(
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     typer.echo(str(result.report_path))
+
+
+@app.command("recalculate-difficulty")
+def recalculate_difficulty(
+    batch_dir: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, dir_okay=True, readable=True),
+    ],
+    out: Annotated[Path, typer.Option("--out", "-o")],
+) -> None:
+    """Recalculate DifficultyVector v2 from archived chart JSON files."""
+    try:
+        recalculate_batch(batch_dir, out)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(str(out))
+
+
+@app.command("migrate-boundary-review")
+def migrate_boundary_review_command(
+    source_batch: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, dir_okay=True, readable=True),
+    ],
+    out: Annotated[Path, typer.Option("--out", "-o")],
+) -> None:
+    """Package a verified legacy batch for local human boundary review."""
+    try:
+        summary = migrate_boundary_review(
+            source_batch,
+            out,
+            migrated_at=datetime.now(UTC),
+        )
+    except (TypeError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    typer.echo(str(summary.target_root / "migration-summary.json"))
 
 
 if __name__ == "__main__":  # pragma: no cover

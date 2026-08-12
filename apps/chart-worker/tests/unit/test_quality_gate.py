@@ -69,6 +69,7 @@ def _evaluate(
     authority: SongTimingAuthority | None = None,
     difficulty: str = "EASY",
     activity: AudioActivity | None = None,
+    boundary_policy_mode: str = "SHADOW",
 ):
     return _gate().evaluate_chart_candidate(
         chart,
@@ -77,6 +78,7 @@ def _evaluate(
         requested_key_mode=4,
         requested_difficulty=difficulty,
         duration_ms=duration_ms,
+        boundary_policy_mode=boundary_policy_mode,
     )
 
 
@@ -95,6 +97,28 @@ def test_acceptance_keeps_shared_section_profile_and_report():
     assert report["qualityProfile"] == result.profile.to_report()
 
 
+def test_acceptance_uses_every_local_bpm_segment_for_hold_beats():
+    events = (OsuBpmEvent(0, 120.0), OsuBpmEvent(1_000, 240.0))
+    chart = GeneratedChart(
+        notes=[NoteEvent(500, 0, kind="HOLD", duration_ms=1_000)],
+        key_mode=4,
+        osu_text="",
+        generator_name="test",
+        seed=0,
+        bpm_events=events,
+    )
+
+    result = _evaluate(
+        chart,
+        (500,),
+        duration_ms=2_000,
+        authority=_authority(events),
+    )
+
+    assert result.profile is not None
+    assert result.profile.difficulty_vector_v2.mean_hold_beats == pytest.approx(3.0)
+
+
 def test_structural_retry_is_not_hidden_by_profile_construction():
     result = _evaluate(
         _chart((1_000,), lane=4),
@@ -105,6 +129,10 @@ def test_structural_retry_is_not_hidden_by_profile_construction():
     assert result.action is _gate().GateAction.RETRY_MAP
     assert result.profile is None
     assert _decision(result, "STRUCTURE").action is _gate().GateAction.RETRY_MAP
+    assert _decision(result, "SONG_BOUNDS").action is _gate().GateAction.PASS
+    assert _decision(result, "SONG_BOUNDS").reasons == (
+        "NOT_EVALUATED_STRUCTURE_INVALID",
+    )
     assert _decision(result, "PATTERN").reasons == (
         "PROFILE_UNAVAILABLE_STRUCTURE_INVALID",
     )
@@ -121,6 +149,60 @@ def test_active_leading_coverage_gap_retries_the_map():
     assert result.action is _gate().GateAction.RETRY_MAP
     assert _decision(result, "COVERAGE").action is _gate().GateAction.RETRY_MAP
     assert _decision(result, "COVERAGE").reasons == ("ACTIVE_LEADING_GAP",)
+
+
+def test_quality_gate_uses_musical_coverage_horizon_for_trailing_gap():
+    activity = AudioActivity(
+        frame_ms=1_000.0,
+        rms_db=np.array([-80.0] * 70 + [-10.0] * 6 + [-80.0] * 12),
+        floor_db=-60.0,
+        active_onset_ms=tuple(range(71_000, 85_000, 1_000)),
+    )
+    onsets = (0, 70_000, *range(71_000, 85_000, 1_000))
+
+    result = _evaluate(
+        _chart((0, 70_000)),
+        onsets,
+        duration_ms=88_000,
+        activity=activity,
+        boundary_policy_mode="EXPERIMENTAL_ENFORCED",
+    )
+
+    assert _decision(result, "COVERAGE").action is _gate().GateAction.RETRY_MAP
+    assert _decision(result, "COVERAGE").reasons == ("ACTIVE_TRAILING_GAP",)
+    assert result.timing.coverage_gaps[0].end_ms == 84_000
+
+
+def test_song_bounds_reject_hold_end_beyond_completion_horizon():
+    activity = AudioActivity(
+        frame_ms=1_000.0,
+        rms_db=np.array([-10.0] * 80 + [-80.0] * 20),
+        floor_db=-60.0,
+        active_onset_ms=(79_000, 80_000),
+    )
+    chart = GeneratedChart(
+        notes=[NoteEvent(79_000, 0, kind="HOLD", duration_ms=16_000)],
+        key_mode=4,
+        osu_text="",
+        generator_name="test",
+        seed=0,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+    )
+
+    result = _evaluate(
+        chart,
+        (79_000, 80_000),
+        duration_ms=100_000,
+        activity=activity,
+        boundary_policy_mode="EXPERIMENTAL_ENFORCED",
+    )
+
+    assert result.action is _gate().GateAction.RETRY_MAP
+    assert _decision(result, "STRUCTURE").action is _gate().GateAction.PASS
+    assert _decision(result, "SONG_BOUNDS").action is _gate().GateAction.RETRY_MAP
+    assert _decision(result, "SONG_BOUNDS").reasons == (
+        "HOLD_END_AFTER_RELEASE",
+    )
 
 
 @pytest.mark.parametrize(
@@ -169,7 +251,9 @@ def test_sparse_onset_support_with_aligned_global_phase_is_advisory():
 
 def test_single_section_onset_shift_is_advisory_at_map_stage():
     rows = tuple(range(1_000, 60_000, 1_000))
-    corrupted = set(range(31_000, 39_000, 1_000))
+    # At 120 BPM the production diagnostic now uses 32-beat (16-second)
+    # sections. Corrupt one complete interior section.
+    corrupted = set(range(33_000, 48_000, 1_000))
     onsets = tuple(row - 60 if row in corrupted else row for row in rows)
     result = _evaluate(_chart(rows), onsets, duration_ms=60_000)
 
@@ -346,8 +430,56 @@ def test_quiet_coverage_gap_is_advisory_with_a_position_specific_reason():
 
     decision = _decision(result, "COVERAGE")
     assert decision.action is _gate().GateAction.PASS
-    assert decision.reasons == ("QUIET_LEADING_GAP",)
+    assert decision.reasons == ("QUIET_POST_FIRST_GAP",)
     assert result.action is _gate().GateAction.PASS
+
+
+def test_near_active_quiet_trailing_gap_requires_review_without_retrying_the_map():
+    rows = tuple(range(0, 91_000, 1_000))
+    trailing_onsets = tuple(range(91_000, 100_000, 1_000))
+    result = _evaluate(
+        _chart(rows),
+        (*rows, *trailing_onsets),
+        duration_ms=100_000,
+        activity=AudioActivity(
+            frame_ms=1_000.0,
+            rms_db=np.array([-10.0] * 90 + [-10.0] * 3 + [-80.0] * 7),
+            floor_db=-20.0,
+            active_onset_ms=(*rows, *trailing_onsets[:6]),
+        ),
+    )
+
+    gap = result.timing.quiet_coverage_gaps[-1]
+    assert gap.position == "TRAILING"
+    assert gap.active_onset_count == 6
+    assert gap.active_frame_ratio == 0.3
+    decision = _decision(result, "COVERAGE")
+    assert decision.action is _gate().GateAction.REVIEW
+    assert decision.reasons == (
+        "QUIET_TRAILING_GAP",
+        "QUIET_TRAILING_GAP_NEAR_ACTIVE_THRESHOLD",
+    )
+    assert result.action is _gate().GateAction.REVIEW
+
+
+def test_clearly_quiet_trailing_gap_remains_advisory_pass():
+    rows = tuple(range(0, 91_000, 1_000))
+    trailing_onsets = tuple(range(91_000, 100_000, 1_000))
+    result = _evaluate(
+        _chart(rows),
+        (*rows, *trailing_onsets),
+        duration_ms=100_000,
+        activity=AudioActivity(
+            frame_ms=1_000.0,
+            rms_db=np.array([-10.0] * 90 + [-10.0] + [-80.0] * 9),
+            floor_db=-20.0,
+            active_onset_ms=(*rows, *trailing_onsets[:2]),
+        ),
+    )
+
+    decision = _decision(result, "COVERAGE")
+    assert decision.action is _gate().GateAction.PASS
+    assert decision.reasons == ("QUIET_TRAILING_GAP",)
 
 
 def test_insufficient_tail_section_cannot_force_a_map_retry():
@@ -446,6 +578,7 @@ def test_axes_remain_independent_and_retry_beats_review_and_pass():
     assert retry.action is _gate().GateAction.RETRY_MAP
     assert retry.decisions and {decision.axis.value for decision in retry.decisions} == {
         "STRUCTURE",
+        "SONG_BOUNDS",
         "TIMING_IDENTITY",
         "TIMING_ALIGNMENT",
         "COVERAGE",

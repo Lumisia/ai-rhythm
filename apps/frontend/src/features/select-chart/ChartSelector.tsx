@@ -4,22 +4,64 @@ interface ChartSelectorProps {
   run: ImportedRun;
   lastReviews?: Readonly<Record<string, string>>;
   onSelect: (chart: ImportedChart) => void;
+  onBoundaryReview: () => void;
   onReset: () => void;
 }
 
 const keyModes = [4, 6, 7] as const;
 
-export function ChartSelector({ run, lastReviews = {}, onSelect, onReset }: ChartSelectorProps) {
+export function ChartSelector({
+  run,
+  lastReviews = {},
+  onSelect,
+  onBoundaryReview,
+  onReset,
+}: ChartSelectorProps) {
+  const publicationLabel = {
+    PRODUCTION_VERIFIED: "RUN VERIFIED",
+    PLAYTEST_ONLY: "PLAYTEST ONLY",
+    LEGACY_UNVERIFIED: "LEGACY UNVERIFIED",
+  }[run.publicationState];
   return (
     <section className="workspace-panel selector-panel" aria-labelledby="selector-title">
       <header className="workspace-heading">
         <div>
-          <p className="eyebrow">RUN VERIFIED / 12 CHARTS</p>
+          <p className="eyebrow">{publicationLabel} / {run.charts.length} CHARTS</p>
           <h2 id="selector-title">{run.manifest.title}</h2>
           <p>{run.manifest.workerVersion} · {new Date(run.manifest.generatedAt).toLocaleString("ko-KR")}</p>
+          {run.publicationReasons.length > 0 ? (
+            <p
+              aria-label="publication status"
+              className="publication-status"
+              data-state={run.publicationState}
+              role="status"
+            >
+              {run.publicationReasons.join(" · ")}
+            </p>
+          ) : null}
         </div>
         <button className="text-button" onClick={onReset} type="button">다른 실행 불러오기</button>
       </header>
+
+      <aside className="boundary-entry" aria-labelledby="boundary-entry-title">
+        <div>
+          <p className="eyebrow">SONG-LEVEL EVIDENCE</p>
+          <h3 id="boundary-entry-title">곡 끝 경계</h3>
+          <p>12개 채보와 별개로, 원본 게임 오디오의 마지막 소리 구간을 한 번만 기록합니다.</p>
+          {!run.boundaryLabelContext.available ? (
+            <p className="boundary-entry__reason">{run.boundaryLabelContext.unavailableReason}</p>
+          ) : (
+            <p className="boundary-entry__ready">보고서 SHA-256과 오디오 시간축이 연결되어 있습니다.</p>
+          )}
+        </div>
+        <button
+          disabled={!run.boundaryLabelContext.available}
+          onClick={onBoundaryReview}
+          type="button"
+        >
+          곡 끝 검토
+        </button>
+      </aside>
 
       <div className="chart-groups">
         {keyModes.map((keyMode) => (

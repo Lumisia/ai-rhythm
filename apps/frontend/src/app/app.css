@@ -362,6 +362,25 @@ button:disabled {
   font-size: 0.6rem;
 }
 
+.workspace-heading .publication-status {
+  max-width: min(760px, 75vw);
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 7px;
+  background: rgba(120, 53, 15, 0.16);
+  color: #fde68a;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  overflow-wrap: anywhere;
+}
+
+.workspace-heading .publication-status[data-state="LEGACY_UNVERIFIED"] {
+  border-color: rgba(96, 165, 250, 0.35);
+  background: rgba(30, 64, 175, 0.14);
+  color: #bfdbfe;
+}
+
 .text-button,
 .transport-controls button {
   padding: 9px 12px;
@@ -485,6 +504,271 @@ button:disabled {
 
 .value-fault {
   color: var(--fault);
+}
+
+/* Song-level boundary evidence */
+
+.boundary-entry {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 20px;
+  align-items: center;
+  margin-top: 18px;
+  padding: 16px 18px;
+  border: 1px solid rgba(94, 234, 212, 0.28);
+  border-radius: 10px;
+  background:
+    linear-gradient(110deg, rgba(94, 234, 212, 0.08), transparent 62%),
+    var(--surface);
+}
+
+.boundary-entry h3,
+.boundary-section-heading h3,
+.boundary-export-card h3 {
+  margin: 2px 0 6px;
+  font-family: var(--display);
+  font-size: 1rem;
+}
+
+.boundary-entry p:not(.eyebrow),
+.boundary-help,
+.boundary-evidence-note,
+.boundary-export-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.boundary-entry button,
+.boundary-transport button,
+.boundary-time-field button {
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.045);
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+}
+
+.boundary-entry button:not(:disabled):hover,
+.boundary-transport button:hover,
+.boundary-time-field button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.boundary-entry__reason,
+.boundary-validation,
+.boundary-error {
+  color: #fca5a5 !important;
+}
+
+.boundary-entry__ready,
+.boundary-ready {
+  color: var(--accent) !important;
+}
+
+.boundary-panel {
+  width: min(1120px, calc(100vw - 40px));
+}
+
+.boundary-layout,
+.boundary-form {
+  display: grid;
+  grid-template-columns: 1.18fr 0.82fr;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.boundary-audio-card,
+.boundary-evidence-card,
+.boundary-form-card,
+.boundary-export-card {
+  padding: 17px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.boundary-section-heading {
+  padding-bottom: 11px;
+  border-bottom: 1px solid rgba(120, 140, 200, 0.14);
+}
+
+.boundary-clock {
+  display: block;
+  margin: 18px 0 12px;
+  color: var(--accent);
+  font-family: var(--display);
+  font-size: clamp(1.5rem, 4vw, 2.3rem);
+  letter-spacing: -0.02em;
+}
+
+.boundary-transport {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.boundary-loop,
+.boundary-confirm {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 7px !important;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.boundary-loop {
+  margin-left: auto;
+}
+
+.boundary-evidence-status {
+  margin: 14px 0 12px;
+  padding: 9px 10px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 7px;
+  color: #fde68a;
+  background: rgba(120, 53, 15, 0.16);
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  overflow-wrap: anywhere;
+}
+
+.boundary-evidence-status[data-available="true"] {
+  border-color: rgba(94, 234, 212, 0.3);
+  color: var(--accent);
+  background: rgba(13, 148, 136, 0.1);
+}
+
+.boundary-evidence-grid {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+
+.boundary-evidence-grid div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(120, 140, 200, 0.1);
+  font-family: var(--mono);
+  font-size: 0.58rem;
+}
+
+.boundary-evidence-grid dt {
+  color: var(--muted);
+}
+
+.boundary-evidence-grid dd {
+  margin: 0;
+  text-align: right;
+}
+
+.boundary-form {
+  grid-template-columns: 1fr 1fr;
+}
+
+.boundary-time-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 11px;
+  margin-top: 14px;
+}
+
+.boundary-time-field,
+.boundary-select-field,
+.boundary-identity-card > label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.boundary-time-field > div {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+}
+
+.boundary-time-field input,
+.boundary-select-field select,
+.boundary-identity-card input,
+.boundary-identity-card select,
+.boundary-identity-card textarea {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.boundary-time-field input,
+.boundary-select-field select,
+.boundary-identity-card input,
+.boundary-identity-card select {
+  height: 36px;
+  padding: 0 9px;
+}
+
+.boundary-tail-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.boundary-tail-options legend {
+  padding: 0 5px;
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.boundary-tail-options label {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  font-size: 0.66rem;
+}
+
+.boundary-identity-card {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.boundary-identity-card .boundary-section-heading,
+.boundary-identity-card .boundary-confirm,
+.boundary-identity-card .boundary-comment {
+  grid-column: 1 / -1;
+}
+
+.boundary-identity-card textarea {
+  padding: 9px;
+  resize: vertical;
+}
+
+.boundary-export-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-column: 1 / -1;
+  gap: 18px;
+  align-items: center;
+  background:
+    linear-gradient(110deg, rgba(167, 139, 250, 0.08), transparent 60%),
+    var(--surface);
+}
+
+.boundary-export-card .primary-action {
+  min-width: 190px;
 }
 
 /* Setup and game */
@@ -962,8 +1246,14 @@ button:disabled {
   }
 
   .play-layout,
-  .review-grid {
+  .review-grid,
+  .boundary-layout,
+  .boundary-form {
     grid-template-columns: 1fr;
+  }
+
+  .boundary-export-card {
+    grid-column: auto;
   }
 
   .playfield-frame {
@@ -994,6 +1284,33 @@ button:disabled {
   .workspace-heading {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .boundary-entry,
+  .boundary-export-card,
+  .boundary-identity-card,
+  .boundary-time-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .boundary-entry button,
+  .boundary-export-card .primary-action {
+    width: 100%;
+  }
+
+  .boundary-time-field > div {
+    grid-template-columns: 1fr;
+  }
+
+  .boundary-identity-card .boundary-section-heading,
+  .boundary-identity-card .boundary-confirm,
+  .boundary-identity-card .boundary-comment {
+    grid-column: auto;
+  }
+
+  .boundary-loop {
+    width: 100%;
+    margin: 4px 0 0;
   }
 
   .chart-group {

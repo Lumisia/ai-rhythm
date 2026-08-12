@@ -23,7 +23,9 @@ from chart_worker.generation.params import (
     TimingGenerationRequest,
 )
 from chart_worker.generation.resnap_diagnostics import (
+    RESNAP_DIAGNOSTICS_VERSION,
     ResnapDiagnostics,
+    mania_object_mismatch,
     read_resnap_diagnostics,
 )
 from chart_worker.schema.note import Chart
@@ -54,7 +56,7 @@ class GeneratedTiming:
     bpm_events: tuple[OsuBpmEvent, ...]
     generator_name: str
     seed: int | None
-    mode: Literal["STANDARD", "SUPER_TIMING"]
+    mode: Literal["STANDARD", "SUPER_TIMING", "BEAT_THIS_FALLBACK"]
 
 
 class ChartGenerator(Protocol):
@@ -89,6 +91,22 @@ def _normalize_end_boundary(
     return normalized, changed
 
 
+def _deduplicate_exact_taps(notes: Chart) -> tuple[Chart, bool]:
+    """Collapse only indistinguishable TAP duplicates emitted by the model."""
+    normalized: Chart = []
+    seen_taps: set[tuple[int, int]] = set()
+    changed = False
+    for note in notes:
+        if note.kind == "TAP":
+            identity = (note.time_ms, note.lane)
+            if identity in seen_taps:
+                changed = True
+                continue
+            seen_taps.add(identity)
+        normalized.append(note)
+    return normalized, changed
+
+
 def inference_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
     """Unicode 제목도 Windows 자식 프로세스가 UTF-8로 출력하게 한다."""
     env = dict(os.environ if base is None else base)
@@ -101,11 +119,14 @@ def inference_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 def _hydra_list(values: tuple[str, ...]) -> str:
-    """Hydra 목록 인자. 값에 콤마가 없으므로 따옴표 없이 적는다."""
+    """Hydra 목록 인자. 각 항목을 인용해 trailing space까지 보존한다."""
+    quoted = []
     for value in values:
         if "," in value or "[" in value or "]" in value:
             raise ValueError(f"descriptor cannot contain list syntax: {value!r}")
-    return "[" + ",".join(values) + "]"
+        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+        quoted.append(f"'{escaped}'")
+    return "[" + ",".join(quoted) + "]"
 
 
 def _absolute(path: Path) -> Path:
@@ -199,7 +220,12 @@ def build_map_command(
     argv = _common_generation_arguments(
         config,
         request.audio_path,
-        request.partial_end_ms or request.duration_ms,
+        # 부분 재생성 창 > 음악 종료 추정 > 오디오 전체 길이 순.
+        # 오디오 길이는 음악 종료가 아니다 — 꼬리 무음에 노트가 생긴다.
+        request.partial_end_ms
+        or request.generation_end_ms
+        or request.music_end_ms
+        or request.duration_ms,
         request.year,
         output_dir,
     )
@@ -213,6 +239,9 @@ def build_map_command(
             "in_context=[TIMING]",
             "output_type=[MAP]",
             "super_timing=false",
+            # Window-relative note-start boundaries are row-specific. Keep the
+            # upstream parallel path off until it can carry one boundary per row.
+            "parallel=false",
         ]
     )
     if request.partial_start_ms is not None:
@@ -222,6 +251,8 @@ def build_map_command(
                 "add_to_beatmap=true",
             ]
         )
+    if request.max_note_start_ms is not None:
+        argv.append(f"last_attack_time={request.max_note_start_ms}")
     if request.seed is not None:
         argv.append(f"seed={request.seed}")
     return argv
@@ -263,6 +294,7 @@ class MapperatorinatorGenerator:
     config: WorkerConfig
     run: RunCommand | None = None
     verify_patch: PatchVerifier = require_mapperatorinator_patch
+    require_bound_resnap_sidecar: bool = True
 
     def _run_and_parse(
         self, argv: list[str], workdir: Path
@@ -330,11 +362,12 @@ class MapperatorinatorGenerator:
                 ErrorCode.CHART_GENERATION_FAILED,
                 f"asked for {request.key_mode}K but got {beatmap.key_mode}K",
             )
-        notes, changed = _normalize_end_boundary(
+        notes, boundary_changed = _normalize_end_boundary(
             beatmap.notes,
             duration_ms=request.duration_ms,
         )
-        if changed:
+        notes, duplicate_taps_removed = _deduplicate_exact_taps(notes)
+        if boundary_changed or duplicate_taps_removed:
             if not beatmap.bpm_events:
                 raise WorkerError(
                     ErrorCode.CHART_GENERATION_FAILED,
@@ -350,6 +383,28 @@ class MapperatorinatorGenerator:
                 title=request.audio_path.stem,
                 bpm_events=beatmap.bpm_events,
             )
+        resnap_diagnostics = read_resnap_diagnostics(osu_path)
+        if self.require_bound_resnap_sidecar and (
+            resnap_diagnostics.version != RESNAP_DIAGNOSTICS_VERSION
+            or resnap_diagnostics.status in ("UNOBSERVED", "INVALID")
+        ):
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                "required bound resnap sidecar is missing, stale, or invalid",
+                context={
+                    "path": str(osu_path.with_suffix(".resnap.json")),
+                    "status": resnap_diagnostics.status,
+                    "version": resnap_diagnostics.version,
+                    "error": resnap_diagnostics.error,
+                },
+            )
+        sidecar_mismatch = mania_object_mismatch(resnap_diagnostics, notes)
+        if sidecar_mismatch is not None:
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                sidecar_mismatch,
+                context={"path": str(osu_path.with_suffix(".resnap.json"))},
+            )
         return GeneratedChart(
             notes=notes,
             key_mode=beatmap.key_mode,
@@ -357,5 +412,5 @@ class MapperatorinatorGenerator:
             generator_name="mapperatorinator-v32",
             seed=request.seed,
             bpm_events=beatmap.bpm_events,
-            resnap_diagnostics=read_resnap_diagnostics(osu_path),
+            resnap_diagnostics=resnap_diagnostics,
         )

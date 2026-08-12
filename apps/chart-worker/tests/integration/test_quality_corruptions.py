@@ -298,6 +298,7 @@ def test_controlled_corruption_activates_only_its_independent_axis(
     )
 
     assert acceptance.action is GateAction(expected_action)
+    expected_decisions = {"SONG_BOUNDS": PASS, **expected_decisions}
     assert {
         axis.value: (
             acceptance.decision(axis).action.value,
@@ -311,6 +312,7 @@ def test_controlled_corruption_activates_only_its_independent_axis(
     report = json.loads(json.dumps(acceptance.to_report()))
     assert set(report["decisions"]) == {
         "STRUCTURE",
+        "SONG_BOUNDS",
         "TIMING_IDENTITY",
         "TIMING_ALIGNMENT",
         "COVERAGE",

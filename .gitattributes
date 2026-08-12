@@ -1,0 +1,2 @@
+# Unified diff files require a single-space prefix on blank context lines.
+apps/chart-worker/patches/*.patch -whitespace

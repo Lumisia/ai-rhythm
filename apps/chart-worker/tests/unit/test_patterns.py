@@ -1,5 +1,6 @@
 import pytest
 
+from chart_worker.postprocess import patterns
 from chart_worker.postprocess.patterns import (
     PatternInstance,
     PatternKind,
@@ -122,6 +123,26 @@ def test_chords_more_than_a_beat_apart_do_not_form_sequence_patterns():
 def test_anchor_is_a_half_beat_lane_with_others_interleaved():
     notes = _taps([(0, 0), (125, 1), (250, 0), (375, 2), (500, 0), (625, 1), (750, 0), (875, 3)])
     assert PatternKind.ANCHOR in _kinds(notes)
+
+
+def test_anchor_interleaving_uses_one_bisect_lookup_per_lane_gap(monkeypatch):
+    calls = 0
+    original = patterns.bisect_right
+
+    def counted(values, target):
+        nonlocal calls
+        calls += 1
+        return original(values, target)
+
+    monkeypatch.setattr(patterns, "bisect_right", counted)
+    notes = _taps(
+        (index * 125, index % 4)
+        for index in range(1_000)
+    )
+
+    detect_patterns(notes, key_mode=4, beat_ms=BEAT_MS)
+
+    assert calls <= len(notes)
 
 
 def test_chordjack_shares_two_lanes_between_chords():

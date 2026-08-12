@@ -1,0 +1,95 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index e19240e..f84665c 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -1273,6 +1273,18 @@ class Processor(object):
+         existing_origins = list(context.get("event_origins", []))
+         if len(existing_events) != len(existing_origins):
+             raise ValueError("events and event_origins must have equal length")
++        existing_groups = ()
++        generated_groups = ()
++        if mania_keycount is not None:
++            existing_groups = canonical_mania_groups(
++                existing_events,
++                existing_times,
++                keycount=mania_keycount,
++            )
++            generated_groups = canonical_mania_groups(
++                result,
++                keycount=mania_keycount,
++            )
+ 
+         candidate_events = existing_events + result
+         candidate_times = existing_times
+@@ -1305,10 +1317,18 @@ class Processor(object):
+                 candidate_times,
+                 keycount=mania_keycount,
+             )
+-            replay_mania_hold_state(
+-                candidate_groups,
+-                keycount=mania_keycount,
+-            )
++            try:
++                replay_mania_hold_state(
++                    candidate_groups,
++                    keycount=mania_keycount,
++                )
++            except ValueError as error:
++                raise ValueError(
++                    f"{error}; sourceWindow={window_id},"
++                    f"frameTime={frame_time},"
++                    f"existingGroups={len(existing_groups)},"
++                    f"generatedGroups={len(generated_groups)}"
++                ) from error
+ 
+         context["events"] = candidate_events
+         context["event_times"] = candidate_times
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index 2bd2937..bfd63e0 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -156,6 +156,44 @@ def test_invalid_cumulative_hold_transition_is_rejected_before_atomic_commit():
+     assert context["event_origins"] == []
+ 
+ 
++def test_cumulative_replay_error_reports_window_and_frame_boundary():
++    processor = make_processor()
++    processor._decode_indexed = lambda _tokens, _frame_time: (
++        [
++            Event(EventType.TIME_SHIFT, 100),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.CIRCLE, 0),
++        ],
++        [0, 1, 2],
++    )
++    context = {
++        "context_type": "MAP",
++        "events": [
++            Event(EventType.TIME_SHIFT, 100),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE, 0),
++        ],
++        "event_times": [100, 100, 100],
++        "event_origins": [
++            EventOrigin.generated(6, 0),
++            EventOrigin.generated(6, 1),
++            EventOrigin.generated(6, 2),
++        ],
++    }
++
++    with pytest.raises(
++        ValueError,
++        match=r"sourceWindow=7,frameTime=62\.0,existingGroups=1,generatedGroups=1",
++    ):
++        processor.add_predicted_tokens_to_context(
++            context,
++            torch.tensor([10, 11, 12]),
++            62.0,
++            source_window_id=7,
++            mania_keycount=4,
++        )
++
++
+ def test_mania_state_boundary_matches_the_prompt_start():
+     processor = make_processor()
+     processor.miliseconds_per_sequence = 5_000

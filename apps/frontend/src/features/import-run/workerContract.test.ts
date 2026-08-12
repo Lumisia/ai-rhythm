@@ -10,9 +10,10 @@ const fixtureRoot = resolve(process.cwd(), "src/test/fixtures/playtest-run");
 
 describe("chart worker output contract", () => {
   it("imports the deterministic worker fixture as a complete run", async () => {
-    const imported = await importRun(loadRunDirectory(fixtureRoot));
+    const imported = await importRun(loadRunDirectory(fixtureRoot), "PLAYTEST");
 
     expect(imported.manifest.version).toBe(1);
+    expect(imported.publicationState).toBe("LEGACY_UNVERIFIED");
     expect(imported.manifest.charts).toHaveLength(12);
     expect(imported.charts).toHaveLength(12);
     expect(new Set(imported.charts.map(({ document }) => document.schemaVersion))).toEqual(
@@ -40,6 +41,9 @@ describe("chart worker output contract", () => {
     expect(imported.audio.game.byteLength).toBeGreaterThan(1_000);
     expect(imported.keysoundManifest).toBeNull();
 
+    if (imported.manifest.version !== 1) {
+      throw new Error("legacy fixture unexpectedly used a v2 manifest");
+    }
     const report = JSON.parse(
       await imported.source.readText(imported.manifest.generationReportPath),
     ) as { charts: unknown[] };
@@ -47,7 +51,7 @@ describe("chart worker output contract", () => {
   });
 
   it("accepts Mapperatorinator timing that begins before audio zero", async () => {
-    const imported = await importRun(loadRunDirectory(fixtureRoot));
+    const imported = await importRun(loadRunDirectory(fixtureRoot), "PLAYTEST");
     const document = {
       ...imported.charts[0].document,
       bpmEvents: [{ timeMs: -120, bpm: 120 }],

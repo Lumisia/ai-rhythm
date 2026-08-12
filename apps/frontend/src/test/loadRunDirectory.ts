@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 
 interface ManifestFileRef {
@@ -13,8 +13,11 @@ interface ManifestPaths {
   };
   charts: ManifestFileRef[];
   keysoundManifestPath: string | null;
-  generationReportPath: string;
+  generationReportPath?: string;
+  generationReport?: ManifestFileRef;
 }
+
+const manifestNames = ["playtest-run-v1.json", "playtest-run-v2.json"] as const;
 
 function checkedPath(root: string, candidate: string): string {
   const normalized = candidate.replaceAll("\\", "/");
@@ -51,11 +54,27 @@ function fileFromPath(root: string, relativePath: string): File {
 
 export function loadRunDirectory(root: string): File[] {
   const absoluteRoot = resolve(root);
-  const manifestPath = checkedPath(absoluteRoot, "playtest-run-v1.json");
+  const presentManifestNames = manifestNames.filter((name) =>
+    existsSync(checkedPath(absoluteRoot, name)),
+  );
+  if (presentManifestNames.length !== 1) {
+    throw new Error(
+      `expected exactly one run manifest, found ${presentManifestNames.length}`,
+    );
+  }
+  const manifestName = presentManifestNames[0];
+  const manifestPath = checkedPath(absoluteRoot, manifestName);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as ManifestPaths;
+  const generationReportPath =
+    manifestName === "playtest-run-v2.json"
+      ? manifest.generationReport?.path
+      : manifest.generationReportPath;
+  if (!generationReportPath) {
+    throw new Error(`${manifestName} does not reference a generation report`);
+  }
   const referencedPaths = new Set([
-    "playtest-run-v1.json",
-    manifest.generationReportPath,
+    manifestName,
+    generationReportPath,
     manifest.audio.game.path,
     ...manifest.charts.map((chart) => chart.path),
   ]);

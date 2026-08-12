@@ -30,7 +30,7 @@ DESCRIPTORS: dict[str, tuple[str, ...]] = {
     "EASY": ("expression/simple",),
     "NORMAL": ("style/mixed rice",),
     "HARD": ("style/mixed rice", "streams/bursts"),
-    "EXPERT": ("style/mixed rice", "skillset/streams", "skillset/tech"),
+    "EXPERT": ("style/mixed rice", "skillset/streams"),
 }
 
 
@@ -63,6 +63,16 @@ class GenerationRequest:
     descriptors: tuple[str, ...] = ()
     requested_star: float = field(default=0.0)
     duration_ms: int = 0
+    music_end_ms: int | None = None
+    """음악이 실제로 끝나는 추정 시각. 오디오 파일 길이(duration_ms)와
+    다르다. 지정되면 모델 end_time 으로 이 값을 쓴다 — 꼬리 무음에
+    노트가 생기는 것을 막는다."""
+    generation_end_ms: int | None = None
+    """Model context horizon used to finish HOLD objects."""
+    last_attack_ms: int | None = None
+    """Last evidence-backed musical attack, before quantization tolerance."""
+    max_note_start_ms: int | None = None
+    """Inclusive boundary after which a new TAP/HOLD start is forbidden."""
     partial_start_ms: int | None = None
     partial_end_ms: int | None = None
     add_to_beatmap: bool = False
@@ -90,6 +100,46 @@ class GenerationRequest:
             raise ValueError(f"unsupported difficulty: {self.difficulty}")
         if self.duration_ms <= 0:
             raise ValueError("duration_ms must be positive")
+        if self.music_end_ms is not None:
+            object.__setattr__(
+                self, "music_end_ms", coerce_int(self.music_end_ms, "music_end_ms")
+            )
+            if not 0 < self.music_end_ms <= self.duration_ms:
+                raise ValueError("music_end_ms must be within canonical audio duration")
+        for field_name in (
+            "generation_end_ms",
+            "last_attack_ms",
+            "max_note_start_ms",
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            value = coerce_int(value, field_name)
+            object.__setattr__(self, field_name, value)
+            if not 0 <= value <= self.duration_ms:
+                raise ValueError(
+                    f"{field_name} must be within canonical audio duration"
+                )
+        if self.generation_end_ms == 0:
+            raise ValueError("generation_end_ms must be positive")
+        if (
+            self.last_attack_ms is not None
+            and self.generation_end_ms is not None
+            and self.last_attack_ms > self.generation_end_ms
+        ):
+            raise ValueError("last_attack_ms cannot exceed generation_end_ms")
+        if (
+            self.last_attack_ms is not None
+            and self.max_note_start_ms is not None
+            and self.last_attack_ms > self.max_note_start_ms
+        ):
+            raise ValueError("last_attack_ms cannot exceed max_note_start_ms")
+        if (
+            self.max_note_start_ms is not None
+            and self.generation_end_ms is not None
+            and self.max_note_start_ms > self.generation_end_ms
+        ):
+            raise ValueError("max_note_start_ms cannot exceed generation_end_ms")
         partial_values = (self.partial_start_ms, self.partial_end_ms)
         if (partial_values[0] is None) != (partial_values[1] is None):
             raise ValueError("partial start and end must be provided together")

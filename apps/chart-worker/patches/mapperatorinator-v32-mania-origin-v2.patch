@@ -1,0 +1,1716 @@
+diff --git a/inference.py b/inference.py
+index 2d899df..d6bf580 100644
+--- a/inference.py
++++ b/inference.py
+@@ -23,10 +23,11 @@ from utils import routed_pickle
+ from config import InferenceConfig
+ from diffusion_pipeline import DiffisionPipeline
+ from osuT5.osuT5.config import TrainConfig
+-from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_events
++from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES
+ from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
+     generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
+ from osuT5.osuT5.inference.server import InferenceClient
++from osuT5.osuT5.inference.origin import merge_origin_streams
+ from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
+ from osuT5.osuT5.model import Mapperatorinator
+ from osuT5.osuT5.tokenizer import ContextType
+@@ -494,6 +495,7 @@ def generate(
+ 
+     # Auto generate timing if not provided in in_context and required for the model and this output_type
+     timing_events, timing_times, timing = None, None, None
++    event_origins = None
+     if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
+         super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer)
+         timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
+@@ -532,9 +534,10 @@ def generate(
+             beatmap_path=beatmap_path,
+             extra_in_context=extra_in_context,
+             verbose=verbose,
++            include_origins=True,
+         )
+ 
+-        events, event_times = reduce(merge_events, result)
++        events, event_times, event_origins = reduce(merge_origin_streams, result)
+ 
+         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
+             timing = postprocessor.generate_timing(events)
+@@ -547,7 +550,12 @@ def generate(
+                     event_times,
+                     timing,
+                     key_count=round(beatmap_config.circle_size),
++                    event_origins=event_origins,
+                 )
++                if len(events) != len(event_origins):
++                    raise ValueError(
++                        "resnap changed event count without updating event origins"
++                    )
+             else:
+                 events, event_times = postprocessor.resnap_events(
+                     events,
+@@ -569,12 +577,14 @@ def generate(
+         # Diffusion may change the event stream. Preserve its previous token-derived
+         # timing behavior outside mania until it exposes matching event times.
+         event_times = None
++        event_origins = None
+ 
+     result = postprocessor.generate(
+         events=events,
+         event_times=event_times,
+         beatmap_config=beatmap_config,
+         timing=timing,
++        event_origins=event_origins,
+     )
+ 
+     if args.add_to_beatmap:
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 5234d80..9ad5bc5 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -66,6 +66,68 @@ class ManiaKeycountLogitsProcessor(LogitsProcessor):
+         return scores_processed
+ 
+ 
++class ManiaColumnBeforeTypeLogitsProcessor(LogitsProcessor):
++    """Enforce the v32 ``time -> column -> note type`` training grammar.
++
++    This deliberately does not infer HOLD state.  A gameplay type without a
++    column is never serializable, whereas an apparent orphan HOLD may depend on
++    cross-window context and belongs in canonical-IR diagnostics.
++    """
++
++    def __init__(self, tokenizer: Tokenizer):
++        self.keycount_start = tokenizer.event_start[EventType.MANIA_KEYCOUNT]
++        self.keycount_end = tokenizer.event_end[EventType.MANIA_KEYCOUNT]
++        self.column_start = tokenizer.event_start[EventType.MANIA_COLUMN]
++        self.column_end = tokenizer.event_end[EventType.MANIA_COLUMN]
++        self.time_start = tokenizer.event_start[EventType.TIME_SHIFT]
++        self.time_end = tokenizer.event_end[EventType.TIME_SHIFT]
++        self.note_type_tokens = torch.tensor([
++            tokenizer.event_start[EventType.CIRCLE],
++            tokenizer.event_start[EventType.HOLD_NOTE],
++            tokenizer.event_start[EventType.HOLD_NOTE_END],
++        ])
++        self.sos_ids = torch.tensor(
++            [tokenizer.sos_id]
++            + list(getattr(tokenizer, "context_sos", {}).values())
++        )
++
++    @staticmethod
++    def _last_index(mask: torch.Tensor) -> int:
++        indices = torch.nonzero(mask, as_tuple=False).flatten()
++        return int(indices[-1].item()) if indices.numel() else -1
++
++    def __call__(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
++        scores_processed = scores.clone()
++        note_types = self.note_type_tokens.to(input_ids.device)
++        sos_ids = self.sos_ids.to(input_ids.device)
++        for row in range(input_ids.shape[0]):
++            tokens = input_ids[row]
++            has_keycount = bool(
++                ((tokens >= self.keycount_start) & (tokens < self.keycount_end))
++                .any()
++                .item()
++            )
++            if not has_keycount:
++                continue
++            last_column = self._last_index(
++                (tokens >= self.column_start) & (tokens < self.column_end)
++            )
++            last_boundary = max(
++                self._last_index(
++                    (tokens >= self.time_start) & (tokens < self.time_end)
++                ),
++                self._last_index(torch.isin(tokens, note_types)),
++                self._last_index(torch.isin(tokens, sos_ids)),
++            )
++            if last_column <= last_boundary:
++                scores_processed[row, note_types] = -torch.inf
++        return scores_processed
++
++
+ class TimeshiftBias(LogitsProcessor):
+     def __init__(self, timeshift_bias: float, time_start: int, time_end: int):
+         self.timeshift_bias = timeshift_bias
+diff --git a/osuT5/osuT5/inference/origin.py b/osuT5/osuT5/inference/origin.py
+new file mode 100644
+index 0000000..6a3ba3f
+--- /dev/null
++++ b/osuT5/osuT5/inference/origin.py
+@@ -0,0 +1,69 @@
++"""Inference-only event provenance kept parallel to training Event objects."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Literal
++
++from ..event import Event
++
++OriginKind = Literal["GENERATED", "REFERENCE"]
++
++
++@dataclass(frozen=True, slots=True)
++class EventOrigin:
++    kind: OriginKind
++    source_window_id: int | None
++    source_token_index: int | None
++    reference_event_index: int | None = None
++
++    @classmethod
++    def generated(cls, window_id: int, token_index: int) -> "EventOrigin":
++        return cls("GENERATED", window_id, token_index)
++
++    @classmethod
++    def reference(cls, event_index: int) -> "EventOrigin":
++        return cls("REFERENCE", None, None, event_index)
++
++    def to_dict(self) -> dict[str, int | str | None]:
++        return {
++            "kind": self.kind,
++            "sourceWindowId": self.source_window_id,
++            "sourceTokenIndex": self.source_token_index,
++            "referenceEventIndex": self.reference_event_index,
++        }
++
++
++OriginStream = tuple[list[Event], list[int], list[EventOrigin]]
++
++
++def validate_origin_stream(stream: OriginStream) -> None:
++    events, event_times, origins = stream
++    if len(events) != len(event_times) or len(events) != len(origins):
++        raise ValueError("events, event_times, and event_origins must have equal length")
++
++
++def merge_origin_streams(left: OriginStream, right: OriginStream) -> OriginStream:
++    """Stable time merge that moves event, time, and origin atomically."""
++    validate_origin_stream(left)
++    validate_origin_stream(right)
++    merged_events: list[Event] = []
++    merged_times: list[int] = []
++    merged_origins: list[EventOrigin] = []
++    i = j = 0
++    while i < len(left[0]) and j < len(right[0]):
++        source, index = (left, i) if left[1][i] <= right[1][j] else (right, j)
++        merged_events.append(source[0][index])
++        merged_times.append(source[1][index])
++        merged_origins.append(source[2][index])
++        if source is left:
++            i += 1
++        else:
++            j += 1
++    for source, start in ((left, i), (right, j)):
++        merged_events.extend(source[0][start:])
++        merged_times.extend(source[1][start:])
++        merged_origins.extend(source[2][start:])
++    result = (merged_events, merged_times, merged_origins)
++    validate_origin_stream(result)
++    return result
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index e7a36ea..c03563c 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -14,6 +14,7 @@ import numpy as np
+ from slider import TimingPoint, Beatmap
+ 
+ from config import InferenceConfig
++from .origin import EventOrigin
+ from .slider_path import SliderPath
+ from .timing_points_change import TimingPointsChange, sort_timing_points
+ from ..dataset.data_utils import get_groups, Group, get_median_mpb, BEAT_TYPES
+@@ -56,6 +57,33 @@ class BeatmapConfig:
+     background_line: str = ""
+ 
+ 
++@dataclasses.dataclass(frozen=True, slots=True)
++class ManiaObject:
++    object_id: int
++    lane: int
++    kind: str
++    start_time_ms: int
++    end_time_ms: int | None
++    start_group_id: int
++    end_group_id: int | None
++    x: int
++    start_origins: tuple[EventOrigin, ...]
++    end_origins: tuple[EventOrigin, ...] = ()
++
++    def to_dict(self) -> dict:
++        return {
++            "objectId": self.object_id,
++            "lane": self.lane,
++            "kind": self.kind,
++            "startTimeMs": self.start_time_ms,
++            "endTimeMs": self.end_time_ms,
++            "startGroupId": self.start_group_id,
++            "endGroupId": self.end_group_id,
++            "startOrigins": [origin.to_dict() for origin in self.start_origins],
++            "endOrigins": [origin.to_dict() for origin in self.end_origins],
++        }
++
++
+ def background_line(background: str) -> str:
+     return f"0,0,\"{os.path.basename(background)}\",0,0\n" if background else ""
+ 
+@@ -142,6 +170,7 @@ class Postprocessor(object):
+         self.snap_near_perfect_overlaps_enabled = args.snap_near_perfect_overlaps
+ 
+         self.logger = logging.getLogger(__name__) if logger is None else logger.getChild(__name__)
++        self.last_mania_objects_report = {"maniaObjects": [], "duplicates": []}
+ 
+     def generate(
+             self,
+@@ -149,6 +178,7 @@ class Postprocessor(object):
+             beatmap_config: BeatmapConfig,
+             timing: list[TimingPoint] = None,
+             event_times: list[int] = None,
++            event_origins: list[EventOrigin] = None,
+     ):
+         """Generate a beatmap file.
+ 
+@@ -157,6 +187,7 @@ class Postprocessor(object):
+             beatmap_config: BeatmapConfig object.
+             timing: List of TimingPoint objects.
+             event_times: Absolute timestamp for each event token.
++            event_origins: Inference source for each event token.
+ 
+         Returns:
+             None. An .osu file will be generated.
+@@ -167,7 +198,6 @@ class Postprocessor(object):
+         slider_head = None
+         anchor_info = []
+         last_anchor = None
+-        hold_note_starts = {}
+         drumroll_start = None
+         denden_start = None
+ 
+@@ -178,8 +208,10 @@ class Postprocessor(object):
+ 
+         if event_times is not None and len(events) != len(event_times):
+             raise ValueError("events and event_times must have equal length")
++        if event_origins is not None and len(events) != len(event_origins):
++            raise ValueError("events and event_origins must have equal length")
+ 
+-        groups, _ = get_groups(
++        groups, group_indices = get_groups(
+             events,
+             event_times=event_times,
+             types_first=self.types_first,
+@@ -189,14 +221,40 @@ class Postprocessor(object):
+         if self.snap_near_perfect_overlaps_enabled:
+             self.snap_near_perfect_overlaps(groups)
+ 
++        mania_objects_by_start = {}
++        duplicate_group_ids = set()
++        if beatmap_config.mode == 3:
++            mania_objects, duplicate_group_ids, duplicates = (
++                self._build_mania_objects(
++                    groups,
++                    group_indices,
++                    event_origins,
++                    round(beatmap_config.circle_size),
++                )
++            )
++            mania_objects_by_start = {
++                obj.start_group_id: obj
++                for obj in mania_objects
++                if obj.kind == "HOLD"
++            }
++            self.last_mania_objects_report = {
++                "maniaObjects": [obj.to_dict() for obj in mania_objects],
++                "duplicates": duplicates,
++            }
++        else:
++            self.last_mania_objects_report = {"maniaObjects": [], "duplicates": []}
++
+         # Prepare unnormalizing scroll speed changes in mania
+         last_time = max(group.time for group in groups) if len(groups) > 0 else 0
+         median_mpb = get_median_mpb(timing, last_time)
+ 
+         # Convert to .osu format
+-        for group in groups:
++        for group_id, group in enumerate(groups):
+             hit_type = group.event_type
+ 
++            if group_id in duplicate_group_ids:
++                continue
++
+             if group.distance is not None and group.x is None and group.y is None:
+                 # Find a point which is dist away from the last point but still within the playfield
+                 coordinates = calculate_coordinates((last_x, last_y), group.distance, 500, (512, 384))
+@@ -230,31 +288,27 @@ class Postprocessor(object):
+                     timing = self.set_sv(timedelta(milliseconds=int(round(group.time))), group.scroll_speed, timing)
+ 
+             elif hit_type == EventType.HOLD_NOTE:
+-                hold_lane = int(round(group.x))
+-                if hold_lane in hold_note_starts:
+-                    previous = hold_note_starts[hold_lane]
+-                    self.logger.warning(f"Warning: Incomplete hold note at {int(round(previous.time))}")
+-
+-                hold_note_starts[hold_lane] = group
+-
+-            elif hit_type == EventType.HOLD_NOTE_END:
+-                hold_lane = int(round(group.x))
+-                hold_note_start = hold_note_starts.pop(hold_lane, None)
+-                if hold_note_start is None:
+-                    self.logger.warning(f"Warning: Hold note end without start at {int(round(group.time))}")
++                mania_object = mania_objects_by_start.get(group_id)
++                if mania_object is None:
+                     continue
+-
+-                hitsound = hold_note_start.hitsounds[0] if len(hold_note_start.hitsounds) > 0 else 0
+-                sampleset = hold_note_start.samplesets[0] if len(hold_note_start.samplesets) > 0 else 0
+-                addition = hold_note_start.additions[0] if len(hold_note_start.additions) > 0 else 0
+-                volume = hold_note_start.volumes[0] if len(
+-                    hold_note_start.volumes) > 0 and beatmap_config.mode == 3 else 0
++                hold_note_end_time = mania_object.end_time_ms
++                hitsound = group.hitsounds[0] if len(group.hitsounds) > 0 else 0
++                sampleset = group.samplesets[0] if len(group.samplesets) > 0 else 0
++                addition = group.additions[0] if len(group.additions) > 0 else 0
++                volume = group.volumes[0] if len(
++                    group.volumes) > 0 and beatmap_config.mode == 3 else 0
+                 hit_object_strings.append(
+-                    f"{int(round(hold_note_start.x))},{192},{int(round(hold_note_start.time))},{128},{hitsound},{int(round(group.time))}:{sampleset}:{addition}:-1:{volume}:"
++                    f"{int(round(group.x))},{192},{int(round(group.time))},{128},{hitsound},{hold_note_end_time}:{sampleset}:{addition}:-1:{volume}:"
+                 )
+-                if len(hold_note_start.volumes) > 0 and beatmap_config.mode != 3:
+-                    timing = self.set_volume(timedelta(milliseconds=int(round(hold_note_start.time))),
+-                                             hold_note_start.volumes[0], timing)
++                if len(group.volumes) > 0 and beatmap_config.mode != 3:
++                    timing = self.set_volume(
++                        timedelta(milliseconds=int(round(group.time))),
++                        group.volumes[0],
++                        timing,
++                    )
++
++            elif hit_type == EventType.HOLD_NOTE_END:
++                continue
+ 
+             elif hit_type == EventType.DRUMROLL:
+                 if drumroll_start is not None:
+@@ -530,6 +584,197 @@ class Postprocessor(object):
+         with open(output_path, "w", encoding='utf-8-sig') as osu_file:
+             osu_file.write(result)
+ 
++    def _build_mania_objects(
++            self,
++            groups: list[Group],
++            group_indices: list[list[int]],
++            event_origins: list[EventOrigin] | None,
++            key_count: int,
++    ) -> tuple[list[ManiaObject], set[int], list[dict]]:
++        """Build one validated gameplay object stream before serialization.
++
++        Only byte-for-byte-equivalent note groups from disjoint generated
++        windows are idempotent. All other overlapping or orphan HOLD events are
++        malformed candidates and must be rejected instead of silently dropped.
++        """
++        note_types = {
++            EventType.CIRCLE,
++            EventType.HOLD_NOTE,
++            EventType.HOLD_NOTE_END,
++        }
++        group_origins: list[tuple[EventOrigin, ...]] = []
++        for indices in group_indices:
++            if event_origins is None:
++                group_origins.append(())
++                continue
++            unique = []
++            for index in indices:
++                origin = event_origins[index]
++                if origin not in unique:
++                    unique.append(origin)
++            group_origins.append(tuple(unique))
++
++        def describe_group(group_id: int) -> dict:
++            group = groups[group_id]
++            return {
++                "groupId": group_id,
++                "type": group.event_type.name,
++                "timeMs": int(round(group.time)),
++                "origins": [
++                    origin.to_dict() for origin in group_origins[group_id]
++                ],
++            }
++
++        duplicate_group_ids: set[int] = set()
++        duplicates: list[dict] = []
++        first_by_signature: dict[tuple, int] = {}
++        for group_id, group in enumerate(groups):
++            if group.event_type not in note_types:
++                continue
++            if group.x is None:
++                origins = group_origins[group_id]
++                origin_summary = [
++                    {
++                        "kind": origin.kind,
++                        "sourceWindowId": origin.source_window_id,
++                        "sourceTokenIndex": origin.source_token_index,
++                        "referenceEventIndex": origin.reference_event_index,
++                    }
++                    for origin in origins
++                ]
++                raise ValueError(
++                    f"mania note group {group_id} has no gameplay column: "
++                    f"type={group.event_type.name}, time={group.time}, "
++                    f"origins={origin_summary}"
++                )
++            lane = self._mania_lane(group.x, key_count)
++            signature = (group.event_type, lane, group.time)
++            previous_id = first_by_signature.get(signature)
++            if previous_id is None:
++                first_by_signature[signature] = group_id
++                continue
++            previous_windows = {
++                origin.source_window_id
++                for origin in group_origins[previous_id]
++                if origin.kind == "GENERATED"
++                and origin.source_window_id is not None
++            }
++            current_windows = {
++                origin.source_window_id
++                for origin in group_origins[group_id]
++                if origin.kind == "GENERATED"
++                and origin.source_window_id is not None
++            }
++            if (
++                    previous_windows
++                    and current_windows
++                    and previous_windows.isdisjoint(current_windows)
++            ):
++                duplicate_group_ids.add(group_id)
++                duplicates.append({
++                    "keptGroupId": previous_id,
++                    "droppedGroupId": group_id,
++                    "reason": "EXACT_CROSS_WINDOW_DUPLICATE",
++                })
++                continue
++            raise ValueError(
++                f"exact duplicate mania group is not cross-window idempotent: "
++                f"groups {previous_id} and {group_id}, "
++                f"type={group.event_type.name}, lane={lane}, time={group.time}"
++            )
++
++        objects: list[ManiaObject] = []
++        active_by_lane: dict[int, int] = {}
++        ordered_group_ids = sorted(
++            range(len(groups)),
++            key=lambda group_id: (
++                groups[group_id].time,
++                (
++                    self._mania_lane(groups[group_id].x, key_count)
++                    if groups[group_id].x is not None
++                    else -1
++                ),
++                {
++                    EventType.HOLD_NOTE_END: 0,
++                    EventType.HOLD_NOTE: 1,
++                    EventType.CIRCLE: 2,
++                }.get(groups[group_id].event_type, 3),
++                group_id,
++            ),
++        )
++        for group_id in ordered_group_ids:
++            group = groups[group_id]
++            if group_id in duplicate_group_ids or group.event_type not in note_types:
++                continue
++            lane = self._mania_lane(group.x, key_count)
++            if group.event_type == EventType.CIRCLE:
++                objects.append(ManiaObject(
++                    object_id=-1,
++                    lane=lane,
++                    kind="TAP",
++                    start_time_ms=int(round(group.time)),
++                    end_time_ms=None,
++                    start_group_id=group_id,
++                    end_group_id=None,
++                    x=int(round(group.x)),
++                    start_origins=group_origins[group_id],
++                ))
++            elif group.event_type == EventType.HOLD_NOTE:
++                if lane in active_by_lane:
++                    previous_id = active_by_lane[lane]
++                    raise ValueError(
++                        f"overlapping HOLD_START in lane {lane}: "
++                        f"previous={describe_group(previous_id)}, "
++                        f"current={describe_group(group_id)}"
++                    )
++                active_by_lane[lane] = group_id
++            else:
++                start_id = active_by_lane.pop(lane, None)
++                if start_id is None:
++                    raise ValueError(
++                        f"HOLD_END without HOLD_START in lane {lane}: "
++                        f"end={describe_group(group_id)}"
++                    )
++                start = groups[start_id]
++                start_time = int(round(start.time))
++                end_time = int(round(group.time))
++                if end_time <= start_time:
++                    raise ValueError(
++                        f"non-positive HOLD duration in lane {lane}: "
++                        f"{start_time}..{end_time}"
++                    )
++                objects.append(ManiaObject(
++                    object_id=-1,
++                    lane=lane,
++                    kind="HOLD",
++                    start_time_ms=start_time,
++                    end_time_ms=end_time,
++                    start_group_id=start_id,
++                    end_group_id=group_id,
++                    x=int(round(start.x)),
++                    start_origins=group_origins[start_id],
++                    end_origins=group_origins[group_id],
++                ))
++
++        if active_by_lane:
++            lane, start_id = min(active_by_lane.items())
++            raise ValueError(
++                f"HOLD_START without HOLD_END in lane {lane}: "
++                f"start={describe_group(start_id)}"
++            )
++
++        objects.sort(key=lambda obj: (
++            obj.start_time_ms,
++            obj.lane,
++            0 if obj.kind == "HOLD" else 1,
++            obj.start_group_id,
++        ))
++        objects = [
++            dataclasses.replace(obj, object_id=object_id)
++            for object_id, obj in enumerate(objects)
++        ]
++        return objects, duplicate_group_ids, duplicates
++
+     def write_resnap_diagnostics(
+             self,
+             output_path: str | Path,
+@@ -542,9 +787,10 @@ class Postprocessor(object):
+         sidecar_path.write_text(
+             json.dumps(
+                 {
+-                    "version": "mania-resnap-v3-hold-pairs",
++                    "version": "mania-origin-v1-canonical-hold-ir",
+                     "seed": seed,
+                     "collisions": collisions,
++                    **self.last_mania_objects_report,
+                 },
+                 ensure_ascii=False,
+                 indent=2,
+@@ -644,6 +890,7 @@ class Postprocessor(object):
+             event_times: list[int],
+             timing: list[TimingPoint],
+             key_count: int = None,
++            event_origins: list[EventOrigin] | None = None,
+     ):
+         """Resnap events and their explicit times to the same beat ticks."""
+         if len(events) != len(event_times):
+@@ -656,6 +903,17 @@ class Postprocessor(object):
+             event_times=original_event_times,
+             types_first=self.types_first,
+         )
++        mania_objects: list[ManiaObject] = []
++        duplicate_group_ids: set[int] = set()
++        if key_count is not None:
++            mania_objects, duplicate_group_ids, _duplicates = (
++                self._build_mania_objects(
++                    before_groups,
++                    group_indices,
++                    event_origins,
++                    key_count,
++                )
++            )
+         proposals = []
+         for group_id, (group, indices) in enumerate(zip(before_groups, group_indices)):
+             time_shift_index = next(
+@@ -737,13 +995,12 @@ class Postprocessor(object):
+                 after_groups,
+                 group_indices,
+         )):
++            if group_id in duplicate_group_ids:
++                continue
+             note_kind = note_kinds.get(before.event_type)
+             if note_kind is None or before.x is None:
+                 continue
+-            lane = min(
+-                key_count - 1,
+-                max(0, int(before.x * key_count / 512)),
+-            )
++            lane = self._mania_lane(before.x, key_count)
+             group_lanes[group_id] = lane
+             snap_divisor = next(
+                 (
+@@ -777,26 +1034,11 @@ class Postprocessor(object):
+             if len(pre_times) >= 2
+         }
+ 
+-        hold_pairs = []
+-        invalid_hold_groups = []
+-        active_hold_by_lane = {}
+-        for group_id, before in enumerate(before_groups):
+-            lane = group_lanes.get(group_id)
+-            if before.event_type == EventType.HOLD_NOTE and lane is not None:
+-                previous_start_id = active_hold_by_lane.get(lane)
+-                if previous_start_id is not None:
+-                    invalid_hold_groups.append((previous_start_id, None, lane))
+-                active_hold_by_lane[lane] = group_id
+-            elif before.event_type == EventType.HOLD_NOTE_END and lane is not None:
+-                start_id = active_hold_by_lane.pop(lane, None)
+-                if start_id is None:
+-                    invalid_hold_groups.append((None, group_id, lane))
+-                else:
+-                    hold_pairs.append((start_id, group_id, lane))
+-        invalid_hold_groups.extend(
+-            (start_id, None, lane)
+-            for lane, start_id in active_hold_by_lane.items()
+-        )
++        hold_pairs = [
++            (obj.start_group_id, obj.end_group_id, obj.lane)
++            for obj in mania_objects
++            if obj.kind == "HOLD" and obj.end_group_id is not None
++        ]
+ 
+         collision_group_ids = {
+             group_id
+@@ -824,10 +1066,8 @@ class Postprocessor(object):
+             raw_end = proposals[end_id]["originalTimeMs"]
+             proposed_start = proposals[start_id]["proposedTimeMs"]
+             proposed_end = proposals[end_id]["proposedTimeMs"]
+-            invalid_raw = raw_end <= raw_start
+             must_restore = (
+-                invalid_raw
+-                or proposed_end <= proposed_start
++                proposed_end <= proposed_start
+                 or start_id in collision_group_ids
+                 or end_id in collision_group_ids
+                 or start_id in snap_conflict_group_ids
+@@ -845,31 +1085,7 @@ class Postprocessor(object):
+                 "rawEndMs": raw_end,
+                 "proposedStartMs": proposed_start,
+                 "proposedEndMs": proposed_end,
+-                "reason": (
+-                    "HOLD_PAIR_INVALID_RAW"
+-                    if invalid_raw
+-                    else "HOLD_PAIR_RAW_RESTORED"
+-                ),
+-            })
+-
+-        for start_id, end_id, lane in invalid_hold_groups:
+-            group_id = start_id if start_id is not None else end_id
+-            raw_time = proposals[group_id]["originalTimeMs"]
+-            restore_group(group_id)
+-            pair_diagnostics.append({
+-                "lane": lane,
+-                "noteKind": "HOLD_PAIR",
+-                "rawStartMs": raw_time if start_id is not None else None,
+-                "rawEndMs": raw_time if end_id is not None else None,
+-                "proposedStartMs": (
+-                    proposals[start_id]["proposedTimeMs"]
+-                    if start_id is not None else None
+-                ),
+-                "proposedEndMs": (
+-                    proposals[end_id]["proposedTimeMs"]
+-                    if end_id is not None else None
+-                ),
+-                "reason": "HOLD_PAIR_INVALID_RAW",
++                "reason": "HOLD_PAIR_RAW_RESTORED",
+             })
+ 
+         collisions = []
+@@ -887,6 +1103,12 @@ class Postprocessor(object):
+         collisions.extend(pair_diagnostics)
+         return resnapped_events, snapped_event_times, collisions
+ 
++    @staticmethod
++    def _mania_lane(x: float, key_count: int) -> int:
++        if key_count <= 0:
++            raise ValueError("key_count must be positive")
++        return min(key_count - 1, max(0, int(x * key_count / 512)))
++
+     def resnap(self, time: float, timing: list[TimingPoint], snap_divisor: int) -> float:
+         """Resnap a time to the nearest beat divisor."""
+         ignore_ticks = {
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 8c81295..d2f8175 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -14,6 +14,7 @@ from tqdm import tqdm
+ from config import InferenceConfig
+ from .compiled_decode import model_generate_compiled
+ from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
++from .origin import EventOrigin
+ from ..dataset.osu_parser import OsuParser
+ from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
+                                   get_scroll_speed_ratio, get_hitsounded_status, calculate_difficulty)
+@@ -210,7 +211,8 @@ class Processor(object):
+             beatmap_path: Optional[str] = None,
+             extra_in_context: Optional[dict[ContextType, tuple[list[Event], list[int]] | tuple[list[Event], list[int], torch.Tensor] | list[TimingPoint]]] = None,
+             verbose: bool = True,
+-    ) -> list[tuple[list[Event], list[int]]]:
++            include_origins: bool = False,
++    ):
+         """Generate a list of Event object lists and their timestamps given source sequences.
+ 
+         Args:
+@@ -221,6 +223,7 @@ class Processor(object):
+             beatmap_path: Path to the beatmap file for context generation.
+             extra_in_context: Extra context information to use instead of beatmap_path.
+             verbose: Whether to show progress bar.
++            include_origins: Return an origin record parallel to every event.
+ 
+         Returns:
+             events: List of Event object lists.
+@@ -278,13 +281,27 @@ class Processor(object):
+             # Trim events to start and end time
+             # Add extra leniency because generated events may not be exactly on time
+             if self.start_time is not None:
+-                self._trim_events_before_time(context["events"], context["event_times"], self.start_time - 10)
++                self._trim_events_before_time(
++                    context["events"], context["event_times"],
++                    self.start_time - 10, context["event_origins"],
++                )
+             if self.end_time is not None:
+-                self._trim_events_after_time(context["events"], context["event_times"], self.end_time + 10)
++                self._trim_events_after_time(
++                    context["events"], context["event_times"],
++                    self.end_time + 10, context["event_origins"],
++                )
+ 
+             # Rescale and unpack position events
+             if context["context_type"] == ContextType.MAP and self.add_positions:
+-                context["events"], context["event_times"] = self._rescale_positions(context["events"], context["event_times"])
++                (
++                    context["events"],
++                    context["event_times"],
++                    context["event_origins"],
++                ) = self._rescale_positions(
++                    context["events"],
++                    context["event_times"],
++                    context["event_origins"],
++                )
+ 
+         # If we are adding to beatmap, add back the events of the reference beatmap
+         if self.add_to_beatmap and (self.start_time is not None or self.end_time is not None):
+@@ -301,23 +318,54 @@ class Processor(object):
+                 )
+                 if self.start_time is not None:
+                     ref_events, ref_event_times = ref_context["events"].copy(), ref_context["event_times"].copy()
+-                    self._trim_events_after_time(ref_events, ref_event_times, self.start_time - 1)
++                    ref_origins = ref_context["event_origins"].copy()
++                    self._trim_events_after_time(
++                        ref_events, ref_event_times, self.start_time - 1,
++                        ref_origins,
++                    )
+                     context["events"] = ref_events + context["events"]
+                     context["event_times"] = ref_event_times + context["event_times"]
++                    context["event_origins"] = ref_origins + context["event_origins"]
+                 if self.end_time is not None:
+                     ref_events, ref_event_times = ref_context["events"].copy(), ref_context["event_times"].copy()
+-                    self._trim_events_before_time(ref_events, ref_event_times, self.end_time + 1)
++                    ref_origins = ref_context["event_origins"].copy()
++                    self._trim_events_before_time(
++                        ref_events, ref_event_times, self.end_time + 1,
++                        ref_origins,
++                    )
+                     context["events"] += ref_events
+                     context["event_times"] += ref_event_times
++                    context["event_origins"] += ref_origins
+ 
+         # Turn mania key column into X position
+         for context in out_context_data:
+             if context["context_type"] != ContextType.MAP or generation_config.gamemode != 3:
+                 continue
+ 
+-            context["events"], context["event_times"] = self._convert_column_to_position(context["events"], context["event_times"], generation_config.keycount)
++            (
++                context["events"],
++                context["event_times"],
++                context["event_origins"],
++            ) = self._convert_column_to_position(
++                context["events"],
++                context["event_times"],
++                generation_config.keycount,
++                context["event_origins"],
++            )
+ 
+-        return [(context["events"], context["event_times"]) for context in out_context_data if context["context_type"] in out_context]
++        selected = [
++            context for context in out_context_data
++            if context["context_type"] in out_context
++        ]
++        if include_origins:
++            return [
++                (context["events"], context["event_times"], context["event_origins"])
++                for context in selected
++            ]
++        return [
++            (context["events"], context["event_times"])
++            for context in selected
++        ]
+ 
+     def generate_sequential(
+             self,
+@@ -414,7 +462,14 @@ class Processor(object):
+ 
+                 # Only support batch size 1
+                 predicted_tokens = result[0, max_len:].cpu()
+-                self.add_predicted_tokens_to_context(context, predicted_tokens, frame_time, trim_lookback, trim_lookahead)
++                self.add_predicted_tokens_to_context(
++                    context,
++                    predicted_tokens,
++                    frame_time,
++                    trim_lookback,
++                    trim_lookahead,
++                    source_window_id=sequence_index,
++                )
+ 
+     def generate_parallel(
+             self,
+@@ -461,10 +516,20 @@ class Processor(object):
+                             self.tokenizer.context_eos[context["context_type"]],
+                             strict=True,
+                         )
+-                        self.add_predicted_tokens_to_context(context, sequence[start:end], frame_time)
++                        self.add_predicted_tokens_to_context(
++                            context,
++                            sequence[start:end],
++                            frame_time,
++                            source_window_id=sequence_index,
++                        )
+                 else:
+                     start, end = self._get_token_context(sequence, self.tokenizer.sos_id, self.tokenizer.eos_id)
+-                    self.add_predicted_tokens_to_context(out_context[0], sequence[start:end], frame_time)
++                    self.add_predicted_tokens_to_context(
++                        out_context[0],
++                        sequence[start:end],
++                        frame_time,
++                        source_window_id=sequence_index,
++                    )
+                 sequence_index += 1
+ 
+     def ai_mod(
+@@ -854,6 +919,7 @@ class Processor(object):
+         data = {
+             "events": [],
+             "event_times": [],
++            "event_origins": [],
+             "context_type": context,
+             "add_type": add_type,
+             "add_class": add_class,
+@@ -906,8 +972,18 @@ class Processor(object):
+             else:
+                 raise ValueError(f"Invalid context type {context}")
+ 
++            data["event_origins"] = [
++                EventOrigin.reference(index)
++                for index in range(len(data["events"]))
++            ]
++
+             if not finished and partial:
+-                self._trim_events_after_time(data["events"], data["event_times"], self.start_time - 1)
++                self._trim_events_after_time(
++                    data["events"],
++                    data["event_times"],
++                    self.start_time - 1,
++                    data["event_origins"],
++                )
+         return data
+ 
+     def get_in_context(
+@@ -1070,7 +1146,8 @@ class Processor(object):
+             predicted_tokens,
+             frame_time,
+             trim_lookback: bool = False,
+-            trim_lookahead: bool = False
++            trim_lookahead: bool = False,
++            source_window_id: int | None = None,
+     ):
+         # Trim prompt and eos tokens
+         while len(predicted_tokens) > 0 and (
+@@ -1087,14 +1164,27 @@ class Processor(object):
+             else:
+                 predicted_tokens = predicted_tokens[:-1]
+ 
+-        result = self._decode(predicted_tokens, frame_time)
++        result, token_indices = self._decode_indexed(predicted_tokens, frame_time)
+         context["events"] += result
++        origins = context.setdefault("event_origins", [])
++        window_id = -1 if source_window_id is None else source_window_id
++        origins.extend(
++            EventOrigin.generated(window_id, token_index)
++            for token_index in token_indices
++        )
+         update_event_times(context["events"], context["event_times"], frame_time + self.eos_time, self.types_first)
++        if len(context["events"]) != len(origins):
++            raise ValueError("events and event_origins must have equal length")
+ 
+         # Trim events which are in the lookahead window
+         if trim_lookahead:
+             lookahead_time = frame_time + self.lookahead_max_time
+-            self._trim_events_after_time(context["events"], context["event_times"], lookahead_time)
++            self._trim_events_after_time(
++                context["events"],
++                context["event_times"],
++                lookahead_time,
++                origins,
++            )
+ 
+     def get_required_extra_special_tokens(self, all_out_context: list[ContextType]) -> list[str]:
+         result = []
+@@ -1243,17 +1333,25 @@ class Processor(object):
+                 break
+         return s, e
+ 
+-    def _trim_events_before_time(self, events, event_times, time):
++    def _trim_events_before_time(self, events, event_times, time, event_origins=None):
++        if event_origins is not None and len(events) != len(event_origins):
++            raise ValueError("events and event_origins must have equal length")
+         for i in range(len(event_times) - 1, -1, -1):
+             if event_times[i] < time:
+                 del events[i]
+                 del event_times[i]
++                if event_origins is not None:
++                    del event_origins[i]
+ 
+-    def _trim_events_after_time(self, events, event_times, time):
++    def _trim_events_after_time(self, events, event_times, time, event_origins=None):
++        if event_origins is not None and len(events) != len(event_origins):
++            raise ValueError("events and event_origins must have equal length")
+         for i in range(len(event_times) - 1, -1, -1):
+             if event_times[i] > time:
+                 del events[i]
+                 del event_times[i]
++                if event_origins is not None:
++                    del event_origins[i]
+             else:
+                 break
+ 
+@@ -1312,15 +1410,51 @@ class Processor(object):
+ 
+         return events
+ 
+-    def _rescale_positions(self, events: list[Event], event_times: list[int]) -> tuple[list[Event], list[int]]:
++    def _decode_indexed(
++            self,
++            tokens: torch.Tensor,
++            frame_time: float,
++    ) -> tuple[list[Event], list[int]]:
++        """Decode events and retain indices in the accepted model slice."""
++        events: list[Event] = []
++        token_indices: list[int] = []
++        for token_index, token in enumerate(tokens):
++            if token == self.tokenizer.eos_id:
++                break
++            try:
++                event = self.tokenizer.decode(token.item())
++            except Exception:
++                continue
++            if event.type == EventType.TIME_SHIFT:
++                half_step = MILISECONDS_PER_STEP // 2 if event.value >= 0 else 0
++                event.value = (
++                    frame_time
++                    + event.value * MILISECONDS_PER_STEP
++                    + half_step
++                )
++            events.append(event)
++            token_indices.append(token_index)
++        return events, token_indices
++
++    def _rescale_positions(
++            self,
++            events: list[Event],
++            event_times: list[int],
++            event_origins: list[EventOrigin] | None = None,
++    ):
++        if event_origins is not None and len(events) != len(event_origins):
++            raise ValueError("events and event_origins must have equal length")
+         new_events = []
+         new_event_times = []
++        new_event_origins = []
+         default_offset = self.position_precision // 2 if self.position_precision > 1 else 0
+         default_offset = np.array([default_offset, default_offset], dtype=np.int32)
+         for i, event in enumerate(events):
+             if event.type == EventType.POS_X or event.type == EventType.POS_Y:
+                 new_events.append(Event(type=event.type, value=event.value * self.position_precision))
+                 new_event_times.append(event_times[i])
++                if event_origins is not None:
++                    new_event_origins.append(event_origins[i])
+             elif event.type == EventType.POS:
+                 if i + 1 < len(events) and events[i + 1].type == EventType.POS_REFINE and self.position_refinement:
+                     refinement_range = self.position_precision // self.position_refinement
+@@ -1336,11 +1470,17 @@ class Processor(object):
+                 new_events.append(Event(type=EventType.POS_Y, value=p[1]))
+                 new_event_times.append(event_times[i])
+                 new_event_times.append(event_times[i])
++                if event_origins is not None:
++                    new_event_origins.extend((event_origins[i], event_origins[i]))
+             else:
+                 new_events.append(event)
+                 new_event_times.append(event_times[i])
++                if event_origins is not None:
++                    new_event_origins.append(event_origins[i])
+ 
+-        return new_events, new_event_times
++        if event_origins is None:
++            return new_events, new_event_times
++        return new_events, new_event_times, new_event_origins
+ 
+     def _kiai_before_time(self, events, event_times, time) -> Event:
+         for i in range(len(events) - 1, -1, -1):
+@@ -1361,9 +1501,14 @@ class Processor(object):
+             return Event(EventType.SCROLL_SPEED, 100)
+         raise ValueError(f"Invalid special event name {name}.")
+ 
+-    def _convert_column_to_position(self, events, event_times, key_count) -> tuple[list[Event], list[int]]:
++    def _convert_column_to_position(
++            self, events, event_times, key_count, event_origins=None
++    ):
++        if event_origins is not None and len(events) != len(event_origins):
++            raise ValueError("events and event_origins must have equal length")
+         new_events = []
+         new_event_times = []
++        new_event_origins = []
+         for i, event in enumerate(events):
+             if event.type == EventType.MANIA_COLUMN:
+                 x = int((event.value + 0.5) * 512 / key_count)
+@@ -1371,10 +1516,16 @@ class Processor(object):
+                 new_events.append(Event(EventType.POS_Y, 192))
+                 new_event_times.append(event_times[i])
+                 new_event_times.append(event_times[i])
++                if event_origins is not None:
++                    new_event_origins.extend((event_origins[i], event_origins[i]))
+             else:
+                 new_events.append(event)
+                 new_event_times.append(event_times[i])
+-        return new_events, new_event_times
++                if event_origins is not None:
++                    new_event_origins.append(event_origins[i])
++        if event_origins is None:
++            return new_events, new_event_times
++        return new_events, new_event_times, new_event_origins
+ 
+     def _reset_generation_stats(self) -> None:
+         self.last_generation_stats = {
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index 32630cc..09c5a14 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -12,7 +12,8 @@ from transformers.modeling_outputs import BaseModelOutput
+ from ..event import EventType, ContextType
+ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
+     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
+-    MonotonicTimeShiftLogitsProcessor, ManiaKeycountLogitsProcessor
++    MonotonicTimeShiftLogitsProcessor, ManiaKeycountLogitsProcessor, \
++    ManiaColumnBeforeTypeLogitsProcessor
+ from .cache_utils import get_cache
+ from ..model import Mapperatorinator
+ from ..tokenizer import Tokenizer
+@@ -94,6 +95,8 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+ 
+     logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
+     logits_processor_list.append(ManiaKeycountLogitsProcessor(tokenizer))
++    if not types_first:
++        logits_processor_list.append(ManiaColumnBeforeTypeLogitsProcessor(tokenizer))
+ 
+     if timeshift_bias != 0:
+         logits_processor_list.append(
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+new file mode 100644
+index 0000000..d235ed0
+--- /dev/null
++++ b/tests/test_mania_event_origins.py
+@@ -0,0 +1,211 @@
++from types import SimpleNamespace
++
++import torch
++
++from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.origin import EventOrigin, merge_origin_streams
++from osuT5.osuT5.inference.processor import GenerationConfig, Processor
++from osuT5.osuT5.tokenizer import ContextType
++
++
++def make_processor() -> Processor:
++    processor = Processor.__new__(Processor)
++    processor.tokenizer = SimpleNamespace(eos_id=999, context_eos={})
++    processor.types_first = False
++    processor.eos_time = 1_000
++    processor.lookahead_time_range = set()
++    processor.lookback_time_range = set()
++    processor.lookahead_max_time = 1_000
++    processor.parser = SimpleNamespace()
++    processor._decode_indexed = lambda _tokens, _frame_time: (
++        [Event(EventType.TIME_SHIFT, 100), Event(EventType.CIRCLE, 0)],
++        [0, 1],
++    )
++    return processor
++
++
++def test_generated_event_origins_survive_decode_and_time_update():
++    processor = make_processor()
++    context = {
++        "context_type": "MAP",
++        "events": [],
++        "event_times": [],
++        "event_origins": [],
++    }
++
++    processor.add_predicted_tokens_to_context(
++        context,
++        torch.tensor([10, 11]),
++        0,
++        source_window_id=7,
++    )
++
++    assert len(context["events"]) == len(context["event_times"]) == 2
++    assert context["event_origins"] == [
++        EventOrigin.generated(7, 0),
++        EventOrigin.generated(7, 1),
++    ]
++
++
++def test_trim_deletes_event_time_and_origin_atomically():
++    processor = make_processor()
++    events = [Event(EventType.CIRCLE, 0), Event(EventType.CIRCLE, 0)]
++    times = [100, 200]
++    origins = [EventOrigin.generated(1, 0), EventOrigin.generated(2, 0)]
++
++    processor._trim_events_before_time(events, times, 150, origins)
++
++    assert len(events) == len(times) == len(origins) == 1
++    assert times == [200]
++    assert origins == [EventOrigin.generated(2, 0)]
++
++
++def test_column_conversion_duplicates_the_parent_origin():
++    processor = make_processor()
++    events = [Event(EventType.MANIA_COLUMN, 0), Event(EventType.CIRCLE, 0)]
++    times = [100, 100]
++    origin = EventOrigin.generated(3, 4)
++
++    converted_events, converted_times, converted_origins = (
++        processor._convert_column_to_position(events, times, 4, [origin, origin])
++    )
++
++    assert [event.type for event in converted_events] == [
++        EventType.POS_X,
++        EventType.POS_Y,
++        EventType.CIRCLE,
++    ]
++    assert converted_times == [100, 100, 100]
++    assert converted_origins == [origin, origin, origin]
++
++
++def test_rescale_positions_moves_origin_with_each_derived_axis():
++    processor = make_processor()
++    processor.position_precision = 2
++    processor.position_refinement = 1
++    processor.x_min = 0
++    processor.y_min = 0
++    processor.x_count = 4
++    origin = EventOrigin.generated(5, 6)
++
++    events, times, origins = processor._rescale_positions(
++        [Event(EventType.POS, 5), Event(EventType.CIRCLE, 0)],
++        [100, 100],
++        [origin, origin],
++    )
++
++    assert [event.type for event in events] == [
++        EventType.POS_X,
++        EventType.POS_Y,
++        EventType.CIRCLE,
++    ]
++    assert times == [100, 100, 100]
++    assert origins == [origin, origin, origin]
++
++
++def test_finished_context_assigns_reference_origins():
++    processor = make_processor()
++    supplied_events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.CIRCLE, 0),
++    ]
++    supplied_times = [100, 100]
++
++    context = processor.get_context(
++        ContextType.MAP,
++        extra_in_context={ContextType.MAP: (supplied_events, supplied_times)},
++        finished=True,
++    )
++
++    assert context["event_origins"] == [
++        EventOrigin.reference(0),
++        EventOrigin.reference(1),
++    ]
++
++
++def test_trimmed_reference_context_keeps_origin_alignment():
++    processor = make_processor()
++    processor.start_time = 150
++    supplied_events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.CIRCLE, 0),
++        Event(EventType.TIME_SHIFT, 200),
++        Event(EventType.CIRCLE, 0),
++    ]
++    supplied_times = [100, 100, 200, 200]
++
++    context = processor.get_context(
++        ContextType.MAP,
++        extra_in_context={ContextType.MAP: (supplied_events, supplied_times)},
++        finished=False,
++        partial=True,
++    )
++
++    assert context["event_times"] == [100, 100]
++    assert context["event_origins"] == [
++        EventOrigin.reference(0),
++        EventOrigin.reference(1),
++    ]
++
++
++def test_merge_origin_streams_preserves_stable_time_order_and_origin():
++    left = (
++        [Event(EventType.CIRCLE, 0)],
++        [100],
++        [EventOrigin.generated(0, 1)],
++    )
++    right = (
++        [Event(EventType.CIRCLE, 0)],
++        [100],
++        [EventOrigin.generated(1, 1)],
++    )
++
++    events, times, origins = merge_origin_streams(left, right)
++
++    assert len(events) == 2
++    assert times == [100, 100]
++    assert origins == [EventOrigin.generated(0, 1), EventOrigin.generated(1, 1)]
++
++
++def test_generate_exposes_origins_only_when_requested():
++    processor = make_processor()
++    processor._get_viable_template = lambda **_kwargs: (
++        [], [ContextType.MAP], []
++    )
++    processor._get_model_cond_kwargs = lambda _config: {}
++    processor.get_in_context = lambda **_kwargs: []
++    context = {
++        "events": [],
++        "event_times": [],
++        "event_origins": [],
++        "context_type": ContextType.MAP,
++        "finished": False,
++    }
++    processor.get_out_context = lambda **_kwargs: [context]
++    processor.generate_sequential = lambda **_kwargs: context.update({
++        "events": [Event(EventType.TIME_SHIFT, 100), Event(EventType.CIRCLE, 0)],
++        "event_origins": [
++            EventOrigin.generated(0, 0),
++            EventOrigin.generated(0, 1),
++        ],
++    })
++    processor.parallel = False
++    processor.model = object()
++    processor.start_time = None
++    processor.end_time = None
++    processor.add_positions = False
++    processor.add_to_beatmap = False
++    processor.last_generation_stats = None
++
++    with_origins = processor.generate(
++        sequences=(torch.empty(0), torch.empty(0), 1_000),
++        generation_config=GenerationConfig(gamemode=0),
++        out_context=[ContextType.MAP],
++        include_origins=True,
++        verbose=False,
++    )
++
++    assert with_origins[0][2] == [
++        EventOrigin.generated(0, 0),
++        EventOrigin.generated(0, 1),
++    ]
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index ba07267..c514df2 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -2,6 +2,7 @@ import json
+ from datetime import timedelta
+ from types import SimpleNamespace
+ 
++import pytest
+ from slider import TimingPoint
+ 
+ from osuT5.osuT5.event import Event, EventType
+@@ -245,7 +246,7 @@ def test_resnap_restores_hold_pair_atomically_when_start_collides_with_tap():
+     } == {"HOLD_PAIR_RAW_RESTORED", "RAW_TIME_COLLISION_PRESERVED"}
+ 
+ 
+-def test_resnap_reports_invalid_raw_hold_without_inventing_an_end():
++def test_resnap_rejects_invalid_raw_hold_before_mutation():
+     events = [
+         Event(EventType.TIME_SHIFT, 510), Event(EventType.SNAPPING, 4),
+         Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
+@@ -254,24 +255,10 @@ def test_resnap_reports_invalid_raw_hold_without_inventing_an_end():
+         Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
+     ]
+ 
+-    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
+-        events, [510] * 5 + [110] * 5, make_timing(), key_count=4,
+-    )
+-
+-    assert [
+-        event.value for event in snapped_events
+-        if event.type == EventType.TIME_SHIFT
+-    ] == [510, 110]
+-    assert snapped_times == [510] * 5 + [110] * 5
+-    assert diagnostics == [{
+-        "lane": 0,
+-        "noteKind": "HOLD_PAIR",
+-        "rawStartMs": 510,
+-        "rawEndMs": 110,
+-        "proposedStartMs": 625,
+-        "proposedEndMs": 125,
+-        "reason": "HOLD_PAIR_INVALID_RAW",
+-    }]
++    with pytest.raises(ValueError, match="HOLD_END without HOLD_START"):
++        make_postprocessor().resnap_events(
++            events, [510] * 5 + [110] * 5, make_timing(), key_count=4,
++        )
+ 
+ 
+ def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
+@@ -285,7 +272,9 @@ def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
+     )
+     assert sidecar_path == osu_path.with_suffix(".resnap.json")
+     assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {
+-        "version": "mania-resnap-v3-hold-pairs",
++        "version": "mania-origin-v1-canonical-hold-ir",
+         "seed": 31,
+         "collisions": collisions,
++        "maniaObjects": [],
++        "duplicates": [],
+     }
+diff --git a/tests/test_mania_keycount_logits_processor.py b/tests/test_mania_keycount_logits_processor.py
+index c8c7d16..96f1fb6 100644
+--- a/tests/test_mania_keycount_logits_processor.py
++++ b/tests/test_mania_keycount_logits_processor.py
+@@ -4,7 +4,10 @@ import pytest
+ import torch
+ 
+ from osuT5.osuT5.event import EventType
+-from osuT5.osuT5.inference.logit_processors import ManiaKeycountLogitsProcessor
++from osuT5.osuT5.inference.logit_processors import (
++    ManiaColumnBeforeTypeLogitsProcessor,
++    ManiaKeycountLogitsProcessor,
++)
+ 
+ 
+ class FakeTokenizer:
+@@ -21,6 +24,24 @@ class FakeTokenizer:
+     }
+ 
+ 
++class FakeGrammarTokenizer:
++    sos_id = 1
++    context_sos = {}
++    event_start = {
++        EventType.MANIA_COLUMN: 10,
++        EventType.TIME_SHIFT: 30,
++        EventType.CIRCLE: 50,
++        EventType.HOLD_NOTE: 51,
++        EventType.HOLD_NOTE_END: 52,
++        EventType.MANIA_KEYCOUNT: 100,
++    }
++    event_end = {
++        EventType.MANIA_COLUMN: 28,
++        EventType.TIME_SHIFT: 40,
++        EventType.MANIA_KEYCOUNT: 118,
++    }
++
++
+ def keycount_token(keycount: int) -> int:
+     return FakeTokenizer.event_start[EventType.MANIA_KEYCOUNT] + keycount - 1
+ 
+@@ -70,3 +91,41 @@ def test_uses_each_batch_rows_own_keycount():
+     assert torch.isneginf(result[0, column_start + 4:column_end]).all()
+     assert not torch.isneginf(result[1, column_start + 4:column_start + 7]).any()
+     assert torch.isneginf(result[1, column_start + 7:column_end]).all()
++
++
++def test_masks_mania_note_types_until_current_group_has_a_column():
++    processor = ManiaColumnBeforeTypeLogitsProcessor(FakeGrammarTokenizer())
++    input_ids = torch.tensor([[1, keycount_token(4), 30]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    result = processor(input_ids, scores)
++
++    assert torch.isneginf(result[0, 50:53]).all()
++    assert not torch.isneginf(result[0, 10:28]).any()
++    assert torch.equal(scores, torch.zeros((1, 128), dtype=torch.float32))
++
++
++def test_allows_mania_note_types_after_column_in_current_group():
++    processor = ManiaColumnBeforeTypeLogitsProcessor(FakeGrammarTokenizer())
++    input_ids = torch.tensor([[1, keycount_token(4), 30, 12]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    assert torch.equal(processor(input_ids, scores), scores)
++
++
++def test_stale_column_before_new_time_does_not_authorize_note_type():
++    processor = ManiaColumnBeforeTypeLogitsProcessor(FakeGrammarTokenizer())
++    input_ids = torch.tensor([[1, keycount_token(4), 30, 12, 50, 31]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    result = processor(input_ids, scores)
++
++    assert torch.isneginf(result[0, 50:53]).all()
++
++
++def test_row_without_mania_keycount_is_not_constrained():
++    processor = ManiaColumnBeforeTypeLogitsProcessor(FakeGrammarTokenizer())
++    input_ids = torch.tensor([[1, 30]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    assert torch.equal(processor(input_ids, scores), scores)
+diff --git a/tests/test_mania_output_safety.py b/tests/test_mania_output_safety.py
+index 65f0528..569a158 100644
+--- a/tests/test_mania_output_safety.py
++++ b/tests/test_mania_output_safety.py
+@@ -5,6 +5,7 @@ import pytest
+ from slider import TimingPoint
+ 
+ from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.origin import EventOrigin
+ from osuT5.osuT5.inference.postprocessor import BeatmapConfig, Postprocessor
+ from osuT5.osuT5.inference.processor import Processor
+ 
+@@ -59,6 +60,220 @@ def test_overlapping_mania_holds_are_paired_by_lane():
+     ]
+ 
+ 
++def test_hold_start_and_end_pair_by_gameplay_lane_not_raw_x():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.POS_X, 100),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500),
++        Event(EventType.POS_X, 101),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    result = make_postprocessor().generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++    )
++
++    hold_rows = [row for row in result.splitlines() if ",128," in row]
++    assert hold_rows == ["100,192,100,128,0,500:0:0:-1:0:"]
++
++
++def _origins_for_groups(events, window_ids):
++    origins = []
++    group_index = -1
++    token_index = 0
++    for event in events:
++        if event.type == EventType.TIME_SHIFT:
++            group_index += 1
++            token_index = 0
++        origins.append(EventOrigin.generated(window_ids[group_index], token_index))
++        token_index += 1
++    return origins
++
++
++def test_exact_cross_window_duplicate_hold_is_idempotent():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++    origins = _origins_for_groups(events, [0, 1, 0, 1])
++    postprocessor = make_postprocessor()
++
++    result = postprocessor.generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++        event_origins=origins,
++    )
++
++    hold_rows = [row for row in result.splitlines() if ",128," in row]
++    assert hold_rows == ["64,192,100,128,0,500:0:0:-1:0:"]
++    assert postprocessor.last_mania_objects_report["duplicates"] == [
++        {"keptGroupId": 0, "droppedGroupId": 1, "reason": "EXACT_CROSS_WINDOW_DUPLICATE"},
++        {"keptGroupId": 2, "droppedGroupId": 3, "reason": "EXACT_CROSS_WINDOW_DUPLICATE"},
++    ]
++
++
++def test_same_window_duplicate_hold_start_is_rejected():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++    origins = _origins_for_groups(events, [0, 0, 0])
++
++    with pytest.raises(ValueError, match="not cross-window idempotent"):
++        make_postprocessor().generate(
++            events,
++            BeatmapConfig(mode=3, circle_size=4),
++            event_origins=origins,
++        )
++
++
++def test_orphan_hold_end_is_rejected():
++    events = [
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    origins = _origins_for_groups(events, [7])
++    with pytest.raises(ValueError) as error:
++        make_postprocessor().generate(
++            events,
++            BeatmapConfig(mode=3, circle_size=4),
++            event_origins=origins,
++        )
++
++    message = str(error.value)
++    assert "HOLD_END without HOLD_START" in message
++    assert "timeMs': 500" in message
++    assert "sourceWindowId': 7" in message
++
++
++def test_overlapping_hold_start_reports_both_times_and_origins():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 200), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++    origins = _origins_for_groups(events, [3, 9, 9])
++
++    with pytest.raises(ValueError) as error:
++        make_postprocessor().generate(
++            events,
++            BeatmapConfig(mode=3, circle_size=4),
++            event_origins=origins,
++        )
++
++    message = str(error.value)
++    assert "overlapping HOLD_START" in message
++    assert "timeMs': 100" in message
++    assert "timeMs': 200" in message
++    assert "sourceWindowId': 3" in message
++    assert "sourceWindowId': 9" in message
++
++
++def test_missing_mania_column_reports_group_and_origin():
++    events = [
++        Event(EventType.TIME_SHIFT, 67_957),
++        Event(EventType.HOLD_NOTE, 0),
++    ]
++    origins = [
++        EventOrigin.generated(41, 0),
++        EventOrigin.generated(41, 1),
++    ]
++
++    with pytest.raises(ValueError) as error:
++        make_postprocessor().generate(
++            events,
++            BeatmapConfig(mode=3, circle_size=4),
++            event_origins=origins,
++        )
++
++    message = str(error.value)
++    assert "type=HOLD_NOTE" in message
++    assert "time=67957" in message
++    assert "sourceWindowId': 41" in message
++    assert "sourceTokenIndex': 0" in message
++
++
++def test_same_window_duplicate_tap_is_rejected():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++    ]
++
++    with pytest.raises(ValueError, match="not cross-window idempotent"):
++        make_postprocessor().generate(
++            events,
++            BeatmapConfig(mode=3, circle_size=4),
++            event_origins=_origins_for_groups(events, [0, 0]),
++        )
++
++
++def test_adjacent_same_lane_holds_close_before_next_start_at_same_time():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        # Deliberately place the next start before the previous end in the raw
++        # merged stream. Canonical ordering must close before opening.
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++        Event(EventType.TIME_SHIFT, 900), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    result = make_postprocessor().generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++        event_origins=_origins_for_groups(events, [0, 0, 0, 0]),
++    )
++
++    hold_rows = [row for row in result.splitlines() if ",128," in row]
++    assert hold_rows == [
++        "64,192,100,128,0,500:0:0:-1:0:",
++        "64,192,500,128,0,900:0:0:-1:0:",
++    ]
++
++
++def test_resnap_validates_canonical_objects_before_changing_times():
++    events = [
++        Event(EventType.TIME_SHIFT, 67_957),
++        Event(EventType.HOLD_NOTE, 0),
++    ]
++    origins = [EventOrigin.generated(41, 0), EventOrigin.generated(41, 1)]
++    timing = [
++        TimingPoint(timedelta(milliseconds=0), 500, 4, 2, -1, 100, None, False)
++    ]
++
++    with pytest.raises(ValueError, match="sourceWindowId.*41"):
++        make_postprocessor().resnap_events(
++            events,
++            [67_957, 67_957],
++            timing,
++            key_count=4,
++            event_origins=origins,
++        )
++
++
+ def test_resnap_never_returns_a_negative_tick():
+     timing = [
+         TimingPoint(

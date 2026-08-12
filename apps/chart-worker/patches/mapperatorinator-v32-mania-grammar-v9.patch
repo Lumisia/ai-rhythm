@@ -1,0 +1,392 @@
+diff --git a/osuT5/osuT5/inference/mania_grammar.py b/osuT5/osuT5/inference/mania_grammar.py
+--- a/osuT5/osuT5/inference/mania_grammar.py
++++ b/osuT5/osuT5/inference/mania_grammar.py
+@@ -15,6 +15,13 @@ MANIA_NOTE_TYPES = frozenset(
+     }
+ )
+ 
++MANIA_NOTE_ON_TYPES = frozenset(
++    {
++        EventType.CIRCLE,
++        EventType.HOLD_NOTE,
++    }
++)
++
+ 
+ @dataclass(frozen=True)
+ class CanonicalManiaGroup:
+@@ -146,9 +153,15 @@ def replay_mania_hold_state(
+         groups: Iterable[CanonicalManiaGroup],
+         *,
+         keycount: int,
++        initial_open_columns: Iterable[int] = (),
+ ) -> tuple[int, ...]:
+     """Replay canonical groups and return lanes left open at stream end."""
+-    open_columns: set[int] = set()
++    open_columns = {int(lane) for lane in initial_open_columns}
++    if any(not 0 <= lane < keycount for lane in open_columns):
++        raise ValueError(
++            "initial open HOLD lane is outside keycount "
++            f"{keycount}: {sorted(open_columns)}"
++        )
+     order = {
+         EventType.HOLD_NOTE_END: 0,
+         EventType.HOLD_NOTE: 1,
+@@ -156,6 +169,7 @@ def replay_mania_hold_state(
+     }
+     unique_groups = {group.signature: group for group in groups}
+     lane_history: dict[int, list[CanonicalManiaGroup]] = {}
++    note_on_positions: set[tuple[int, int]] = set()
+     for group in sorted(
+             unique_groups.values(),
+             key=lambda item: (item.time_ms, item.lane, order[item.event_type]),
+@@ -166,11 +180,22 @@ def replay_mania_hold_state(
+                 f"at {group.time_ms}"
+             )
+         try:
++            note_on_position = (group.time_ms, group.lane)
++            if (
++                    group.event_type in MANIA_NOTE_ON_TYPES
++                    and note_on_position in note_on_positions
++            ):
++                raise ValueError(
++                    "duplicate note-on at the same time and lane "
++                    f"{group.time_ms}/{group.lane}"
++                )
+             apply_mania_hold_transition(
+                 open_columns,
+                 group.lane,
+                 group.event_type,
+             )
++            if group.event_type in MANIA_NOTE_ON_TYPES:
++                note_on_positions.add(note_on_position)
+         except ValueError as error:
+             history = ",".join(
+                 f"{item.time_ms}:{item.event_type.name}"
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -7,7 +7,7 @@ from transformers import LogitsProcessor
+ from osuT5.osuT5.dataset.data_utils import TIMED_EVENTS, TYPE_EVENTS
+ from osuT5.osuT5.event import EventType, Event
+ from osuT5.osuT5.inference.mania_grammar import (
+-    apply_mania_hold_transition,
++    CanonicalManiaGroup,
+     canonical_mania_groups,
+     replay_mania_hold_state,
+ )
+@@ -160,10 +160,10 @@ def mania_open_hold_columns_before(
+ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+     """Mask only lane transitions that cannot form a playable HOLD stream.
+ 
+-    ``initial_open_columns`` is the canonical state immediately after the
+-    decoder prompt.  Prompt groups are still parsed to preserve their
+-    signatures and pending time/column context, but their state transitions
+-    must not be replayed over that already-folded state.
++    ``initial_open_columns`` is the canonical state immediately before the
++    current decoder frame. Prompt and generated groups are replayed together
++    in canonical time order so a generated lookback event is checked against
++    the state at its own event time, not against the state at prompt end.
+     """
+ 
+     def __init__(
+@@ -286,12 +286,6 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     event_type = self.event_type_by_token[token]
+                     signature = (current_time_token, current_lane, event_type)
+                     if signature not in seen_groups:
+-                        if position >= self.prompt_length:
+-                            apply_mania_hold_transition(
+-                                open_columns,
+-                                current_lane,
+-                                event_type,
+-                            )
+                         seen_groups.add(signature)
+                         if position >= self.prompt_length:
+                             generated_groups.add(signature)
+@@ -301,6 +295,26 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                         )
+                     current_lane = None
+ 
++            def replay_signatures(
++                    signatures: set[tuple[int | None, int, EventType]],
++            ) -> tuple[int, ...]:
++                groups = (
++                    CanonicalManiaGroup(
++                        time_ms=(-1 if time_token is None else time_token),
++                        lane=lane,
++                        event_type=event_type,
++                        event_indices=(),
++                    )
++                    for time_token, lane, event_type in signatures
++                )
++                return replay_mania_hold_state(
++                    groups,
++                    keycount=keycount,
++                    initial_open_columns=self.initial_open_columns,
++                )
++
++            open_columns = set(replay_signatures(seen_groups))
++
+             if current_lane is None:
+                 self._telemetry["missingColumnSteps"] += 1
+                 scores_processed[row, self.tap_token] = -torch.inf
+@@ -352,32 +366,40 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 raise ValueError(
+                     f"current mania lane {current_lane} is outside keycount {keycount}"
+                 )
+-            if current_lane in open_columns:
+-                self._telemetry["invalidLaneTransitionSteps"] += 1
+-                scores_processed[row, self.tap_token] = -torch.inf
+-                scores_processed[row, self.hold_start_token] = -torch.inf
+-            else:
+-                self._telemetry["invalidLaneTransitionSteps"] += 1
+-                scores_processed[row, self.hold_end_token] = -torch.inf
+-                if (
+-                        self.require_closed_holds_at_eos
+-                        and self.max_sequence_length is not None
+-                ):
+-                    remaining_tokens = (
+-                        self.max_sequence_length - input_ids.shape[1]
+-                    )
+-                    required_after_start = 2 * (len(open_columns) + 1)
+-                    if remaining_tokens - 1 < required_after_start:
+-                        self._telemetry["unclosableHoldStartSteps"] += 1
+-                        scores_processed[row, self.hold_start_token] = -torch.inf
+             signature_by_token = {
+                 token: (current_time_token, current_lane, event_type)
+                 for token, event_type in self.event_type_by_token.items()
+             }
++            invalid_transition = False
++            candidate_open_columns: dict[int, tuple[int, ...]] = {}
+             for token, signature in signature_by_token.items():
+                 if signature in generated_groups:
+                     self._telemetry["duplicateTokensMasked"] += 1
+                     scores_processed[row, token] = -torch.inf
++                    continue
++                try:
++                    candidate_open_columns[token] = replay_signatures(
++                        seen_groups | {signature}
++                    )
++                except ValueError:
++                    invalid_transition = True
++                    scores_processed[row, token] = -torch.inf
++            if invalid_transition:
++                self._telemetry["invalidLaneTransitionSteps"] += 1
++
++            if (
++                    self.require_closed_holds_at_eos
++                    and self.max_sequence_length is not None
++            ):
++                remaining_after_candidate = (
++                    self.max_sequence_length - input_ids.shape[1] - 1
++                )
++                for token, candidate_state in candidate_open_columns.items():
++                    required_after_candidate = 2 * len(candidate_state)
++                    if remaining_after_candidate < required_after_candidate:
++                        if token == self.hold_start_token:
++                            self._telemetry["unclosableHoldStartSteps"] += 1
++                        scores_processed[row, token] = -torch.inf
+             self._telemetry["pendingGroupBoundarySteps"] += 1
+             remaining_tokens = (
+                 None
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -507,13 +507,10 @@ class Processor(object):
+                     ),
+                 )
+ 
+-    def _mania_prompt_end_time(self, frame_time: float) -> float:
+-        """Return the exclusive end of the output context in the prompt.
+-
+-        The HOLD processor receives canonical state folded through this
+-        boundary and therefore must not apply prompt transitions again.
+-        """
+-        return frame_time + self.miliseconds_per_sequence
++    @staticmethod
++    def _mania_prompt_start_time(frame_time: float) -> float:
++        """Return the boundary immediately before the current output frame."""
++        return frame_time
+ 
+     def _mania_prompt_open_hold_columns(
+             self,
+@@ -521,11 +518,11 @@ class Processor(object):
+             frame_time: float,
+             mania_keycount: int,
+     ) -> tuple[int, ...]:
+-        """Fold canonical HOLD state through the complete prompt interval."""
++        """Capture canonical HOLD state immediately before prompt events."""
+         return mania_open_hold_columns_before(
+             context["events"],
+             context["event_times"],
+-            self._mania_prompt_end_time(frame_time),
++            self._mania_prompt_start_time(frame_time),
+             mania_keycount,
+         )
+ 
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -14,7 +14,11 @@ from osuT5.osuT5.inference.server import (
+     effective_generation_limit,
+     get_mania_hold_grammar_telemetry,
+ )
+-from osuT5.osuT5.inference.mania_grammar import canonical_mania_groups
++from osuT5.osuT5.inference.mania_grammar import (
++    CanonicalManiaGroup,
++    canonical_mania_groups,
++    replay_mania_hold_state,
++)
+ 
+ 
+ class FakeTokenizer:
+@@ -189,8 +193,8 @@ def test_generated_duplicate_group_is_masked_but_prompt_history_is_idempotent():
+     assert torch.isneginf(result[0, 50])
+ 
+ 
+-def test_prompt_hold_start_is_not_replayed_over_prompt_end_state():
+-    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
++def test_prompt_hold_start_is_replayed_from_prompt_start_state():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
+     prompt = torch.tensor(
+         [[keycount_token(4), 1, 30, 12, 51]]
+     )
+@@ -207,8 +211,8 @@ def test_prompt_hold_start_is_not_replayed_over_prompt_end_state():
+     assert not torch.isneginf(pending_same_lane[0, 52])
+ 
+ 
+-def test_prompt_hold_end_is_not_replayed_over_prompt_end_state():
+-    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++def test_prompt_hold_end_is_replayed_from_prompt_start_state():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
+     prompt = torch.tensor(
+         [[keycount_token(4), 1, 30, 12, 52]]
+     )
+@@ -346,6 +350,97 @@ def test_generated_release_closes_prompt_end_hold_before_next_group():
+     assert torch.isneginf(result[0, 52])
+ 
+ 
++def test_prompt_timeline_blocks_generated_tap_inside_an_existing_hold():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor(
++        [[
++            keycount_token(4), 1,
++            30, 12, 51,
++            32, 12, 52,
++        ]]
++    )
++    processor(prompt, scores())
++
++    pending_inside_hold = torch.tensor(
++        [[
++            keycount_token(4), 1,
++            30, 12, 51,
++            32, 12, 52,
++            31, 12,
++        ]]
++    )
++    result = processor(pending_inside_hold, scores())
++
++    assert torch.isneginf(result[0, 50])
++
++
++def test_prompt_timeline_blocks_different_note_on_at_same_time_and_lane():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor(
++        [[
++            keycount_token(4), 1,
++            30, 12, 51,
++            32, 12, 52,
++        ]]
++    )
++    processor(prompt, scores())
++
++    pending_same_position = torch.tensor(
++        [[
++            keycount_token(4), 1,
++            30, 12, 51,
++            32, 12, 52,
++            30, 12,
++        ]]
++    )
++    result = processor(pending_same_position, scores())
++
++    assert torch.isneginf(result[0, 50])
++    # An exact cross-window duplicate remains idempotent and is resolved by
++    # origin-aware canonical merging. Only a different note-on is forbidden.
++    assert not torch.isneginf(result[0, 51])
++
++
++def test_prompt_timeline_allows_release_then_tap_at_same_time_and_lane():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
++    prompt = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 52]]
++    )
++    processor(prompt, scores())
++
++    pending_after_release = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 52, 30, 12]]
++    )
++    result = processor(pending_after_release, scores())
++
++    assert not torch.isneginf(result[0, 50])
++    assert not torch.isneginf(result[0, 51])
++    assert not torch.isneginf(result[0, 52])
++
++
++def test_canonical_replay_rejects_two_note_ons_at_same_time_and_lane():
++    groups = [
++        CanonicalManiaGroup(100, 1, EventType.HOLD_NOTE, (0,)),
++        CanonicalManiaGroup(100, 1, EventType.CIRCLE, (1,)),
++    ]
++
++    with pytest.raises(ValueError, match="duplicate note-on"):
++        replay_mania_hold_state(groups, keycount=4)
++
++
++def test_canonical_replay_allows_release_then_tap_at_same_time():
++    groups = [
++        CanonicalManiaGroup(100, 1, EventType.HOLD_NOTE_END, (0,)),
++        CanonicalManiaGroup(100, 1, EventType.CIRCLE, (1,)),
++    ]
++
++    assert replay_mania_hold_state(
++        groups,
++        keycount=4,
++        initial_open_columns=(1,),
++    ) == ()
++
++
+ def test_state_processor_is_noop_without_explicit_boundary_state():
+     processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), None)
+     input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -156,14 +156,14 @@ def test_invalid_cumulative_hold_transition_is_rejected_before_atomic_commit():
+     assert context["event_origins"] == []
+ 
+ 
+-def test_mania_state_boundary_matches_the_prompt_end():
++def test_mania_state_boundary_matches_the_prompt_start():
+     processor = make_processor()
+     processor.miliseconds_per_sequence = 5_000
+ 
+-    assert processor._mania_prompt_end_time(5_000) == 10_000
++    assert processor._mania_prompt_start_time(5_000) == 5_000
+ 
+ 
+-def test_mania_prompt_state_folds_every_group_before_prompt_end():
++def test_mania_prompt_state_folds_only_groups_before_prompt_start():
+     processor = make_processor()
+     processor.miliseconds_per_sequence = 1_000
+     context = {
+@@ -178,7 +178,7 @@ def test_mania_prompt_state_folds_every_group_before_prompt_end():
+         "event_times": [100, 100, 100, 900, 900, 900],
+     }
+ 
+-    assert processor._mania_prompt_open_hold_columns(context, 0, 4) == ()
++    assert processor._mania_prompt_open_hold_columns(context, 500, 4) == (1,)
+ 
+ 
+ def test_mania_context_trimming_starts_at_complete_group_boundary():

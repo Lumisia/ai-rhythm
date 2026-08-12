@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
@@ -10,34 +10,73 @@ from time import perf_counter_ns
 from typing import Literal
 from uuid import UUID, uuid4
 
+from chart_worker.analysis.activity import (
+    evaluate_boundary_policy,
+    observe_outro,
+)
+from chart_worker.analysis.hold_lane_state import analyze_hold_lane_state
 from chart_worker.analysis.onset import OnsetAnalysis, analyze_canonical_audio
+from chart_worker.analysis.outro_evidence import build_outro_evidence_profile
+from chart_worker.analysis.runtime_fingerprint import build_runtime_fingerprint
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.attempt_journal import build_attempt_journal_projection
 from chart_worker.generation.fake import FakeGenerator
+from chart_worker.generation.generation_control import (
+    MAX_CRASH_ATTEMPTS,
+    MAX_TOTAL_ATTEMPTS,
+    MAX_VARIANT_ATTEMPTS,
+)
 from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
 from chart_worker.generation.mapperatorinator_patch import CONSTRAINT_PATCH_ID
 from chart_worker.generation.params import DESCRIPTORS
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.playtest_run import (
     AudioFileRef,
-    PlaytestRunManifest,
+    MissingChartRef,
+    OutcomeStatusSnapshot,
+    PlaytestRunManifestV2,
+    PublicationDecisionSnapshot,
+    ReportFileRef,
     RunAudioRefs,
     RunChartRef,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.authority_epoch import AuthorityEpochRecord
 from chart_worker.stages.s1_prepare import run_prepare
-from chart_worker.stages.s2_generate import MAX_VARIANT_ATTEMPTS, run_generation
+from chart_worker.stages.s2_generate import (
+    run_generation,
+)
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.s3_export import run_export
 from chart_worker.stages.timing_feedback import RetryTimingSignal
 from chart_worker.stages.types import (
     ExportedVariant,
     GeneratedVariant,
+    GenerationOutcome,
+    MissingVariant,
     PreparedAudio,
     SongTimingAuthority,
 )
-from chart_worker.validation.quality_gate import GateAction
+from chart_worker.validation.difficulty_selector import DifficultySelectionComparison
+from chart_worker.validation.intro_phrase_family import IntroPhraseFamilyReview
+from chart_worker.validation.intro_start_contract import (
+    IntroContractReview,
+    IntroStartContract,
+)
+from chart_worker.validation.outcome_status import (
+    failure_outcome_status,
+    success_outcome_status,
+)
+from chart_worker.validation.outro_family_review import OutroFamilyReview
+from chart_worker.validation.publication_policy import (
+    BoundaryPublicationAssessment,
+    assess_boundary_publication,
+    decide_publication,
+)
+from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateAction
+from chart_worker.validation.song_family_selector import SongSelectionComparison
+from chart_worker.validation.timing_family_review import TimingFamilyReview
 from chart_worker.validation.timing_review import TimingAuthorityAction
 
 GeneratorName = Literal["fake", "mapperatorinator"]
@@ -46,9 +85,13 @@ AnalysisStage = Callable[[Path], OnsetAnalysis]
 TimingStage = Callable[
     [PreparedAudio, OnsetAnalysis, Path, ChartGenerator, int], SongTimingAuthority
 ]
+SuperTimingStage = Callable[
+    [PreparedAudio, OnsetAnalysis, Path, ChartGenerator, int, int],
+    SongTimingAuthority,
+]
 GenerationStage = Callable[
-    [PreparedAudio, SongTimingAuthority, OnsetAnalysis, Path, ChartGenerator, int],
-    tuple[GeneratedVariant, ...],
+    [PreparedAudio, SongTimingAuthority, OnsetAnalysis, Path, ChartGenerator, int, int],
+    GenerationOutcome,
 ]
 ExportStage = Callable[
     [PreparedAudio, tuple[GeneratedVariant, ...], Path, str],
@@ -57,7 +100,16 @@ ExportStage = Callable[
 
 
 def _prepare_stage(source: Path, run_dir: Path, config: WorkerConfig) -> PreparedAudio:
-    return run_prepare(source, run_dir, config=config)
+    prepared = run_prepare(source, run_dir, config=config)
+    return replace(
+        prepared,
+        difficulty_selector_mode=config.difficulty_selector_mode,
+        boundary_policy_mode=config.boundary_policy_mode,
+        beat_this_enabled=config.beat_this_enabled,
+        beat_this_checkpoint=config.beat_this_checkpoint,
+        beat_this_device=config.beat_this_device,
+        beat_this_float16=config.beat_this_float16,
+    )
 
 
 def _generation_stage(
@@ -67,7 +119,8 @@ def _generation_stage(
     run_dir: Path,
     generator: ChartGenerator,
     seed: int,
-) -> tuple[GeneratedVariant, ...]:
+    authority_epoch: int,
+) -> GenerationOutcome:
     return run_generation(
         prepared,
         authority,
@@ -75,6 +128,7 @@ def _generation_stage(
         run_dir,
         generator=generator,
         seed=seed,
+        authority_epoch=authority_epoch,
     )
 
 
@@ -91,6 +145,7 @@ def _timing_stage(
         run_dir,
         generator=generator,
         seed=seed,
+        authority_epoch=1,
     )
 
 
@@ -100,6 +155,7 @@ def _super_timing_stage(
     run_dir: Path,
     generator: ChartGenerator,
     seed: int,
+    authority_epoch: int,
 ) -> SongTimingAuthority:
     return run_timing_generation(
         prepared,
@@ -108,6 +164,7 @@ def _super_timing_stage(
         generator=generator,
         seed=seed,
         force_super=True,
+        authority_epoch=authority_epoch,
     )
 
 
@@ -146,7 +203,7 @@ class PipelineDependencies:
     analyze: AnalysisStage = _analysis_stage
     select_generator: Callable[[GeneratorName, WorkerConfig], ChartGenerator] = _select_generator
     timing: TimingStage = _timing_stage
-    super_timing: TimingStage = _super_timing_stage
+    super_timing: SuperTimingStage = _super_timing_stage
     generation: GenerationStage = _generation_stage
     export: ExportStage = _export_stage
     now: Callable[[], datetime] = _utc_now
@@ -215,6 +272,7 @@ def _timing_authority_report(
             "timingAuthorityLeadingCoverage": None,
             "timingAuthorityLocalReview": None,
             "timingAuthorityRecoveryPreflight": None,
+            "timingAuthoritySelection": None,
         }
     return {
         "timingAuthority": _relative(authority.reference_path, run_dir),
@@ -222,9 +280,7 @@ def _timing_authority_report(
         "timingGenerationMode": authority.mode,
         "timingAttemptCount": authority.attempt_count,
         "timingAuthorityTempoMetrics": (
-            authority.tempo_metrics.to_report()
-            if authority.tempo_metrics is not None
-            else None
+            authority.tempo_metrics.to_report() if authority.tempo_metrics is not None else None
         ),
         "timingAuthorityReview": (
             authority.review.to_report() if authority.review is not None else None
@@ -235,13 +291,16 @@ def _timing_authority_report(
             else None
         ),
         "timingAuthorityLocalReview": (
-            authority.local_review.to_report()
-            if authority.local_review is not None
-            else None
+            authority.local_review.to_report() if authority.local_review is not None else None
         ),
         "timingAuthorityRecoveryPreflight": (
             authority.recovery_preflight.to_report()
             if authority.recovery_preflight is not None
+            else None
+        ),
+        "timingAuthoritySelection": (
+            authority.candidate_selection.to_report()
+            if authority.candidate_selection is not None
             else None
         ),
     }
@@ -285,20 +344,25 @@ def _max_gap_ms(variant: GeneratedVariant) -> int:
 
 def _require_difficulty_order_reports(
     generated: tuple[GeneratedVariant, ...],
+    missing: tuple[MissingVariant, ...] = (),
 ) -> dict[str, dict[str, object]]:
     expected = {(key_mode, difficulty) for key_mode in KEY_MODES for difficulty in DIFFICULTIES}
+    declared_missing = {(entry.key_mode, entry.difficulty) for entry in missing}
     observed = [(variant.key_mode, variant.difficulty) for variant in generated]
     context: dict[str, object] = {}
 
-    missing_variants = sorted(expected.difference(observed))
+    overlap = sorted(declared_missing.intersection(observed))
+    if overlap:
+        context["missingButGenerated"] = [
+            {"keyMode": key_mode, "difficulty": difficulty} for key_mode, difficulty in overlap
+        ]
+    missing_variants = sorted(expected.difference(observed).difference(declared_missing))
     if missing_variants:
         context["missingVariants"] = [
             {"keyMode": key_mode, "difficulty": difficulty}
             for key_mode, difficulty in missing_variants
         ]
-    duplicate_variants = sorted(
-        pair for pair in set(observed) if observed.count(pair) > 1
-    )
+    duplicate_variants = sorted(pair for pair in set(observed) if observed.count(pair) > 1)
     if duplicate_variants:
         context["duplicateVariants"] = [
             {"keyMode": key_mode, "difficulty": difficulty}
@@ -345,12 +409,25 @@ def _generation_report(
     run_dir: Path,
     config: WorkerConfig,
     prepared: PreparedAudio,
+    analysis: OnsetAnalysis,
     authority: SongTimingAuthority,
     difficulty_order_reports: dict[str, dict[str, object]],
     authority_epochs: list[AuthorityEpochRecord],
     map_timing_escalations: list[dict[str, object]],
     selected_authority_epoch: int,
+    boundary_publication_assessment: BoundaryPublicationAssessment,
+    difficulty_selection_shadows: tuple[DifficultySelectionComparison, ...] = (),
+    song_selection_shadow: SongSelectionComparison | None = None,
+    intro_start_contract: IntroStartContract | None = None,
+    intro_contract_review: IntroContractReview | None = None,
+    intro_phrase_family_reviews: tuple[IntroPhraseFamilyReview, ...] = (),
+    timing_family_reviews: tuple[TimingFamilyReview, ...] = (),
+    outro_family_review: OutroFamilyReview | None = None,
+    additional_inference_calls: int = 0,
+    missing: tuple[MissingVariant, ...] = (),
+    music_bounds: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    strict_blockers = boundary_publication_assessment.strict_blockers
     charts = []
     resnap_collisions = []
     for variant, result in zip(generated, exported, strict=True):
@@ -358,6 +435,10 @@ def _generation_report(
         acceptance = variant.acceptance.to_report()
         quality_profile = acceptance["qualityProfile"]
         resnap_diagnostics = variant.generated.resnap_diagnostics.to_report()
+        hold_lane_state_trace = analyze_hold_lane_state(
+            notes,
+            variant.generated.resnap_diagnostics,
+        ).to_report()
         resnap_collisions.extend(
             {
                 "keyMode": variant.key_mode,
@@ -382,11 +463,6 @@ def _generation_report(
                 "generationAttemptCount": variant.generation_attempt_count,
                 "provenance": variant.provenance,
                 "recoveryReason": variant.recovery_reason,
-                "recoveryPlan": (
-                    variant.recovery_plan.to_report()
-                    if variant.recovery_plan is not None
-                    else None
-                ),
                 "attemptErrors": list(variant.attempt_errors),
                 "attemptEvidence": list(variant.attempt_evidence),
                 "acceptanceStatus": acceptance["action"],
@@ -399,19 +475,16 @@ def _generation_report(
                 "timingDiagnostics": acceptance["timing"],
                 "noteGrid": acceptance["noteGrid"],
                 "difficultyProfile": (
-                    quality_profile["difficultyProfile"]
-                    if quality_profile is not None
-                    else None
+                    quality_profile["difficultyProfile"] if quality_profile is not None else None
+                ),
+                "difficultyVectorV2": (
+                    quality_profile["difficultyVectorV2"] if quality_profile is not None else None
                 ),
                 "holdProfile": (
-                    quality_profile["holdProfile"]
-                    if quality_profile is not None
-                    else None
+                    quality_profile["holdProfile"] if quality_profile is not None else None
                 ),
                 "patternProfile": (
-                    quality_profile["patternProfile"]
-                    if quality_profile is not None
-                    else None
+                    quality_profile["patternProfile"] if quality_profile is not None else None
                 ),
                 "rawNoteCount": len(notes),
                 "finalNoteCount": len(result.document.notes),
@@ -421,17 +494,61 @@ def _generation_report(
                 "rawOsuPath": _relative(variant.raw_osu_path, run_dir),
                 "chartPath": _relative(result.path, run_dir),
                 "resnapDiagnostics": resnap_diagnostics,
+                "holdLaneStateTrace": hold_lane_state_trace,
             }
         )
+    timing_review_required = (
+        (authority.review is not None and authority.review.action is TimingAuthorityAction.REVIEW)
+        or any(chart["acceptanceStatus"] != "PASS" for chart in charts)
+        or (intro_contract_review is not None and intro_contract_review.status == "REVIEW")
+        or any(review.should_block_publication for review in intro_phrase_family_reviews)
+        or any(review.status == "OUTLIER" for review in timing_family_reviews)
+        or (outro_family_review is not None and outro_family_review.status == "REVIEW")
+    )
+    has_raw = any(variant.provenance == "RAW_UNVERIFIED" for variant in generated)
+    # timingReviewRequired 는 진단 플래그로 남긴다 (배치 실측상 잦고,
+    # 사람 판정과 자주 어긋난다). 곡 상태를 낮추는 것은 실제 계약 위반
+    # 두 가지뿐이다: 조합 누락(PARTIAL), 품질 축 우회 발행(REVIEW).
+    if missing:
+        status = "PARTIAL"
+    elif (
+        has_raw
+        or (intro_contract_review is not None and intro_contract_review.status == "REVIEW")
+        or any(review.should_block_publication for review in intro_phrase_family_reviews)
+        or any(review.status == "OUTLIER" for review in timing_family_reviews)
+        or (outro_family_review is not None and outro_family_review.status == "REVIEW")
+    ):
+        status = "REVIEW"
+    else:
+        status = "PASS"
+    outcome_status_v2 = success_outcome_status(
+        expected_slots=len(KEY_MODES) * len(DIFFICULTIES),
+        generated_slots=len(generated),
+        requires_review=timing_review_required or has_raw or bool(missing),
+    )
+    publication_decision = decide_publication(
+        outcome=outcome_status_v2,
+        published_slots=len(generated),
+        expected_slots=len(KEY_MODES) * len(DIFFICULTIES),
+        strict_blockers=strict_blockers,
+    )
     return {
         "version": 1,
-        "qualityGateVersion": "quality-gate-v1",
-        "publishable": True,
-        "status": "PASS",
+        "qualityGateVersion": QUALITY_GATE_VERSION,
+        "publishable": publication_decision.decision == "ALLOW_PRODUCTION",
+        "status": status,
+        "outcomeStatusV2": outcome_status_v2.to_report(),
+        "strictBlockers": list(strict_blockers),
+        "publicationDecision": publication_decision.to_report(),
+        "boundaryPublicationAssessment": boundary_publication_assessment.to_report(),
         "runId": str(run_id),
         "sourceName": options.source.name,
         "generator": options.generator,
         "strategy": "MAPPERATORINATOR_SHARED_TIMING",
+        "attemptJournal": build_attempt_journal_projection(
+            run_dir / "attempt-journal.jsonl",
+            relative_to=run_dir,
+        ),
         **_timing_authority_report(authority, run_dir),
         **_authority_epoch_report(
             authority_epochs,
@@ -439,22 +556,51 @@ def _generation_report(
             selected_authority_epoch,
         ),
         "resnapCollisions": resnap_collisions,
-        "noteMutationEnabled": False,
+        "noteMutationEnabled": (
+            intro_contract_review is not None and intro_contract_review.corrected_count > 0
+        ),
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
         ),
-        "attemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
+        "attemptsPerChartMax": MAX_TOTAL_ATTEMPTS,
+        "qualityAttemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
+        "crashAttemptsPerChartMax": MAX_CRASH_ATTEMPTS,
         "canonicalAudioSha256": prepared.normalized.sha256,
-        "timingReviewRequired": (
-            authority.review is not None
-            and authority.review.action is TimingAuthorityAction.REVIEW
-        )
-        or any(
-            chart["acceptanceStatus"] != "PASS" for chart in charts
+        "runtimeFingerprint": build_runtime_fingerprint(
+            config=config,
+            prepared=prepared,
+            analysis=analysis,
+            authority=authority,
+            generator=options.generator,
+            worker_version=options.worker_version,
         ),
+        "timingReviewRequired": timing_review_required,
         "elapsedMsByStage": elapsed,
         "warnings": [],
         "difficultyOrder": difficulty_order_reports,
+        "difficultySelectionShadow": [
+            comparison.to_report() for comparison in difficulty_selection_shadows
+        ],
+        "songSelectionShadow": (
+            song_selection_shadow.to_report() if song_selection_shadow is not None else None
+        ),
+        "introStartContract": (
+            intro_start_contract.to_report() if intro_start_contract is not None else None
+        ),
+        "introContractReview": (
+            intro_contract_review.to_report() if intro_contract_review is not None else None
+        ),
+        "introPhraseFamilyReviews": [
+            review.to_report() for review in intro_phrase_family_reviews
+        ],
+        "timingFamilyReviews": [review.to_report() for review in timing_family_reviews],
+        "outroFamilyReview": (
+            outro_family_review.to_report() if outro_family_review is not None else None
+        ),
+        "additionalInferenceCalls": additional_inference_calls,
+        "musicBounds": music_bounds,
+        "availableCharts": len(charts),
+        "missingCharts": [entry.to_report() for entry in missing],
         "charts": charts,
     }
 
@@ -467,26 +613,49 @@ def _failure_generation_report(
     prepared: PreparedAudio,
     authority: SongTimingAuthority | None,
     error: WorkerError,
+    boundary_publication_assessment: BoundaryPublicationAssessment,
     *,
     failure_stage: str | None = None,
     authority_epochs: list[AuthorityEpochRecord] | None = None,
     map_timing_escalations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
+    strict_blockers = boundary_publication_assessment.strict_blockers
     status = {
         ErrorCode.CHART_TIMING_REVIEW_REQUIRED: "REVIEW",
         ErrorCode.CHART_TIMING_CANDIDATE_FAILED: "EXHAUSTED",
         ErrorCode.CHART_CANDIDATES_EXHAUSTED: "EXHAUSTED",
         ErrorCode.CHART_VALIDATION_FAILED: "FAILED",
     }[error.code]
+    failure_category = {
+        ErrorCode.CHART_TIMING_REVIEW_REQUIRED: "POLICY",
+        ErrorCode.CHART_TIMING_CANDIDATE_FAILED: "GENERATION",
+        ErrorCode.CHART_CANDIDATES_EXHAUSTED: "GENERATION",
+        ErrorCode.CHART_VALIDATION_FAILED: "VALIDATION",
+    }[error.code]
+    outcome_status_v2 = failure_outcome_status(category=failure_category)
+    publication_decision = decide_publication(
+        outcome=outcome_status_v2,
+        published_slots=0,
+        expected_slots=len(KEY_MODES) * len(DIFFICULTIES),
+        strict_blockers=strict_blockers,
+    )
     report: dict[str, object] = {
         "version": 1,
-        "qualityGateVersion": "quality-gate-v1",
+        "qualityGateVersion": QUALITY_GATE_VERSION,
         "runId": str(run_id),
         "sourceName": options.source.name,
         "generator": options.generator,
         "strategy": "MAPPERATORINATOR_SHARED_TIMING",
+        "attemptJournal": build_attempt_journal_projection(
+            run_dir / "attempt-journal.jsonl",
+            relative_to=run_dir,
+        ),
         "publishable": False,
         "status": status,
+        "outcomeStatusV2": outcome_status_v2.to_report(),
+        "strictBlockers": list(strict_blockers),
+        "publicationDecision": publication_decision.to_report(),
+        "boundaryPublicationAssessment": boundary_publication_assessment.to_report(),
         "error": {
             "code": error.code.value,
             "context": error.context,
@@ -516,16 +685,34 @@ def _write_generation_report(path: Path, report: dict[str, object]) -> None:
     temporary.replace(path)
 
 
+def _write_playtest_manifest(path: Path, manifest: PlaytestRunManifestV2) -> None:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        manifest.model_dump_json(by_alias=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def _require_publishable_acceptance(generated: tuple[GeneratedVariant, ...]) -> None:
-    rejected = [
-        {
-            "key_mode": variant.key_mode,
-            "difficulty": variant.difficulty,
-            "gate_report": variant.acceptance.to_report(),
-        }
-        for variant in generated
-        if variant.acceptance.action is GateAction.RETRY_MAP
-    ]
+    """Reject every active quality-gate failure before promotion.
+
+    Raw model output remains useful audit evidence, but provenance is not a
+    quality waiver.  Exhausted retry budgets must not turn a rejected chart
+    into a playable one.
+    """
+    rejected = []
+    for variant in generated:
+        if variant.acceptance.action is not GateAction.RETRY_MAP:
+            continue
+        rejected.append(
+            {
+                "key_mode": variant.key_mode,
+                "difficulty": variant.difficulty,
+                "provenance": variant.provenance,
+                "gate_report": variant.acceptance.to_report(),
+            }
+        )
     if not rejected:
         return
     raise WorkerError(
@@ -558,6 +745,27 @@ def run_pipeline(
     _require_canonical_audio_hash(prepared)
     onsets = dependencies.analyze(normalized.path)
     elapsed["analysis"] = _elapsed_ms(started)
+    boundary_evaluation = (
+        evaluate_boundary_policy(
+            onsets.activity,
+            prepared.normalized.duration_ms,
+            enforcement_mode=prepared.boundary_policy_mode,
+        )
+        if onsets.activity is not None
+        else None
+    )
+    boundary_publication_assessment = assess_boundary_publication(
+        policy_state=(
+            boundary_evaluation.policy_state
+            if boundary_evaluation is not None
+            else None
+        ),
+        confidence=(
+            boundary_evaluation.confidence
+            if boundary_evaluation is not None
+            else None
+        ),
+    )
 
     generator = dependencies.select_generator(options.generator, dependencies.config)
 
@@ -581,6 +789,7 @@ def run_pipeline(
                 prepared,
                 None,
                 error,
+                boundary_publication_assessment,
                 failure_stage="TIMING",
             ),
         )
@@ -593,24 +802,27 @@ def run_pipeline(
     generation_elapsed_ms = 0
     selected_authority_epoch: int | None = None
 
+    outcome: GenerationOutcome | None = None
     for epoch in (1, 2):
         started = perf_counter_ns()
         try:
-            generated = dependencies.generation(
+            outcome = dependencies.generation(
                 prepared,
                 authority,
                 onsets,
                 run_dir,
                 generator,
                 options.seed,
+                epoch,
             )
+            generated = outcome.variants
             _require_publishable_acceptance(generated)
-            difficulty_order_reports = _require_difficulty_order_reports(generated)
+            difficulty_order_reports = _require_difficulty_order_reports(generated, outcome.missing)
         except RetryTimingSignal as signal:
             generation_elapsed_ms += _elapsed_ms(started)
             escalation = {"epoch": epoch, **signal.to_context()}
             map_timing_escalations.append(escalation)
-            if epoch == 2 or authority.mode == "SUPER_TIMING":
+            if epoch == 2 or authority.mode != "STANDARD":
                 authority_epochs.append(
                     AuthorityEpochRecord(
                         epoch=epoch,
@@ -622,12 +834,10 @@ def run_pipeline(
                 )
                 error = WorkerError(
                     ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-                    "Super timing authority also failed corroborated MAP timing checks",
+                    "Final timing authority failed corroborated MAP timing checks",
                     context={
-                        "reason": "SUPER_TIMING_MAP_FEEDBACK_EXHAUSTED",
-                        "epochs": [
-                            record.to_report() for record in authority_epochs
-                        ],
+                        "reason": "FINAL_TIMING_AUTHORITY_MAP_FEEDBACK_EXHAUSTED",
+                        "epochs": [record.to_report() for record in authority_epochs],
                         "mapTimingEscalations": map_timing_escalations,
                     },
                 )
@@ -642,6 +852,7 @@ def run_pipeline(
                         prepared,
                         authority,
                         error,
+                        boundary_publication_assessment,
                         failure_stage="GENERATION",
                         authority_epochs=authority_epochs,
                         map_timing_escalations=map_timing_escalations,
@@ -666,6 +877,7 @@ def run_pipeline(
                     run_dir,
                     generator,
                     options.seed,
+                    epoch + 1,
                 )
             except WorkerError as error:
                 if error.code not in {
@@ -685,6 +897,7 @@ def run_pipeline(
                         prepared,
                         None,
                         error,
+                        boundary_publication_assessment,
                         failure_stage="TIMING",
                         authority_epochs=authority_epochs,
                         map_timing_escalations=map_timing_escalations,
@@ -721,6 +934,7 @@ def run_pipeline(
                     prepared,
                     authority,
                     error,
+                    boundary_publication_assessment,
                     failure_stage="GENERATION",
                     authority_epochs=authority_epochs,
                     map_timing_escalations=map_timing_escalations,
@@ -756,25 +970,85 @@ def run_pipeline(
     elapsed["export"] = _elapsed_ms(started)
 
     report_path = run_dir / "generation-report.json"
-    _write_generation_report(
-        report_path,
-        _generation_report(
-            options,
-            run_id,
-            elapsed,
-            generated,
-            exported,
-            run_dir,
-            dependencies.config,
-            prepared,
-            authority,
-            difficulty_order_reports,
-            authority_epochs,
-            map_timing_escalations,
-            selected_authority_epoch,
-        ),
+    assert outcome is not None
+    outro_observation = (
+        observe_outro(onsets.activity, prepared.normalized.duration_ms)
+        if onsets.activity is not None
+        else None
     )
-    manifest = PlaytestRunManifest(
+    outro_evidence_profile = (
+        build_outro_evidence_profile(
+            activity=onsets.activity,
+            onset_ms=onsets.onset_ms,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+        if onsets.activity is not None
+        else None
+    )
+    generation_report = _generation_report(
+        options,
+        run_id,
+        elapsed,
+        generated,
+        exported,
+        run_dir,
+        dependencies.config,
+        prepared,
+        onsets,
+        authority,
+        difficulty_order_reports,
+        authority_epochs,
+        map_timing_escalations,
+        selected_authority_epoch,
+        boundary_publication_assessment,
+        difficulty_selection_shadows=outcome.difficulty_selection_shadows,
+        song_selection_shadow=outcome.song_selection_shadow,
+        intro_start_contract=outcome.intro_start_contract,
+        intro_contract_review=outcome.intro_contract_review,
+        intro_phrase_family_reviews=outcome.intro_phrase_family_reviews,
+        timing_family_reviews=outcome.timing_family_reviews,
+        outro_family_review=outcome.outro_family_review,
+        additional_inference_calls=outcome.additional_inference_calls,
+        missing=outcome.missing,
+        music_bounds={
+            "audioDurationMs": prepared.normalized.duration_ms,
+            "musicEndMs": (
+                (
+                    prepared.normalized.duration_ms
+                    if boundary_evaluation.effective_source
+                    == "FULL_DURATION_BASELINE"
+                    else boundary_evaluation.provisional_decision.selected_music_end_ms
+                )
+                if boundary_evaluation is not None
+                else None
+            ),
+            "outroObservation": (
+                outro_observation.to_report() if outro_observation is not None else None
+            ),
+            "outroEvidenceProfile": (
+                outro_evidence_profile.to_report()
+                if outro_evidence_profile is not None
+                else None
+            ),
+            "outroPolicyDecision": (
+                boundary_evaluation.provisional_decision.to_report()
+                if boundary_evaluation is not None
+                else None
+            ),
+            "boundaryPolicyEvaluation": (
+                boundary_evaluation.to_report()
+                if boundary_evaluation is not None
+                else None
+            ),
+            "songBoundaryContract": (
+                boundary_evaluation.effective_contract.to_report()
+                if boundary_evaluation is not None
+                else None
+            ),
+        },
+    )
+    _write_generation_report(report_path, generation_report)
+    manifest = PlaytestRunManifestV2(
         run_id=run_id,
         title=options.title,
         generated_at=dependencies.now(),
@@ -794,13 +1068,26 @@ def run_pipeline(
             )
             for result in exported
         ],
-        generation_report_path=_relative(report_path, run_dir),
+        missing_charts=[
+            MissingChartRef(
+                key_mode=entry.key_mode,
+                difficulty=entry.difficulty,
+                reason=entry.reason,
+            )
+            for entry in outcome.missing
+        ],
+        generation_report=ReportFileRef(
+            path=_relative(report_path, run_dir),
+            sha256=sha256_file(report_path),
+        ),
+        outcome=OutcomeStatusSnapshot.model_validate(generation_report["outcomeStatusV2"]),
+        strict_blockers=generation_report["strictBlockers"],
+        publication=PublicationDecisionSnapshot.model_validate(
+            generation_report["publicationDecision"]
+        ),
     )
-    manifest_path = run_dir / "playtest-run-v1.json"
-    manifest_path.write_text(
-        manifest.model_dump_json(by_alias=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    manifest_path = run_dir / "playtest-run-v2.json"
+    _write_playtest_manifest(manifest_path, manifest)
     return PipelineResult(
         run_id=run_id,
         output_dir=run_dir,

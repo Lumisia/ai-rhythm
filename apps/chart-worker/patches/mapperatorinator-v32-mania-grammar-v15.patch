@@ -1,0 +1,105 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 65c9466..6778cec 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -333,12 +333,22 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 scores_processed[row, self.tap_token] = -torch.inf
+                 scores_processed[row, self.hold_start_token] = -torch.inf
+                 scores_processed[row, self.hold_end_token] = -torch.inf
++                missing_time = current_time_token is None
++                if missing_time:
++                    # A column without an addressable time would inherit the
++                    # previous context event time during merge. Require an
++                    # explicit TIME_SHIFT before a new gameplay group instead.
++                    scores_processed[
++                        row, self.column_start:self.column_end
++                    ] = -torch.inf
+                 remaining_tokens = (
+                     None
+                     if self.max_sequence_length is None
+                     else self.max_sequence_length - input_ids.shape[1]
+                 )
+-                required_closure_tokens = 2 * len(open_columns)
++                required_closure_tokens = 2 * len(open_columns) + (
++                    1 if missing_time and open_columns else 0
++                )
+                 if (
+                         self.require_closed_holds_at_eos
+                         and open_columns
+@@ -354,15 +364,16 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                         )
+                     if remaining_tokens == required_closure_tokens:
+                         self._telemetry["forcedClosureSteps"] += 1
+-                        scores_processed[
+-                            row, self.column_start:self.column_end
+-                        ] = -torch.inf
+-                        for lane in open_columns:
+-                            token = self.column_start + lane
+-                            scores_processed[row, token] = scores[row, token]
+-                        scores_processed[
+-                            row, self.time_start:self.time_end
+-                        ] = -torch.inf
++                        if not missing_time:
++                            scores_processed[
++                                row, self.column_start:self.column_end
++                            ] = -torch.inf
++                            for lane in open_columns:
++                                token = self.column_start + lane
++                                scores_processed[row, token] = scores[row, token]
++                            scores_processed[
++                                row, self.time_start:self.time_end
++                            ] = -torch.inf
+                 if (
+                         remaining_tokens is not None
+                         and remaining_tokens < 2
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index a68effa..d8859e8 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -99,6 +99,46 @@ def test_state_processor_also_masks_note_types_until_group_has_column():
+     assert torch.isneginf(result[0, 50:53]).all()
+ 
+ 
++def test_group_without_prompt_or_generated_timeshift_requires_time_before_column():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++
++    without_time = processor(
++        torch.tensor([[keycount_token(4), 1]]), scores()
++    )
++    after_time = processor(
++        torch.tensor([[keycount_token(4), 1, 30]]), scores()
++    )
++
++    assert torch.isneginf(without_time[0, 10:28]).all()
++    assert not torch.isneginf(without_time[0, 30:40]).all()
++    assert not torch.isneginf(after_time[0, 10:14]).any()
++
++
++def test_final_hold_closure_budget_includes_missing_timeshift():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (1, 3),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=7,
++    )
++
++    result = processor(
++        torch.tensor([[keycount_token(4), 1]]), scores()
++    )
++
++    assert torch.isneginf(result[0, 10:28]).all()
++    assert not torch.isneginf(result[0, 30:40]).all()
++
++    insufficient = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (1, 3),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=6,
++    )
++    with pytest.raises(ValueError, match="insufficient sequence budget"):
++        insufficient(torch.tensor([[keycount_token(4), 1]]), scores())
++
++
+ def test_pending_column_cannot_be_abandoned_by_time_column_or_eos():
+     processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
+     input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])

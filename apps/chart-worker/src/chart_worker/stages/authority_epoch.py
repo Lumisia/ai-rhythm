@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
+TimingAuthorityMode = Literal["STANDARD", "SUPER_TIMING", "BEAT_THIS_FALLBACK"]
+
 AuthorityEpochStatus = Literal[
     "SELECTED",
     "REJECTED_MAP_TIMING_FEEDBACK",
@@ -14,7 +16,7 @@ AuthorityEpochStatus = Literal[
 class AuthorityEpochRecord:
     epoch: int
     authority_sha256: str
-    mode: Literal["STANDARD", "SUPER_TIMING"]
+    mode: TimingAuthorityMode
     status: AuthorityEpochStatus
     escalation: dict[str, object] | None = None
 

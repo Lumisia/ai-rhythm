@@ -1,0 +1,187 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 88376ae7ac728318910ca6094415bd62ae9f04ac..891433fd3870512cd1ce3d0d0979a3d15401267d 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -158,7 +158,13 @@ def mania_open_hold_columns_before(
+ 
+ 
+ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+-    """Mask only lane transitions that cannot form a playable HOLD stream."""
++    """Mask only lane transitions that cannot form a playable HOLD stream.
++
++    ``initial_open_columns`` is the canonical state immediately after the
++    decoder prompt.  Prompt groups are still parsed to preserve their
++    signatures and pending time/column context, but their state transitions
++    must not be replayed over that already-folded state.
++    """
+ 
+     def __init__(
+             self,
+@@ -266,11 +272,12 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     event_type = self.event_type_by_token[token]
+                     signature = (current_time_token, current_lane, event_type)
+                     if signature not in seen_groups:
+-                        apply_mania_hold_transition(
+-                            open_columns,
+-                            current_lane,
+-                            event_type,
+-                        )
++                        if position >= self.prompt_length:
++                            apply_mania_hold_transition(
++                                open_columns,
++                                current_lane,
++                                event_type,
++                            )
+                         seen_groups.add(signature)
+                         if position >= self.prompt_length:
+                             generated_groups.add(signature)
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 7d4ed52ce0777282ee37d92ba825b68b64918474..d6d6e883b4fcd239d5eb62f3b987af67382f3cd4 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -460,13 +460,9 @@ class Processor(object):
+                         context["context_type"] == ContextType.MAP
+                         and mania_keycount is not None
+                 ):
+-                    mania_open_hold_columns = mania_open_hold_columns_before(
+-                        context["events"],
+-                        context["event_times"],
+-                        self._mania_state_boundary_time(
+-                            frame_time,
+-                            trim_lookback,
+-                        ),
++                    mania_open_hold_columns = self._mania_prompt_open_hold_columns(
++                        context,
++                        frame_time,
+                         mania_keycount,
+                     )
+ 
+@@ -511,13 +507,27 @@ class Processor(object):
+                     ),
+                 )
+ 
+-    def _mania_state_boundary_time(
++    def _mania_prompt_end_time(self, frame_time: float) -> float:
++        """Return the exclusive end of the output context in the prompt.
++
++        The HOLD processor receives canonical state folded through this
++        boundary and therefore must not apply prompt transitions again.
++        """
++        return frame_time + self.miliseconds_per_sequence
++
++    def _mania_prompt_open_hold_columns(
+             self,
++            context: dict[str, Any],
+             frame_time: float,
+-            trim_lookback: bool,
+-    ) -> float:
+-        """Return the first retained time represented by the decode window."""
+-        return frame_time + self.lookback_time if trim_lookback else frame_time
++            mania_keycount: int,
++    ) -> tuple[int, ...]:
++        """Fold canonical HOLD state through the complete prompt interval."""
++        return mania_open_hold_columns_before(
++            context["events"],
++            context["event_times"],
++            self._mania_prompt_end_time(frame_time),
++            mania_keycount,
++        )
+ 
+     def generate_parallel(
+             self,
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index 93dcf31b7de334a851f8342a8af81b5b35bdcf95..e62868817888358d4cad75672335103f3274ebdd 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -156,12 +156,29 @@ def test_invalid_cumulative_hold_transition_is_rejected_before_atomic_commit():
+     assert context["event_origins"] == []
+ 
+ 
+-def test_mania_state_boundary_matches_the_retained_window_start():
++def test_mania_state_boundary_matches_the_prompt_end():
+     processor = make_processor()
+-    processor.lookback_time = 1_250
++    processor.miliseconds_per_sequence = 5_000
+ 
+-    assert processor._mania_state_boundary_time(5_000, False) == 5_000
+-    assert processor._mania_state_boundary_time(5_000, True) == 6_250
++    assert processor._mania_prompt_end_time(5_000) == 10_000
++
++
++def test_mania_prompt_state_folds_every_group_before_prompt_end():
++    processor = make_processor()
++    processor.miliseconds_per_sequence = 1_000
++    context = {
++        "events": [
++            Event(EventType.TIME_SHIFT, 100),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE, 0),
++            Event(EventType.TIME_SHIFT, 900),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE_END, 0),
++        ],
++        "event_times": [100, 100, 100, 900, 900, 900],
++    }
++
++    assert processor._mania_prompt_open_hold_columns(context, 0, 4) == ()
+ 
+ 
+ def test_mania_context_trimming_starts_at_complete_group_boundary():
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index a093b80bb16394d3b2108f9505d6e6104e87f3c1..c9d9d6062cd3fbc4bdd9fb190f5a3a372ebb7ee5 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -119,6 +119,42 @@ def test_generated_duplicate_group_is_masked_but_prompt_history_is_idempotent():
+     assert torch.isneginf(result[0, 50])
+ 
+ 
++def test_prompt_hold_start_is_not_replayed_over_prompt_end_state():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
++    prompt = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 51]]
++    )
++
++    first_generated_group = processor(prompt, scores())
++    pending_same_lane = processor(
++        torch.tensor([[keycount_token(4), 1, 30, 12, 51, 31, 12]]),
++        scores(),
++    )
++
++    assert torch.isneginf(first_generated_group[0, 50:53]).all()
++    assert torch.isneginf(pending_same_lane[0, 50])
++    assert torch.isneginf(pending_same_lane[0, 51])
++    assert not torch.isneginf(pending_same_lane[0, 52])
++
++
++def test_prompt_hold_end_is_not_replayed_over_prompt_end_state():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 52]]
++    )
++
++    first_generated_group = processor(prompt, scores())
++    pending_same_lane = processor(
++        torch.tensor([[keycount_token(4), 1, 30, 12, 52, 31, 12]]),
++        scores(),
++    )
++
++    assert torch.isneginf(first_generated_group[0, 50:53]).all()
++    assert not torch.isneginf(pending_same_lane[0, 50])
++    assert not torch.isneginf(pending_same_lane[0, 51])
++    assert torch.isneginf(pending_same_lane[0, 52])
++
++
+ def test_final_window_masks_eos_until_every_open_hold_is_released():
+     processor = ManiaHoldStateLogitsProcessor(
+         FakeTokenizer(), (2,), require_closed_holds_at_eos=True
+@@ -224,8 +260,9 @@ def test_hold_state_processor_reports_intervention_counts():
+     assert get_mania_hold_grammar_telemetry([processor]) == processor.telemetry()
+ 
+ 
+-def test_prefix_release_closes_initial_hold_before_next_group():
++def test_generated_release_closes_prompt_end_hold_before_next_group():
+     processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
++    processor(torch.tensor([[keycount_token(4), 1]]), scores())
+     input_ids = torch.tensor(
+         [[keycount_token(4), 1, 30, 12, 52, 30, 12]]
+     )

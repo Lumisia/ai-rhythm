@@ -1,0 +1,79 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index f84665c..5ad05d0 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -541,8 +541,8 @@ class Processor(object):
+             frame_time: float,
+             mania_keycount: int,
+     ) -> tuple[tuple[int, int, str], ...]:
+-        """Return every canonical group in the frame, even if tokens trim it."""
+-        frame_end = frame_time + self.miliseconds_per_sequence
++        """Return canonical groups addressable by this decoder time vocabulary."""
++        timeshift_range = self.tokenizer.event_range[EventType.TIME_SHIFT]
+         groups = canonical_mania_groups(
+             context["events"],
+             context["event_times"],
+@@ -550,7 +550,14 @@ class Processor(object):
+         )
+         signatures: list[tuple[int, int, str]] = []
+         for group in groups:
+-            if not frame_time <= group.time_ms < frame_end:
++            relative_time = int(
++                (group.time_ms - frame_time) / MILISECONDS_PER_STEP
++            )
++            if not (
++                timeshift_range.min_value
++                <= relative_time
++                <= timeshift_range.max_value
++            ):
+                 continue
+             encoded_time = self._encode(
+                 [Event(EventType.TIME_SHIFT, group.time_ms)],
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index bfd63e0..5637159 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -222,6 +222,9 @@ def test_mania_prompt_state_folds_only_groups_before_prompt_start():
+ def test_mania_prompt_group_contract_includes_complete_current_frame():
+     processor = make_processor()
+     processor.miliseconds_per_sequence = 1_000
++    processor.tokenizer.event_range = {
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=0, max_value=100),
++    }
+     processor._encode = lambda events, _frame_time: torch.tensor(
+         [[30 + int(event.value) // 10 for event in events]]
+     )
+@@ -243,6 +246,33 @@ def test_mania_prompt_group_contract_includes_complete_current_frame():
+     )
+ 
+ 
++def test_mania_prompt_group_contract_includes_addressable_negative_time():
++    processor = make_processor()
++    processor.miliseconds_per_sequence = 1_000
++    processor.tokenizer.event_range = {
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=-100, max_value=100),
++    }
++    processor._encode = lambda events, frame_time: torch.tensor(
++        [[30 + int((event.value - frame_time) / 10) for event in events]]
++    )
++    context = {
++        "events": [
++            Event(EventType.TIME_SHIFT, 100),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE, 0),
++            Event(EventType.TIME_SHIFT, 900),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE_END, 0),
++        ],
++        "event_times": [100, 100, 100, 900, 900, 900],
++    }
++
++    assert processor._mania_prompt_group_signatures(context, 500, 4) == (
++        (-10, 1, EventType.HOLD_NOTE.value),
++        (70, 1, EventType.HOLD_NOTE_END.value),
++    )
++
++
+ def test_mania_context_trimming_starts_at_complete_group_boundary():
+     processor = make_processor()
+     processor.tokenizer = SimpleNamespace(

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from chart_worker.analysis.activity import BoundaryPolicyMode, build_song_boundary_contract
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing_diagnostics import TimingCoverageGap, diagnose_chart_timing
 from chart_worker.generation.params import GenerationRequest
@@ -76,13 +77,27 @@ def _request(difficulty: str, authority: SongTimingAuthority, duration_ms: int) 
 def _diagnose_rows(
     rows: tuple[int, ...],
     onsets: OnsetAnalysis,
+    authority: SongTimingAuthority,
     duration_ms: int,
+    boundary_policy_mode: BoundaryPolicyMode,
 ):
     notes = [NoteEvent(time_ms=time_ms, lane=0) for time_ms in rows]
+    coverage_end_ms = (
+        build_song_boundary_contract(
+            onsets.activity,
+            duration_ms,
+            enforcement_mode=boundary_policy_mode,
+        )
+        .required_coverage_end_ms
+        if onsets.activity is not None
+        else duration_ms
+    )
     return diagnose_chart_timing(
         notes,
         onsets.onset_ms,
         duration_ms=duration_ms,
+        coverage_end_ms=coverage_end_ms,
+        bpm_events=authority.bpm_events,
         activity=onsets.activity,
     )
 
@@ -92,13 +107,20 @@ def review_recovery_preflight(
     onsets: OnsetAnalysis,
     *,
     duration_ms: int,
+    boundary_policy_mode: BoundaryPolicyMode = "SHADOW",
 ) -> RecoveryPreflight:
     """Compare current recovery divisors with bounded alternatives without mutation."""
     difficulty_reports = []
     for difficulty in DIFFICULTIES:
         request = _request(difficulty, authority, duration_ms)
         selected = plan_recovery_rows(request, authority, onsets)
-        selected_diagnostics = _diagnose_rows(selected.rows, onsets, duration_ms)
+        selected_diagnostics = _diagnose_rows(
+            selected.rows,
+            onsets,
+            authority,
+            duration_ms,
+            boundary_policy_mode,
+        )
 
         viable_divisors = []
         for divisor in ALLOWED_DIVISORS:
@@ -108,7 +130,13 @@ def review_recovery_preflight(
                 onsets,
                 subdivisions=divisor,
             )
-            diagnostics = _diagnose_rows(candidate.rows, onsets, duration_ms)
+            diagnostics = _diagnose_rows(
+                candidate.rows,
+                onsets,
+                authority,
+                duration_ms,
+                boundary_policy_mode,
+            )
             if candidate.rows and not diagnostics.coverage_gaps:
                 viable_divisors.append(divisor)
 

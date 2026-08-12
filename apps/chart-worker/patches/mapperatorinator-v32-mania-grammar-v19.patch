@@ -1,0 +1,54 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -533,9 +533,13 @@ class Processor(object):
+     def _mania_prompt_start_time(self, frame_time: float) -> float:
+         """Return the earliest time represented by the prompt contract."""
+         timeshift_range = self.tokenizer.event_range[EventType.TIME_SHIFT]
+-        return frame_time + (
+-            timeshift_range.min_value * MILISECONDS_PER_STEP
+-        )
++        bucket_start = timeshift_range.min_value * MILISECONDS_PER_STEP
++        if timeshift_range.min_value < 0:
++            # Python int() truncates negative relative times toward zero.
++            # Consequently the minimum negative token also represents the
++            # preceding integer millisecond values in the same 10 ms bucket.
++            bucket_start -= MILISECONDS_PER_STEP - 1
++        return frame_time + bucket_start
+ 
+     def _mania_prompt_open_hold_columns(
+             self,
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -213,7 +213,29 @@ def test_mania_state_boundary_matches_the_prompt_start():
+     processor = make_processor()
+     processor.tokenizer.event_range[EventType.TIME_SHIFT].min_value = -100
+ 
+-    assert processor._mania_prompt_start_time(5_000) == 4_000
++    assert processor._mania_prompt_start_time(5_000) == 3_991
++
++
++def test_mania_prompt_state_uses_negative_timeshift_bucket_lower_edge():
++    processor = make_processor()
++    processor.tokenizer.event_range[EventType.TIME_SHIFT].min_value = -40
++    context = {
++        "events": [
++            Event(EventType.TIME_SHIFT, 90),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE, 0),
++            Event(EventType.TIME_SHIFT, 91),
++            Event(EventType.MANIA_COLUMN, 1),
++            Event(EventType.HOLD_NOTE_END, 0),
++        ],
++        "event_times": [90, 90, 90, 91, 91, 91],
++    }
++
++    # int(-40.9) is -40, so the HOLD_END at 91 ms is addressable while
++    # the HOLD_START at 90 ms is not.  Initial state must therefore be
++    # captured immediately before 91 ms, not at the nominal 100 ms point.
++    assert processor._mania_prompt_start_time(500) == 91
++    assert processor._mania_prompt_open_hold_columns(context, 500, 4) == (1,)
+ 
+ 
+ def test_mania_prompt_state_folds_only_groups_before_addressable_prompt_start():

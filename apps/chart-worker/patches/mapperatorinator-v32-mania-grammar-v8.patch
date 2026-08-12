@@ -1,0 +1,71 @@
+diff --git a/osuT5/osuT5/inference/mania_grammar.py b/osuT5/osuT5/inference/mania_grammar.py
+index a4e0c0d..25bf739 100644
+--- a/osuT5/osuT5/inference/mania_grammar.py
++++ b/osuT5/osuT5/inference/mania_grammar.py
+@@ -155,6 +155,7 @@ def replay_mania_hold_state(
+         EventType.CIRCLE: 2,
+     }
+     unique_groups = {group.signature: group for group in groups}
++    lane_history: dict[int, list[CanonicalManiaGroup]] = {}
+     for group in sorted(
+             unique_groups.values(),
+             key=lambda item: (item.time_ms, item.lane, order[item.event_type]),
+@@ -164,5 +165,22 @@ def replay_mania_hold_state(
+                 f"mania lane {group.lane} is outside keycount {keycount} "
+                 f"at {group.time_ms}"
+             )
+-        apply_mania_hold_transition(open_columns, group.lane, group.event_type)
++        try:
++            apply_mania_hold_transition(
++                open_columns,
++                group.lane,
++                group.event_type,
++            )
++        except ValueError as error:
++            history = ",".join(
++                f"{item.time_ms}:{item.event_type.name}"
++                for item in lane_history.get(group.lane, [])[-8:]
++            )
++            raise ValueError(
++                f"{error}; offending=time={group.time_ms},lane={group.lane},"
++                f"type={group.event_type.name}; laneHistory=[{history}]"
++            ) from error
++        history = lane_history.setdefault(group.lane, [])
++        history.append(group)
++        del history[:-8]
+     return tuple(sorted(open_columns))
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index 080e1ca..d9f071f 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -513,10 +513,29 @@ def test_boundary_snapshot_rejects_tap_during_active_hold():
+         Event(EventType.CIRCLE, 0),
+     ]
+ 
+-    with pytest.raises(ValueError, match="TAP while HOLD is active"):
++    with pytest.raises(ValueError, match="TAP while HOLD is active") as exc_info:
+         mania_open_hold_columns_before(
+             events,
+             [100, 100, 100, 200, 200, 200],
+             300,
+             4,
+         )
++
++    message = str(exc_info.value)
++    assert "offending=time=200,lane=0,type=CIRCLE" in message
++    assert "laneHistory=[100:HOLD_NOTE]" in message
++
++
++def test_boundary_snapshot_orphan_error_records_empty_lane_history():
++    events = [
++        Event(EventType.TIME_SHIFT, 250),
++        Event(EventType.MANIA_COLUMN, 3),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    with pytest.raises(ValueError, match="HOLD_END without HOLD_START") as exc_info:
++        mania_open_hold_columns_before(events, [250, 250, 250], 300, 4)
++
++    message = str(exc_info.value)
++    assert "offending=time=250,lane=3,type=HOLD_NOTE_END" in message
++    assert "laneHistory=[]" in message

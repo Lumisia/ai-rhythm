@@ -1,9 +1,11 @@
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.beat import BeatGrid
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.errors import ErrorCode, WorkerError
@@ -50,9 +52,12 @@ def _prepared_sha(tmp_path: Path) -> str:
 class RecordingGenerator:
     def __init__(self) -> None:
         self.timing_calls = []
+        self.timing_workdirs = []
 
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
+        workdir.mkdir(parents=True, exist_ok=True)
         return GeneratedTiming(
             osu_text="",
             bpm_events=(OsuBpmEvent(0, 120.0),),
@@ -65,6 +70,7 @@ class RecordingGenerator:
 class InvalidThenSuperGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
         if not request.super_timing:
             return GeneratedTiming(
                 osu_text="",
@@ -85,6 +91,7 @@ class InvalidThenSuperGenerator(RecordingGenerator):
 class LongActiveThenSuperGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
         return GeneratedTiming(
             osu_text="",
             bpm_events=(OsuBpmEvent(0 if request.super_timing else 95_645, 120.0),),
@@ -97,6 +104,7 @@ class LongActiveThenSuperGenerator(RecordingGenerator):
 class ShortActiveIntroGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
         return GeneratedTiming(
             osu_text="",
             bpm_events=(OsuBpmEvent(2_678, 120.0),),
@@ -109,6 +117,7 @@ class ShortActiveIntroGenerator(RecordingGenerator):
 class LongThenShortActiveIntroGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
         return GeneratedTiming(
             osu_text="",
             bpm_events=(
@@ -123,6 +132,7 @@ class LongThenShortActiveIntroGenerator(RecordingGenerator):
 class AlwaysLongActiveGapGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
         return GeneratedTiming(
             osu_text="",
             bpm_events=(OsuBpmEvent(95_645, 120.0),),
@@ -135,6 +145,7 @@ class AlwaysLongActiveGapGenerator(RecordingGenerator):
 class LocalOutlierThenSuperGenerator(RecordingGenerator):
     def generate_timing(self, request, workdir):
         self.timing_calls.append(request)
+        self.timing_workdirs.append(workdir)
         events = (
             (OsuBpmEvent(0, 120.0),)
             if request.super_timing
@@ -252,6 +263,9 @@ def test_generates_one_standard_timing_and_promotes_it_beside_audio(tmp_path):
     assert authority.mode == "STANDARD"
     assert authority.tempo_metrics is not None
     assert authority.review is not None
+    assert authority.candidate_selection is not None
+    assert authority.candidate_selection.reason == "ONLY_STRUCTURALLY_VALID_CANDIDATE"
+    assert len(authority.candidate_selection.candidates) == 1
 
 
 def test_structural_standard_failure_uses_super_timing_once(tmp_path):
@@ -288,7 +302,8 @@ def test_long_active_standard_gap_uses_super_timing_once(tmp_path):
     assert authority.leading_coverage.action is TimingAuthorityAction.PASS
 
 
-def test_short_active_intro_is_promoted_without_event_mutation(tmp_path):
+def test_short_phase_supported_intro_keeps_standard_for_map_recovery(tmp_path):
+    """인트로 phase가 맞으면 같은 Timing을 재생성하지 않는다."""
     generator = ShortActiveIntroGenerator()
 
     authority = run_timing_generation(
@@ -304,6 +319,9 @@ def test_short_active_intro_is_promoted_without_event_mutation(tmp_path):
     assert authority.bpm_events[0].time_ms == 2_678
     assert authority.leading_coverage is not None
     assert authority.leading_coverage.action is TimingAuthorityAction.REVIEW
+    assert authority.leading_coverage.reasons == (
+        "CONFIRMED_INTRO_ANCHOR_BEFORE_FIRST_EVENT",
+    )
 
 
 def test_super_short_active_intro_is_promoted_without_event_mutation(tmp_path):
@@ -344,6 +362,138 @@ def test_two_long_active_gaps_fail_with_attempt_evidence(tmp_path):
         attempt["leadingCoverage"]["action"] == "RETRY_TIMING"
         for attempt in attempts
     )
+
+
+def test_two_long_active_gaps_try_independent_beat_grid_before_final_failure(
+    monkeypatch,
+    tmp_path,
+):
+    duration_ms = 150_000
+    generator = AlwaysLongActiveGapGenerator()
+    prepared = replace(
+        _prepared(tmp_path, duration_ms=duration_ms),
+        beat_this_enabled=True,
+    )
+    beat_calls = []
+
+    def analyze_beats(path):
+        beat_calls.append(path)
+        beat_ms = tuple(range(0, duration_ms, 500))
+        return BeatGrid(
+            beat_ms=beat_ms,
+            downbeat_indices=tuple(range(0, len(beat_ms), 4)),
+            bpm=120.0,
+            beats_per_bar=4,
+            bpm_drift_pct=0.0,
+            raw_beat_count=len(beat_ms),
+            dropped_beat_count=0,
+            residual_rms_ms=0.0,
+            residual_max_ms=0.0,
+        )
+
+    monkeypatch.setattr(
+        s2_timing,
+        "review_timing_authority",
+        lambda metrics: TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+    )
+
+    authority = run_timing_generation(
+        prepared,
+        _active_analysis(duration_ms),
+        tmp_path,
+        generator=generator,
+        seed=9,
+        beat_analyzer=analyze_beats,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert beat_calls == [prepared.normalized.path]
+    assert authority.mode == "BEAT_THIS_FALLBACK"
+    assert authority.attempt_count == 3
+    assert authority.leading_coverage is not None
+    assert authority.leading_coverage.action is TimingAuthorityAction.PASS
+    assert authority.reference_path.is_file()
+
+
+def test_integrated_tempo_rejection_reaches_independent_fallback(monkeypatch, tmp_path):
+    duration_ms = 30_000
+    prepared = replace(
+        _prepared(tmp_path, duration_ms=duration_ms),
+        beat_this_enabled=True,
+    )
+    reviews = iter(
+        (
+            TimingAuthorityReview(
+                TimingAuthorityAction.RETRY_TIMING,
+                ("STRONG_HALF_TEMPO_ALTERNATIVE",),
+            ),
+            TimingAuthorityReview(
+                TimingAuthorityAction.RETRY_TIMING,
+                ("STRONG_HALF_TEMPO_ALTERNATIVE",),
+            ),
+            TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+        )
+    )
+    monkeypatch.setattr(s2_timing, "review_timing_authority", lambda metrics: next(reviews))
+    beat_calls = []
+
+    def analyze_beats(path):
+        beat_calls.append(path)
+        beat_ms = tuple(range(0, duration_ms, 500))
+        return BeatGrid(
+            beat_ms=beat_ms,
+            downbeat_indices=tuple(range(0, len(beat_ms), 4)),
+            bpm=120.0,
+            beats_per_bar=4,
+            bpm_drift_pct=0.0,
+            raw_beat_count=len(beat_ms),
+            dropped_beat_count=0,
+            residual_rms_ms=0.0,
+            residual_max_ms=0.0,
+        )
+
+    authority = run_timing_generation(
+        prepared,
+        _base_tempo_analysis(),
+        tmp_path,
+        generator=RecordingGenerator(),
+        seed=9,
+        beat_analyzer=analyze_beats,
+    )
+
+    assert beat_calls == [prepared.normalized.path]
+    assert authority.mode == "BEAT_THIS_FALLBACK"
+    assert authority.attempt_count == 3
+
+
+def test_integrated_tempo_rejection_without_fallback_still_requires_review(
+    monkeypatch, tmp_path
+):
+    reviews = iter(
+        (
+            TimingAuthorityReview(
+                TimingAuthorityAction.RETRY_TIMING,
+                ("STRONG_HALF_TEMPO_ALTERNATIVE",),
+            ),
+            TimingAuthorityReview(
+                TimingAuthorityAction.RETRY_TIMING,
+                ("STRONG_HALF_TEMPO_ALTERNATIVE",),
+            ),
+        )
+    )
+    monkeypatch.setattr(s2_timing, "review_timing_authority", lambda metrics: next(reviews))
+
+    with pytest.raises(WorkerError) as captured:
+        run_timing_generation(
+            _prepared(tmp_path, duration_ms=30_000),
+            _base_tempo_analysis(),
+            tmp_path,
+            generator=RecordingGenerator(),
+            seed=9,
+        )
+
+    assert captured.value.code is ErrorCode.CHART_TIMING_REVIEW_REQUIRED
+    assert captured.value.context["attempt_count"] == 2
 
 
 def test_local_timing_damage_uses_super_once_before_map(monkeypatch, tmp_path):
@@ -514,7 +664,9 @@ def test_insufficient_standard_review_is_conditionally_accepted_without_super(tm
 @pytest.mark.parametrize(
     "reason", ["TEMPO_EVIDENCE_DISAGREES", "WEAK_BASE_TEMPO_SUPPORT"]
 )
-def test_actionable_standard_review_uses_super_once(monkeypatch, tmp_path, reason):
+def test_actionable_standard_review_compares_super_and_keeps_lower_cost_tie(
+    monkeypatch, tmp_path, reason
+):
     generator = RecordingGenerator()
     reviews = iter(
         (
@@ -533,8 +685,122 @@ def test_actionable_standard_review_uses_super_once(monkeypatch, tmp_path, reaso
     )
 
     assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "STANDARD"
+    assert authority.attempt_count == 1
+    assert authority.candidate_selection is not None
+    assert authority.candidate_selection.reason == "LOWER_CANDIDATE_COST"
+    assert [
+        candidate.mode for candidate in authority.candidate_selection.candidates
+    ] == ["STANDARD", "SUPER_TIMING"]
+
+
+def test_close_standard_super_pair_uses_one_optional_beat_analysis(
+    monkeypatch, tmp_path
+):
+    class ShiftedThenAlignedGenerator(RecordingGenerator):
+        def generate_timing(self, request, workdir):
+            generated = super().generate_timing(request, workdir)
+            return GeneratedTiming(
+                osu_text="",
+                bpm_events=(OsuBpmEvent(0 if request.super_timing else 200, 120.0),),
+                generator_name=generated.generator_name,
+                seed=generated.seed,
+                mode=generated.mode,
+            )
+
+    reviews = iter(
+        (
+            TimingAuthorityReview(
+                TimingAuthorityAction.REVIEW,
+                ("TEMPO_EVIDENCE_DISAGREES",),
+            ),
+            TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+        )
+    )
+    monkeypatch.setattr(s2_timing, "review_timing_authority", lambda metrics: next(reviews))
+    original_build = s2_timing.build_timing_candidate_evidence
+
+    def close_evidence(**kwargs):
+        evidence = original_build(**kwargs)
+        return replace(
+            evidence,
+            contradicted_active_ms=0,
+            contradicted_ratio=0.0,
+            beat_consensus_by_level={"HALF": 0.4, "BASE": 0.4, "DOUBLE": 0.3},
+            best_metrical_level="BASE",
+        )
+
+    monkeypatch.setattr(s2_timing, "build_timing_candidate_evidence", close_evidence)
+    beat_calls = []
+
+    def analyze_beats(path):
+        beat_calls.append(path)
+        beats = tuple(range(0, 30_000, 1_000))
+        return BeatGrid(
+            beat_ms=beats,
+            downbeat_indices=tuple(range(0, len(beats), 4)),
+            bpm=60.0,
+            beats_per_bar=4,
+            bpm_drift_pct=0.0,
+            raw_beat_count=len(beats),
+            dropped_beat_count=0,
+            residual_rms_ms=0.0,
+            residual_max_ms=0.0,
+        )
+
+    prepared = replace(_prepared(tmp_path, duration_ms=30_000), beat_this_enabled=True)
+    authority = run_timing_generation(
+        prepared,
+        _active_analysis(30_000),
+        tmp_path,
+        generator=ShiftedThenAlignedGenerator(),
+        seed=9,
+        beat_analyzer=analyze_beats,
+    )
+
+    assert beat_calls == [prepared.normalized.path]
     assert authority.mode == "SUPER_TIMING"
-    assert authority.attempt_count == 2
+    assert authority.candidate_selection is not None
+    assert authority.candidate_selection.reason == "HIGHER_EXTERNAL_BEAT_F1"
+    assert authority.candidate_selection.external_beat_status == "AVAILABLE"
+
+
+def test_missing_optional_beat_dependency_degrades_to_internal_selection(
+    monkeypatch, tmp_path
+):
+    reviews = iter(
+        (
+            TimingAuthorityReview(
+                TimingAuthorityAction.REVIEW,
+                ("TEMPO_EVIDENCE_DISAGREES",),
+            ),
+            TimingAuthorityReview(TimingAuthorityAction.PASS, ()),
+        )
+    )
+    monkeypatch.setattr(s2_timing, "review_timing_authority", lambda metrics: next(reviews))
+    monkeypatch.setattr(
+        s2_timing,
+        "timing_candidates_need_external_corroboration",
+        lambda candidates: True,
+    )
+
+    def unavailable(_path):
+        raise ModuleNotFoundError("No module named 'beat_this'")
+
+    authority = run_timing_generation(
+        replace(_prepared(tmp_path), beat_this_enabled=True),
+        _base_tempo_analysis(),
+        tmp_path,
+        generator=RecordingGenerator(),
+        seed=9,
+        beat_analyzer=unavailable,
+    )
+
+    assert authority.mode == "STANDARD"
+    assert authority.candidate_selection is not None
+    assert authority.candidate_selection.reason == "LOWER_CANDIDATE_COST"
+    assert authority.candidate_selection.external_beat_status == "UNAVAILABLE"
+    assert "beat_this" in authority.candidate_selection.external_beat_error
 
 
 def test_identity_failure_uses_super_timing_and_leaves_no_rejected_reference(tmp_path, monkeypatch):
@@ -563,3 +829,42 @@ def test_identity_failure_uses_super_timing_and_leaves_no_rejected_reference(tmp
     assert authority.mode == "SUPER_TIMING"
     assert authority.reference_path.is_file()
     assert not list((tmp_path / "audio").glob("timing-reference-*.osu"))
+
+
+def test_timing_workdir_is_unique_per_authority_epoch(tmp_path):
+    """epoch 2 재선택이 epoch 1 의 산출물과 충돌하면 안 된다.
+
+    force_super=True 면 attempt_count 가 항상 1이라, epoch 를 경로에 넣지
+    않으면 두 epoch 가 같은 디렉터리를 쓴다. epoch 1 이 남긴 .osu 때문에
+    _require_clean_output_dir 이 곡 전체를 실패시켰다 (24곡 배치 song 24).
+    """
+    prepared = _prepared(tmp_path, duration_ms=150_000)
+    analysis = _active_analysis(150_000)
+
+    first = RecordingGenerator()
+    run_timing_generation(
+        prepared, analysis, tmp_path, generator=first, seed=9, authority_epoch=1
+    )
+    second = RecordingGenerator()
+    run_timing_generation(
+        prepared,
+        analysis,
+        tmp_path,
+        generator=second,
+        seed=9,
+        force_super=True,
+        authority_epoch=2,
+    )
+
+    used = [*first.timing_workdirs, *second.timing_workdirs]
+    assert len(set(used)) == len(used)
+    assert all("epoch-1" in workdir.parts for workdir in first.timing_workdirs)
+    assert all("epoch-2" in workdir.parts for workdir in second.timing_workdirs)
+    # 실제로 만들어진 디렉터리도 겹치지 않는다.
+    produced = sorted(
+        path.relative_to(tmp_path).as_posix()
+        for path in (tmp_path / "timing" / "work").rglob("*")
+        if path.is_dir()
+    )
+    assert "timing/work/epoch-1/standard/attempt-1" in produced
+    assert "timing/work/epoch-2/super/attempt-1" in produced

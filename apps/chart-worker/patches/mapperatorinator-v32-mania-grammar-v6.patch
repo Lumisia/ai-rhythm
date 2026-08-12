@@ -1,0 +1,121 @@
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index 3b1de61..f0b5284 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -25,7 +25,7 @@ from transformers import LogitsProcessorList
+ 
+ from .cache_utils import get_cache
+ from .server import get_eos_token_id, _build_generation_stats, build_logits_processors, \
+-    get_mania_hold_grammar_telemetry, model_generate
++    effective_generation_limit, get_mania_hold_grammar_telemetry, model_generate
+ from ..event import ContextType, EventType
+ from .logit_processors import MonotonicTimeShiftLogitsProcessor
+ 
+@@ -326,6 +326,8 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     negative_prompt_attention_mask = model_kwargs.get("negative_prompt_attention_mask")
+     pad_token_id = getattr(tokenizer, 'pad_id', None)
+     device = model.device
++    model_max = model.config.max_target_positions
++    hard_cap = effective_generation_limit(model, max_length)
+ 
+     eff_batch = decoder_input_ids.shape[0] * (2 if (cfg_scale > 1 and negative_prompt is not None) else 1)
+     eos_token_ids = get_eos_token_id(tokenizer, lookback_time=lookback_time,
+@@ -337,7 +339,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         max_note_start_time,
+         mania_open_hold_columns,
+         mania_require_closed_holds_at_eos,
+-        max_length,
++        hard_cap,
+     )
+     # Hoist MonotonicTimeShift out of the per-step list into an O(1) incremental
+     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
+@@ -353,13 +355,11 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+ 
+     prompt_len = decoder_input_ids.shape[1]
+     b0 = decoder_input_ids.shape[0]
+-    model_max = model.config.max_target_positions
+     enc_hidden = encoder_outputs.last_hidden_state  # (B, L_enc, D)
+     eos_t = torch.tensor(eos_token_ids, device=device, dtype=torch.long)
+     # The true generation limit, matching the non-compiled path (which caps at
+     # max_length and its full-size cache). We must never stop a window short of
+     # this just because a bucket was too small.
+-    hard_cap = min(max_length, model_max)
+ 
+     def _run_window(cache_len):
+         """Prefill + captured decode with a given static-cache length.
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index 7b045f9..86d364a 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -86,6 +86,17 @@ def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float
+     return eos_token_id
+ 
+ 
++def effective_generation_limit(model, configured_max_length):
++    """Return the generation limit enforced by both the model and caller."""
++    model_max_length = int(model.config.max_target_positions)
++    if configured_max_length is None:
++        generation_config = getattr(model, "generation_config", None)
++        configured_max_length = getattr(generation_config, "max_length", None)
++    if configured_max_length is None:
++        return model_max_length
++    return min(int(configured_max_length), model_max_length)
++
++
+ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                             temperature, timing_temperature, mania_column_temperature,
+                             taiko_hit_temperature, lookback_time, device,
+@@ -300,6 +311,11 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     if context_type is not None:
+         context_type = ContextType(context_type)  # Convert to ContextType enum
+ 
++    # Grammar reserve checks must use the limit the model can actually reach.
++    effective_max_length = effective_generation_limit(
++        model, generate_kwargs.get('max_length')
++    )
++
+     # Create the logits processors
+     logits_processor_list = build_logits_processors(
+         tokenizer, cfg_scale, timeshift_bias, types_first, temperature,
+@@ -308,7 +324,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+         max_note_start_time,
+         mania_open_hold_columns,
+         mania_require_closed_holds_at_eos,
+-        generate_kwargs.get('max_length'),
++        effective_max_length,
+     )
+ 
+     # Prepare cache
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index e3d0022..eb7cafe 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -11,6 +11,7 @@ from osuT5.osuT5.inference.logit_processors import (
+ )
+ from osuT5.osuT5.inference.server import (
+     build_logits_processors,
++    effective_generation_limit,
+     get_mania_hold_grammar_telemetry,
+ )
+ from osuT5.osuT5.inference.mania_grammar import canonical_mania_groups
+@@ -49,6 +50,20 @@ def scores() -> torch.Tensor:
+     return torch.zeros((1, 128), dtype=torch.float32)
+ 
+ 
++def test_effective_generation_limit_never_exceeds_model_capacity():
++    model = SimpleNamespace(
++        config=SimpleNamespace(max_target_positions=128),
++        generation_config=SimpleNamespace(max_length=96),
++    )
++
++    assert effective_generation_limit(model, 512) == 128
++    assert effective_generation_limit(model, 64) == 64
++    assert effective_generation_limit(model, None) == 96
++    assert effective_generation_limit(
++        SimpleNamespace(config=SimpleNamespace(max_target_positions=128)), None
++    ) == 128
++
++
+ def test_closed_lane_masks_orphan_hold_end_only():
+     processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
+     input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])

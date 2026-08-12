@@ -54,10 +54,21 @@ def test_long_active_leading_gap_retries_with_stable_evidence():
         "onsetCount": 189,
         "activeOnsetCount": 189,
         "activeFrameRatio": 1.0,
+        "introAnchor": {
+            "status": "UNCERTAIN",
+            "anchorMs": 500,
+            "anchorGridMs": 510,
+            "gridDistanceMs": 10,
+            "aggregatePercentileRank": 0.5,
+            "prominentBandCount": 0,
+            "pulseContinuationMatches": 1,
+            "pulseContinuationOpportunities": 4,
+        },
     }
 
 
-def test_short_active_leading_gap_is_review():
+def test_short_confirmed_intro_routes_to_map_review_without_timing_retry():
+    """phase가 맞는 인트로는 Timing 대신 MAP 첫 창 복구 대상으로 남긴다."""
     onsets = tuple(range(100, 2_600, 250))
 
     result = review_leading_timing_coverage(
@@ -67,8 +78,44 @@ def test_short_active_leading_gap_is_review():
     )
 
     assert result.action is TimingAuthorityAction.REVIEW
-    assert result.reasons == ("SHORT_ACTIVE_LEADING_TIMING_GAP",)
+    assert result.reasons == ("CONFIRMED_INTRO_ANCHOR_BEFORE_FIRST_EVENT",)
+    assert result.intro_anchor.status == "CONFIRMED"
     assert result.leading_duration_ms == 2_678
+
+
+def test_anchor_within_half_a_beat_passes():
+    """리듬 시작이 첫 timing event 반 박 이내면 인트로가 덮여 있다."""
+    result = review_leading_timing_coverage(
+        (OsuBpmEvent(520, 120.0),),
+        _analysis(
+            10_000,
+            onset_ms=(500, 750, 1_000),
+            active_onset_ms=(500, 750, 1_000),
+            active=True,
+        ),
+        duration_ms=10_000,
+    )
+
+    assert result.action is TimingAuthorityAction.PASS
+    assert result.reasons == ()
+
+
+def test_single_intro_fx_is_not_treated_as_rhythm_start():
+    """단발 FX 하나로 timing 재생성을 강제하지 않는다."""
+    result = review_leading_timing_coverage(
+        (OsuBpmEvent(4_000, 120.0),),
+        _analysis(
+            20_000,
+            onset_ms=(120,),
+            active_onset_ms=(120,),
+            active=True,
+        ),
+        duration_ms=20_000,
+    )
+
+    assert result.action is TimingAuthorityAction.REVIEW
+    assert result.reasons == ("UNCERTAIN_INTRO_ANCHOR",)
+    assert result.intro_anchor.status == "UNCERTAIN"
 
 
 def test_long_quiet_leading_gap_passes():

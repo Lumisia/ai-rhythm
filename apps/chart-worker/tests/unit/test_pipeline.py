@@ -7,18 +7,22 @@ import pytest
 
 from chart_worker import pipeline
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.attempt_journal import AttemptJournal
 from chart_worker.generation.fake import FakeGenerator
-from chart_worker.generation.recovery import RecoveryRowPlan
+from chart_worker.generation.mapperatorinator_patch import CONSTRAINT_PATCH_ID
+from chart_worker.generation.resnap_diagnostics import RESNAP_DIAGNOSTICS_VERSION
 from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
-from chart_worker.schema.playtest_run import PlaytestRunManifest
+from chart_worker.schema.playtest_run import PlaytestRunManifestV2
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.timing_feedback import (
     MapTimingFailureSignature,
     RetryTimingSignal,
 )
+from chart_worker.stages.types import MissingVariant
 from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.quality_gate import GateAction
 from chart_worker.validation.timing_review import (
@@ -44,7 +48,8 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         dependencies=fake_dependencies(),
     )
 
-    manifest = PlaytestRunManifest.model_validate_json(
+    assert result.manifest_path == output_dir / "playtest-run-v2.json"
+    manifest = PlaytestRunManifestV2.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     assert len(manifest.charts) == 12
@@ -62,6 +67,19 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert not (output_dir / "analysis").exists()
 
     report = json.loads((output_dir / "generation-report.json").read_text())
+    assert manifest.generation_report.path == "generation-report.json"
+    assert manifest.generation_report.sha256 == sha256_file(output_dir / "generation-report.json")
+    assert manifest.outcome.model_dump(by_alias=True) == report["outcomeStatusV2"]
+    assert manifest.publication.model_dump(by_alias=True) == report["publicationDecision"]
+    assert manifest.strict_blockers == ["BOUNDARY_POLICY_UNCALIBRATED"]
+    assert report["boundaryPublicationAssessment"] == {
+        "version": "boundary-publication-assessment-v1",
+        "evidenceStatus": "UNAVAILABLE",
+        "policyState": None,
+        "confidence": None,
+        "strictBlockers": ["BOUNDARY_POLICY_UNCALIBRATED"],
+    }
+    assert manifest.publication.decision == "PLAYTEST_ONLY"
     assert report["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
     assert report["timingAuthority"] == "audio/timing-reference.osu"
     assert report["timingAuthoritySha256"] == sha256_file(
@@ -99,18 +117,43 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         "onsetCount": 0,
         "activeOnsetCount": 0,
         "activeFrameRatio": 0.0,
+        "introAnchor": {
+            "status": "NON_RHYTHMIC",
+            "anchorMs": None,
+            "anchorGridMs": None,
+            "gridDistanceMs": None,
+            "aggregatePercentileRank": None,
+            "prominentBandCount": 0,
+            "pulseContinuationMatches": 0,
+            "pulseContinuationOpportunities": 0,
+        },
     }
-    assert report["timingAuthorityLocalReview"]["version"] == "local-timing-review-v1"
-    assert report["timingAuthorityLocalReview"]["action"] == "PASS"
-    assert report["timingAuthorityRecoveryPreflight"]["version"] == (
-        "recovery-preflight-v1"
+    assert report["timingAuthorityLocalReview"]["version"] == (
+        "local-timing-review-v2-duration-weighted"
     )
+    assert report["timingAuthoritySelection"]["selectedMode"] == "STANDARD"
+    assert report["timingAuthoritySelection"]["reason"] == ("ONLY_STRUCTURALLY_VALID_CANDIDATE")
+    assert report["timingAuthorityLocalReview"]["action"] == "PASS"
+    assert report["timingAuthorityRecoveryPreflight"]["version"] == ("recovery-preflight-v1")
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
-    assert report["attemptsPerChartMax"] == 3
+    assert report["attemptsPerChartMax"] == 6
+    assert report["qualityAttemptsPerChartMax"] == 3
+    assert report["crashAttemptsPerChartMax"] == 3
     assert report["canonicalAudioSha256"] == manifest.audio.game.sha256
-    assert report["qualityGateVersion"] == "quality-gate-v1"
-    assert report["publishable"] is True
+    assert report["runtimeFingerprint"]["canonicalAudioSha256"] == (manifest.audio.game.sha256)
+    assert (
+        report["runtimeFingerprint"]["timingAuthoritySha256"] == (report["timingAuthoritySha256"])
+    )
+    assert report["runtimeFingerprint"]["id"].startswith("sha256:")
+    assert report["runtimeFingerprint"]["evidenceGrade"] == "VERIFIED_CODE"
+    assert report["qualityGateVersion"] == "quality-gate-v3-outro-review"
+    assert report["publishable"] is False
+    assert report["publicationDecision"] == {
+        "policyVersion": "PUBLICATION_POLICY_V2",
+        "decision": "PLAYTEST_ONLY",
+        "reasonCodes": ["BOUNDARY_POLICY_UNCALIBRATED"],
+    }
     assert report["status"] == "PASS"
     assert report["timingReviewRequired"] is False
     assert report["selectedAuthorityEpoch"] == 1
@@ -128,10 +171,33 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
     assert set(report["difficultyOrder"]) == {"4K", "6K", "7K"}
+    assert len(report["difficultySelectionShadow"]) == 3
+    assert all(
+        comparison["mode"] == "SHADOW_V2" for comparison in report["difficultySelectionShadow"]
+    )
+    assert report["songSelectionShadow"]["mode"] == "SHADOW_V2"
+    assert report["songSelectionShadow"]["contextId"] != "EMPTY"
+    assert report["songSelectionShadow"]["songFamiliesEvaluated"] > 0
+    assert (
+        report["songSelectionShadow"]["currentAssignment"]
+        == (report["songSelectionShadow"]["shadowAssignment"])
+    )
+    assert report["introStartContract"]["version"] == "intro-start-contract-v2"
+    assert report["introContractReview"]["status"] == "PASS"
+    assert len(report["introPhraseFamilyReviews"]) == 3
     assert all(
         review["status"] == "PASS"
-        for review in report["difficultyOrder"].values()
+        for review in report["introPhraseFamilyReviews"]
     )
+    assert (
+        report["outroFamilyReview"]["version"]
+        == "outro-family-review-v3-tiered-start-shadow"
+    )
+    assert report["outroFamilyReview"]["mode"] == "SHADOW"
+    assert report["outroFamilyReview"]["mutatesCharts"] is False
+    assert report["outroFamilyReview"]["additionalInferenceCalls"] == 0
+    assert report["additionalInferenceCalls"] <= 1
+    assert all(review["status"] == "PASS" for review in report["difficultyOrder"].values())
 
     for chart_report, chart_ref, raw_path in zip(
         report["charts"], manifest.charts, result.raw_osu_paths, strict=True
@@ -146,32 +212,25 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         assert chart_report["generationAttemptCount"] == 1
         assert chart_report["provenance"] == "PRIMARY"
         assert chart_report["recoveryReason"] is None
-        assert chart_report["recoveryPlan"] is None
+        assert "recoveryPlan" not in chart_report
         assert chart_report["selectedSeed"] == chart_report["seed"]
         assert chart_report["attemptErrors"] == []
         assert chart_report["timingDiagnostics"]["status"] == "PASS"
         assert chart_report["acceptanceStatus"] == "PASS"
-        assert chart_report["acceptanceReasons"] == [
-            "INSUFFICIENT_PROFILE_VARIATION"
-        ]
+        assert chart_report["acceptanceReasons"] == ["INSUFFICIENT_PROFILE_VARIATION"]
         assert set(chart_report["noteGrid"]) == {
             "uniqueRowCount",
             "cleanRowCount",
             "cleanRate",
             "absoluteP95Beats",
         }
-        assert (
-            chart_report["noteGrid"]["uniqueRowCount"]
-            == chart_report["rawNoteCount"]
-        )
-        assert (
-            chart_report["noteGrid"]["cleanRowCount"]
-            == chart_report["rawNoteCount"]
-        )
+        assert chart_report["noteGrid"]["uniqueRowCount"] == chart_report["rawNoteCount"]
+        assert chart_report["noteGrid"]["cleanRowCount"] == chart_report["rawNoteCount"]
         assert chart_report["noteGrid"]["cleanRate"] == 1.0
         assert 0.0 <= chart_report["noteGrid"]["absoluteP95Beats"] <= 0.025
         assert set(chart_report["acceptanceDecisions"]) == {
             "STRUCTURE",
+            "SONG_BOUNDS",
             "TIMING_IDENTITY",
             "TIMING_ALIGNMENT",
             "COVERAGE",
@@ -179,31 +238,53 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         }
         assert set(chart_report) >= {
             "difficultyProfile",
+            "difficultyVectorV2",
             "holdProfile",
             "patternProfile",
         }
         assert chart_report["difficultyProfile"]["projectRating"] > 0
+        assert chart_report["difficultyVectorV2"]["orderingScore"] > 0
         assert "sectionOccupancyRatios" in chart_report["holdProfile"]
         assert "sectionLaneImbalances" in chart_report["patternProfile"]
         assert "activeOnsetCount" in chart_report["timingDiagnostics"]
         assert "quietCoverageGaps" in chart_report["timingDiagnostics"]
         assert chart_report["cfgScale"] == 1.0
         assert chart_report["resnapDiagnostics"] == {
-            "version": "resnap-collisions-v1",
+            "version": RESNAP_DIAGNOSTICS_VERSION,
             "status": "UNOBSERVED",
+            "osuSha256": None,
             "collisions": [],
+            "maniaObjects": [],
+            "duplicates": [],
             "error": None,
         }
-        assert chart_report["descriptors"] == {
-            "EASY": ["expression/simple"],
-            "NORMAL": ["style/mixed rice"],
-            "HARD": ["style/mixed rice", "streams/bursts"],
-            "EXPERT": [
-                "style/mixed rice",
-                "skillset/streams",
-                "skillset/tech",
-            ],
-        }[chart_report["difficulty"]]
+        assert chart_report["holdLaneStateTrace"] == {
+            "version": "hold-lane-state-shadow-v1",
+            "enforcement": "SHADOW",
+            "status": "PASS",
+            "laneCount": chart_report["keyMode"],
+            "holdCount": chart_report["holdCount"],
+            "tapCount": chart_report["rawNoteCount"] - chart_report["holdCount"],
+            "transitionCount": chart_report["rawNoteCount"] + chart_report["holdCount"],
+            "violations": [],
+            "sidecarEvidenceStatus": "UNAVAILABLE",
+            "sidecarObjectCount": 0,
+            "sidecarHoldCount": 0,
+            "originBackedHoldCount": 0,
+            "sidecarMismatch": None,
+        }
+        assert (
+            chart_report["descriptors"]
+            == {
+                "EASY": ["expression/simple"],
+                "NORMAL": ["style/mixed rice"],
+                "HARD": ["style/mixed rice", "streams/bursts"],
+                "EXPERT": [
+                    "style/mixed rice",
+                    "skillset/streams",
+                ],
+            }[chart_report["difficulty"]]
+        )
         assert chart_report["chartPath"] == chart_ref.path
         assert chart_report["rawOsuPath"] == raw_path.relative_to(output_dir).as_posix()
         assert "candidates" not in chart_report
@@ -219,9 +300,7 @@ def test_success_report_uses_null_for_unavailable_optional_timing_evidence(
 
     def timing(prepared, analysis, run_dir, generator, seed):
         authority = dependencies.timing(prepared, analysis, run_dir, generator, seed)
-        return replace(
-            authority, tempo_metrics=None, review=None, leading_coverage=None
-        )
+        return replace(authority, tempo_metrics=None, review=None, leading_coverage=None)
 
     run_pipeline(
         PipelineOptions(
@@ -260,6 +339,16 @@ def test_authority_review_sets_review_required_when_all_maps_pass(tmp_path: Path
                 onset_count=11,
                 active_onset_count=11,
                 active_frame_ratio=1.0,
+                intro_anchor=IntroAnchorEvidence(
+                    status="CONFIRMED",
+                    anchor_ms=100,
+                    anchor_grid_ms=0,
+                    grid_distance_ms=100,
+                    aggregate_percentile_rank=0.95,
+                    prominent_band_count=3,
+                    pulse_continuation_matches=2,
+                    pulse_continuation_opportunities=4,
+                ),
             ),
         )
 
@@ -301,8 +390,8 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
         context={"seed": 7, "attempts": [{"seed": 7, "gateReport": {"action": status}}]},
     )
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
-        del prepared, authority, analysis, run_dir, generator, seed
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        del prepared, authority, analysis, run_dir, generator, seed, authority_epoch
         raise failure
 
     def export(prepared, generated, run_dir, worker_version):
@@ -328,17 +417,26 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
     assert captured.value is failure
     report = json.loads((output_dir / "generation-report.json").read_text())
     assert report["version"] == 1
-    assert report["qualityGateVersion"] == "quality-gate-v1"
+    assert report["qualityGateVersion"] == "quality-gate-v3-outro-review"
     assert report["runId"] == "00000000-0000-0000-0000-000000000007"
     assert report["publishable"] is False
+    assert report["publicationDecision"] == {
+        "policyVersion": "PUBLICATION_POLICY_V2",
+        "decision": "REJECTED",
+        "reasonCodes": [
+            "BOUNDARY_POLICY_UNCALIBRATED",
+            "EXECUTION_FAILED",
+            "INCOMPLETE_CHART_SET",
+            "QUALITY_UNKNOWN",
+            "STRICT_OUTCOME_FALSE",
+        ],
+    }
     assert report["status"] == status
     assert report["error"] == {
         "code": code.value,
         "context": failure.context,
     }
-    assert report["canonicalAudioSha256"] == sha256_file(
-        output_dir / "audio" / "game.flac"
-    )
+    assert report["canonicalAudioSha256"] == sha256_file(output_dir / "audio" / "game.flac")
     assert report["timingAuthority"] == "audio/timing-reference.osu"
     assert report["timingAuthoritySha256"] == sha256_file(
         output_dir / "audio" / "timing-reference.osu"
@@ -356,14 +454,80 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
         "onsetCount": 0,
         "activeOnsetCount": 0,
         "activeFrameRatio": 0.0,
+        "introAnchor": {
+            "status": "NON_RHYTHMIC",
+            "anchorMs": None,
+            "anchorGridMs": None,
+            "gridDistanceMs": None,
+            "aggregatePercentileRank": None,
+            "prominentBandCount": 0,
+            "pulseContinuationMatches": 0,
+            "pulseContinuationOpportunities": 0,
+        },
     }
-    assert report["timingAuthorityLocalReview"]["version"] == "local-timing-review-v1"
+    assert report["timingAuthorityLocalReview"]["version"] == (
+        "local-timing-review-v2-duration-weighted"
+    )
     assert report["timingAuthorityRecoveryPreflight"]["version"] == (
         "recovery-preflight-v1"
     )
     assert export_calls == []
     assert not (output_dir / "charts").exists()
-    assert not (output_dir / "playtest-run-v1.json").exists()
+    assert not (output_dir / "playtest-run-v2.json").exists()
+
+
+def test_generation_failure_report_projects_durable_attempt_journal(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        del prepared, authority, analysis, generator, seed
+        journal = AttemptJournal(run_dir / "attempt-journal.jsonl")
+        journal.append(
+            event_type="INFERENCE_STARTED",
+            authority_epoch=authority_epoch,
+            key_mode=4,
+            difficulty="EASY",
+            attempt=1,
+            seed=7,
+        )
+        journal.append(
+            event_type="INFERENCE_FAILED",
+            authority_epoch=authority_epoch,
+            key_mode=4,
+            difficulty="EASY",
+            attempt=1,
+            seed=7,
+            payload={"code": "CHART_GENERATION_FAILED"},
+        )
+        raise WorkerError(
+            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+            "fixture exhausted",
+        )
+
+    with pytest.raises(WorkerError):
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=output_dir,
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(dependencies, generation=generation),
+        )
+
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    projection = report["attemptJournal"]
+    assert projection["status"] == "AVAILABLE"
+    assert projection["recordCount"] == 2
+    assert projection["eventCounts"] == {
+        "INFERENCE_FAILED": 1,
+        "INFERENCE_STARTED": 1,
+    }
+    assert [record["sequence"] for record in projection["records"]] == [1, 2]
 
 
 def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path):
@@ -373,16 +537,21 @@ def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path)
     dependencies = fake_dependencies()
     export_calls = []
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
-        variants = dependencies.generation(
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
             prepared,
             authority,
             analysis,
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
-        return (replace(variants[0], difficulty_order=None), *variants[1:])
+        variants = outcome.variants
+        return replace(
+            outcome,
+            variants=(replace(variants[0], difficulty_order=None), *variants[1:]),
+        )
 
     def export(prepared, generated, run_dir, worker_version):
         export_calls.append(run_dir)
@@ -416,7 +585,7 @@ def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path)
     }
     assert export_calls == []
     assert not (output_dir / "charts").exists()
-    assert not (output_dir / "playtest-run-v1.json").exists()
+    assert not (output_dir / "playtest-run-v2.json").exists()
 
 
 def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
@@ -442,10 +611,10 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
         del prepared, analysis, run_dir, generator, seed
         raise failure
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
         generation_calls.append(run_dir)
         return dependencies.generation(
-            prepared, authority, analysis, run_dir, generator, seed
+            prepared, authority, analysis, run_dir, generator, seed, authority_epoch
         )
 
     def export(prepared, generated, run_dir, worker_version):
@@ -482,9 +651,7 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
             "attempts": [{"attempt": 1, "seed": 7, "mode": "STANDARD"}],
         },
     }
-    assert report["canonicalAudioSha256"] == sha256_file(
-        output_dir / "audio" / "game.flac"
-    )
+    assert report["canonicalAudioSha256"] == sha256_file(output_dir / "audio" / "game.flac")
     assert report["timingAuthority"] is None
     assert report["timingAuthoritySha256"] is None
     assert generation_calls == []
@@ -492,7 +659,7 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
     assert not (output_dir / "audio" / "timing-reference.osu").exists()
     assert not (output_dir / "raw").exists()
     assert not (output_dir / "charts").exists()
-    assert not (output_dir / "playtest-run-v1.json").exists()
+    assert not (output_dir / "playtest-run-v2.json").exists()
 
 
 def test_timing_candidates_exhausted_writes_attempt_evidence_before_reraising(
@@ -552,11 +719,13 @@ def test_timing_candidates_exhausted_writes_attempt_evidence_before_reraising(
         "context": failure.context,
     }
     assert report["timingAuthority"] is None
-    assert not (output_dir / "playtest-run-v1.json").exists()
+    assert not (output_dir / "playtest-run-v2.json").exists()
 
 
+@pytest.mark.parametrize("provenance", ("PRIMARY", "RAW_UNVERIFIED"))
 def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
     tmp_path: Path,
+    provenance: str,
 ):
     action = GateAction.RETRY_MAP
     code = ErrorCode.CHART_CANDIDATES_EXHAUSTED
@@ -568,16 +737,18 @@ def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
     export_calls = []
     rejected_acceptance = None
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
         nonlocal rejected_acceptance
-        variants = dependencies.generation(
+        outcome = dependencies.generation(
             prepared,
             authority,
             analysis,
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
+        variants = outcome.variants
         first, *remaining = variants[0].acceptance.decisions
         rejected_acceptance = replace(
             variants[0].acceptance,
@@ -587,9 +758,16 @@ def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
                 *remaining,
             ),
         )
-        return (
-            replace(variants[0], acceptance=rejected_acceptance),
-            *variants[1:],
+        return replace(
+            outcome,
+            variants=(
+                replace(
+                    variants[0],
+                    acceptance=rejected_acceptance,
+                    provenance=provenance,
+                ),
+                *variants[1:],
+            ),
         )
 
     def export(prepared, generated, run_dir, worker_version):
@@ -618,6 +796,7 @@ def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
             {
                 "key_mode": 4,
                 "difficulty": "EASY",
+                "provenance": provenance,
                 "gate_report": rejected_acceptance.to_report(),
             }
         ]
@@ -631,7 +810,7 @@ def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
     }
     assert export_calls == []
     assert not (output_dir / "charts").exists()
-    assert not (output_dir / "playtest-run-v1.json").exists()
+    assert not (output_dir / "playtest-run-v2.json").exists()
 
 
 def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
@@ -641,15 +820,17 @@ def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
     dependencies = fake_dependencies()
     export_calls = []
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
-        variants = dependencies.generation(
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
             prepared,
             authority,
             analysis,
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
+        variants = outcome.variants
         first, *remaining = variants[0].acceptance.decisions
         review = replace(
             variants[0].acceptance,
@@ -659,7 +840,10 @@ def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
                 *remaining,
             ),
         )
-        return (replace(variants[0], acceptance=review), *variants[1:])
+        return replace(
+            outcome,
+            variants=(replace(variants[0], acceptance=review), *variants[1:]),
+        )
 
     def export(prepared, generated, run_dir, worker_version):
         export_calls.append(run_dir)
@@ -680,13 +864,22 @@ def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
     )
 
     report = json.loads((output_dir / "generation-report.json").read_text())
-    assert report["publishable"] is True
+    assert report["publishable"] is False
+    assert report["publicationDecision"] == {
+        "policyVersion": "PUBLICATION_POLICY_V2",
+        "decision": "PLAYTEST_ONLY",
+        "reasonCodes": [
+            "BOUNDARY_POLICY_UNCALIBRATED",
+            "QUALITY_REVIEW_REQUIRED",
+            "STRICT_OUTCOME_FALSE",
+        ],
+    }
     assert report["status"] == "PASS"
     assert report["timingReviewRequired"] is True
     assert report["charts"][0]["acceptanceStatus"] == "REVIEW"
     assert "FIXTURE_REVIEW" in report["charts"][0]["acceptanceReasons"]
     assert export_calls == [output_dir]
-    assert (output_dir / "playtest-run-v1.json").is_file()
+    assert (output_dir / "playtest-run-v2.json").is_file()
 
 
 def test_generation_report_uses_recorded_acceptance_timing(tmp_path: Path):
@@ -748,7 +941,15 @@ def test_pipeline_runs_shared_timing_before_twelve_maps_with_one_generator(
         assert selected_generator is generator
         return dependencies.timing(prepared, analysis, run_dir, selected_generator, seed)
 
-    def generation(prepared, authority, analysis, run_dir, selected_generator, seed):
+    def generation(
+        prepared,
+        authority,
+        analysis,
+        run_dir,
+        selected_generator,
+        seed,
+        authority_epoch,
+    ):
         calls.append("generation")
         assert selected_generator is generator
         return dependencies.generation(
@@ -758,6 +959,7 @@ def test_pipeline_runs_shared_timing_before_twelve_maps_with_one_generator(
             run_dir,
             selected_generator,
             seed,
+            authority_epoch,
         )
 
     def export(prepared, generated, run_dir, worker_version):
@@ -793,22 +995,24 @@ def test_generation_report_records_the_selected_retry_attempt(tmp_path: Path):
     source.write_bytes(b"source")
     dependencies = fake_dependencies()
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
-        variants = dependencies.generation(
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
             prepared,
             authority,
             analysis,
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
+        variants = outcome.variants
         retried = replace(
             variants[0],
             generated=replace(variants[0].generated, seed=19),
             attempt=2,
             attempt_errors=("lane 4 is outside requested 4K",),
         )
-        return (retried, *variants[1:])
+        return replace(outcome, variants=(retried, *variants[1:]))
 
     run_pipeline(
         PipelineOptions(
@@ -828,32 +1032,29 @@ def test_generation_report_records_the_selected_retry_attempt(tmp_path: Path):
     assert first["attemptErrors"] == ["lane 4 is outside requested 4K"]
 
 
-def test_generation_report_records_recovery_provenance(tmp_path: Path):
+def test_generation_report_records_raw_unverified_provenance(tmp_path: Path):
+    """품질 축을 우회한 raw 모델 출력은 provenance 와 곡 상태로 드러난다."""
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     dependencies = fake_dependencies()
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
-        variants = dependencies.generation(
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
             prepared,
             authority,
             analysis,
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
+        variants = outcome.variants
         recovered = replace(
             variants[0],
-            provenance="RECOVERY_FALLBACK",
-            recovery_reason="MODEL_CANDIDATES_EXHAUSTED",
-            recovery_plan=RecoveryRowPlan(
-                rows=(0, 500, 1_000),
-                subdivisions=4,
-                selection_reason="PREFLIGHT_ALTERNATE",
-                viable_divisors=(4, 6, 8),
-            ),
+            provenance="RAW_UNVERIFIED",
+            recovery_reason="QUALITY_GATE_REJECTED",
         )
-        return (recovered, *variants[1:])
+        return replace(outcome, variants=(recovered, *variants[1:]))
 
     run_pipeline(
         PipelineOptions(
@@ -866,17 +1067,203 @@ def test_generation_report_records_recovery_provenance(tmp_path: Path):
         dependencies=replace(dependencies, generation=generation),
     )
 
-    first = json.loads(
-        (tmp_path / "run" / "generation-report.json").read_text()
-    )["charts"][0]
-    assert first["provenance"] == "RECOVERY_FALLBACK"
-    assert first["recoveryReason"] == "MODEL_CANDIDATES_EXHAUSTED"
-    assert first["recoveryPlan"] == {
-        "subdivisions": 4,
-        "selectionReason": "PREFLIGHT_ALTERNATE",
-        "viableDivisors": [4, 6, 8],
-        "rowCount": 3,
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    first = report["charts"][0]
+    assert first["provenance"] == "RAW_UNVERIFIED"
+    assert first["recoveryReason"] == "QUALITY_GATE_REJECTED"
+    assert "recoveryPlan" not in first
+    # raw 출력이 섞이면 곡을 PASS 로 올리지 않는다.
+    assert report["status"] == "REVIEW"
+    assert report["publishable"] is False
+    assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
+
+
+def test_generation_report_records_missing_charts_as_partial(tmp_path: Path):
+    """조합 하나가 빠지면 나머지는 발행하고 곡 상태만 PARTIAL 로 낮춘다."""
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        dropped, *kept = outcome.variants
+        return replace(
+            outcome,
+            variants=tuple(kept),
+            missing=(
+                MissingVariant(
+                    key_mode=dropped.key_mode,
+                    difficulty=dropped.difficulty,
+                    reason="NO_PUBLISHABLE_CANDIDATE",
+                ),
+            ),
+        )
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["status"] == "PARTIAL"
+    assert report["publishable"] is False
+    assert report["publicationDecision"] == {
+        "policyVersion": "PUBLICATION_POLICY_V2",
+        "decision": "PLAYTEST_ONLY",
+        "reasonCodes": [
+            "BOUNDARY_POLICY_UNCALIBRATED",
+            "INCOMPLETE_CHART_SET",
+            "QUALITY_REVIEW_REQUIRED",
+            "STRICT_OUTCOME_FALSE",
+        ],
     }
+    assert report["availableCharts"] == 11
+    assert len(report["charts"]) == 11
+    assert report["missingCharts"] == [
+        {
+            "keyMode": 4,
+            "difficulty": "EASY",
+            "reason": "NO_PUBLISHABLE_CANDIDATE",
+            "attemptErrors": [],
+            "attemptEvidence": [],
+        }
+    ]
+
+
+def test_generation_report_preserves_blocked_intro_phrase_defect(tmp_path: Path):
+    from chart_worker.validation.intro_phrase_family import (
+        IntroPhraseChartView,
+        review_intro_phrase_pair,
+    )
+
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        dropped = next(
+            variant
+            for variant in outcome.variants
+            if (variant.key_mode, variant.difficulty) == (4, "EXPERT")
+        )
+        review = review_intro_phrase_pair(
+            IntroPhraseChartView(4, "HARD", 100, 300, 0.4),
+            IntroPhraseChartView(4, "EXPERT", 0, 12_000, 24.0),
+            start_delta_beats=0.2,
+        )
+        return replace(
+            outcome,
+            variants=tuple(variant for variant in outcome.variants if variant is not dropped),
+            missing=(
+                MissingVariant(
+                    4,
+                    "EXPERT",
+                    "INTRO_PHRASE_DEFECT_UNRESOLVED",
+                    attempt_evidence=(
+                        {"reason": "INTRO_PHRASE_DEFECT_PUBLICATION_BLOCKED"},
+                    ),
+                ),
+            ),
+            intro_phrase_family_reviews=(review,),
+        )
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["status"] == "PARTIAL"
+    assert report["publishable"] is False
+    assert report["timingReviewRequired"] is True
+    assert report["introPhraseFamilyReviews"][0]["status"] == "DEFECT"
+    assert report["introPhraseFamilyReviews"][0]["reason"] == (
+        "ISOLATED_EXPERT_FIRST_ROW"
+    )
+    assert report["missingCharts"][0]["reason"] == (
+        "INTRO_PHRASE_DEFECT_UNRESOLVED"
+    )
+
+
+def test_intro_phrase_review_observation_does_not_downgrade_or_block_song(
+    tmp_path: Path,
+):
+    from chart_worker.validation.intro_phrase_family import (
+        IntroPhraseChartView,
+        review_intro_phrase_pair,
+    )
+
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        review = review_intro_phrase_pair(
+            IntroPhraseChartView(4, "HARD", 15_790, 15_915, 0.25),
+            IntroPhraseChartView(4, "EXPERT", 0, 11_848, 23.696),
+            start_delta_beats=31.58,
+        )
+        assert review.status == "REVIEW"
+        assert review.should_block_publication is False
+        return replace(outcome, intro_phrase_family_reviews=(review,))
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["status"] == "PASS"
+    assert report["publishable"] is False
+    assert report["publicationDecision"]["reasonCodes"] == [
+        "BOUNDARY_POLICY_UNCALIBRATED"
+    ]
+    assert report["timingReviewRequired"] is False
+    assert report["introPhraseFamilyReviews"][0]["status"] == "REVIEW"
+    assert report["introPhraseFamilyReviews"][0]["reason"] == "EXPERT_EARLY_GHOST"
 
 
 def test_pipeline_analyzes_only_the_canonical_game_audio_once(tmp_path: Path):
@@ -921,7 +1308,7 @@ def test_pipeline_passes_one_shared_onset_analysis_to_timing_and_map_generation(
         timing_analyses.append(analysis)
         return dependencies.timing(prepared, analysis, run_dir, generator, seed)
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
         generation_analyses.append(analysis)
         return dependencies.generation(
             prepared,
@@ -930,6 +1317,7 @@ def test_pipeline_passes_one_shared_onset_analysis_to_timing_and_map_generation(
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
 
     run_pipeline(
@@ -979,20 +1367,86 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
     )
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
-    assert report["publishable"] is True
+    outro_profile = report["musicBounds"]["outroEvidenceProfile"]
+    assert outro_profile["version"] == "outro-evidence-profile-v1"
+    assert outro_profile["policyState"] == "UNCALIBRATED"
+    assert outro_profile["semanticClassification"] == "UNAVAILABLE"
+    assert [window["windowMs"] for window in outro_profile["windows"]] == [
+        1_000,
+        2_000,
+        5_000,
+        10_000,
+    ]
+    boundary = report["musicBounds"]["boundaryPolicyEvaluation"]
+    assert boundary["policyState"] == "PROVISIONAL"
+    assert boundary["confidence"] == "UNKNOWN"
+    assert boundary["enforcementMode"] == "SHADOW"
+    assert boundary["effectiveSource"] == "FULL_DURATION_BASELINE"
+    assert boundary["effectiveContract"] == report["musicBounds"]["songBoundaryContract"]
+    assert boundary["observationSha256"] == (
+        boundary["provisionalDecision"]["observationSha256"]
+    )
+    assert report["boundaryPublicationAssessment"] == {
+        "version": "boundary-publication-assessment-v1",
+        "evidenceStatus": "AVAILABLE",
+        "policyState": "PROVISIONAL",
+        "confidence": "UNKNOWN",
+        "strictBlockers": ["BOUNDARY_POLICY_UNCALIBRATED"],
+    }
+    assert report["publishable"] is False
+    assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
     assert report["status"] == "PASS"
     assert report["timingReviewRequired"] is True
     assert len(report["charts"]) == 12
+    assert all(chart["timingDiagnostics"]["activeOnsetCount"] == 0 for chart in report["charts"])
     assert all(
-        chart["timingDiagnostics"]["activeOnsetCount"] == 0
-        for chart in report["charts"]
-    )
-    assert all(
-        "LOW_ACTIVE_ONSET_SUPPORT"
-        in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
+        "LOW_ACTIVE_ONSET_SUPPORT" in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
         for chart in report["charts"]
     )
     assert len(list((tmp_path / "run" / "charts").glob("*.json"))) == 12
+
+
+def test_outro_family_shadow_finding_marks_review_without_spending_generation_budget(
+    tmp_path: Path,
+):
+    from chart_worker.validation.outro_family_review import (
+        OutroChartView,
+        review_outro_family,
+    )
+
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(*args, **kwargs):
+        outcome = dependencies.generation(*args, **kwargs)
+        review = review_outro_family(
+            (
+                OutroChartView(4, "HARD", 99_000, 99_500),
+                OutroChartView(6, "HARD", 99_200, 99_700),
+                OutroChartView(7, "HARD", 89_000, 89_500),
+            )
+        )
+        return replace(outcome, outro_family_review=review)
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["outroFamilyReview"]["status"] == "REVIEW"
+    assert report["outroFamilyReview"]["findings"][0]["reason"] == (
+        "OUTRO_FAMILY_EARLY_START"
+    )
+    assert report["status"] == "REVIEW"
+    assert report["timingReviewRequired"] is True
+    assert report["additionalInferenceCalls"] == 0
 
 
 def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: Path):
@@ -1010,13 +1464,7 @@ def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: P
     )
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
-    assert (
-        report["mapperatorinatorConstraintPatch"]
-        == (
-            "mania-keycount-v1+mania-output-safety-v1+mania-event-times-v1"
-            "+mania-resnap-collisions-v1"
-        )
-    )
+    assert report["mapperatorinatorConstraintPatch"] == CONSTRAINT_PATCH_ID
 
 
 def test_pipeline_rejects_canonical_audio_changed_after_prepare(tmp_path: Path):
@@ -1059,7 +1507,7 @@ def test_pipeline_rejects_canonical_audio_changed_during_generation(tmp_path: Pa
     dependencies = fake_dependencies()
     export_calls = []
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
         variants = dependencies.generation(
             prepared,
             authority,
@@ -1067,6 +1515,7 @@ def test_pipeline_rejects_canonical_audio_changed_during_generation(tmp_path: Pa
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
         prepared.normalized.path.write_bytes(b"tampered during generation")
         return variants
@@ -1105,7 +1554,7 @@ def test_pipeline_rejects_canonical_audio_changed_during_timing(tmp_path: Path):
         prepared.normalized.path.write_bytes(b"tampered during timing")
         return authority
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
         generation_calls.append(run_dir)
         return dependencies.generation(
             prepared,
@@ -1114,6 +1563,7 @@ def test_pipeline_rejects_canonical_audio_changed_during_timing(tmp_path: Path):
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
 
     with pytest.raises(WorkerError) as captured:
@@ -1194,10 +1644,11 @@ def test_map_timing_feedback_replaces_authority_and_regenerates_all_variants(
     source.write_bytes(b"source")
     dependencies = fake_dependencies()
     generation_modes: list[str] = []
+    generation_epochs: list[int] = []
     stable_raw_counts: list[int] = []
     super_calls: list[int] = []
 
-    def super_timing(prepared, analysis, run_dir, generator, seed):
+    def super_timing(prepared, analysis, run_dir, generator, seed, authority_epoch=2):
         super_calls.append(seed)
         return run_timing_generation(
             prepared,
@@ -1208,25 +1659,27 @@ def test_map_timing_feedback_replaces_authority_and_regenerates_all_variants(
             force_super=True,
         )
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
         generation_modes.append(authority.mode)
+        generation_epochs.append(authority_epoch)
         stable_raw_counts.append(len(list((run_dir / "raw").glob("*.osu"))))
         if len(generation_modes) == 1:
             raise _retry_timing_signal(authority.sha256)
-        variants = dependencies.generation(
+        outcome = dependencies.generation(
             prepared,
             authority,
             analysis,
             run_dir,
             generator,
             seed,
+            authority_epoch,
         )
-        assert len(variants) == 12
+        assert len(outcome.variants) == 12
+        assert not outcome.missing
         assert all(
-            variant.timing_authority_sha256 == authority.sha256
-            for variant in variants
+            variant.timing_authority_sha256 == authority.sha256 for variant in outcome.variants
         )
-        return variants
+        return outcome
 
     result = run_pipeline(
         PipelineOptions(
@@ -1244,6 +1697,7 @@ def test_map_timing_feedback_replaces_authority_and_regenerates_all_variants(
     )
 
     assert generation_modes == ["STANDARD", "SUPER_TIMING"]
+    assert generation_epochs == [1, 2]
     assert stable_raw_counts == [0, 0]
     assert super_calls == [7]
     assert len(result.raw_osu_paths) == 12
@@ -1264,7 +1718,7 @@ def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
     dependencies = fake_dependencies()
     generation_modes: list[str] = []
 
-    def super_timing(prepared, analysis, run_dir, generator, seed):
+    def super_timing(prepared, analysis, run_dir, generator, seed, authority_epoch=2):
         return run_timing_generation(
             prepared,
             analysis,
@@ -1274,8 +1728,8 @@ def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
             force_super=True,
         )
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
-        del prepared, analysis, run_dir, generator, seed
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        del prepared, analysis, run_dir, generator, seed, authority_epoch
         generation_modes.append(authority.mode)
         raise _retry_timing_signal(authority.sha256)
 
@@ -1305,3 +1759,53 @@ def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
     ]
     assert len(report["mapTimingEscalations"]) == 2
     assert report["failureStage"] == "GENERATION"
+
+
+def test_independent_fallback_does_not_reenter_failed_super_timing_path(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    generation_modes: list[str] = []
+    super_calls: list[int] = []
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        authority = dependencies.timing(prepared, analysis, run_dir, generator, seed)
+        return replace(authority, mode="BEAT_THIS_FALLBACK")
+
+    def super_timing(prepared, analysis, run_dir, generator, seed, authority_epoch=2):
+        del prepared, analysis, run_dir, generator, authority_epoch
+        super_calls.append(seed)
+        raise AssertionError("independent fallback must not re-enter Super Timing")
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        del prepared, analysis, run_dir, generator, seed, authority_epoch
+        generation_modes.append(authority.mode)
+        raise _retry_timing_signal(authority.sha256)
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(
+                dependencies,
+                timing=timing,
+                super_timing=super_timing,
+                generation=generation,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert generation_modes == ["BEAT_THIS_FALLBACK"]
+    assert super_calls == []
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["failureStage"] == "GENERATION"
+    assert report["timingGenerationMode"] == "BEAT_THIS_FALLBACK"
+    assert report["timingCandidates"][-1]["mode"] == "BEAT_THIS_FALLBACK"
+    assert report["timingCandidates"][-1]["status"] == "FAILED"

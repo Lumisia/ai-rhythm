@@ -1,0 +1,232 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 2059070..65c9466 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -171,6 +171,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             tokenizer: Tokenizer,
+             initial_open_columns: tuple[int, ...] | None,
+             prompt_group_signatures: tuple[tuple[int, int, str], ...] = (),
++            prompt_current_time_token: int | None = None,
+             require_closed_holds_at_eos: bool = False,
+             max_sequence_length: int | None = None,
+     ):
+@@ -183,6 +184,11 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             (int(time_token), int(lane), EventType(event_type_value))
+             for time_token, lane, event_type_value in prompt_group_signatures
+         )
++        self.prompt_current_time_token = (
++            None
++            if prompt_current_time_token is None
++            else int(prompt_current_time_token)
++        )
+         self.sos_id = tokenizer.sos_id
+         self.eos_ids = tuple(
+             [tokenizer.eos_id]
+@@ -272,7 +278,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 )
+ 
+             current_lane: int | None = None
+-            current_time_token: int | None = None
++            current_time_token = self.prompt_current_time_token
+             seen_groups: set[tuple[int | None, int, EventType]] = set(
+                 self.prompt_group_signatures
+             )
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 5ad05d0..5cac55e 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -457,6 +457,7 @@ class Processor(object):
+ 
+                 mania_open_hold_columns = None
+                 mania_prompt_group_signatures = ()
++                mania_prompt_current_time_token = None
+                 if (
+                         context["context_type"] == ContextType.MAP
+                         and mania_keycount is not None
+@@ -473,6 +474,12 @@ class Processor(object):
+                             mania_keycount,
+                         )
+                     )
++                    mania_prompt_current_time_token = (
++                        self._mania_prompt_current_time_token(
++                            context,
++                            frame_time,
++                        )
++                    )
+ 
+                 result, generation_stats = self.model_generate(
+                     model_kwargs | dict(
+@@ -487,6 +494,9 @@ class Processor(object):
+                     context_type=context["context_type"].value,
+                     mania_open_hold_columns=mania_open_hold_columns,
+                     mania_prompt_group_signatures=mania_prompt_group_signatures,
++                    mania_prompt_current_time_token=(
++                        mania_prompt_current_time_token
++                    ),
+                     mania_require_closed_holds_at_eos=(
+                         mania_open_hold_columns is not None and not trim_lookahead
+                     ),
+@@ -572,6 +582,31 @@ class Processor(object):
+             )
+         return tuple(signatures)
+ 
++    def _mania_prompt_current_time_token(
++            self,
++            context: dict[str, Any],
++            frame_time: float,
++    ) -> int | None:
++        """Return the token for the append boundary inherited by a partial group."""
++        if not context["event_times"]:
++            return None
++        current_time = context["event_times"][-1]
++        relative_time = int(
++            (current_time - frame_time) / MILISECONDS_PER_STEP
++        )
++        timeshift_range = self.tokenizer.event_range[EventType.TIME_SHIFT]
++        if not (
++            timeshift_range.min_value
++            <= relative_time
++            <= timeshift_range.max_value
++        ):
++            return None
++        encoded_time = self._encode(
++            [Event(EventType.TIME_SHIFT, current_time)],
++            frame_time,
++        )
++        return int(encoded_time[0, 0].item())
++
+     def generate_parallel(
+             self,
+             *,
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index 3d77174..25656d3 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -103,6 +103,7 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                             max_note_start_time=None,
+                             mania_open_hold_columns=None,
+                             mania_prompt_group_signatures=(),
++                            mania_prompt_current_time_token=None,
+                             mania_require_closed_holds_at_eos=False,
+                             mania_max_sequence_length=None):
+     """Create the logits processors used by every generate path."""
+@@ -125,6 +126,7 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                     tokenizer,
+                     mania_open_hold_columns,
+                     prompt_group_signatures=mania_prompt_group_signatures,
++                    prompt_current_time_token=mania_prompt_current_time_token,
+                     require_closed_holds_at_eos=mania_require_closed_holds_at_eos,
+                     max_sequence_length=mania_max_sequence_length,
+                 )
+@@ -310,6 +312,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_prompt_group_signatures = generate_kwargs.pop(
+         'mania_prompt_group_signatures', ()
+     )
++    mania_prompt_current_time_token = generate_kwargs.pop(
++        'mania_prompt_current_time_token', None
++    )
+     mania_require_closed_holds_at_eos = generate_kwargs.pop(
+         'mania_require_closed_holds_at_eos', False
+     )
+@@ -329,6 +334,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+         max_note_start_time,
+         mania_open_hold_columns,
+         mania_prompt_group_signatures,
++        mania_prompt_current_time_token,
+         mania_require_closed_holds_at_eos,
+         effective_max_length,
+     )
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index 52169ab..bc4aa32 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -313,6 +313,9 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_prompt_group_signatures = generate_kwargs.pop(
+         'mania_prompt_group_signatures', ()
+     )
++    mania_prompt_current_time_token = generate_kwargs.pop(
++        'mania_prompt_current_time_token', None
++    )
+     mania_require_closed_holds_at_eos = generate_kwargs.pop(
+         'mania_require_closed_holds_at_eos', False
+     )
+@@ -342,6 +345,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         max_note_start_time,
+         mania_open_hold_columns,
+         mania_prompt_group_signatures,
++        mania_prompt_current_time_token,
+         mania_require_closed_holds_at_eos,
+         hard_cap,
+     )
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index 22de60e..a68effa 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -392,6 +392,24 @@ def test_trimmed_prompt_groups_still_block_candidate_inside_hold():
+     assert torch.isneginf(result[0, 50])
+ 
+ 
++def test_trimmed_prompt_without_timeshift_inherits_canonical_prompt_time():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_group_signatures=(
++            (30, 2, EventType.HOLD_NOTE.value),
++        ),
++        prompt_current_time_token=30,
++    )
++    trimmed_prompt_with_only_pending_column = torch.tensor(
++        [[keycount_token(4), 1, 12]]
++    )
++
++    result = processor(trimmed_prompt_with_only_pending_column, scores())
++
++    assert torch.isneginf(result[0, 50])
++
++
+ def test_prompt_timeline_blocks_different_note_on_at_same_time_and_lane():
+     processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
+     prompt = torch.tensor(
+@@ -513,6 +531,7 @@ def test_processor_stack_propagates_final_window_hold_closure_contract():
+         mania_prompt_group_signatures=(
+             (30, 2, EventType.HOLD_NOTE.value),
+         ),
++        mania_prompt_current_time_token=30,
+         mania_require_closed_holds_at_eos=True,
+         mania_max_sequence_length=123,
+     )
+@@ -527,6 +546,7 @@ def test_processor_stack_propagates_final_window_hold_closure_contract():
+     assert processor.prompt_group_signatures == frozenset(
+         {(30, 2, EventType.HOLD_NOTE)}
+     )
++    assert processor.prompt_current_time_token == 30
+ 
+ 
+ def test_hold_state_contract_rejects_unsupported_types_first_grammar():
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index 5637159..0302137 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -273,6 +273,22 @@ def test_mania_prompt_group_contract_includes_addressable_negative_time():
+     )
+ 
+ 
++def test_mania_prompt_current_time_contract_uses_context_append_boundary():
++    processor = make_processor()
++    processor.tokenizer.event_range = {
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=-1_000, max_value=1_000),
++    }
++    processor._encode = lambda events, frame_time: torch.tensor(
++        [[30 + int((event.value - frame_time) / 10) for event in events]]
++    )
++    context = {
++        "events": [Event(EventType.CIRCLE, 0)],
++        "event_times": [71282],
++    }
++
++    assert processor._mania_prompt_current_time_token(context, 78603) == -702
++
++
+ def test_mania_context_trimming_starts_at_complete_group_boundary():
+     processor = make_processor()
+     processor.tokenizer = SimpleNamespace(

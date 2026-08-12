@@ -38,6 +38,42 @@ def test_accepts_zero_millisecond_rows_and_a_note_before_audio_end():
     validate_generated_chart(chart, key_mode=4, duration_ms=10_000)
 
 
+def test_allows_hold_release_after_last_attack_but_rejects_a_late_start():
+    valid = generated([hold(8_400, 1, 1_500)])
+    validate_generated_chart(
+        valid,
+        key_mode=4,
+        duration_ms=10_000,
+        max_note_start_ms=8_500,
+    )
+
+    invalid = generated([tap(8_501, 2)])
+    with pytest.raises(GeneratedChartValidationError) as captured:
+        validate_generated_chart(
+            invalid,
+            key_mode=4,
+            duration_ms=10_000,
+            max_note_start_ms=8_500,
+        )
+
+    assert captured.value.reason_code == "NOTE_START_AFTER_MUSIC"
+
+
+def test_rejects_hold_end_after_release_boundary():
+    chart = generated([hold(8_000, 0, 1_500)])
+
+    with pytest.raises(GeneratedChartValidationError) as captured:
+        validate_generated_chart(
+            chart,
+            key_mode=4,
+            duration_ms=10_000,
+            max_note_start_ms=8_500,
+            max_hold_end_ms=9_000,
+        )
+
+    assert captured.value.reason_code == "HOLD_END_AFTER_RELEASE"
+
+
 def test_rejects_duplicate_lane_and_time():
     chart = generated([tap(0, 1), tap(0, 1)])
     with pytest.raises(

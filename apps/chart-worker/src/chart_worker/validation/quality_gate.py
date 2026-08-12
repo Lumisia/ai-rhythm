@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
+from chart_worker.analysis.activity import BoundaryPolicyMode, build_song_boundary_contract
 from chart_worker.analysis.chart_profile import (
     ChartQualityProfile,
     build_chart_quality_profile,
@@ -10,6 +11,7 @@ from chart_worker.analysis.chart_profile import (
 from chart_worker.analysis.grid_alignment import NoteGridMetrics, measure_note_grid_alignment
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing_diagnostics import (
+    ACTIVE_GAP_MIN_FRAME_RATIO,
     ACTIVE_GAP_MIN_ONSETS,
     SECTION_PHASE_DRIFT_MAX_MS,
     TimingDiagnostics,
@@ -28,9 +30,13 @@ from chart_worker.validation.timing_authority import (
     validate_timing_identity,
 )
 
+QUALITY_GATE_VERSION = "quality-gate-v3-outro-review"
+QUIET_TRAILING_REVIEW_PROXIMITY = 0.5
+
 
 class GateAxis(StrEnum):
     STRUCTURE = "STRUCTURE"
+    SONG_BOUNDS = "SONG_BOUNDS"
     TIMING_IDENTITY = "TIMING_IDENTITY"
     TIMING_ALIGNMENT = "TIMING_ALIGNMENT"
     COVERAGE = "COVERAGE"
@@ -118,6 +124,31 @@ def _timing_identity_decision(
     return GateDecision(GateAxis.TIMING_IDENTITY, GateAction.PASS, ())
 
 
+def _song_bounds_decision(
+    chart: GeneratedChart,
+    *,
+    key_mode: int,
+    duration_ms: int,
+    max_note_start_ms: int,
+    max_hold_end_ms: int,
+) -> GateDecision:
+    try:
+        validate_generated_chart(
+            chart,
+            key_mode=key_mode,
+            duration_ms=duration_ms,
+            max_note_start_ms=max_note_start_ms,
+            max_hold_end_ms=max_hold_end_ms,
+        )
+    except GeneratedChartValidationError as error:
+        return GateDecision(
+            GateAxis.SONG_BOUNDS,
+            GateAction.RETRY_MAP,
+            (error.reason_code,),
+        )
+    return GateDecision(GateAxis.SONG_BOUNDS, GateAction.PASS, ())
+
+
 def _coverage_decision(timing: TimingDiagnostics) -> GateDecision:
     active_reasons = tuple(f"ACTIVE_{gap.position}_GAP" for gap in timing.coverage_gaps)
     if active_reasons:
@@ -126,6 +157,21 @@ def _coverage_decision(timing: TimingDiagnostics) -> GateDecision:
         f"QUIET_{gap.position}_GAP" for gap in timing.quiet_coverage_gaps
     )
     if quiet_reasons:
+        near_active_trailing = any(
+            gap.position == "TRAILING"
+            and min(
+                gap.active_onset_count / ACTIVE_GAP_MIN_ONSETS,
+                gap.active_frame_ratio / ACTIVE_GAP_MIN_FRAME_RATIO,
+            )
+            >= QUIET_TRAILING_REVIEW_PROXIMITY
+            for gap in timing.quiet_coverage_gaps
+        )
+        if near_active_trailing:
+            return GateDecision(
+                GateAxis.COVERAGE,
+                GateAction.REVIEW,
+                (*quiet_reasons, "QUIET_TRAILING_GAP_NEAR_ACTIVE_THRESHOLD"),
+            )
         return GateDecision(GateAxis.COVERAGE, GateAction.PASS, quiet_reasons)
     return GateDecision(GateAxis.COVERAGE, GateAction.PASS, ())
 
@@ -238,6 +284,7 @@ def evaluate_chart_candidate(
     requested_key_mode: int,
     requested_difficulty: str,
     duration_ms: int,
+    boundary_policy_mode: BoundaryPolicyMode = "SHADOW",
 ) -> ChartAcceptance:
     """Evaluate a candidate without changing its notes, holds, or timing events."""
     if requested_difficulty not in DIFFICULTIES:
@@ -246,10 +293,24 @@ def evaluate_chart_candidate(
     structure, structure_error = _structure_decision(
         chart, key_mode=requested_key_mode, duration_ms=duration_ms
     )
+    boundary = (
+        build_song_boundary_contract(
+            onset_analysis.activity,
+            duration_ms,
+            enforcement_mode=boundary_policy_mode,
+        )
+        if onset_analysis.activity is not None
+        else None
+    )
+    coverage_end_ms = (
+        boundary.required_coverage_end_ms if boundary is not None else duration_ms
+    )
     timing = diagnose_chart_timing(
         chart.notes,
         onset_analysis.onset_ms,
         duration_ms=duration_ms,
+        coverage_end_ms=coverage_end_ms,
+        bpm_events=authority.bpm_events,
         activity=onset_analysis.activity,
     )
     unique_rows = tuple(sorted({note.time_ms for note in chart.notes}))
@@ -261,6 +322,7 @@ def evaluate_chart_candidate(
             key_mode=requested_key_mode,
             duration_ms=duration_ms,
             beat_ms=60_000.0 / authority.bpm_events[0].bpm,
+            bpm_events=authority.bpm_events,
             activity=onset_analysis.activity,
         )
         from chart_worker.validation.profile_review import review_profile
@@ -280,6 +342,33 @@ def evaluate_chart_candidate(
         )
     decisions = (
         structure,
+        (
+            _song_bounds_decision(
+                chart,
+                key_mode=requested_key_mode,
+                duration_ms=duration_ms,
+                max_note_start_ms=(
+                    boundary.max_note_start_ms
+                    if boundary is not None
+                    else duration_ms
+                ),
+                max_hold_end_ms=(
+                    min(
+                        duration_ms,
+                        boundary.release_end_ms
+                        + boundary.quantization_tolerance_ms,
+                    )
+                    if boundary is not None
+                    else duration_ms
+                ),
+            )
+            if structure.action is GateAction.PASS
+            else GateDecision(
+                GateAxis.SONG_BOUNDS,
+                GateAction.PASS,
+                ("NOT_EVALUATED_STRUCTURE_INVALID",),
+            )
+        ),
         _timing_identity_decision(chart, authority),
         _timing_alignment_decision(
             timing,

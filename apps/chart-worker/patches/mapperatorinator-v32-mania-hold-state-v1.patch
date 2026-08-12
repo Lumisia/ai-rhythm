@@ -1,0 +1,711 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index b3932ce..151c7cb 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -68,7 +68,7 @@ class ManiaKeycountLogitsProcessor(LogitsProcessor):
+         return scores_processed
+ 
+ 
+-class ManiaColumnBeforeTypeLogitsProcessor(LogitsProcessor):
++class ManiaColumnBeforeTypeLogitsProcessor(LogitsProcessor):
+     """Enforce the v32 ``time -> column -> note type`` training grammar.
+ 
+     This deliberately does not infer HOLD state.  A gameplay type without a
+@@ -127,10 +127,189 @@ class ManiaColumnBeforeTypeLogitsProcessor(LogitsProcessor):
+             )
+             if last_column <= last_boundary:
+                 scores_processed[row, note_types] = -torch.inf
+-        return scores_processed
+-
+-
+-class ManiaStartBoundaryLogitsProcessor(LogitsProcessor):
++        return scores_processed
++
++
++def _apply_mania_hold_transition(
++        open_columns: set[int],
++        lane: int,
++        event_type: EventType,
++) -> None:
++    """Apply one serializable mania lane transition or fail explicitly."""
++    if event_type == EventType.CIRCLE:
++        if lane in open_columns:
++            raise ValueError(f"TAP while HOLD is active in lane {lane}")
++        return
++    if event_type == EventType.HOLD_NOTE:
++        if lane in open_columns:
++            raise ValueError(f"overlapping HOLD_START in lane {lane}")
++        open_columns.add(lane)
++        return
++    if event_type == EventType.HOLD_NOTE_END:
++        if lane not in open_columns:
++            raise ValueError(f"HOLD_END without HOLD_START in lane {lane}")
++        open_columns.remove(lane)
++
++
++def mania_open_hold_columns_before(
++        events: list[Event],
++        event_times: list[float],
++        boundary_time: float,
++        keycount: int,
++) -> tuple[int, ...]:
++    """Return lanes with a HOLD open immediately before ``boundary_time``.
++
++    Exact event signatures can be repeated by overlapping generation windows;
++    they are state-idempotent here. Canonical origin validation remains the
++    authority for deciding whether such duplicates may be published.
++    """
++    if len(events) != len(event_times):
++        raise ValueError("events and event_times must have equal length")
++
++    note_types = {
++        EventType.CIRCLE,
++        EventType.HOLD_NOTE,
++        EventType.HOLD_NOTE_END,
++    }
++    current_lane: int | None = None
++    groups: set[tuple[int, int, EventType]] = set()
++    for event, event_time in zip(events, event_times):
++        if event.type == EventType.TIME_SHIFT:
++            current_lane = None
++        elif event.type == EventType.MANIA_COLUMN:
++            current_lane = int(event.value)
++        elif event.type in note_types:
++            if current_lane is None:
++                raise ValueError(
++                    f"mania note has no gameplay column: type={event.type.name}, "
++                    f"time={event_time}"
++                )
++            if event_time < boundary_time:
++                groups.add((int(round(event_time)), current_lane, event.type))
++            current_lane = None
++
++    open_columns: set[int] = set()
++    order = {
++        EventType.HOLD_NOTE_END: 0,
++        EventType.HOLD_NOTE: 1,
++        EventType.CIRCLE: 2,
++    }
++    for time_ms, lane, event_type in sorted(
++            groups,
++            key=lambda group: (group[0], group[1], order[group[2]]),
++    ):
++        if not 0 <= lane < keycount:
++            raise ValueError(
++                f"mania lane {lane} is outside keycount {keycount} at {time_ms}"
++            )
++        _apply_mania_hold_transition(open_columns, lane, event_type)
++    return tuple(sorted(open_columns))
++
++
++class ManiaHoldStateLogitsProcessor(LogitsProcessor):
++    """Mask only lane transitions that cannot form a playable HOLD stream."""
++
++    def __init__(
++            self,
++            tokenizer: Tokenizer,
++            initial_open_columns: tuple[int, ...] | None,
++    ):
++        self.initial_open_columns = (
++            None
++            if initial_open_columns is None
++            else frozenset(int(lane) for lane in initial_open_columns)
++        )
++        self.sos_id = tokenizer.sos_id
++        self.keycount_start = tokenizer.event_start[EventType.MANIA_KEYCOUNT]
++        self.keycount_end = tokenizer.event_end[EventType.MANIA_KEYCOUNT]
++        self.keycount_min = tokenizer.event_range[EventType.MANIA_KEYCOUNT].min_value
++        self.column_start = tokenizer.event_start[EventType.MANIA_COLUMN]
++        self.column_end = tokenizer.event_end[EventType.MANIA_COLUMN]
++        self.time_start = tokenizer.event_start[EventType.TIME_SHIFT]
++        self.time_end = tokenizer.event_end[EventType.TIME_SHIFT]
++        self.tap_token = tokenizer.event_start[EventType.CIRCLE]
++        self.hold_start_token = tokenizer.event_start[EventType.HOLD_NOTE]
++        self.hold_end_token = tokenizer.event_start[EventType.HOLD_NOTE_END]
++        self.event_type_by_token = {
++            self.tap_token: EventType.CIRCLE,
++            self.hold_start_token: EventType.HOLD_NOTE,
++            self.hold_end_token: EventType.HOLD_NOTE_END,
++        }
++
++    def __call__(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
++        if self.initial_open_columns is None:
++            return scores
++
++        scores_processed = scores.clone()
++        for row in range(input_ids.shape[0]):
++            tokens = input_ids[row]
++            keycount_tokens = tokens[
++                (tokens >= self.keycount_start) & (tokens < self.keycount_end)
++            ]
++            sos_indices = torch.nonzero(tokens == self.sos_id, as_tuple=False).flatten()
++            if keycount_tokens.numel() == 0 or sos_indices.numel() == 0:
++                continue
++            keycount = (
++                int(keycount_tokens[-1].item())
++                - self.keycount_start
++                + self.keycount_min
++            )
++            open_columns = set(self.initial_open_columns)
++            if any(not 0 <= lane < keycount for lane in open_columns):
++                raise ValueError(
++                    f"initial open HOLD lane is outside keycount {keycount}: "
++                    f"{sorted(open_columns)}"
++                )
++
++            current_lane: int | None = None
++            current_time_token: int | None = None
++            seen_groups: set[tuple[int | None, int, EventType]] = set()
++            start = int(sos_indices[-1].item()) + 1
++            for token_tensor in tokens[start:]:
++                token = int(token_tensor.item())
++                if self.time_start <= token < self.time_end:
++                    current_time_token = token
++                    current_lane = None
++                elif self.column_start <= token < self.column_end:
++                    current_lane = token - self.column_start
++                elif token in self.event_type_by_token:
++                    if current_lane is None:
++                        raise ValueError(
++                            "mania note type in prompt has no gameplay column"
++                        )
++                    event_type = self.event_type_by_token[token]
++                    signature = (current_time_token, current_lane, event_type)
++                    if signature not in seen_groups:
++                        _apply_mania_hold_transition(
++                            open_columns,
++                            current_lane,
++                            event_type,
++                        )
++                        seen_groups.add(signature)
++                    current_lane = None
++
++            if current_lane is None:
++                scores_processed[row, self.tap_token] = -torch.inf
++                scores_processed[row, self.hold_start_token] = -torch.inf
++                scores_processed[row, self.hold_end_token] = -torch.inf
++                continue
++            if not 0 <= current_lane < keycount:
++                raise ValueError(
++                    f"current mania lane {current_lane} is outside keycount {keycount}"
++                )
++            if current_lane in open_columns:
++                scores_processed[row, self.tap_token] = -torch.inf
++                scores_processed[row, self.hold_start_token] = -torch.inf
++            else:
++                scores_processed[row, self.hold_end_token] = -torch.inf
++        return scores_processed
++
++
++class ManiaStartBoundaryLogitsProcessor(LogitsProcessor):
+     """Forbid TAP/HOLD starts after a window-relative attack boundary.
+ 
+     HOLD_NOTE_END remains available so a HOLD opened before the boundary can
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index f2774ed..5661bc1 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -13,8 +13,9 @@ from tqdm import tqdm
+ 
+ from config import InferenceConfig
+ from .compiled_decode import model_generate_compiled
+-from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
+-from .origin import EventOrigin
++from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
++from .origin import EventOrigin
++from .logit_processors import mania_open_hold_columns_before
+ from ..dataset.osu_parser import OsuParser
+ from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
+                                   get_scroll_speed_ratio, get_hitsounded_status, calculate_difficulty)
+@@ -256,17 +257,23 @@ class Processor(object):
+         )
+ 
+         # Start generation
+-        inputs = dict(
++        inputs = dict(
+             sequences=sequences,
+             in_context=in_context_data,
+             out_context=out_context_data,
+             model_kwargs=model_kwargs,
+             req_special_tokens=req_special_tokens,
+-            verbose=verbose,
+-        )
+-
+-        generate_func = self.generate_parallel if self.parallel else self.generate_sequential
+-        self._reset_generation_stats()
++            verbose=verbose,
++        )
++
++        generate_func = self.generate_parallel if self.parallel else self.generate_sequential
++        if not self.parallel:
++            inputs["mania_keycount"] = (
++                generation_config.keycount
++                if generation_config.gamemode == 3
++                else None
++            )
++        self._reset_generation_stats()
+         if isinstance(self.model, InferenceClient):
+             with self.model:
+                 generate_func(**inputs)
+@@ -368,15 +375,16 @@ class Processor(object):
+             for context in selected
+         ]
+ 
+-    def generate_sequential(
++    def generate_sequential(
+             self,
+             *,
+             sequences: tuple[torch.Tensor, torch.Tensor, float],
+             in_context: list[dict[str, Any]],
+             out_context: list[dict[str, Any]],
+-            model_kwargs: dict[str, Any],
+-            req_special_tokens: list[str],
+-            verbose: bool = True,
++            model_kwargs: dict[str, Any],
++            req_special_tokens: list[str],
++            mania_keycount: int | None = None,
++            verbose: bool = True,
+     ):
+         """Generate windows sequentially, reusing encoder outputs precomputed in a
+         single batched pass before the decode loop. Each window skips the
+@@ -443,9 +451,21 @@ class Processor(object):
+                     self.prepare_context_sequences(out_context[:i + 1], frame_time, True, req_special_tokens),
+                 )
+ 
+-                [prompt, uncond_prompt], max_len = self.pad_prompts([cond_prompt, uncond_prompt])
+-
+-                result, generation_stats = self.model_generate(
++                [prompt, uncond_prompt], max_len = self.pad_prompts([cond_prompt, uncond_prompt])
++
++                mania_open_hold_columns = None
++                if (
++                        context["context_type"] == ContextType.MAP
++                        and mania_keycount is not None
++                ):
++                    mania_open_hold_columns = mania_open_hold_columns_before(
++                        context["events"],
++                        context["event_times"],
++                        frame_time,
++                        mania_keycount,
++                    )
++
++                result, generation_stats = self.model_generate(
+                     model_kwargs | dict(
+                         encoder_outputs=enc_hidden[wi:wi + 1],
+                         decoder_input_ids=prompt,
+@@ -455,8 +475,9 @@ class Processor(object):
+                     ),
+                     lookback_time=self.lookback_time if trim_lookback else 0,
+                     lookahead_time=self.lookahead_time if trim_lookahead else 0,
+-                    context_type=context["context_type"].value,
+-                    max_note_start_time=(
++                    context_type=context["context_type"].value,
++                    mania_open_hold_columns=mania_open_hold_columns,
++                    max_note_start_time=(
+                         self.last_attack_time - frame_time
+                         if self.last_attack_time is not None
+                         else None
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index 5cfbb35..7e2093c 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -13,7 +13,8 @@ from ..event import EventType, ContextType
+ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_tokens, \
+     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
+     MonotonicTimeShiftLogitsProcessor, ManiaKeycountLogitsProcessor, \
+-    ManiaColumnBeforeTypeLogitsProcessor, ManiaStartBoundaryLogitsProcessor
++    ManiaColumnBeforeTypeLogitsProcessor, ManiaHoldStateLogitsProcessor, \
++    ManiaStartBoundaryLogitsProcessor
+ from .cache_utils import get_cache
+ from ..model import Mapperatorinator
+ from ..tokenizer import Tokenizer
+@@ -85,10 +86,11 @@ def get_eos_token_id(tokenizer, lookback_time: float = 0, lookahead_time: float
+     return eos_token_id
+ 
+ 
+-def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+-                            temperature, timing_temperature, mania_column_temperature,
+-                            taiko_hit_temperature, lookback_time, device,
+-                            max_note_start_time=None):
++def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
++                            temperature, timing_temperature, mania_column_temperature,
++                            taiko_hit_temperature, lookback_time, device,
++                            max_note_start_time=None,
++                            mania_open_hold_columns=None):
+     """Create the logits processors used by every generate path."""
+     logits_processor_list = LogitsProcessorList()
+     if cfg_scale > 1.0:
+@@ -96,8 +98,16 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+ 
+     logits_processor_list.append(MonotonicTimeShiftLogitsProcessor(tokenizer))
+     logits_processor_list.append(ManiaKeycountLogitsProcessor(tokenizer))
+-    if not types_first:
+-        logits_processor_list.append(ManiaColumnBeforeTypeLogitsProcessor(tokenizer))
++    if not types_first:
++        if mania_open_hold_columns is None:
++            logits_processor_list.append(ManiaColumnBeforeTypeLogitsProcessor(tokenizer))
++        else:
++            logits_processor_list.append(
++                ManiaHoldStateLogitsProcessor(
++                    tokenizer,
++                    mania_open_hold_columns,
++                )
++            )
+     if max_note_start_time is not None:
+         logits_processor_list.append(
+             ManiaStartBoundaryLogitsProcessor(tokenizer, max_note_start_time)
+@@ -266,8 +276,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     taiko_hit_temperature = generate_kwargs.pop('taiko_hit_temperature', temperature)
+     lookback_time = generate_kwargs.pop('lookback_time', 0.0)
+     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
+-    context_type = generate_kwargs.pop('context_type', None)
+-    max_note_start_time = generate_kwargs.pop('max_note_start_time', None)
++    context_type = generate_kwargs.pop('context_type', None)
++    max_note_start_time = generate_kwargs.pop('max_note_start_time', None)
++    mania_open_hold_columns = generate_kwargs.pop('mania_open_hold_columns', None)
+     if context_type is not None:
+         context_type = ContextType(context_type)  # Convert to ContextType enum
+ 
+@@ -275,9 +286,10 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     logits_processor_list = build_logits_processors(
+         tokenizer, cfg_scale, timeshift_bias, types_first, temperature,
+         timing_temperature, mania_column_temperature, taiko_hit_temperature,
+-        lookback_time, model.device,
+-        max_note_start_time,
+-    )
++        lookback_time, model.device,
++        max_note_start_time,
++        mania_open_hold_columns,
++    )
+ 
+     # Prepare cache
+     cache = get_cache(model, batch_size, generate_kwargs.get('num_beams', 1), cfg_scale)
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index 6eb6c70..69618ba 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -306,8 +306,9 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     taiko_hit_temperature = generate_kwargs.pop('taiko_hit_temperature', temperature)
+     lookback_time = generate_kwargs.pop('lookback_time', 0.0)
+     lookahead_time = generate_kwargs.pop('lookahead_time', 0.0)
+-    context_type = generate_kwargs.pop('context_type', None)
+-    max_note_start_time = generate_kwargs.pop('max_note_start_time', None)
++    context_type = generate_kwargs.pop('context_type', None)
++    max_note_start_time = generate_kwargs.pop('max_note_start_time', None)
++    mania_open_hold_columns = generate_kwargs.pop('mania_open_hold_columns', None)
+     do_sample = generate_kwargs.pop('do_sample', True)
+     top_p = generate_kwargs.pop('top_p', 0.95)
+     top_k = generate_kwargs.pop('top_k', 0)
+@@ -328,9 +329,10 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     logits_processor_list = build_logits_processors(
+         tokenizer, cfg_scale, timeshift_bias, types_first, temperature,
+         timing_temperature, mania_column_temperature, taiko_hit_temperature,
+-        lookback_time, device,
+-        max_note_start_time,
+-    )
++        lookback_time, device,
++        max_note_start_time,
++        mania_open_hold_columns,
++    )
+     # Hoist MonotonicTimeShift out of the per-step list into an O(1) incremental
+     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
+     # monotonic mask and the merged-batch state bookkeeping differs); with CFG we
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index 1fca1bb..e577b50 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -707,9 +707,16 @@ class Postprocessor(object):
+             group = groups[group_id]
+             if group_id in duplicate_group_ids or group.event_type not in note_types:
+                 continue
+-            lane = self._mania_lane(group.x, key_count)
+-            if group.event_type == EventType.CIRCLE:
+-                objects.append(ManiaObject(
++            lane = self._mania_lane(group.x, key_count)
++            if group.event_type == EventType.CIRCLE:
++                if lane in active_by_lane:
++                    start_id = active_by_lane[lane]
++                    raise ValueError(
++                        f"TAP while HOLD is active in lane {lane}: "
++                        f"start={describe_group(start_id)}, "
++                        f"tap={describe_group(group_id)}"
++                    )
++                objects.append(ManiaObject(
+                     object_id=-1,
+                     lane=lane,
+                     kind="TAP",
+diff --git a/tests/test_mania_output_safety.py b/tests/test_mania_output_safety.py
+index 0bb9d58..4ec3266 100644
+--- a/tests/test_mania_output_safety.py
++++ b/tests/test_mania_output_safety.py
+@@ -227,7 +227,7 @@ def test_same_window_duplicate_tap_is_rejected():
+         )
+ 
+ 
+-def test_adjacent_same_lane_holds_close_before_next_start_at_same_time():
++def test_adjacent_same_lane_holds_close_before_next_start_at_same_time():
+     events = [
+         Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
+         Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
+@@ -248,10 +248,28 @@ def test_adjacent_same_lane_holds_close_before_next_start_at_same_time():
+     )
+ 
+     hold_rows = [row for row in result.splitlines() if ",128," in row]
+-    assert hold_rows == [
+-        "64,192,100,128,0,500:0:0:-1:0:",
+-        "64,192,500,128,0,900:0:0:-1:0:",
+-    ]
++    assert hold_rows == [
++        "64,192,100,128,0,500:0:0:-1:0:",
++        "64,192,500,128,0,900:0:0:-1:0:",
++    ]
++
++
++def test_tap_during_active_hold_is_rejected_by_canonical_builder():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 200), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++        Event(EventType.TIME_SHIFT, 300), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    with pytest.raises(ValueError, match="TAP while HOLD is active"):
++        make_postprocessor().generate(
++            events,
++            BeatmapConfig(mode=3, circle_size=4),
++            event_origins=_origins_for_groups(events, [0, 0, 0]),
++        )
+ 
+ 
+ def test_resnap_validates_canonical_objects_before_changing_times():
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+new file mode 100644
+index 0000000..a55504f
+--- /dev/null
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -0,0 +1,218 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.logit_processors import (
++    ManiaColumnBeforeTypeLogitsProcessor,
++    ManiaHoldStateLogitsProcessor,
++    mania_open_hold_columns_before,
++)
++from osuT5.osuT5.inference.server import build_logits_processors
++
++
++class FakeTokenizer:
++    sos_id = 1
++    context_sos = {}
++    event_start = {
++        EventType.MANIA_COLUMN: 10,
++        EventType.TIME_SHIFT: 30,
++        EventType.CIRCLE: 50,
++        EventType.HOLD_NOTE: 51,
++        EventType.HOLD_NOTE_END: 52,
++        EventType.MANIA_KEYCOUNT: 100,
++    }
++    event_end = {
++        EventType.MANIA_COLUMN: 28,
++        EventType.TIME_SHIFT: 40,
++        EventType.MANIA_KEYCOUNT: 118,
++    }
++    event_range = {
++        EventType.MANIA_KEYCOUNT: SimpleNamespace(min_value=1),
++    }
++
++
++def keycount_token(keycount: int) -> int:
++    return FakeTokenizer.event_start[EventType.MANIA_KEYCOUNT] + keycount - 1
++
++
++def scores() -> torch.Tensor:
++    return torch.zeros((1, 128), dtype=torch.float32)
++
++
++def test_closed_lane_masks_orphan_hold_end_only():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])
++
++    result = processor(input_ids, scores())
++
++    assert not torch.isneginf(result[0, 50])
++    assert not torch.isneginf(result[0, 51])
++    assert torch.isneginf(result[0, 52])
++
++
++def test_open_lane_masks_tap_and_overlapping_hold_start_only():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
++    input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])
++
++    result = processor(input_ids, scores())
++
++    assert torch.isneginf(result[0, 50])
++    assert torch.isneginf(result[0, 51])
++    assert not torch.isneginf(result[0, 52])
++
++
++def test_state_processor_also_masks_note_types_until_group_has_column():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    input_ids = torch.tensor([[keycount_token(4), 1, 30]])
++
++    result = processor(input_ids, scores())
++
++    assert torch.isneginf(result[0, 50:53]).all()
++
++
++def test_prefix_release_closes_initial_hold_before_next_group():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), (2,))
++    input_ids = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 52, 30, 12]]
++    )
++
++    result = processor(input_ids, scores())
++
++    assert not torch.isneginf(result[0, 50])
++    assert not torch.isneginf(result[0, 51])
++    assert torch.isneginf(result[0, 52])
++
++
++def test_state_processor_is_noop_without_explicit_boundary_state():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), None)
++    input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])
++    original = scores()
++
++    assert torch.equal(processor(input_ids, original), original)
++
++
++def test_state_processor_is_noop_without_mania_keycount():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    input_ids = torch.tensor([[1, 30, 12]])
++    original = scores()
++
++    assert torch.equal(processor(input_ids, original), original)
++
++
++def test_processor_stack_replaces_column_scan_when_boundary_state_is_available():
++    processors = build_logits_processors(
++        FakeTokenizer(),
++        cfg_scale=1.0,
++        timeshift_bias=0,
++        types_first=False,
++        temperature=1.0,
++        timing_temperature=1.0,
++        mania_column_temperature=1.0,
++        taiko_hit_temperature=1.0,
++        lookback_time=0,
++        device="cpu",
++        mania_open_hold_columns=(),
++    )
++
++    assert sum(isinstance(item, ManiaHoldStateLogitsProcessor) for item in processors) == 1
++    assert not any(
++        isinstance(item, ManiaColumnBeforeTypeLogitsProcessor)
++        for item in processors
++    )
++
++
++def test_boundary_snapshot_preserves_hold_opened_before_window():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 2),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 300),
++        Event(EventType.MANIA_COLUMN, 2),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++    event_times = [100, 100, 100, 300, 300, 300]
++
++    assert mania_open_hold_columns_before(events, event_times, 300, 4) == (2,)
++    assert mania_open_hold_columns_before(events, event_times, 301, 4) == ()
++
++
++def test_boundary_snapshot_treats_exact_duplicate_group_as_idempotent():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 1),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 1),
++        Event(EventType.HOLD_NOTE, 0),
++    ]
++    event_times = [100] * len(events)
++
++    assert mania_open_hold_columns_before(events, event_times, 200, 4) == (1,)
++
++
++def test_boundary_snapshot_allows_release_then_start_at_same_time():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 1),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500),
++        Event(EventType.MANIA_COLUMN, 1),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 500),
++        Event(EventType.MANIA_COLUMN, 1),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++    event_times = [100, 100, 100, 500, 500, 500, 500, 500, 500]
++
++    assert mania_open_hold_columns_before(events, event_times, 600, 4) == (1,)
++
++
++def test_boundary_snapshot_rejects_orphan_hold_end():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 0),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    with pytest.raises(ValueError, match="HOLD_END without HOLD_START"):
++        mania_open_hold_columns_before(events, [100, 100, 100], 200, 4)
++
++
++def test_boundary_snapshot_rejects_overlapping_hold_start():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 0),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 200),
++        Event(EventType.MANIA_COLUMN, 0),
++        Event(EventType.HOLD_NOTE, 0),
++    ]
++
++    with pytest.raises(ValueError, match="overlapping HOLD_START"):
++        mania_open_hold_columns_before(
++            events,
++            [100, 100, 100, 200, 200, 200],
++            300,
++            4,
++        )
++
++
++def test_boundary_snapshot_rejects_tap_during_active_hold():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 0),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 200),
++        Event(EventType.MANIA_COLUMN, 0),
++        Event(EventType.CIRCLE, 0),
++    ]
++
++    with pytest.raises(ValueError, match="TAP while HOLD is active"):
++        mania_open_hold_columns_before(
++            events,
++            [100, 100, 100, 200, 200, 200],
++            300,
++            4,
++        )
+

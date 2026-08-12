@@ -177,10 +177,13 @@ def test_profile_report_uses_stable_camel_case_fields():
     assert set(report) == {
         "activeSectionMask",
         "difficultyProfile",
+        "difficultyVectorV2",
         "holdProfile",
         "patternProfile",
     }
     assert report["difficultyProfile"]["projectRating"] > 0
+    assert report["difficultyVectorV2"]["version"] == "difficulty-vector-v2"
+    assert report["difficultyVectorV2"]["orderingScore"] > 0
     with pytest.raises(TypeError):
         profile.pattern.histogram["JACK"] = 99
     with pytest.raises(TypeError):

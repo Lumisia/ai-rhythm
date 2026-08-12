@@ -7,11 +7,17 @@ from typing import Literal
 import numpy as np
 
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.event_matching import maximum_ordered_match_count
+from chart_worker.analysis.song_context import LocalTempoMap
+from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import Chart
 
 TimingStatus = Literal["PASS", "REVIEW", "INSUFFICIENT"]
 
 SECTION_MS = 15_000
+SECTION_BEATS = 32.0
+MIN_BEAT_SECTION_MS = 8_000
+MAX_BEAT_SECTION_MS = 30_000
 MIN_SECTION_ROWS = 8
 OVERALL_PRECISION_50_MIN = 0.70
 SECTION_PRECISION_50_MIN = 0.60
@@ -29,6 +35,11 @@ class TimingMetrics:
     signed_median_ms: float | None
     absolute_p95_ms: float | None
     absolute_p99_ms: float | None
+    matched_count_50: int = 0
+    matched_precision_50: float | None = None
+    matched_recall_50: float | None = None
+    matched_f1_50: float | None = None
+    onset_reuse_inflation_50: float | None = None
 
     def to_report(self) -> dict[str, int | float | None]:
         return {
@@ -38,6 +49,11 @@ class TimingMetrics:
             "signedMedianMs": self.signed_median_ms,
             "absoluteP95Ms": self.absolute_p95_ms,
             "absoluteP99Ms": self.absolute_p99_ms,
+            "matchedCount50": self.matched_count_50,
+            "matchedPrecision50": self.matched_precision_50,
+            "matchedRecall50": self.matched_recall_50,
+            "matchedF150": self.matched_f1_50,
+            "onsetReuseInflation50": self.onset_reuse_inflation_50,
         }
 
 
@@ -66,7 +82,7 @@ class TimingCoverageGap:
     onset_count: int
     active_onset_count: int
     active_frame_ratio: float
-    position: Literal["LEADING", "MIDDLE", "TRAILING"]
+    position: Literal["LEADING", "POST_FIRST", "MIDDLE", "TRAILING"]
 
     def to_report(self) -> dict[str, int | float | str]:
         return {
@@ -121,7 +137,12 @@ def _nearest_errors_ms(
     return rows - nearest
 
 
-def _metrics(rows: tuple[int, ...], onsets: np.ndarray) -> TimingMetrics:
+def _metrics(
+    rows: tuple[int, ...],
+    onsets: np.ndarray,
+    *,
+    matching_onsets: np.ndarray | None = None,
+) -> TimingMetrics:
     if not rows or onsets.size == 0:
         return TimingMetrics(
             row_count=len(rows),
@@ -131,15 +152,44 @@ def _metrics(rows: tuple[int, ...], onsets: np.ndarray) -> TimingMetrics:
             absolute_p95_ms=None,
             absolute_p99_ms=None,
         )
-    errors = _nearest_errors_ms(np.asarray(rows, dtype=np.int64), onsets)
+    row_array = np.asarray(rows, dtype=np.int64)
+    errors = _nearest_errors_ms(row_array, onsets)
     absolute = np.abs(errors)
+    match_reference = onsets if matching_onsets is None else matching_onsets
+    matched_count = maximum_ordered_match_count(
+        row_array,
+        match_reference,
+        window_ms=50,
+    )
+    matched_precision = matched_count / row_array.size
+    matched_recall = (
+        matched_count / match_reference.size if match_reference.size else None
+    )
+    matched_f1 = (
+        2 * matched_precision * matched_recall / (matched_precision + matched_recall)
+        if matched_recall is not None and matched_precision + matched_recall > 0
+        else 0.0
+        if matched_recall is not None
+        else None
+    )
+    nearest_precision_50 = float(np.mean(absolute <= 50))
     return TimingMetrics(
         row_count=len(rows),
         precision_20=round(float(np.mean(absolute <= 20)), 6),
-        precision_50=round(float(np.mean(absolute <= 50)), 6),
+        precision_50=round(nearest_precision_50, 6),
         signed_median_ms=round(float(np.median(errors)), 6),
         absolute_p95_ms=round(float(np.percentile(absolute, 95)), 6),
         absolute_p99_ms=round(float(np.percentile(absolute, 99)), 6),
+        matched_count_50=matched_count,
+        matched_precision_50=round(matched_precision, 6),
+        matched_recall_50=(
+            round(matched_recall, 6) if matched_recall is not None else None
+        ),
+        matched_f1_50=(round(matched_f1, 6) if matched_f1 is not None else None),
+        onset_reuse_inflation_50=round(
+            max(0.0, nearest_precision_50 - matched_precision),
+            6,
+        ),
     )
 
 
@@ -171,7 +221,10 @@ def _coverage_gaps(
     duration_ms: int,
     activity: AudioActivity | None,
 ) -> tuple[tuple[TimingCoverageGap, ...], tuple[TimingCoverageGap, ...]]:
-    boundaries = tuple(sorted({0, duration_ms, *rows}))
+    coverage_rows = tuple(row for row in rows if 0 <= row <= duration_ms)
+    boundaries = tuple(sorted({0, duration_ms, *coverage_rows}))
+    first_row_ms = coverage_rows[0] if coverage_rows else None
+    second_row_ms = coverage_rows[1] if len(coverage_rows) >= 2 else None
     active_gaps = []
     quiet_gaps = []
     for start_ms, end_ms in pairwise(boundaries):
@@ -196,8 +249,10 @@ def _coverage_gaps(
                 active_onset_count=active_onset_count,
                 active_frame_ratio=active_frame_ratio,
                 position=(
-                    "LEADING"
-                    if start_ms == 0
+                    "POST_FIRST"
+                    if start_ms == first_row_ms and end_ms == second_row_ms
+                    else "LEADING"
+                    if start_ms == 0 and end_ms == first_row_ms
                     else "TRAILING"
                     if end_ms == duration_ms
                     else "MIDDLE"
@@ -213,19 +268,92 @@ def _coverage_gaps(
     return tuple(active_gaps), tuple(quiet_gaps)
 
 
+def _time_after_beats(
+    tempo_map: LocalTempoMap,
+    *,
+    start_ms: int,
+    beat_count: float,
+    duration_ms: int,
+) -> int:
+    """Return the wall-clock time after integrating ``beat_count`` local beats."""
+    cursor = start_ms
+    remaining_beats = beat_count
+    while cursor < duration_ms:
+        event = tempo_map.at(cursor)
+        event_index = max(0, tempo_map.times.index(event.time_ms))
+        next_event_ms = (
+            tempo_map.times[event_index + 1]
+            if event_index + 1 < len(tempo_map.times)
+            else duration_ms
+        )
+        segment_end = min(duration_ms, max(cursor + 1, next_event_ms))
+        available_beats = (segment_end - cursor) * event.bpm / 60_000.0
+        if available_beats >= remaining_beats:
+            return min(
+                duration_ms,
+                round(cursor + remaining_beats * 60_000.0 / event.bpm),
+            )
+        remaining_beats -= available_beats
+        cursor = segment_end
+    return duration_ms
+
+
+def _section_boundaries(
+    *,
+    duration_ms: int,
+    section_ms: int | None,
+    bpm_events: tuple[OsuBpmEvent, ...] | None,
+) -> tuple[tuple[int, int], ...]:
+    if duration_ms == 0:
+        return ((0, 0),)
+    if section_ms is not None or not bpm_events:
+        fixed_ms = SECTION_MS if section_ms is None else section_ms
+        return tuple(
+            (start_ms, min(duration_ms, start_ms + fixed_ms))
+            for start_ms in range(0, duration_ms, fixed_ms)
+        )
+
+    tempo_map = LocalTempoMap(bpm_events)
+    sections = []
+    start_ms = 0
+    while start_ms < duration_ms:
+        beat_end_ms = _time_after_beats(
+            tempo_map,
+            start_ms=start_ms,
+            beat_count=SECTION_BEATS,
+            duration_ms=duration_ms,
+        )
+        end_ms = min(
+            duration_ms,
+            max(
+                start_ms + MIN_BEAT_SECTION_MS,
+                min(start_ms + MAX_BEAT_SECTION_MS, beat_end_ms),
+            ),
+        )
+        sections.append((start_ms, end_ms))
+        start_ms = end_ms
+    return tuple(sections)
+
+
 def diagnose_chart_timing(
     notes: Chart,
     onset_ms: tuple[int, ...],
     *,
     duration_ms: int,
-    section_ms: int = SECTION_MS,
+    coverage_end_ms: int | None = None,
+    section_ms: int | None = None,
+    bpm_events: tuple[OsuBpmEvent, ...] | None = None,
     minimum_section_rows: int = MIN_SECTION_ROWS,
     activity: AudioActivity | None = None,
 ) -> TimingDiagnostics:
     """Compare unique note rows with nearest onsets without changing the chart."""
     if duration_ms < 0:
         raise ValueError("duration_ms must be non-negative")
-    if section_ms <= 0:
+    if coverage_end_ms is None:
+        coverage_end_ms = duration_ms
+    if not 0 <= coverage_end_ms <= duration_ms:
+        raise ValueError("coverage_end_ms must be within duration_ms")
+    if section_ms is not None and section_ms <= 0:
         raise ValueError("section_ms must be positive")
     if minimum_section_rows <= 0:
         raise ValueError("minimum_section_rows must be positive")
@@ -245,19 +373,30 @@ def diagnose_chart_timing(
         rows,
         onsets,
         active_onsets,
-        duration_ms=duration_ms,
+        duration_ms=coverage_end_ms,
         activity=activity,
     )
     sections = []
-    for start_ms in range(0, max(1, duration_ms), section_ms):
-        end_ms = min(duration_ms, start_ms + section_ms)
+    for start_ms, end_ms in _section_boundaries(
+        duration_ms=duration_ms,
+        section_ms=section_ms,
+        bpm_events=bpm_events,
+    ):
         is_last = end_ms == duration_ms
         section_rows = tuple(
             row
             for row in rows
             if start_ms <= row and (row <= end_ms if is_last else row < end_ms)
         )
-        metrics = _metrics(section_rows, onsets)
+        section_onsets = onsets[
+            (onsets >= start_ms)
+            & (onsets <= end_ms if is_last else onsets < end_ms)
+        ]
+        metrics = _metrics(
+            section_rows,
+            onsets,
+            matching_onsets=section_onsets,
+        )
         sections.append(
             TimingSection(
                 start_ms=start_ms,

@@ -64,7 +64,7 @@ function chart(index: number, keyMode: KeyMode, difficulty: Difficulty): Importe
   };
 }
 
-function importedRun(): ImportedRun {
+function importedRun(boundaryAvailable = false): ImportedRun {
   const charts: ImportedChart[] = [];
   let index = 0;
   for (const keyMode of keyModes) {
@@ -75,6 +75,7 @@ function importedRun(): ImportedRun {
   }
   return {
     source: {
+      has: () => false,
       readBytes: async () => new ArrayBuffer(0),
       readText: async () => "",
     },
@@ -94,8 +95,38 @@ function importedRun(): ImportedRun {
       generationReportPath: "generation-report.json",
     },
     charts,
+    publicationState: "PRODUCTION_VERIFIED",
+    publicationReasons: [],
     keysoundManifest: null,
     audio: { game: new ArrayBuffer(8), noDrums: null, keys: null },
+    boundaryLabelContext: {
+      available: boundaryAvailable,
+      unavailableReason: boundaryAvailable
+        ? null
+        : "v1 run manifest does not bind generation-report SHA-256",
+      songVersionId: "10000000-0000-4000-8000-000000000001",
+      gameAudioAssetId: "20000000-0000-4000-8000-000000000001",
+      audioDurationMs: 8000,
+      generationReport: boundaryAvailable
+        ? { path: "generation-report.json", sha256: "b".repeat(64) }
+        : null,
+      automaticEvidence: {
+        availability: "UNAVAILABLE",
+        unavailableReason: "musicBounds must be an object",
+        evaluationVersion: null,
+        policyState: null,
+        policyConfidence: null,
+        enforcementMode: null,
+        observationSha256: null,
+        lastDetectedOnsetMs: null,
+        lastActiveRmsEndMs: null,
+        lastEvidenceMs: null,
+        provisionalMaxNoteStartMs: null,
+        provisionalReleaseEndMs: null,
+        effectiveMaxNoteStartMs: null,
+        effectiveReleaseEndMs: null,
+      },
+    },
   };
 }
 
@@ -135,6 +166,25 @@ describe("LocalPlaytestPage", () => {
     );
     await user.click(await screen.findByRole("button", { name: "4K EASY 플레이" }));
     expect(screen.getByRole("heading", { name: "플레이 설정" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "채보 목록으로" }));
+    expect(await screen.findAllByRole("button", { name: /플레이$/ })).toHaveLength(12);
+  });
+
+  it("opens the separate song-end review and returns to all twelve charts", async () => {
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: vi.fn(() => "blob:game-audio"),
+    });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+    const user = userEvent.setup();
+    render(<LocalPlaytestPage importer={async () => importedRun(true)} />);
+    await user.upload(
+      screen.getByLabelText("실행 폴더"),
+      new File(["manifest"], "playtest-run-v2.json"),
+    );
+
+    await user.click(await screen.findByRole("button", { name: "곡 끝 검토" }));
+    expect(screen.getByRole("heading", { name: "곡 끝 경계 검토" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "채보 목록으로" }));
     expect(await screen.findAllByRole("button", { name: /플레이$/ })).toHaveLength(12);
   });

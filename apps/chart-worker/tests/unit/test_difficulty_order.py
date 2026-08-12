@@ -90,10 +90,46 @@ def test_monotonic_ratings_pass_and_serialize_in_label_order():
         },
         "invertedPairs": [],
         "ambiguousPairs": [],
+        "narrowPairs": [],
         "retryDifficulties": [],
     }
 
 
-def test_requires_exactly_the_four_supported_labels():
-    with pytest.raises(ValueError, match="exactly"):
-        review_difficulty_order({"EASY": _profile(1.0)})
+def test_rejects_unknown_labels():
+    with pytest.raises(ValueError, match="unknown difficulties"):
+        review_difficulty_order({"EASY": _profile(1.0), "LUNATIC": _profile(9.0)})
+
+
+def test_requires_at_least_one_label():
+    with pytest.raises(ValueError, match="at least one"):
+        review_difficulty_order({})
+
+
+def test_reviews_a_subset_when_a_label_has_no_publishable_candidate():
+    """발행 가능한 후보가 없는 난이도는 단조성 검사에서 빠진다.
+
+    망가진 조합을 기준점으로 삼아 멀쩡한 조합을 끌어내리면 안 된다.
+    """
+    review = review_difficulty_order(
+        {"EASY": _profile(1.0), "NORMAL": _profile(2.0), "HARD": _profile(3.0)}
+    )
+
+    assert review.status == "PASS"
+    assert review.ordered_ratings == (("EASY", 1.0), ("NORMAL", 2.0), ("HARD", 3.0))
+    assert review.retry_difficulties == frozenset()
+
+
+def test_adjacent_gap_below_minimum_is_reported_as_narrow():
+    review = review_difficulty_order(
+        {
+            "EASY": _profile(1.0),
+            "NORMAL": _profile(1.1),
+            "HARD": _profile(3.0),
+            "EXPERT": _profile(4.0),
+        }
+    )
+
+    # 역전은 아니므로 차단하지 않는다. 라벨이 겹친다는 근거만 남긴다.
+    assert review.status == "PASS"
+    assert review.narrow_pairs == (("EASY", "NORMAL"),)
+    assert review.to_report()["narrowPairs"] == [["EASY", "NORMAL"]]

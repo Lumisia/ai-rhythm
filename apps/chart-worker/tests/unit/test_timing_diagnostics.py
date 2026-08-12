@@ -1,7 +1,9 @@
 import numpy as np
+import pytest
 
 from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.timing_diagnostics import diagnose_chart_timing
+from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import NoteEvent
 
 
@@ -56,6 +58,36 @@ def test_passes_well_aligned_rows_without_let_chords_inflate_the_score():
     assert result.status == "PASS"
 
 
+def test_reports_one_to_one_matches_without_reusing_one_audio_onset():
+    result = diagnose_chart_timing(
+        [tap(980), tap(1_020)],
+        (1_000,),
+        duration_ms=2_000,
+    )
+
+    assert result.overall.precision_50 == 1.0
+    assert result.overall.matched_count_50 == 1
+    assert result.overall.matched_precision_50 == 0.5
+    assert result.overall.matched_recall_50 == 1.0
+    assert result.overall.matched_f1_50 == 0.666667
+    assert result.overall.onset_reuse_inflation_50 == 0.5
+
+
+def test_sparse_easy_chart_is_not_rejected_for_intentionally_low_recall():
+    rows = tuple(range(1_000, 9_000, 1_000))
+    onsets = tuple(range(500, 9_000, 500))
+
+    result = diagnose_chart_timing(
+        [tap(row) for row in rows],
+        onsets,
+        duration_ms=9_000,
+    )
+
+    assert result.overall.matched_precision_50 == 1.0
+    assert result.overall.matched_recall_50 == 0.470588
+    assert result.status == "PASS"
+
+
 def test_reports_absolute_p99_for_a_globally_shifted_chart():
     rows = tuple(range(1_000, 9_000, 1_000))
 
@@ -78,6 +110,19 @@ def test_labels_deleted_active_front_as_a_leading_coverage_gap():
 
     assert result.coverage_gaps[0].position == "LEADING"
     assert result.coverage_gaps[0].to_report()["position"] == "LEADING"
+
+
+def test_labels_gap_after_zero_ms_first_row_as_post_first_not_leading():
+    result = diagnose_chart_timing(
+        [tap(0), tap(12_745), tap(13_000)],
+        (0, *range(1_000, 12_000, 1_000), 12_745, 13_000),
+        duration_ms=20_000,
+    )
+
+    assert result.coverage_gaps[0].start_ms == 0
+    assert result.coverage_gaps[0].end_ms == 12_745
+    assert result.coverage_gaps[0].position == "POST_FIRST"
+    assert result.coverage_gaps[0].to_report()["position"] == "POST_FIRST"
 
 
 def test_reports_section_phase_delta_and_gap_positions_at_boundaries():
@@ -103,12 +148,12 @@ def test_reports_section_phase_delta_and_gap_positions_at_boundaries():
         20.0,
     ]
     assert [gap.position for gap in gap_result.coverage_gaps] == [
-        "LEADING",
+        "POST_FIRST",
         "MIDDLE",
         "TRAILING",
     ]
     assert [gap.to_report()["position"] for gap in gap_result.coverage_gaps] == [
-        "LEADING",
+        "POST_FIRST",
         "MIDDLE",
         "TRAILING",
     ]
@@ -164,7 +209,7 @@ def test_marks_long_gap_with_active_onsets_for_review():
             "onsetCount": 20,
             "activeOnsetCount": 20,
             "activeFrameRatio": 1.0,
-            "position": "LEADING",
+            "position": "POST_FIRST",
         }
     ]
 
@@ -212,6 +257,45 @@ def test_reports_quiet_gap_without_forcing_review():
     assert result.status == "PASS"
 
 
+def test_coverage_horizon_prevents_silent_tail_from_diluting_active_gap():
+    activity = AudioActivity(
+        frame_ms=1_000.0,
+        rms_db=np.array(
+            [-80.0] * 70 + [-10.0] * 6 + [-80.0] * 12,
+        ),
+        floor_db=-60.0,
+        active_onset_ms=tuple(range(71_000, 85_000, 1_000)),
+    )
+    onsets = (0, 70_000, *range(71_000, 85_000, 1_000))
+
+    full_duration = diagnose_chart_timing(
+        [tap(0), tap(70_000)],
+        onsets,
+        duration_ms=88_000,
+        activity=activity,
+    )
+    musical_horizon = diagnose_chart_timing(
+        [tap(0), tap(70_000)],
+        onsets,
+        duration_ms=88_000,
+        coverage_end_ms=84_000,
+        activity=activity,
+    )
+
+    assert full_duration.coverage_gaps == ()
+    assert full_duration.quiet_coverage_gaps[0].active_frame_ratio == pytest.approx(
+        6 / 18,
+        abs=1e-6,
+    )
+    assert musical_horizon.quiet_coverage_gaps == ()
+    assert musical_horizon.coverage_gaps[0].position == "TRAILING"
+    assert musical_horizon.coverage_gaps[0].end_ms == 84_000
+    assert musical_horizon.coverage_gaps[0].active_frame_ratio == pytest.approx(
+        6 / 14,
+        abs=1e-6,
+    )
+
+
 def test_serializes_stable_camel_case_report_fields():
     result = diagnose_chart_timing(
         [tap(row) for row in range(1_000, 9_000, 1_000)],
@@ -234,6 +318,11 @@ def test_serializes_stable_camel_case_report_fields():
             "signedMedianMs": 0.0,
             "absoluteP95Ms": 0.0,
             "absoluteP99Ms": 0.0,
+            "matchedCount50": 8,
+            "matchedPrecision50": 1.0,
+            "matchedRecall50": 1.0,
+            "matchedF150": 1.0,
+            "onsetReuseInflation50": 0.0,
         },
         "sections": [
             {
@@ -246,6 +335,11 @@ def test_serializes_stable_camel_case_report_fields():
                 "signedMedianMs": 0.0,
                 "absoluteP95Ms": 0.0,
                 "absoluteP99Ms": 0.0,
+                "matchedCount50": 8,
+                "matchedPrecision50": 1.0,
+                "matchedRecall50": 1.0,
+                "matchedF150": 1.0,
+                "onsetReuseInflation50": 0.0,
                 "phaseDeltaMs": 0.0,
             },
             {
@@ -258,7 +352,76 @@ def test_serializes_stable_camel_case_report_fields():
                 "signedMedianMs": None,
                 "absoluteP95Ms": None,
                 "absoluteP99Ms": None,
+                "matchedCount50": 0,
+                "matchedPrecision50": None,
+                "matchedRecall50": None,
+                "matchedF150": None,
+                "onsetReuseInflation50": None,
                 "phaseDeltaMs": None,
             }
         ],
     }
+
+
+def test_uses_beat_normalized_sections_with_slow_tempo_cap():
+    result = diagnose_chart_timing(
+        [],
+        (),
+        duration_ms=65_000,
+        bpm_events=(OsuBpmEvent(time_ms=0, bpm=60.0),),
+    )
+
+    assert [(section.start_ms, section.end_ms) for section in result.sections] == [
+        (0, 30_000),
+        (30_000, 60_000),
+        (60_000, 65_000),
+    ]
+
+
+def test_uses_thirty_two_beat_sections_at_typical_tempo():
+    result = diagnose_chart_timing(
+        [],
+        (),
+        duration_ms=33_000,
+        bpm_events=(OsuBpmEvent(time_ms=0, bpm=120.0),),
+    )
+
+    assert [(section.start_ms, section.end_ms) for section in result.sections] == [
+        (0, 16_000),
+        (16_000, 32_000),
+        (32_000, 33_000),
+    ]
+
+
+def test_uses_beat_normalized_sections_with_fast_tempo_floor():
+    result = diagnose_chart_timing(
+        [],
+        (),
+        duration_ms=17_000,
+        bpm_events=(OsuBpmEvent(time_ms=0, bpm=300.0),),
+    )
+
+    assert [(section.start_ms, section.end_ms) for section in result.sections] == [
+        (0, 8_000),
+        (8_000, 16_000),
+        (16_000, 17_000),
+    ]
+
+
+def test_integrates_local_bpm_changes_when_building_sections():
+    result = diagnose_chart_timing(
+        [],
+        (),
+        duration_ms=40_000,
+        bpm_events=(
+            OsuBpmEvent(time_ms=0, bpm=60.0),
+            OsuBpmEvent(time_ms=10_000, bpm=180.0),
+        ),
+    )
+
+    assert [(section.start_ms, section.end_ms) for section in result.sections] == [
+        (0, 17_333),
+        (17_333, 28_000),
+        (28_000, 38_667),
+        (38_667, 40_000),
+    ]

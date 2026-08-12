@@ -1,0 +1,309 @@
+diff --git a/inference.py b/inference.py
+--- a/inference.py
++++ b/inference.py
+@@ -551,6 +551,7 @@
+                     timing,
+                     key_count=round(beatmap_config.circle_size),
+                     event_origins=event_origins,
++                    max_note_start_time=args.last_attack_time,
+                 )
+                 if len(events) != len(event_origins):
+                     raise ValueError(
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -15,6 +15,16 @@
+ 
+ MILISECONDS_PER_SECOND = 1000
+ MILISECONDS_PER_STEP = 10
++
++
++def _max_decoded_time_shift_value(max_time_ms: float) -> int:
++    """Largest token value whose decoded center does not exceed a boundary."""
++    half_step = MILISECONDS_PER_STEP // 2
++    if max_time_ms < half_step:
++        # Non-negative tokens decode at +5ms, while negative tokens do not
++        # receive the centering offset. There is no token in (-10ms, +5ms).
++        return min(-1, math.floor(max_time_ms / MILISECONDS_PER_STEP))
++    return math.floor((max_time_ms - half_step) / MILISECONDS_PER_STEP)
+ 
+ 
+ def get_beat_type_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
+@@ -542,7 +552,7 @@
+         self.time_start = tokenizer.event_start[EventType.TIME_SHIFT]
+         self.time_end = tokenizer.event_end[EventType.TIME_SHIFT]
+         min_time_value = tokenizer.event_range[EventType.TIME_SHIFT].min_value
+-        max_time_value = math.floor(max_note_start_time / MILISECONDS_PER_STEP)
++        max_time_value = _max_decoded_time_shift_value(max_note_start_time)
+         self.max_time_token = self.time_start + max_time_value - min_time_value
+         self.start_type_tokens = torch.tensor([
+             tokenizer.event_start[EventType.CIRCLE],
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -935,6 +935,7 @@
+             timing: list[TimingPoint],
+             key_count: int = None,
+             event_origins: list[EventOrigin] | None = None,
++            max_note_start_time: int | None = None,
+     ):
+         """Resnap events and their explicit times to the same beat ticks."""
+         if len(events) != len(event_times):
+@@ -1008,6 +1009,51 @@
+                 if conflict:
+                     snap_conflict_group_ids.add(group_id)
+ 
++        boundary_single_diagnostics = []
++        boundary_pair_diagnostics = []
++        boundary_restored_pair_group_ids = set()
++        if max_note_start_time is not None and key_count is not None:
++            for mania_object in mania_objects:
++                start_id = mania_object.start_group_id
++                raw_start = proposals[start_id]["originalTimeMs"]
++                proposed_start = final_times[start_id]
++                if raw_start > max_note_start_time:
++                    raise ValueError(
++                        "raw mania note start exceeds max_note_start_time: "
++                        f"lane={mania_object.lane}, rawStart={raw_start}, "
++                        f"boundary={max_note_start_time}"
++                    )
++                if proposed_start <= max_note_start_time:
++                    continue
++                if mania_object.kind == "HOLD":
++                    end_id = mania_object.end_group_id
++                    if end_id is None:
++                        raise ValueError("canonical HOLD is missing its end group")
++                    raw_end = proposals[end_id]["originalTimeMs"]
++                    proposed_end = final_times[end_id]
++                    final_times[start_id] = raw_start
++                    final_times[end_id] = raw_end
++                    boundary_restored_pair_group_ids.update((start_id, end_id))
++                    boundary_pair_diagnostics.append({
++                        "lane": mania_object.lane,
++                        "noteKind": "HOLD_PAIR",
++                        "rawStartMs": raw_start,
++                        "rawEndMs": raw_end,
++                        "proposedStartMs": proposed_start,
++                        "proposedEndMs": proposed_end,
++                        "reason": "HOLD_PAIR_START_BOUNDARY_RAW_RESTORED",
++                    })
++                else:
++                    final_times[start_id] = raw_start
++                    boundary_single_diagnostics.append({
++                        "lane": mania_object.lane,
++                        "noteKind": "TAP",
++                        "preTimeMs": raw_start,
++                        "postTimeMs": proposed_start,
++                        "snapDivisor": proposals[start_id]["snapDivisor"],
++                        "reason": "START_BOUNDARY_RAW_RESTORED",
++                    })
++
+         resnapped_events = list(events)
+         snapped_event_times = list(event_times)
+         for group_id, indices in enumerate(group_indices):
+@@ -1095,8 +1141,8 @@
+             for start_id, end_id, _lane in hold_pairs
+             for group_id in (start_id, end_id)
+         }
+-        restored_pair_group_ids = set()
+-        pair_diagnostics = []
++        restored_pair_group_ids = set(boundary_restored_pair_group_ids)
++        pair_diagnostics = list(boundary_pair_diagnostics)
+ 
+         def restore_group(group_id):
+             raw_time = proposals[group_id]["originalTimeMs"]
+@@ -1106,6 +1152,8 @@
+                     resnapped_events[index] = Event(EventType.TIME_SHIFT, raw_time)
+ 
+         for start_id, end_id, lane in hold_pairs:
++            if start_id in boundary_restored_pair_group_ids:
++                continue
+             raw_start = proposals[start_id]["originalTimeMs"]
+             raw_end = proposals[end_id]["originalTimeMs"]
+             proposed_start = proposals[start_id]["proposedTimeMs"]
+@@ -1132,7 +1180,7 @@
+                 "reason": "HOLD_PAIR_RAW_RESTORED",
+             })
+ 
+-        collisions = []
++        collisions = list(boundary_single_diagnostics)
+         for observation, group_id in zip(observations, observation_group_ids):
+             target = (observation["lane"], observation["postTimeMs"])
+             if target in collision_targets:
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -85,6 +85,83 @@
+     assert snapped_times == [125, 125, 125, 125, 125]
+ 
+ 
++def test_resnap_restores_tap_when_snap_crosses_note_start_boundary():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++
++    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
++        events,
++        [110] * 5,
++        make_timing(),
++        key_count=4,
++        max_note_start_time=120,
++    )
++
++    assert snapped_events[0].value == 110
++    assert snapped_times == [110] * 5
++    assert diagnostics == [{
++        "lane": 0,
++        "noteKind": "TAP",
++        "preTimeMs": 110,
++        "postTimeMs": 125,
++        "snapDivisor": 4,
++        "reason": "START_BOUNDARY_RAW_RESTORED",
++    }]
++
++
++def test_resnap_restores_hold_pair_atomically_when_start_snap_crosses_boundary():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0), Event(EventType.TIME_SHIFT, 260),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
++        events,
++        [110] * 5 + [260] * 5,
++        make_timing(),
++        key_count=4,
++        max_note_start_time=120,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [110, 260]
++    assert snapped_times == [110] * 5 + [260] * 5
++    assert diagnostics == [{
++        "lane": 0,
++        "noteKind": "HOLD_PAIR",
++        "rawStartMs": 110,
++        "rawEndMs": 260,
++        "proposedStartMs": 125,
++        "proposedEndMs": 375,
++        "reason": "HOLD_PAIR_START_BOUNDARY_RAW_RESTORED",
++    }]
++
++
++def test_resnap_rejects_raw_note_start_after_boundary():
++    events = [
++        Event(EventType.TIME_SHIFT, 125), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++
++    with pytest.raises(ValueError, match="raw mania note start"):
++        make_postprocessor().resnap_events(
++            events,
++            [125] * 5,
++            make_timing(),
++            key_count=4,
++            max_note_start_time=120,
++        )
++
++
+ def test_resnap_reports_distinct_pre_times_collapsed_to_same_mania_lane():
+     events = [
+         Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -675,7 +675,7 @@
+         for item in processors
+         if isinstance(item, ManiaHoldStateLogitsProcessor)
+     )
+-    assert processor.max_note_start_time_token == 31
++    assert processor.max_note_start_time_token == 30
+ 
+ 
+ def test_hold_state_contract_rejects_unsupported_types_first_grammar():
+diff --git a/tests/test_mania_keycount_logits_processor.py b/tests/test_mania_keycount_logits_processor.py
+--- a/tests/test_mania_keycount_logits_processor.py
++++ b/tests/test_mania_keycount_logits_processor.py
+@@ -154,37 +154,51 @@
+     assert not torch.isneginf(result[0, 52])
+ 
+ 
+-def test_attack_boundary_keeps_starts_at_or_before_limit():
++def test_attack_boundary_keeps_starts_only_when_decoded_time_is_within_limit():
+     processor = ManiaStartBoundaryLogitsProcessor(
+         FakeGrammarTokenizer(),
+         max_note_start_time=50,
+     )
++    input_ids = torch.tensor([[1, keycount_token(4), 34, 12]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    assert torch.equal(processor(input_ids, scores), scores)
++
++
++def test_attack_boundary_masks_token_whose_half_step_decode_exceeds_limit():
++    processor = ManiaStartBoundaryLogitsProcessor(
++        FakeGrammarTokenizer(),
++        max_note_start_time=50,
++    )
+     input_ids = torch.tensor([[1, keycount_token(4), 35, 12]])
+-    scores = torch.zeros((1, 128), dtype=torch.float32)
+-
+-    assert torch.equal(processor(input_ids, scores), scores)
+-
+-
+-def test_attack_boundary_ignores_non_mania_rows():
+-    processor = ManiaStartBoundaryLogitsProcessor(
+-        FakeGrammarTokenizer(),
+-        max_note_start_time=-1,
+-    )
+-    input_ids = torch.tensor([[1, 39]])
+-    scores = torch.zeros((1, 128), dtype=torch.float32)
+-
+-    assert torch.equal(processor(input_ids, scores), scores)
+-
+-
+-def test_attack_boundary_before_window_masks_zero_time_starts():
+-    processor = ManiaStartBoundaryLogitsProcessor(
+-        FakeGrammarTokenizer(),
+-        max_note_start_time=-1,
+-    )
+-    input_ids = torch.tensor([[1, keycount_token(4), 30, 12]])
+     scores = torch.zeros((1, 128), dtype=torch.float32)
+ 
+     result = processor(input_ids, scores)
+ 
+     assert torch.isneginf(result[0, 50:52]).all()
+     assert not torch.isneginf(result[0, 52])
++
++
++def test_attack_boundary_ignores_non_mania_rows():
++    processor = ManiaStartBoundaryLogitsProcessor(
++        FakeGrammarTokenizer(),
++        max_note_start_time=-1,
++    )
++    input_ids = torch.tensor([[1, 39]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    assert torch.equal(processor(input_ids, scores), scores)
++
++
++def test_attack_boundary_before_window_masks_zero_time_starts():
++    processor = ManiaStartBoundaryLogitsProcessor(
++        FakeGrammarTokenizer(),
++        max_note_start_time=-1,
++    )
++    input_ids = torch.tensor([[1, keycount_token(4), 30, 12]])
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++
++    result = processor(input_ids, scores)
++
++    assert torch.isneginf(result[0, 50:52]).all()
++    assert not torch.isneginf(result[0, 52])

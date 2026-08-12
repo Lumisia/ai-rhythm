@@ -63,6 +63,10 @@ export class LocalDirectoryAssetSource implements AssetSource {
     }
   }
 
+  has(relativePath: string): boolean {
+    return this.#files.has(normalizeRelativePath(relativePath));
+  }
+
   async readBytes(relativePath: string): Promise<ArrayBuffer> {
     const path = normalizeRelativePath(relativePath);
     const file = this.#files.get(path);

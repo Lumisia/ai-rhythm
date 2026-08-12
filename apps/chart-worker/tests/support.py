@@ -119,7 +119,9 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
             seed=seed,
         )
 
-    def generation(prepared, authority, analysis, run_dir, generator, seed):
+    def generation(
+        prepared, authority, analysis, run_dir, generator, seed, authority_epoch
+    ):
         return run_generation(
             prepared,
             authority,
@@ -127,6 +129,7 @@ def _dependencies(samples: np.ndarray, sample_rate_hz: int) -> PipelineDependenc
             run_dir,
             generator=generator,
             seed=seed,
+            authority_epoch=authority_epoch,
         )
 
     return PipelineDependencies(

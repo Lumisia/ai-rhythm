@@ -1,0 +1,87 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 6778cec..88ba319 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -157,4 +157,7 @@ def mania_open_hold_columns_before(
+     )
+ 
+ 
++_PROMPT_TIME_UNSET = object()
++
++
+ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+@@ -171,7 +174,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             tokenizer: Tokenizer,
+             initial_open_columns: tuple[int, ...] | None,
+             prompt_group_signatures: tuple[tuple[int, int, str], ...] = (),
+-            prompt_current_time_token: int | None = None,
++            prompt_current_time_token: int | None | object = _PROMPT_TIME_UNSET,
+             require_closed_holds_at_eos: bool = False,
+             max_sequence_length: int | None = None,
+     ):
+@@ -184,8 +187,12 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             (int(time_token), int(lane), EventType(event_type_value))
+             for time_token, lane, event_type_value in prompt_group_signatures
+         )
++        self.has_prompt_current_time_contract = (
++            prompt_current_time_token is not _PROMPT_TIME_UNSET
++        )
+         self.prompt_current_time_token = (
+             None
+-            if prompt_current_time_token is None
++            if prompt_current_time_token is _PROMPT_TIME_UNSET
++            or prompt_current_time_token is None
+             else int(prompt_current_time_token)
+         )
+@@ -285,4 +292,12 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             generated_groups: set[tuple[int | None, int, EventType]] = set()
+             start = int(sos_indices[-1].item()) + 1
+             for position, token_tensor in enumerate(tokens[start:], start=start):
++                if (
++                        position == self.prompt_length
++                        and self.has_prompt_current_time_contract
++                ):
++                    # Prompt tokens describe historical groups. At the first
++                    # generated token, restore the canonical append boundary;
++                    # an older prompt TIME_SHIFT must not leak into merge time.
++                    current_time_token = self.prompt_current_time_token
+                 token = int(token_tensor.item())
+@@ -308,4 +323,10 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                         )
+                     current_lane = None
+ 
++            if (
++                    tokens.shape[0] <= self.prompt_length
++                    and self.has_prompt_current_time_contract
++            ):
++                current_time_token = self.prompt_current_time_token
++
+             def replay_signatures(
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index d8859e8..289b4e6 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -114,4 +114,23 @@ def test_group_without_prompt_or_generated_timeshift_requires_time_before_column
+     assert not torch.isneginf(after_time[0, 10:14]).any()
+ 
+ 
++def test_canonical_append_boundary_overrides_older_prompt_timeshift():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_group_signatures=(
++            (30, 2, EventType.CIRCLE.value),
++        ),
++        prompt_current_time_token=None,
++    )
++    prompt_with_old_complete_group = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 50]]
++    )
++
++    result = processor(prompt_with_old_complete_group, scores())
++
++    assert torch.isneginf(result[0, 10:28]).all()
++    assert not torch.isneginf(result[0, 30:40]).all()
++
++
+ def test_final_hold_closure_budget_includes_missing_timeshift():

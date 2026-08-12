@@ -145,8 +145,19 @@ def test_local_review_report_preserves_segment_threshold_inputs():
 
     report = _review(authority, analysis, duration_ms).to_report()
 
-    assert report["version"] == "local-timing-review-v1"
+    assert report["version"] == "local-timing-review-v2-duration-weighted"
     assert report["action"] == "RETRY_TIMING"
+    assert report["durationEvidence"] == {
+        "activeEvidenceMs": 30_000,
+        "supportedActiveMs": 9_000,
+        "contradictedActiveMs": 11_000,
+        "insufficientActiveMs": 0,
+        "quietMs": 0,
+        "supportedRatio": 0.3,
+        "contradictedRatio": 0.366667,
+        "insufficientRatio": 0.0,
+        "segmentCount": 3,
+    }
     assert report["segments"][1]["startMs"] == 10_000
     assert report["segments"][1]["bpm"] == 5.6
     assert report["segments"][1]["contradictionCount"] >= 2

@@ -13,10 +13,10 @@ if (!runDirectory) {
 } else {
   describe("local worker run", () => {
     it("passes the frontend importer and gameplay constraints", async () => {
-      const imported = await importRun(loadRunDirectory(runDirectory));
+      const imported = await importRun(loadRunDirectory(runDirectory), "PLAYTEST");
       const report = diagnoseCharts(imported.charts.map(({ document }) => document));
 
-      expect(imported.charts).toHaveLength(12);
+      expect(imported.charts.length + (imported.manifest.missingCharts ?? []).length).toBe(12);
       expect(imported.audio.game.byteLength).toBeGreaterThan(1_000_000);
       expect(report.errors).toEqual([]);
       expect(
@@ -24,6 +24,9 @@ if (!runDirectory) {
           document.generator.name.toLocaleLowerCase("en-US").includes("mapperatorinator"),
         ),
       ).toBe(true);
+      if (imported.manifest.version === 2) {
+        expect(imported.boundaryLabelContext.available).toBe(true);
+      }
 
       console.info(
         JSON.stringify(

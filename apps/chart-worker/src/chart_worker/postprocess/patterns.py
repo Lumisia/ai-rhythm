@@ -10,6 +10,7 @@ laneSemantics 에 의존하므로 lane_rules 가 맡는다.
 """
 
 import math
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from enum import StrEnum
@@ -234,16 +235,17 @@ def detect_anchor(rows: list[Row], *, beat_ms: float) -> list[PatternInstance]:
     for row in rows:
         for lane in row.lanes:
             by_lane.setdefault(lane, []).append(row.time_ms)
-    other_times = {row.time_ms for row in rows if row.size >= 1}
+    other_times = tuple(row.time_ms for row in rows if row.size >= 1)
 
     found = []
     for lane, times in by_lane.items():
         run = [times[0]]
         for previous, current in pairwise(times):
             gap = current - previous
-            interleaved = any(
-                previous < time_ms < current and time_ms not in (previous, current)
-                for time_ms in other_times
+            position = bisect_right(other_times, previous)
+            interleaved = (
+                position < len(other_times)
+                and other_times[position] < current
             )
             if low <= gap <= high and interleaved:
                 run.append(current)
@@ -505,15 +507,31 @@ def _shields(notes: Chart, holds: list[NoteEvent], *, beat_ms: float) -> list[Pa
     found = []
     for hold in holds:
         end_ms = hold.time_ms + (hold.duration_ms or 0)
-        for tap_ms in taps_by_lane.get(hold.lane, ()):
-            if 0 < hold.time_ms - tap_ms <= limit:
-                found.append(
-                    PatternInstance(PatternKind.SHIELD, tap_ms, hold.time_ms, (hold.lane,), 2)
+        lane_taps = taps_by_lane.get(hold.lane, ())
+        before_start = bisect_left(lane_taps, hold.time_ms)
+        before_limit = bisect_left(lane_taps, hold.time_ms - limit)
+        for tap_ms in lane_taps[before_limit:before_start]:
+            found.append(
+                PatternInstance(
+                    PatternKind.SHIELD,
+                    tap_ms,
+                    hold.time_ms,
+                    (hold.lane,),
+                    2,
                 )
-            elif 0 < tap_ms - end_ms <= limit:
-                found.append(
-                    PatternInstance(PatternKind.REVERSE_SHIELD, end_ms, tap_ms, (hold.lane,), 2)
+            )
+        after_start = bisect_right(lane_taps, end_ms)
+        after_limit = bisect_right(lane_taps, end_ms + limit)
+        for tap_ms in lane_taps[after_start:after_limit]:
+            found.append(
+                PatternInstance(
+                    PatternKind.REVERSE_SHIELD,
+                    end_ms,
+                    tap_ms,
+                    (hold.lane,),
+                    2,
                 )
+            )
     return found
 
 

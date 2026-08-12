@@ -92,7 +92,7 @@ def test_requested_stars_and_descriptors_are_explicit():
         "EASY": ("expression/simple",),
         "NORMAL": ("style/mixed rice",),
         "HARD": ("style/mixed rice", "streams/bursts"),
-        "EXPERT": ("style/mixed rice", "skillset/streams", "skillset/tech"),
+        "EXPERT": ("style/mixed rice", "skillset/streams"),
     }
 
 
@@ -128,6 +128,33 @@ def test_map_command_reuses_the_timing_reference(config, tmp_path):
     assert pairs["beatmap_path"] == f"'{timing.resolve()}'"
     assert pairs["in_context"] == "[TIMING]"
     assert "TIMING" not in pairs["output_type"]
+
+
+def test_map_command_separates_generation_and_note_start_horizons(config, tmp_path):
+    request = _request(
+        music_end_ms=15_000,
+        generation_end_ms=18_000,
+        last_attack_ms=14_500,
+        max_note_start_ms=14_570,
+    )
+
+    pairs = _pairs(build_map_command(config, request, tmp_path / "map"))
+
+    assert pairs["end_time"] == "18000"
+    assert pairs["last_attack_time"] == "14570"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"last_attack_ms": 15_001, "max_note_start_ms": 15_000},
+        {"max_note_start_ms": 18_001, "generation_end_ms": 18_000},
+        {"max_note_start_ms": DURATION_MS + 1},
+    ],
+)
+def test_map_request_rejects_inconsistent_song_boundaries(overrides):
+    with pytest.raises(ValueError, match="last_attack|max_note_start"):
+        _request(**overrides)
 
 
 def test_partial_map_command_replaces_only_the_requested_window(config, tmp_path):
@@ -193,7 +220,7 @@ def test_map_command_requests_only_a_map_generation(config, tmp_path):
         "year": "2023",
         "end_time": str(DURATION_MS),
         "cfg_scale": "1.0",
-        "descriptors": "[style/mixed rice,skillset/streams,skillset/tech]",
+        "descriptors": "['style/mixed rice','skillset/streams']",
         "precision": "fp16",
         "export_osz": "false",
         "beatmap_path": f"'{Path('timing-reference.osu').resolve()}'",
@@ -203,6 +230,7 @@ def test_map_command_requests_only_a_map_generation(config, tmp_path):
         "hitsounded": "false",
         "fast_decoder_loop": "true",
         "resnap_events": "true",
+        "parallel": "false",
     }
 
 
@@ -226,6 +254,18 @@ def test_descriptors_with_hydra_list_syntax_are_rejected(config, tmp_path):
         build_map_command(config, _request(descriptors=("style/a,b",)), tmp_path)
 
 
+def test_descriptor_quotes_preserve_trailing_space_for_v32_vocabulary(config, tmp_path):
+    pairs = _pairs(
+        build_map_command(
+            config,
+            _request(descriptors=("style/LN mixed ",)),
+            tmp_path,
+        )
+    )
+
+    assert pairs["descriptors"] == "['style/LN mixed ']"
+
+
 def test_find_generated_osu_requires_exactly_one_file(tmp_path):
     with pytest.raises(WorkerError) as missing:
         find_generated_osu(tmp_path)
@@ -239,13 +279,27 @@ def test_find_generated_osu_requires_exactly_one_file(tmp_path):
 
 def test_generator_generates_map_and_parses_raw_timing(config, tmp_path):
     result = MapperatorinatorGenerator(
-        config=config, run=_fake_run(), verify_patch=lambda _home: None
+        config=config,
+        run=_fake_run(),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
     ).generate_map(_request(seed=3), tmp_path / "work")
     assert [note.time_ms for note in result.notes] == [1000, 1200]
     assert result.key_mode == 4
     assert result.generator_name == "mapperatorinator-v32"
     assert result.seed == 3
     assert [(event.time_ms, event.bpm) for event in result.bpm_events] == [(0, 120.0)]
+
+
+def test_generator_requires_a_bound_resnap_sidecar(config, tmp_path):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError, match="bound resnap sidecar"):
+        generator.generate_map(_request(seed=3), tmp_path / "work")
 
 
 def test_generator_normalizes_events_within_ten_ms_of_audio_end(config, tmp_path):
@@ -262,6 +316,7 @@ def test_generator_normalizes_events_within_ten_ms_of_audio_end(config, tmp_path
         config=config,
         run=_fake_run(osu_text=raw),
         verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
     ).generate_map(_request(), tmp_path / "work")
 
     assert [
@@ -275,6 +330,47 @@ def test_generator_normalizes_events_within_ten_ms_of_audio_end(config, tmp_path
     assert reparsed.notes == result.notes
 
 
+def test_generator_collapses_only_indistinguishable_model_taps(config, tmp_path):
+    raw = MINI_OSU.replace(
+        "64,192,1000,1,0,0:0:0:0:\n",
+        "64,192,1000,1,0,0:0:0:0:\n"
+        "64,192,1000,1,0,0:0:0:0:\n",
+    )
+    result = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(osu_text=raw),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
+    ).generate_map(_request(), tmp_path / "work")
+
+    assert [(note.time_ms, note.lane) for note in result.notes] == [
+        (1000, 0),
+        (1200, 1),
+    ]
+    assert parse_osu_mania(result.osu_text).notes == result.notes
+    validate_generated_chart(result, key_mode=4, duration_ms=DURATION_MS)
+
+
+def test_generator_does_not_collapse_tap_and_hold_at_the_same_lane_time(
+    config, tmp_path
+):
+    raw = MINI_OSU.replace(
+        "64,192,1000,1,0,0:0:0:0:\n",
+        "64,192,1000,1,0,0:0:0:0:\n"
+        "64,192,1000,128,0,1500:0:0:0:0:\n",
+    )
+    result = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(osu_text=raw),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
+    ).generate_map(_request(), tmp_path / "work")
+
+    assert len(result.notes) == 3
+    with pytest.raises(GeneratedChartValidationError, match="duplicate"):
+        validate_generated_chart(result, key_mode=4, duration_ms=DURATION_MS)
+
+
 def test_generator_does_not_hide_events_beyond_end_tolerance(config, tmp_path):
     raw = MINI_OSU.replace(
         "192,192,1200,1,0,0:0:0:0:",
@@ -284,6 +380,7 @@ def test_generator_does_not_hide_events_beyond_end_tolerance(config, tmp_path):
         config=config,
         run=_fake_run(osu_text=raw),
         verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
     ).generate_map(_request(), tmp_path / "work")
 
     with pytest.raises(GeneratedChartValidationError, match="duration"):
@@ -313,7 +410,10 @@ def test_generator_maps_parse_failure(config, tmp_path):
 
 def test_generator_rejects_a_mismatched_keycount(config, tmp_path):
     generator = MapperatorinatorGenerator(
-        config=config, run=_fake_run(), verify_patch=lambda _home: None
+        config=config,
+        run=_fake_run(),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
     )
     with pytest.raises(WorkerError, match="asked for 7K"):
         generator.generate_map(_request(key_mode=7), tmp_path / "work")
@@ -374,6 +474,7 @@ def test_generator_verifies_constraint_patch_before_inference(config, tmp_path):
         config=config,
         run=_fake_run(),
         verify_patch=lambda home: calls.append(home),
+        require_bound_resnap_sidecar=False,
     )
 
     generator.generate_map(_request(), tmp_path / "work")
@@ -398,7 +499,7 @@ def test_generator_retains_optional_resnap_collision_evidence(config, tmp_path):
         config=config,
         run=_fake_run(
             resnap_sidecar={
-                "version": "resnap-collisions-v1",
+                "version": "resnap-collisions-v2-preserve-raw",
                 "seed": 11,
                 "collisions": [
                     {
@@ -407,17 +508,54 @@ def test_generator_retains_optional_resnap_collision_evidence(config, tmp_path):
                         "preTimeMs": 1_190,
                         "postTimeMs": 1_200,
                         "snapDivisor": 4,
+                        "reason": "SNAP_TARGET_CONFLICT_PRESERVED",
                     }
                 ],
             }
         ),
         verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
     )
 
     generated = generator.generate_map(_request(seed=11), tmp_path / "work")
 
     assert generated.resnap_diagnostics.status == "OBSERVED"
     assert generated.resnap_diagnostics.collisions[0].post_time_ms == 1_200
+    assert (
+        generated.resnap_diagnostics.collisions[0].reason
+        == "SNAP_TARGET_CONFLICT_PRESERVED"
+    )
+
+
+def test_generator_rejects_v4_object_sidecar_that_disagrees_with_osu(config, tmp_path):
+    sidecar = {
+        "version": "mania-origin-v1-canonical-hold-ir",
+        "seed": 11,
+        "collisions": [],
+        "maniaObjects": [
+            {
+                "objectId": 0,
+                "lane": 3,
+                "kind": "TAP",
+                "startTimeMs": 1000,
+                "endTimeMs": None,
+                "startGroupId": 0,
+                "endGroupId": None,
+                "startOrigins": [],
+                "endOrigins": [],
+            }
+        ],
+        "duplicates": [],
+    }
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(resnap_sidecar=sidecar),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
+    )
+
+    with pytest.raises(WorkerError, match="sidecar.*does not match"):
+        generator.generate_map(_request(seed=11), tmp_path / "work")
 
 
 def test_fake_generator_generates_standard_timing():

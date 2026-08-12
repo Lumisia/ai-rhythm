@@ -1,0 +1,99 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -15,7 +15,6 @@ from config import InferenceConfig
+ from .compiled_decode import model_generate_compiled
+ from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
+ from .origin import EventOrigin
+-from .logit_processors import mania_open_hold_columns_before
+ from .mania_grammar import canonical_mania_groups, replay_mania_hold_state
+ from ..dataset.osu_parser import OsuParser
+ from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
+@@ -530,16 +529,10 @@ class Processor(object):
+                     ),
+                 )
+ 
+-    def _mania_prompt_start_time(self, frame_time: float) -> float:
+-        """Return the earliest time represented by the prompt contract."""
+-        timeshift_range = self.tokenizer.event_range[EventType.TIME_SHIFT]
+-        bucket_start = timeshift_range.min_value * MILISECONDS_PER_STEP
+-        if timeshift_range.min_value < 0:
+-            # Python int() truncates negative relative times toward zero.
+-            # Consequently the minimum negative token also represents the
+-            # preceding integer millisecond values in the same 10 ms bucket.
+-            bucket_start -= MILISECONDS_PER_STEP - 1
+-        return frame_time + bucket_start
++    @staticmethod
++    def _mania_relative_time_value(event_time: float, frame_time: float) -> int:
++        """Quantize an event with the same rule used by tokenizer encoding."""
++        return int((event_time - frame_time) / MILISECONDS_PER_STEP)
+ 
+     def _mania_prompt_open_hold_columns(
+             self,
+@@ -547,12 +540,22 @@ class Processor(object):
+             frame_time: float,
+             mania_keycount: int,
+     ) -> tuple[int, ...]:
+-        """Capture canonical HOLD state immediately before prompt events."""
+-        return mania_open_hold_columns_before(
++        """Replay canonical groups that fall before the decoder vocabulary."""
++        timeshift_range = self.tokenizer.event_range[EventType.TIME_SHIFT]
++        groups = canonical_mania_groups(
+             context["events"],
+             context["event_times"],
+-            self._mania_prompt_start_time(frame_time),
+-            mania_keycount,
++            keycount=mania_keycount,
++        )
++        past_groups = (
++            group
++            for group in groups
++            if self._mania_relative_time_value(group.time_ms, frame_time)
++            < timeshift_range.min_value
++        )
++        return replay_mania_hold_state(
++            past_groups,
++            keycount=mania_keycount,
+         )
+ 
+     def _mania_prompt_group_signatures(
+@@ -570,8 +573,9 @@ class Processor(object):
+         )
+         signatures: list[tuple[int, int, str]] = []
+         for group in groups:
+-            relative_time = int(
+-                (group.time_ms - frame_time) / MILISECONDS_PER_STEP
++            relative_time = self._mania_relative_time_value(
++                group.time_ms,
++                frame_time,
+             )
+             if not (
+                 timeshift_range.min_value
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -209,11 +209,11 @@ def test_cumulative_replay_error_reports_window_and_frame_boundary():
+         )
+ 
+ 
+-def test_mania_state_boundary_matches_the_prompt_start():
++def test_mania_relative_time_value_matches_tokenizer_truncation():
+     processor = make_processor()
+-    processor.tokenizer.event_range[EventType.TIME_SHIFT].min_value = -100
+ 
+-    assert processor._mania_prompt_start_time(5_000) == 3_991
++    assert processor._mania_relative_time_value(3_990, 5_000) == -101
++    assert processor._mania_relative_time_value(3_991, 5_000) == -100
+ 
+ 
+ def test_mania_prompt_state_uses_negative_timeshift_bucket_lower_edge():
+@@ -234,8 +234,7 @@ def test_mania_prompt_state_uses_negative_timeshift_bucket_lower_edge():
+     # int(-40.9) is -40, so the HOLD_END at 91 ms is addressable while
+     # the HOLD_START at 90 ms is not.  Initial state must therefore be
+     # captured immediately before 91 ms, not at the nominal 100 ms point.
+-    assert processor._mania_prompt_start_time(500) == 91
+-    assert processor._mania_prompt_open_hold_columns(context, 500, 4) == (1,)
++    assert processor._mania_prompt_open_hold_columns(context, 500.5, 4) == (1,)
+ 
+ 
+ def test_mania_prompt_state_folds_only_groups_before_addressable_prompt_start():

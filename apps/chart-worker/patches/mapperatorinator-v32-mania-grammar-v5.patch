@@ -1,0 +1,120 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 891433fd3870512cd1ce3d0d0979a3d15401267d..2d42ae1d7e92970211c7c96b46bbf0e8df640e6e 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -4,7 +4,7 @@ import torch
+ import torch.nn.functional as F
+ from transformers import LogitsProcessor
+ 
+-from osuT5.osuT5.dataset.data_utils import TIMED_EVENTS
++from osuT5.osuT5.dataset.data_utils import TIMED_EVENTS, TYPE_EVENTS
+ from osuT5.osuT5.event import EventType, Event
+ from osuT5.osuT5.inference.mania_grammar import (
+     apply_mania_hold_transition,
+@@ -201,6 +201,18 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             self.hold_start_token: EventType.HOLD_NOTE,
+             self.hold_end_token: EventType.HOLD_NOTE_END,
+         }
++        self.non_mania_type_token_ranges = tuple(
++            (
++                tokenizer.event_start[event_type],
++                tokenizer.event_end.get(
++                    event_type,
++                    tokenizer.event_start[event_type] + 1,
++                ),
++            )
++            for event_type in TYPE_EVENTS
++            if event_type not in self.event_type_by_token.values()
++            and event_type in tokenizer.event_start
++        )
+         self._telemetry = {
+             "calls": 0,
+             "rows": 0,
+@@ -365,6 +377,8 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     self._telemetry["duplicateTokensMasked"] += 1
+                     scores_processed[row, token] = -torch.inf
+             self._telemetry["pendingGroupBoundarySteps"] += 1
++            for start, end in self.non_mania_type_token_ranges:
++                scores_processed[row, start:end] = -torch.inf
+             scores_processed[row, self.column_start:self.column_end] = -torch.inf
+             scores_processed[row, self.time_start:self.time_end] = -torch.inf
+             scores_processed[row, list(self.eos_ids)] = -torch.inf
+diff --git a/osuT5/osuT5/inference/mania_grammar.py b/osuT5/osuT5/inference/mania_grammar.py
+index e04eecd8cd08414cab3bdf21ea0c71921ec7276c..a4e0c0da40ed6e24c7c8b91f51c4863f852c1df9 100644
+--- a/osuT5/osuT5/inference/mania_grammar.py
++++ b/osuT5/osuT5/inference/mania_grammar.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ from dataclasses import dataclass
+ from typing import Iterable, Sequence
+ 
++from ..dataset.data_utils import TYPE_EVENTS
+ from ..event import Event, EventType
+ 
+ 
+@@ -124,6 +125,12 @@ def canonical_mania_groups(
+             pending_indices = []
+             continue
+ 
++        if pending_lane is not None and event.type in TYPE_EVENTS:
++            raise ValueError(
++                f"incomplete mania group before type boundary at event {index}: "
++                f"lane={pending_lane}, type={event.type.name}"
++            )
++
+         if pending_lane is not None:
+             pending_indices.append(index)
+ 
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index c9d9d6062cd3fbc4bdd9fb190f5a3a372ebb7ee5..e3d00227b7e85de8e950034b19487dd9e00f6d1f 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -13,6 +13,7 @@ from osuT5.osuT5.inference.server import (
+     build_logits_processors,
+     get_mania_hold_grammar_telemetry,
+ )
++from osuT5.osuT5.inference.mania_grammar import canonical_mania_groups
+ 
+ 
+ class FakeTokenizer:
+@@ -27,11 +28,13 @@ class FakeTokenizer:
+         EventType.HOLD_NOTE: 51,
+         EventType.HOLD_NOTE_END: 52,
+         EventType.MANIA_KEYCOUNT: 100,
++        EventType.KIAI: 60,
+     }
+     event_end = {
+         EventType.MANIA_COLUMN: 28,
+         EventType.TIME_SHIFT: 40,
+         EventType.MANIA_KEYCOUNT: 118,
++        EventType.KIAI: 62,
+     }
+     event_range = {
+         EventType.MANIA_KEYCOUNT: SimpleNamespace(min_value=1),
+@@ -90,6 +93,27 @@ def test_pending_column_cannot_be_abandoned_by_time_column_or_eos():
+     assert not torch.isneginf(result[0, 51])
+ 
+ 
++def test_pending_column_masks_other_serialization_type_boundaries():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    input_ids = torch.tensor([[keycount_token(4), 1, 30, 12]])
++
++    result = processor(input_ids, scores())
++
++    assert torch.isneginf(result[0, 60:62]).all()
++
++
++def test_canonical_parser_rejects_type_boundary_inside_mania_group():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 2),
++        Event(EventType.KIAI, 1),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    with pytest.raises(ValueError, match="type boundary"):
++        canonical_mania_groups(events, [100, 100, 100, 100], keycount=4)
++
++
+ def test_new_group_is_masked_when_token_budget_cannot_complete_it():
+     processor = ManiaHoldStateLogitsProcessor(
+         FakeTokenizer(), (), max_sequence_length=5

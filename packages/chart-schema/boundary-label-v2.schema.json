@@ -1,0 +1,456 @@
+{
+  "$defs": {
+    "BoundaryAudioIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "durationMs": {
+          "exclusiveMinimum": 0,
+          "minimum": 0,
+          "title": "Durationms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "durationMs"
+      ],
+      "title": "BoundaryAudioIdentity",
+      "type": "object"
+    },
+    "BoundaryAutomaticEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "enum": [
+            "AVAILABLE",
+            "UNAVAILABLE"
+          ],
+          "title": "Availability",
+          "type": "string"
+        },
+        "unavailableReason": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unavailablereason"
+        },
+        "evaluationVersion": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evaluationversion"
+        },
+        "policyState": {
+          "anyOf": [
+            {
+              "enum": [
+                "EXPERIMENTAL",
+                "PROVISIONAL",
+                "CALIBRATED",
+                "FROZEN"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Policystate"
+        },
+        "policyConfidence": {
+          "anyOf": [
+            {
+              "enum": [
+                "HIGH",
+                "MEDIUM",
+                "LOW",
+                "UNKNOWN"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Policyconfidence"
+        },
+        "enforcementMode": {
+          "anyOf": [
+            {
+              "enum": [
+                "SHADOW",
+                "EXPERIMENTAL_ENFORCED"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Enforcementmode"
+        },
+        "observationSha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observationsha256"
+        },
+        "lastDetectedOnsetMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lastdetectedonsetms"
+        },
+        "lastActiveRmsEndMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lastactivermsendms"
+        },
+        "lastEvidenceMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lastevidencems"
+        },
+        "provisionalMaxNoteStartMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provisionalmaxnotestartms"
+        },
+        "provisionalReleaseEndMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Provisionalreleaseendms"
+        },
+        "effectiveMaxNoteStartMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effectivemaxnotestartms"
+        },
+        "effectiveReleaseEndMs": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Effectivereleaseendms"
+        }
+      },
+      "required": [
+        "availability"
+      ],
+      "title": "BoundaryAutomaticEvidence",
+      "type": "object"
+    },
+    "BoundaryGenerationReportRef": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "BoundaryGenerationReportRef",
+      "type": "object"
+    },
+    "BoundaryHumanAnnotationV2": {
+      "additionalProperties": false,
+      "description": "사람이 구분해 들은 새 타점·주요 콘텐츠·허용 release 경계.",
+      "properties": {
+        "lastPlayableAttack": {
+          "$ref": "#/$defs/TimeUncertaintyInterval"
+        },
+        "primaryContentEnd": {
+          "$ref": "#/$defs/TimeUncertaintyInterval"
+        },
+        "acceptableReleaseEnd": {
+          "$ref": "#/$defs/TimeUncertaintyInterval"
+        },
+        "provisionalBoundaryVerdict": {
+          "enum": [
+            "TOO_EARLY",
+            "ACCEPTABLE",
+            "TOO_LATE",
+            "UNCERTAIN",
+            "NOT_AVAILABLE"
+          ],
+          "title": "Provisionalboundaryverdict",
+          "type": "string"
+        },
+        "tailCharacters": {
+          "items": {
+            "enum": [
+              "MUSIC",
+              "FADE_OR_REVERB",
+              "NOISE",
+              "ENCODING_TAIL",
+              "SILENCE",
+              "MIXED_OR_UNCERTAIN"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Tailcharacters",
+          "type": "array"
+        },
+        "confidence": {
+          "enum": [
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        },
+        "comment": {
+          "default": "",
+          "maxLength": 4000,
+          "title": "Comment",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lastPlayableAttack",
+        "primaryContentEnd",
+        "acceptableReleaseEnd",
+        "provisionalBoundaryVerdict",
+        "tailCharacters",
+        "confidence"
+      ],
+      "title": "BoundaryHumanAnnotationV2",
+      "type": "object"
+    },
+    "BoundaryLabelGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "groupId": {
+          "maxLength": 120,
+          "minLength": 1,
+          "title": "Groupid",
+          "type": "string"
+        },
+        "relation": {
+          "enum": [
+            "EXACT_RECORDING",
+            "RELATED_VERSION",
+            "UNKNOWN"
+          ],
+          "title": "Relation",
+          "type": "string"
+        },
+        "confirmed": {
+          "title": "Confirmed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "groupId",
+        "relation",
+        "confirmed"
+      ],
+      "title": "BoundaryLabelGroup",
+      "type": "object"
+    },
+    "BoundaryRunIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "runId": {
+          "format": "uuid",
+          "title": "Runid",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "songVersionId": {
+          "format": "uuid",
+          "title": "Songversionid",
+          "type": "string"
+        },
+        "gameAudioAssetId": {
+          "format": "uuid",
+          "title": "Gameaudioassetid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "runId",
+        "title",
+        "songVersionId",
+        "gameAudioAssetId"
+      ],
+      "title": "BoundaryRunIdentity",
+      "type": "object"
+    },
+    "TimeUncertaintyInterval": {
+      "additionalProperties": false,
+      "properties": {
+        "earliestMs": {
+          "minimum": 0,
+          "title": "Earliestms",
+          "type": "integer"
+        },
+        "latestMs": {
+          "minimum": 0,
+          "title": "Latestms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "earliestMs",
+        "latestMs"
+      ],
+      "title": "TimeUncertaintyInterval",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "세 가지 사람 경계를 혼동하지 않는 boundary-label-v2 계약.",
+  "properties": {
+    "version": {
+      "const": 2,
+      "default": 2,
+      "title": "Version",
+      "type": "integer"
+    },
+    "labelId": {
+      "format": "uuid",
+      "title": "Labelid",
+      "type": "string"
+    },
+    "createdAt": {
+      "format": "date-time",
+      "title": "Createdat",
+      "type": "string"
+    },
+    "reviewerId": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Reviewerid",
+      "type": "string"
+    },
+    "run": {
+      "$ref": "#/$defs/BoundaryRunIdentity"
+    },
+    "audio": {
+      "$ref": "#/$defs/BoundaryAudioIdentity"
+    },
+    "generationReport": {
+      "$ref": "#/$defs/BoundaryGenerationReportRef"
+    },
+    "group": {
+      "$ref": "#/$defs/BoundaryLabelGroup"
+    },
+    "automaticEvidence": {
+      "$ref": "#/$defs/BoundaryAutomaticEvidence"
+    },
+    "annotation": {
+      "$ref": "#/$defs/BoundaryHumanAnnotationV2"
+    }
+  },
+  "required": [
+    "labelId",
+    "createdAt",
+    "reviewerId",
+    "run",
+    "audio",
+    "generationReport",
+    "group",
+    "automaticEvidence",
+    "annotation"
+  ],
+  "title": "BoundaryLabelV2",
+  "type": "object"
+}

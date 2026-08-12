@@ -1,0 +1,73 @@
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index c03563c..630f1ec 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import hashlib
+ import json
+ import logging
+ import os
+@@ -782,12 +783,19 @@ class Postprocessor(object):
+             seed: int,
+             collisions: list[dict],
+     ) -> Path:
+-        sidecar_path = Path(output_path).with_suffix(".resnap.json")
++        output_path = Path(output_path)
++        if not output_path.is_file():
++            raise FileNotFoundError(
++                f"cannot bind resnap diagnostics to missing output: {output_path}"
++            )
++        sidecar_path = output_path.with_suffix(".resnap.json")
++        temporary_path = sidecar_path.with_suffix(".json.tmp")
+         sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+-        sidecar_path.write_text(
++        temporary_path.write_text(
+             json.dumps(
+                 {
+-                    "version": "mania-origin-v1-canonical-hold-ir",
++                    "version": "mania-origin-v2-osu-bound",
++                    "osuSha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                     "seed": seed,
+                     "collisions": collisions,
+                     **self.last_mania_objects_report,
+@@ -797,6 +805,7 @@ class Postprocessor(object):
+             ) + "\n",
+             encoding="utf-8",
+         )
++        temporary_path.replace(sidecar_path)
+         return sidecar_path
+ 
+     def export_osz(self, output_path: str, osu_content: str, osu_filename: str, audio_path: str, background_path: str = None):
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index c514df2..699e750 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -1,3 +1,4 @@
++import hashlib
+ import json
+ from datetime import timedelta
+ from types import SimpleNamespace
+@@ -263,6 +264,7 @@ def test_resnap_rejects_invalid_raw_hold_before_mutation():
+ 
+ def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
+     osu_path = tmp_path / "beatmap.osu"
++    osu_path.write_bytes(b"osu-output")
+     collisions = [
+         {"lane": 0, "noteKind": "TAP", "preTimeMs": 110,
+          "postTimeMs": 125, "snapDivisor": 4}
+@@ -272,9 +274,11 @@ def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
+     )
+     assert sidecar_path == osu_path.with_suffix(".resnap.json")
+     assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {
+-        "version": "mania-origin-v1-canonical-hold-ir",
++        "version": "mania-origin-v2-osu-bound",
++        "osuSha256": hashlib.sha256(b"osu-output").hexdigest(),
+         "seed": 31,
+         "collisions": collisions,
+         "maniaObjects": [],
+         "duplicates": [],
+     }
++    assert not sidecar_path.with_suffix(".json.tmp").exists()

@@ -33,6 +33,38 @@ def test_unknown_mapperatorinator_precision_is_rejected():
         WorkerConfig(mapperatorinator_precision="fp32")
 
 
+def test_difficulty_selector_defaults_to_v2_after_regression_gate_passes(monkeypatch):
+    monkeypatch.delenv("DIFFICULTY_SELECTOR_MODE", raising=False)
+
+    assert load_config().difficulty_selector_mode == "V2"
+
+
+@pytest.mark.parametrize("mode", ["CURRENT", "SHADOW_V2", "V2"])
+def test_supported_difficulty_selector_modes_are_accepted(mode):
+    assert WorkerConfig(difficulty_selector_mode=mode).difficulty_selector_mode == mode
+
+
+def test_unknown_difficulty_selector_mode_is_rejected():
+    with pytest.raises(ValidationError):
+        WorkerConfig(difficulty_selector_mode="AUTO")
+
+
+def test_boundary_policy_defaults_to_shadow(monkeypatch):
+    monkeypatch.delenv("BOUNDARY_POLICY_MODE", raising=False)
+
+    assert load_config().boundary_policy_mode == "SHADOW"
+
+
+@pytest.mark.parametrize("mode", ["SHADOW", "EXPERIMENTAL_ENFORCED"])
+def test_supported_boundary_policy_modes_are_accepted(mode):
+    assert WorkerConfig(boundary_policy_mode=mode).boundary_policy_mode == mode
+
+
+def test_unknown_boundary_policy_mode_is_rejected():
+    with pytest.raises(ValidationError):
+        WorkerConfig(boundary_policy_mode="ACTIVE")
+
+
 @pytest.mark.parametrize(
     ("ffmpeg_bin", "expected"),
     [

@@ -1,0 +1,719 @@
+diff --git a/inference.py b/inference.py
+index e1a64eb..2d899df 100644
+--- a/inference.py
++++ b/inference.py
+@@ -488,6 +488,7 @@ def generate(
+     sequences = preprocessor.segment(audio)
+     extra_in_context = {}
+     output_type = args.output_type.copy()
++    resnap_collisions = []
+     timing_model = model if timing_model is None else timing_model
+     timing_tokenizer = tokenizer if timing_tokenizer is None else timing_tokenizer
+ 
+@@ -533,16 +534,28 @@ def generate(
+             verbose=verbose,
+         )
+ 
+-        events, _ = reduce(merge_events, result)
++        events, event_times = reduce(merge_events, result)
+ 
+         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
+             timing = postprocessor.generate_timing(events)
+ 
+         # Resnap timing events
+         if args.resnap_events and timing is not None:
+-            events = postprocessor.resnap_events(events, timing)
++            if args.gamemode == 3 and ContextType.MAP in output_type:
++                events, event_times, resnap_collisions = postprocessor.resnap_events(
++                    events,
++                    event_times,
++                    timing,
++                    key_count=round(beatmap_config.circle_size),
++                )
++            else:
++                events, event_times = postprocessor.resnap_events(
++                    events,
++                    event_times,
++                    timing,
++                )
+     else:
+-        events = timing_events
++        events, event_times = timing_events, timing_times
+ 
+     # Generate positions with diffusion
+     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
+@@ -553,9 +566,13 @@ def generate(
+             timing=timing,
+             verbose=verbose,
+         )
++        # Diffusion may change the event stream. Preserve its previous token-derived
++        # timing behavior outside mania until it exposes matching event times.
++        event_times = None
+ 
+     result = postprocessor.generate(
+         events=events,
++        event_times=event_times,
+         beatmap_config=beatmap_config,
+         timing=timing,
+     )
+@@ -580,6 +597,12 @@ def generate(
+     else:
+         result_path = output_osu_path
+         postprocessor.write_result(result_path, result)
++        if args.gamemode == 3 and ContextType.MAP in output_type and args.resnap_events:
++            postprocessor.write_resnap_diagnostics(
++                result_path,
++                seed=args.seed,
++                collisions=resnap_collisions,
++            )
+         if verbose:
+             logger.info(f"Generated beatmap saved to {result_path}")
+ 
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index 90be337..e7a36ea 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -1,10 +1,12 @@
+ from __future__ import annotations
+ 
+ import dataclasses
++import json
+ import logging
+ import os
+ import zipfile
+ from datetime import timedelta
++from pathlib import Path
+ from string import Template
+ from typing import Optional
+ 
+@@ -146,6 +148,7 @@ class Postprocessor(object):
+             events: list[Event],
+             beatmap_config: BeatmapConfig,
+             timing: list[TimingPoint] = None,
++            event_times: list[int] = None,
+     ):
+         """Generate a beatmap file.
+ 
+@@ -153,6 +156,7 @@ class Postprocessor(object):
+             events: List of Event objects.
+             beatmap_config: BeatmapConfig object.
+             timing: List of TimingPoint objects.
++            event_times: Absolute timestamp for each event token.
+ 
+         Returns:
+             None. An .osu file will be generated.
+@@ -172,7 +176,14 @@ class Postprocessor(object):
+                 timedelta(milliseconds=self.offset), self.beat_length, 4, 2, -1, 100, None, False
+             )]
+ 
+-        groups, _ = get_groups(events, types_first=self.types_first)
++        if event_times is not None and len(events) != len(event_times):
++            raise ValueError("events and event_times must have equal length")
++
++        groups, _ = get_groups(
++            events,
++            event_times=event_times,
++            types_first=self.types_first,
++        )
+         last_x, last_y = 256, 192
+ 
+         if self.snap_near_perfect_overlaps_enabled:
+@@ -519,6 +530,29 @@ class Postprocessor(object):
+         with open(output_path, "w", encoding='utf-8-sig') as osu_file:
+             osu_file.write(result)
+ 
++    def write_resnap_diagnostics(
++            self,
++            output_path: str | Path,
++            *,
++            seed: int,
++            collisions: list[dict],
++    ) -> Path:
++        sidecar_path = Path(output_path).with_suffix(".resnap.json")
++        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
++        sidecar_path.write_text(
++            json.dumps(
++                {
++                    "version": "mania-resnap-v3-hold-pairs",
++                    "seed": seed,
++                    "collisions": collisions,
++                },
++                ensure_ascii=False,
++                indent=2,
++            ) + "\n",
++            encoding="utf-8",
++        )
++        return sidecar_path
++
+     def export_osz(self, output_path: str, osu_content: str, osu_filename: str, audio_path: str, background_path: str = None):
+         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+ 
+@@ -604,27 +638,254 @@ class Postprocessor(object):
+     def calc_length(self, sv, span_duration, redline, slider_multiplier):
+         return sv * span_duration * 100 / redline.ms_per_beat * slider_multiplier
+ 
+-    def resnap_events(self, events: list[Event], timing: list[TimingPoint]) -> list[Event]:
+-        """Resnap events to the designated beat snap divisors."""
++    def resnap_events(
++            self,
++            events: list[Event],
++            event_times: list[int],
++            timing: list[TimingPoint],
++            key_count: int = None,
++    ):
++        """Resnap events and their explicit times to the same beat ticks."""
++        if len(events) != len(event_times):
++            raise ValueError("events and event_times must have equal length")
++
+         timing = sort_timing_points(timing)
+-        resnapped_events = []
+-        for i, event in enumerate(events):
+-            if event.type != EventType.TIME_SHIFT:
+-                resnapped_events.append(event)
++        original_event_times = list(event_times)
++        before_groups, group_indices = get_groups(
++            events,
++            event_times=original_event_times,
++            types_first=self.types_first,
++        )
++        proposals = []
++        for group_id, (group, indices) in enumerate(zip(before_groups, group_indices)):
++            time_shift_index = next(
++                (
++                    index
++                    for index in indices
++                    if events[index].type == EventType.TIME_SHIFT
++                ),
++                None,
++            )
++            snap_divisor = next(
++                (
++                    events[index].value
++                    for index in indices
++                    if events[index].type == EventType.SNAPPING
++                ),
++                0,
++            )
++            proposed_time = group.time
++            if time_shift_index is not None and snap_divisor > 0:
++                proposed_time = int(
++                    self.resnap(events[time_shift_index].value, timing, snap_divisor)
++                )
++            proposals.append({
++                "groupId": group_id,
++                "originalTimeMs": group.time,
++                "proposedTimeMs": proposed_time,
++                "snapDivisor": snap_divisor,
++            })
++
++        proposals_by_original = {}
++        for proposal in proposals:
++            proposals_by_original.setdefault(
++                proposal["originalTimeMs"], []
++            ).append(proposal)
++
++        snap_conflict_group_ids = set()
++        final_times = {}
++        for original_time, same_time_proposals in proposals_by_original.items():
++            targets = {
++                proposal["proposedTimeMs"] for proposal in same_time_proposals
++            }
++            conflict = len(targets) > 1
++            final_time = original_time if conflict else next(iter(targets))
++            for proposal in same_time_proposals:
++                group_id = proposal["groupId"]
++                final_times[group_id] = final_time
++                if conflict:
++                    snap_conflict_group_ids.add(group_id)
++
++        resnapped_events = list(events)
++        snapped_event_times = list(event_times)
++        for group_id, indices in enumerate(group_indices):
++            final_time = final_times[group_id]
++            for index in indices:
++                snapped_event_times[index] = final_time
++                if events[index].type == EventType.TIME_SHIFT:
++                    resnapped_events[index] = Event(EventType.TIME_SHIFT, final_time)
++        if key_count is None:
++            return resnapped_events, snapped_event_times
++        if key_count <= 0:
++            raise ValueError("key_count must be positive")
++
++        after_groups, _ = get_groups(
++            resnapped_events,
++            event_times=snapped_event_times,
++            types_first=self.types_first,
++        )
++        observations = []
++        note_kinds = {
++            EventType.CIRCLE: "TAP",
++            EventType.HOLD_NOTE: "HOLD_START",
++            EventType.HOLD_NOTE_END: "HOLD_END",
++        }
++        observation_group_ids = []
++        group_lanes = {}
++        for group_id, (before, after, indices) in enumerate(zip(
++                before_groups,
++                after_groups,
++                group_indices,
++        )):
++            note_kind = note_kinds.get(before.event_type)
++            if note_kind is None or before.x is None:
+                 continue
++            lane = min(
++                key_count - 1,
++                max(0, int(before.x * key_count / 512)),
++            )
++            group_lanes[group_id] = lane
++            snap_divisor = next(
++                (
++                    events[index].value
++                    for index in indices
++                    if events[index].type == EventType.SNAPPING
++                ),
++                0,
++            )
++            observation = {
++                "lane": lane,
++                "noteKind": note_kind,
++                "preTimeMs": before.time,
++                "postTimeMs": proposals[group_id]["proposedTimeMs"],
++                "snapDivisor": snap_divisor,
++            }
++            if group_id in snap_conflict_group_ids:
++                observation["reason"] = "SNAP_TARGET_CONFLICT_PRESERVED"
++            observations.append(observation)
++            observation_group_ids.append(group_id)
++
++        pre_times_by_target = {}
++        for observation in observations:
++            target = (observation["lane"], observation["postTimeMs"])
++            pre_times_by_target.setdefault(target, set()).add(
++                observation["preTimeMs"]
++            )
++        collision_targets = {
++            target
++            for target, pre_times in pre_times_by_target.items()
++            if len(pre_times) >= 2
++        }
+ 
+-            time = event.value
+-            snap_divisor = 0
+-
+-            if i + 1 < len(events) and events[i + 1].type == EventType.SNAPPING:
+-                snap_divisor = events[i + 1].value
+-
+-            if snap_divisor > 0:
+-                time = int(self.resnap(time, timing, snap_divisor))
+-
+-            resnapped_events.append(Event(EventType.TIME_SHIFT, time))
++        hold_pairs = []
++        invalid_hold_groups = []
++        active_hold_by_lane = {}
++        for group_id, before in enumerate(before_groups):
++            lane = group_lanes.get(group_id)
++            if before.event_type == EventType.HOLD_NOTE and lane is not None:
++                previous_start_id = active_hold_by_lane.get(lane)
++                if previous_start_id is not None:
++                    invalid_hold_groups.append((previous_start_id, None, lane))
++                active_hold_by_lane[lane] = group_id
++            elif before.event_type == EventType.HOLD_NOTE_END and lane is not None:
++                start_id = active_hold_by_lane.pop(lane, None)
++                if start_id is None:
++                    invalid_hold_groups.append((None, group_id, lane))
++                else:
++                    hold_pairs.append((start_id, group_id, lane))
++        invalid_hold_groups.extend(
++            (start_id, None, lane)
++            for lane, start_id in active_hold_by_lane.items()
++        )
+ 
+-        return resnapped_events
++        collision_group_ids = {
++            group_id
++            for observation, group_id in zip(observations, observation_group_ids)
++            if (observation["lane"], observation["postTimeMs"])
++            in collision_targets
++        }
++        paired_group_ids = {
++            group_id
++            for start_id, end_id, _lane in hold_pairs
++            for group_id in (start_id, end_id)
++        }
++        restored_pair_group_ids = set()
++        pair_diagnostics = []
++
++        def restore_group(group_id):
++            raw_time = proposals[group_id]["originalTimeMs"]
++            for index in group_indices[group_id]:
++                snapped_event_times[index] = raw_time
++                if events[index].type == EventType.TIME_SHIFT:
++                    resnapped_events[index] = Event(EventType.TIME_SHIFT, raw_time)
++
++        for start_id, end_id, lane in hold_pairs:
++            raw_start = proposals[start_id]["originalTimeMs"]
++            raw_end = proposals[end_id]["originalTimeMs"]
++            proposed_start = proposals[start_id]["proposedTimeMs"]
++            proposed_end = proposals[end_id]["proposedTimeMs"]
++            invalid_raw = raw_end <= raw_start
++            must_restore = (
++                invalid_raw
++                or proposed_end <= proposed_start
++                or start_id in collision_group_ids
++                or end_id in collision_group_ids
++                or start_id in snap_conflict_group_ids
++                or end_id in snap_conflict_group_ids
++            )
++            if not must_restore:
++                continue
++            restore_group(start_id)
++            restore_group(end_id)
++            restored_pair_group_ids.update((start_id, end_id))
++            pair_diagnostics.append({
++                "lane": lane,
++                "noteKind": "HOLD_PAIR",
++                "rawStartMs": raw_start,
++                "rawEndMs": raw_end,
++                "proposedStartMs": proposed_start,
++                "proposedEndMs": proposed_end,
++                "reason": (
++                    "HOLD_PAIR_INVALID_RAW"
++                    if invalid_raw
++                    else "HOLD_PAIR_RAW_RESTORED"
++                ),
++            })
++
++        for start_id, end_id, lane in invalid_hold_groups:
++            group_id = start_id if start_id is not None else end_id
++            raw_time = proposals[group_id]["originalTimeMs"]
++            restore_group(group_id)
++            pair_diagnostics.append({
++                "lane": lane,
++                "noteKind": "HOLD_PAIR",
++                "rawStartMs": raw_time if start_id is not None else None,
++                "rawEndMs": raw_time if end_id is not None else None,
++                "proposedStartMs": (
++                    proposals[start_id]["proposedTimeMs"]
++                    if start_id is not None else None
++                ),
++                "proposedEndMs": (
++                    proposals[end_id]["proposedTimeMs"]
++                    if end_id is not None else None
++                ),
++                "reason": "HOLD_PAIR_INVALID_RAW",
++            })
++
++        collisions = []
++        for observation, group_id in zip(observations, observation_group_ids):
++            target = (observation["lane"], observation["postTimeMs"])
++            if target in collision_targets:
++                observation["reason"] = "RAW_TIME_COLLISION_PRESERVED"
++                if group_id not in paired_group_ids:
++                    restore_group(group_id)
++            if (
++                    "reason" in observation
++                    and group_id not in restored_pair_group_ids
++            ):
++                collisions.append(observation)
++        collisions.extend(pair_diagnostics)
++        return resnapped_events, snapped_event_times, collisions
+ 
+     def resnap(self, time: float, timing: list[TimingPoint], snap_divisor: int) -> float:
+         """Resnap a time to the nearest beat divisor."""
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+new file mode 100644
+index 0000000..ba07267
+--- /dev/null
++++ b/tests/test_mania_event_times.py
+@@ -0,0 +1,291 @@
++import json
++from datetime import timedelta
++from types import SimpleNamespace
++
++from slider import TimingPoint
++
++from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.postprocessor import BeatmapConfig, Postprocessor
++
++
++def make_postprocessor() -> Postprocessor:
++    args = SimpleNamespace(
++        offset=0,
++        bpm=120,
++        timing_leniency=0,
++        train=SimpleNamespace(data=SimpleNamespace(
++            types_first=False,
++            add_positions=True,
++            mania_bpm_normalized_scroll_speed=False,
++            add_sv=False,
++        )),
++        start_time=None,
++        end_time=3_000,
++        snap_near_perfect_overlaps=False,
++    )
++    return Postprocessor(args)
++
++
++def make_timing() -> list[TimingPoint]:
++    return [TimingPoint(
++        timedelta(milliseconds=0),
++        500,
++        4,
++        2,
++        -1,
++        100,
++        None,
++        False,
++    )]
++
++
++def test_explicit_event_times_preserve_a_same_timestamp_second_group():
++    events = [
++        Event(EventType.TIME_SHIFT, 1_000),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 2_000),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    result = make_postprocessor().generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++        event_times=[1_000] * 7 + [2_000] * 4,
++    )
++
++    assert "192,192,1000,128,0,2000:0:0:-1:0:" in result
++    assert "192,192,0,128" not in result
++
++
++def test_resnap_updates_event_tokens_and_explicit_times_together():
++    events = [
++        Event(EventType.TIME_SHIFT, 110),
++        Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++
++    snapped_events, snapped_times = make_postprocessor().resnap_events(
++        events,
++        [110, 110, 110, 110, 110],
++        make_timing(),
++    )
++
++    assert snapped_events[0].value == 125
++    assert snapped_times == [125, 125, 125, 125, 125]
++
++
++def test_resnap_reports_distinct_pre_times_collapsed_to_same_mania_lane():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 140),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++    ]
++    _, _, collisions = make_postprocessor().resnap_events(
++        events, [110] * 5 + [140] * 5, make_timing(), key_count=4,
++    )
++    assert collisions == [
++        {"lane": 0, "noteKind": "TAP", "preTimeMs": 110,
++         "postTimeMs": 125, "snapDivisor": 4,
++         "reason": "RAW_TIME_COLLISION_PRESERVED"},
++        {"lane": 0, "noteKind": "TAP", "preTimeMs": 140,
++         "postTimeMs": 125, "snapDivisor": 4,
++         "reason": "RAW_TIME_COLLISION_PRESERVED"},
++    ]
++
++
++def test_resnap_does_not_report_same_time_on_different_mania_lanes():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 140),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++    ]
++    _, _, collisions = make_postprocessor().resnap_events(
++        events, [110] * 5 + [140] * 5, make_timing(), key_count=4,
++    )
++    assert collisions == []
++
++
++def test_resnap_preserves_same_timestamp_chord_when_snap_targets_disagree():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 110),
++        Event(EventType.SNAPPING, 3), Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++    ]
++
++    snapped_events, snapped_times, collisions = make_postprocessor().resnap_events(
++        events, [110] * 10, make_timing(), key_count=4,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [110, 110]
++    assert snapped_times == [110] * 10
++    assert {collision["reason"] for collision in collisions} == {
++        "SNAP_TARGET_CONFLICT_PRESERVED"
++    }
++
++
++def test_resnap_restores_distinct_raw_times_collapsed_on_same_lane():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 140),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.CIRCLE, 0),
++    ]
++
++    snapped_events, snapped_times, collisions = make_postprocessor().resnap_events(
++        events, [110] * 5 + [140] * 5, make_timing(), key_count=4,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [110, 140]
++    assert snapped_times == [110] * 5 + [140] * 5
++    assert {collision["reason"] for collision in collisions} == {
++        "RAW_TIME_COLLISION_PRESERVED"
++    }
++
++
++def test_resnap_restores_both_hold_endpoints_when_snap_would_collapse_them():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0), Event(EventType.TIME_SHIFT, 140),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
++        events, [110] * 5 + [140] * 5, make_timing(), key_count=4,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [110, 140]
++    assert snapped_times == [110] * 5 + [140] * 5
++    assert diagnostics == [{
++        "lane": 0,
++        "noteKind": "HOLD_PAIR",
++        "rawStartMs": 110,
++        "rawEndMs": 140,
++        "proposedStartMs": 125,
++        "proposedEndMs": 125,
++        "reason": "HOLD_PAIR_RAW_RESTORED",
++    }]
++
++
++def test_resnap_restores_hold_pair_atomically_when_end_collides_with_tap():
++    events = [
++        Event(EventType.TIME_SHIFT, 110), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0), Event(EventType.TIME_SHIFT, 260),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++        Event(EventType.TIME_SHIFT, 270), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++
++    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
++        events, [110] * 5 + [260] * 5 + [270] * 5,
++        make_timing(), key_count=4,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [110, 260, 270]
++    assert {
++        item["reason"] for item in diagnostics
++    } == {"HOLD_PAIR_RAW_RESTORED", "RAW_TIME_COLLISION_PRESERVED"}
++
++
++def test_resnap_restores_hold_pair_atomically_when_start_collides_with_tap():
++    events = [
++        Event(EventType.TIME_SHIFT, 100), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0), Event(EventType.TIME_SHIFT, 110),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 260), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
++        events, [100] * 5 + [110] * 5 + [260] * 5,
++        make_timing(), key_count=4,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [100, 110, 260]
++    assert {
++        item["reason"] for item in diagnostics
++    } == {"HOLD_PAIR_RAW_RESTORED", "RAW_TIME_COLLISION_PRESERVED"}
++
++
++def test_resnap_reports_invalid_raw_hold_without_inventing_an_end():
++    events = [
++        Event(EventType.TIME_SHIFT, 510), Event(EventType.SNAPPING, 4),
++        Event(EventType.POS_X, 64), Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0), Event(EventType.TIME_SHIFT, 110),
++        Event(EventType.SNAPPING, 4), Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192), Event(EventType.HOLD_NOTE_END, 0),
++    ]
++
++    snapped_events, snapped_times, diagnostics = make_postprocessor().resnap_events(
++        events, [510] * 5 + [110] * 5, make_timing(), key_count=4,
++    )
++
++    assert [
++        event.value for event in snapped_events
++        if event.type == EventType.TIME_SHIFT
++    ] == [510, 110]
++    assert snapped_times == [510] * 5 + [110] * 5
++    assert diagnostics == [{
++        "lane": 0,
++        "noteKind": "HOLD_PAIR",
++        "rawStartMs": 510,
++        "rawEndMs": 110,
++        "proposedStartMs": 625,
++        "proposedEndMs": 125,
++        "reason": "HOLD_PAIR_INVALID_RAW",
++    }]
++
++
++def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
++    osu_path = tmp_path / "beatmap.osu"
++    collisions = [
++        {"lane": 0, "noteKind": "TAP", "preTimeMs": 110,
++         "postTimeMs": 125, "snapDivisor": 4}
++    ]
++    sidecar_path = make_postprocessor().write_resnap_diagnostics(
++        osu_path, seed=31, collisions=collisions,
++    )
++    assert sidecar_path == osu_path.with_suffix(".resnap.json")
++    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {
++        "version": "mania-resnap-v3-hold-pairs",
++        "seed": 31,
++        "collisions": collisions,
++    }

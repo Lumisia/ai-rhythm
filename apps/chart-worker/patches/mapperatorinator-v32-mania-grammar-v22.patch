@@ -1,0 +1,83 @@
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -15,7 +15,11 @@ from config import InferenceConfig
+ from .compiled_decode import model_generate_compiled
+ from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
+ from .origin import EventOrigin
+-from .mania_grammar import canonical_mania_groups, replay_mania_hold_state
++from .mania_grammar import (
++    MANIA_NOTE_TYPES,
++    canonical_mania_groups,
++    replay_mania_hold_state,
++)
+ from ..dataset.osu_parser import OsuParser
+ from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
+                                   get_scroll_speed_ratio, get_hitsounded_status, calculate_difficulty,
+@@ -1812,6 +1816,7 @@ class Processor(object):
+         new_events = []
+         new_event_times = []
+         new_event_origins = []
++        pending_mania_column = False
+         for i, event in enumerate(events):
+             if event.type == EventType.MANIA_COLUMN:
+                 x = int((event.value + 0.5) * 512 / key_count)
+@@ -1821,11 +1826,22 @@ class Processor(object):
+                 new_event_times.append(event_times[i])
+                 if event_origins is not None:
+                     new_event_origins.extend((event_origins[i], event_origins[i]))
++                pending_mania_column = True
++            elif pending_mania_column and event.type in {
++                    EventType.POS_X,
++                    EventType.POS_Y,
++            }:
++                # MANIA_COLUMN is the sole lane authority. Legacy position
++                # attributes emitted inside the same gameplay group must not
++                # overwrite the canonical column during serialization.
++                continue
+             else:
+                 new_events.append(event)
+                 new_event_times.append(event_times[i])
+                 if event_origins is not None:
+                     new_event_origins.append(event_origins[i])
++                if pending_mania_column and event.type in MANIA_NOTE_TYPES:
++                    pending_mania_column = False
+         if event_origins is None:
+             return new_events, new_event_times
+         return new_events, new_event_times, new_event_origins
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -437,6 +437,32 @@ def test_column_conversion_duplicates_the_parent_origin():
+     assert converted_origins == [origin, origin, origin]
+ 
+ 
++def test_column_conversion_discards_conflicting_legacy_position_attributes():
++    processor = make_processor()
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 0),
++        Event(EventType.POS_X, -48),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++    ]
++    times = [100] * len(events)
++    origins = [EventOrigin.generated(8, i) for i in range(len(events))]
++
++    converted_events, converted_times, converted_origins = (
++        processor._convert_column_to_position(events, times, 6, origins)
++    )
++
++    assert [(event.type, event.value) for event in converted_events] == [
++        (EventType.TIME_SHIFT, 100),
++        (EventType.POS_X, 42),
++        (EventType.POS_Y, 192),
++        (EventType.HOLD_NOTE, 0),
++    ]
++    assert converted_times == [100, 100, 100, 100]
++    assert converted_origins == [origins[0], origins[1], origins[1], origins[4]]
++
++
+ def test_rescale_positions_moves_origin_with_each_derived_axis():
+     processor = make_processor()
+     processor.position_precision = 2

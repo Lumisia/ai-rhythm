@@ -1,0 +1,99 @@
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 2d42ae1..7494d68 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -225,6 +225,8 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             "forcedClosureSteps": 0,
+             "insufficientClosureBudgetSteps": 0,
+             "unclosableHoldStartSteps": 0,
++            "forcedGroupCompletionSteps": 0,
++            "impossibleGroupCompletionSteps": 0,
+         }
+ 
+     def telemetry(self) -> dict[str, int]:
+@@ -377,6 +379,34 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     self._telemetry["duplicateTokensMasked"] += 1
+                     scores_processed[row, token] = -torch.inf
+             self._telemetry["pendingGroupBoundarySteps"] += 1
++            remaining_tokens = (
++                None
++                if self.max_sequence_length is None
++                else self.max_sequence_length - input_ids.shape[1]
++            )
++            if remaining_tokens is not None and remaining_tokens <= 0:
++                self._telemetry["impossibleGroupCompletionSteps"] += 1
++                raise ValueError(
++                    "insufficient sequence budget to complete pending mania "
++                    f"group: remaining={remaining_tokens}, lane={current_lane}"
++                )
++            if remaining_tokens == 1:
++                note_tokens = (
++                    self.tap_token,
++                    self.hold_start_token,
++                    self.hold_end_token,
++                )
++                note_scores = scores_processed[row, list(note_tokens)].clone()
++                if torch.isneginf(note_scores).all():
++                    self._telemetry["impossibleGroupCompletionSteps"] += 1
++                    raise ValueError(
++                        "no legal note type can complete pending mania group: "
++                        f"lane={current_lane}"
++                    )
++                self._telemetry["forcedGroupCompletionSteps"] += 1
++                scores_processed[row, :] = -torch.inf
++                scores_processed[row, list(note_tokens)] = note_scores
++                continue
+             for start, end in self.non_mania_type_token_ranges:
+                 scores_processed[row, start:end] = -torch.inf
+             scores_processed[row, self.column_start:self.column_end] = -torch.inf
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index eb7cafe..080e1ca 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -145,6 +145,37 @@ def test_new_group_is_masked_when_token_budget_cannot_complete_it():
+     assert torch.isneginf(one_slot_left[0, 10:28]).all()
+ 
+ 
++def test_pending_column_forces_a_legal_note_type_in_last_sequence_slot():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), max_sequence_length=5
++    )
++
++    result = processor(
++        torch.tensor([[keycount_token(4), 1, 30, 12]]), scores()
++    )
++
++    assert not torch.isneginf(result[0, 50])
++    assert not torch.isneginf(result[0, 51])
++    assert torch.isneginf(result[0, 52])
++    assert torch.isneginf(result[0, 70])
++    assert processor.telemetry()["forcedGroupCompletionSteps"] == 1
++
++
++def test_pending_open_lane_forces_hold_end_in_last_sequence_slot():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (2,), max_sequence_length=5
++    )
++
++    result = processor(
++        torch.tensor([[keycount_token(4), 1, 30, 12]]), scores()
++    )
++
++    assert torch.isneginf(result[0, 50])
++    assert torch.isneginf(result[0, 51])
++    assert not torch.isneginf(result[0, 52])
++    assert torch.isneginf(result[0, 70])
++
++
+ def test_generated_duplicate_group_is_masked_but_prompt_history_is_idempotent():
+     processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
+     prompt = torch.tensor([[keycount_token(4), 1, 30, 12]])
+@@ -295,6 +326,8 @@ def test_hold_state_processor_reports_intervention_counts():
+         "forcedClosureSteps": 0,
+         "insufficientClosureBudgetSteps": 0,
+         "unclosableHoldStartSteps": 0,
++        "forcedGroupCompletionSteps": 0,
++        "impossibleGroupCompletionSteps": 0,
+     }
+     assert get_mania_hold_grammar_telemetry([processor]) == processor.telemetry()
+ 
