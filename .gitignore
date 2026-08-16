@@ -141,6 +141,9 @@ Desktop.ini
 
 # Local test evidence (generated; never commit)
 /.test-evidence/
+/.integration-*/
+/.pytest-*/
+/.tmp-*/
 /apps/chart-worker/.data/test-evidence/
 /apps/chart-worker/.integration-*/
 /apps/chart-worker/.pytest-*/
