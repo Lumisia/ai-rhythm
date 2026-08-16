@@ -16,6 +16,31 @@ def test_every_error_code_has_a_disposition():
         assert isinstance(disposition_of(code), Disposition)
 
 
+def test_tail_terminal_errors_are_present_and_nonretryable():
+    codes = {code.value: code for code in ErrorCode}
+
+    assert {
+        "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "INFERENCE_PROTOCOL_FAILED",
+    } <= codes.keys()
+    assert disposition_of(codes["MANIA_TAIL_REPAIR_EXHAUSTED"]) is Disposition.FINAL
+    assert disposition_of(codes["INFERENCE_PROTOCOL_FAILED"]) is Disposition.FINAL_ALERT
+    assert WorkerError(codes["MANIA_TAIL_REPAIR_EXHAUSTED"], "boom").retryable is False
+    assert WorkerError(codes["INFERENCE_PROTOCOL_FAILED"], "boom").retryable is False
+
+
+def test_resident_pre_accept_and_post_accept_failures_have_opposite_retry_policy():
+    assert disposition_of(ErrorCode.INFERENCE_START_FAILED) is Disposition.RETRYABLE
+    assert disposition_of(ErrorCode.INFERENCE_COMPLETION_UNKNOWN) is Disposition.FINAL_ALERT
+    assert disposition_of(ErrorCode.INFERENCE_INVOCATION_CONFLICT) is Disposition.FINAL_ALERT
+    assert WorkerError(ErrorCode.INFERENCE_START_FAILED, "before accepted").retryable is True
+    assert (
+        WorkerError(ErrorCode.INFERENCE_COMPLETION_UNKNOWN, "after accepted").retryable
+        is False
+    )
+    assert WorkerError(ErrorCode.INFERENCE_INVOCATION_CONFLICT, "conflict").retryable is False
+
+
 @pytest.mark.parametrize(
     ("code", "expected"),
     [
@@ -87,3 +112,10 @@ def test_error_code_str_value_matches_name():
 def test_worker_error_is_not_a_value_error():
     """입력 검증 실패(ValueError)와 단계 실패를 섞지 않는다."""
     assert not isinstance(WorkerError(ErrorCode.AUDIO_INVALID, "bad"), ValueError)
+
+
+def test_partial_rejoin_invalid_is_final():
+    """PARTIAL_REMAP 은 한 번만 청구된다. 같은 참조로 다시 해도 같은 결과다."""
+    assert (
+        disposition_of(ErrorCode.MANIA_PARTIAL_REJOIN_INVALID) is Disposition.FINAL
+    )

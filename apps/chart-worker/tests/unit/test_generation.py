@@ -1,12 +1,21 @@
+import hashlib
 import json
+import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from chart_worker.audio.runner import CommandError, CommandResult
+from chart_worker.audio import profile
+from chart_worker.audio.runner import CommandError, CommandResult, CommandRunner
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation import mapperatorinator
 from chart_worker.generation.fake import FakeGenerator, synthesize_chart
+from chart_worker.generation.inference_session import (
+    InvocationArtifact,
+    InvocationResult,
+)
 from chart_worker.generation.mapperatorinator import (
     MapperatorinatorGenerator,
     build_map_command,
@@ -37,6 +46,20 @@ TIMING_OSU = (
     "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
     "\n[TimingPoints]\n0,500,4,2,0,60,1,0\n\n[HitObjects]\n"
 )
+INVOCATION_RESULT_PREFIX = "MAPPERATORINATOR_INVOCATION_RESULT="
+OVERSIZED_INTEGER_TERMINAL = '{"version":' + "9" * 5_000 + "}"
+TAIL_FAILURE_CONTEXT = {
+    "reason": "END_BOUNDARY_CROSSES_HOLD",
+    "signature": "END_BOUNDARY_CROSSES_HOLD:500:11",
+    "requestedEndMs": 500,
+    "effectiveCutMs": 500,
+    "earliestGeneratedSourceWindowId": 11,
+    "repairTriggerReason": "END_BOUNDARY_CROSSES_HOLD",
+    "repairTriggerSourceWindowId": 11,
+    "repairStartWindowId": 9,
+    "repairWindowIds": [9, 10, 11],
+    "repairAttempts": 2,
+}
 
 
 @pytest.fixture
@@ -81,6 +104,91 @@ def _fake_run(osu_text=MINI_OSU, fail=False, resnap_sidecar=None):
     return run
 
 
+def _terminal_run(record, *, returncode=17, duplicate=False, stderr="diagnostic"):
+    def run(argv):
+        encoded = record if isinstance(record, str) else json.dumps(record)
+        line = f"{INVOCATION_RESULT_PREFIX}{encoded}"
+        stdout = f"{line}\n{line}\n" if duplicate else f"{line}\n"
+        return CommandResult(argv, returncode, stdout, stderr)
+
+    return run
+
+
+def _resident_config() -> WorkerConfig:
+    return WorkerConfig(
+        mapperatorinator_python=Path("C:/mapp/.venv/Scripts/python.exe"),
+        mapperatorinator_home=Path("C:/mapp"),
+        mapperatorinator_backend="song_session",
+        mapperatorinator_hold_state_mode="incremental",
+        mapperatorinator_model_root=Path("C:/models/mapperatorinator-snapshot"),
+        mapperatorinator_model_revision="a" * 40,
+    )
+
+
+def _resident_session(osu_text: str = MINI_OSU):
+    calls: list[tuple[list[str], Path]] = []
+
+    def invoke(argv: list[str], workdir: Path) -> InvocationResult:
+        calls.append((list(argv), workdir))
+        workdir.mkdir(parents=True, exist_ok=True)
+        output = workdir / "resident.osu"
+        payload = osu_text.encode("utf-8")
+        output.write_bytes(payload)
+        return InvocationResult(
+            status="SUCCESS",
+            command=CommandResult(argv, 0, "", ""),
+            accepted=True,
+            invocation_id="b" * 64,
+            request_hash="c" * 64,
+            artifacts=(
+                InvocationArtifact(
+                    relative_path="resident.osu",
+                    size=len(payload),
+                    sha256=hashlib.sha256(payload).hexdigest(),
+                ),
+            ),
+        )
+
+    return SimpleNamespace(invoke=invoke), calls
+
+
+def test_song_session_generator_requires_attached_session_before_output_mutation(tmp_path):
+    workdir = tmp_path / "must-not-exist"
+    generator = MapperatorinatorGenerator(
+        config=_resident_config(),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
+    )
+
+    with pytest.raises(ValueError, match="attached inference session"):
+        generator.generate_map(_request(), workdir)
+
+    assert not workdir.exists()
+
+
+def test_song_session_generator_uses_only_bound_artifact_and_direct_offline_overrides(tmp_path):
+    session, calls = _resident_session()
+
+    result = MapperatorinatorGenerator(
+        config=_resident_config(),
+        session=session,
+        run=lambda _argv: pytest.fail("one-shot runner must not be called"),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
+    ).generate_map(_request(seed=3), tmp_path / "resident-work")
+
+    assert result.key_mode == 4
+    assert len(calls) == 1
+    argv, observed_workdir = calls[0]
+    assert observed_workdir == tmp_path / "resident-work"
+    pairs = _pairs(argv)
+    assert pairs["model_path"] == "'C:\\models\\mapperatorinator-snapshot'"
+    assert pairs["use_server"] == "false"
+    assert pairs["parallel"] == "false"
+    assert pairs["generate_positions"] == "false"
+    assert pairs["mania_hold_state_mode"] == "incremental"
+
+
 def test_requested_stars_and_descriptors_are_explicit():
     assert REQUESTED_STAR == {
         "EASY": 1.0,
@@ -118,6 +226,82 @@ def test_timing_command_generates_only_timing(config, tmp_path):
     assert pairs["super_timing"] == "false"
     assert "beatmap_path" not in pairs
     assert "in_context" not in pairs
+
+
+@pytest.mark.parametrize("mode", ["full_scan", "incremental_verify", "incremental"])
+def test_timing_and_map_commands_each_propagate_one_hold_state_mode(
+    config, tmp_path, mode
+):
+    configured = config.model_copy(update={"mapperatorinator_hold_state_mode": mode})
+    commands = (
+        build_timing_command(
+            configured,
+            TimingGenerationRequest(
+                audio_path=Path("game.flac"), duration_ms=DURATION_MS
+            ),
+            tmp_path / "timing",
+        ),
+        build_map_command(configured, _request(), tmp_path / "map"),
+    )
+
+    for argv in commands:
+        hold_state_overrides = [
+            item for item in argv if item.startswith("mania_hold_state_mode=")
+        ]
+        assert hold_state_overrides == [f"mania_hold_state_mode={mode}"]
+
+
+def test_map_command_propagates_opt_in_processor_generation_telemetry(
+    config, tmp_path
+):
+    configured = config.model_copy(
+        update={"mapperatorinator_write_generation_telemetry": True}
+    )
+    argv = build_map_command(configured, _request(), tmp_path / "map")
+
+    assert [
+        item for item in argv if item.startswith("write_generation_telemetry=")
+    ] == ["write_generation_telemetry=true"]
+
+
+def test_timing_command_does_not_request_map_processor_telemetry(config, tmp_path):
+    configured = config.model_copy(
+        update={"mapperatorinator_write_generation_telemetry": True}
+    )
+
+    argv = build_timing_command(
+        configured,
+        TimingGenerationRequest(
+            audio_path=Path("game.flac"),
+            duration_ms=DURATION_MS,
+        ),
+        tmp_path / "timing",
+    )
+
+    assert not any(
+        item.startswith("write_generation_telemetry=") for item in argv
+    )
+
+
+@pytest.mark.parametrize("builder", ["timing", "map"])
+def test_generation_commands_do_not_enable_generation_telemetry_by_default(
+    config, tmp_path, builder
+):
+    if builder == "timing":
+        argv = build_timing_command(
+            config,
+            TimingGenerationRequest(
+                audio_path=Path("game.flac"),
+                duration_ms=DURATION_MS,
+            ),
+            tmp_path / "timing",
+        )
+    else:
+        argv = build_map_command(config, _request(), tmp_path / "map")
+
+    assert not any(
+        item.startswith("write_generation_telemetry=") for item in argv
+    )
 
 
 def test_map_command_reuses_the_timing_reference(config, tmp_path):
@@ -230,6 +414,7 @@ def test_map_command_requests_only_a_map_generation(config, tmp_path):
         "hitsounded": "false",
         "fast_decoder_loop": "true",
         "resnap_events": "true",
+        "mania_hold_state_mode": "incremental",
         "parallel": "false",
     }
 
@@ -330,6 +515,96 @@ def test_generator_normalizes_events_within_ten_ms_of_audio_end(config, tmp_path
     assert reparsed.notes == result.notes
 
 
+def test_generator_validates_bound_sidecar_before_local_end_normalization(
+    config, tmp_path
+):
+    raw = (
+        "osu file format v14\n\n[General]\nMode: 3\n\n[Difficulty]\nCircleSize:4\n"
+        "\n[TimingPoints]\n0,500,4,2,0,60,1,0\n"
+        "\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n"
+        "192,192,19000,128,0,20006:0:0:0:0:\n"
+        "320,192,20006,1,0,0:0:0:0:\n"
+        "448,192,20006,128,0,20500:0:0:0:0:\n"
+        "64,192,20010,1,0,0:0:0:0:\n"
+    )
+    sidecar = {
+        "version": "mania-origin-v1-canonical-hold-ir",
+        "seed": 11,
+        "collisions": [],
+        "maniaObjects": [
+            {
+                "objectId": 0,
+                "lane": 0,
+                "kind": "TAP",
+                "startTimeMs": 1000,
+                "endTimeMs": None,
+                "startGroupId": 0,
+                "endGroupId": None,
+                "startOrigins": [],
+                "endOrigins": [],
+            },
+            {
+                "objectId": 1,
+                "lane": 1,
+                "kind": "HOLD",
+                "startTimeMs": 19000,
+                "endTimeMs": 20006,
+                "startGroupId": 1,
+                "endGroupId": 2,
+                "startOrigins": [],
+                "endOrigins": [],
+            },
+            {
+                "objectId": 2,
+                "lane": 2,
+                "kind": "TAP",
+                "startTimeMs": 20006,
+                "endTimeMs": None,
+                "startGroupId": 3,
+                "endGroupId": None,
+                "startOrigins": [],
+                "endOrigins": [],
+            },
+            {
+                "objectId": 3,
+                "lane": 3,
+                "kind": "HOLD",
+                "startTimeMs": 20006,
+                "endTimeMs": 20500,
+                "startGroupId": 4,
+                "endGroupId": 5,
+                "startOrigins": [],
+                "endOrigins": [],
+            },
+            {
+                "objectId": 4,
+                "lane": 0,
+                "kind": "TAP",
+                "startTimeMs": 20010,
+                "endTimeMs": None,
+                "startGroupId": 6,
+                "endGroupId": None,
+                "startOrigins": [],
+                "endOrigins": [],
+            },
+        ],
+        "duplicates": [],
+    }
+
+    result = MapperatorinatorGenerator(
+        config=config,
+        run=_fake_run(osu_text=raw, resnap_sidecar=sidecar),
+        verify_patch=lambda _home: None,
+        require_bound_resnap_sidecar=False,
+    ).generate_map(_request(seed=11), tmp_path / "work")
+
+    assert [(note.time_ms, note.kind, note.duration_ms) for note in result.notes] == [
+        (1000, "TAP", None),
+        (19000, "HOLD", 1000),
+    ]
+    assert len(result.resnap_diagnostics.mania_objects) == 5
+
+
 def test_generator_collapses_only_indistinguishable_model_taps(config, tmp_path):
     raw = MINI_OSU.replace(
         "64,192,1000,1,0,0:0:0:0:\n",
@@ -395,6 +670,528 @@ def test_generator_maps_subprocess_failure(config, tmp_path):
         generator.generate_map(_request(), tmp_path / "work")
     assert caught.value.code is ErrorCode.CHART_GENERATION_FAILED
     assert "cuda oom" in caught.value.context["stderr"]
+
+
+def test_generator_maps_definitive_tail_exhaustion_with_exact_context(config, tmp_path):
+    terminal = {
+        "version": 1,
+        "status": "FAILURE",
+        "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": TAIL_FAILURE_CONTEXT,
+    }
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(terminal),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+    assert caught.value.context == TAIL_FAILURE_CONTEXT
+    assert caught.value.context is not TAIL_FAILURE_CONTEXT
+
+
+def test_generator_accepts_token_budget_exhaustion_as_definitive_tail_failure(
+    config, tmp_path
+):
+    context = {
+        **TAIL_FAILURE_CONTEXT,
+        "reason": "TOKEN_BUDGET_EXHAUSTED",
+        "signature": "TOKEN_BUDGET_EXHAUSTED:500:11",
+        "repairTriggerReason": "TOKEN_BUDGET_EXHAUSTED",
+    }
+    terminal = {
+        "version": 1,
+        "status": "FAILURE",
+        "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": context,
+    }
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(terminal),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+    assert caught.value.context == context
+
+
+def test_generator_accepts_finalizer_cut_past_requested_end(config, tmp_path):
+    context = {
+        **TAIL_FAILURE_CONTEXT,
+        "requestedEndMs": 500,
+        "effectiveCutMs": 510,
+    }
+    terminal = {
+        "version": 1,
+        "status": "FAILURE",
+        "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": context,
+    }
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(terminal),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+    assert caught.value.context == context
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {
+            **TAIL_FAILURE_CONTEXT,
+            "signature": "END_BOUNDARY_CROSSES_HOLD:500:1000000",
+            "earliestGeneratedSourceWindowId": 1_000_000,
+            "repairTriggerSourceWindowId": 1_000_000,
+            "repairStartWindowId": 999_998,
+            "repairWindowIds": [999_998, 999_999, 1_000_000],
+        },
+        {
+            **TAIL_FAILURE_CONTEXT,
+            "signature": "END_BOUNDARY_CROSSES_HOLD:500:2",
+            "earliestGeneratedSourceWindowId": 2,
+            "repairTriggerSourceWindowId": 2,
+            "repairStartWindowId": 0,
+            "repairWindowIds": list(range(4_096)),
+        },
+        {
+            **TAIL_FAILURE_CONTEXT,
+            "signature": "END_BOUNDARY_CROSSES_HOLD:86400000:11",
+            "requestedEndMs": 86_400_000,
+            "effectiveCutMs": 86_400_010,
+        },
+        {
+            **TAIL_FAILURE_CONTEXT,
+            "repairWindowIds": [9],
+        },
+        {
+            **TAIL_FAILURE_CONTEXT,
+            "reason": "NO_LEGAL_MANIA_GROUP_COMPLETION",
+            "signature": "NO_LEGAL_MANIA_GROUP_COMPLETION:500:1",
+            "earliestGeneratedSourceWindowId": 1,
+            "repairStartWindowId": 1,
+            "repairWindowIds": [1],
+            "repairTriggerReason": "PRE_TRIM_INVALID",
+            "repairTriggerSourceWindowId": 3,
+        },
+    ],
+)
+def test_generator_accepts_tail_context_protocol_bounds(config, tmp_path, context):
+    terminal = {
+        "version": 1,
+        "status": "FAILURE",
+        "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": context,
+    }
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(terminal),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+    assert caught.value.context == context
+
+
+@pytest.mark.parametrize(
+    ("record", "returncode", "duplicate"),
+    [
+        ("not-json", 17, False),
+        (OVERSIZED_INTEGER_TERMINAL, 17, False),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": TAIL_FAILURE_CONTEXT,
+            },
+            17,
+            True,
+        ),
+        (
+            {
+                "version": 2,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": TAIL_FAILURE_CONTEXT,
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "signature": "END_BOUNDARY_CROSSES_HOLD:86400001:11",
+                    "requestedEndMs": 86_400_001,
+                    "effectiveCutMs": 86_400_011,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairWindowIds": [9, 2**100],
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "signature": f"END_BOUNDARY_CROSSES_HOLD:500:{2**100}",
+                    "earliestGeneratedSourceWindowId": 2**100,
+                    "repairStartWindowId": 2**100 - 2,
+                    "repairWindowIds": [2**100 - 2, 2**100 - 1, 2**100],
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "signature": "END_BOUNDARY_CROSSES_HOLD:500:2",
+                    "earliestGeneratedSourceWindowId": 2,
+                    "repairTriggerSourceWindowId": 2,
+                    "repairStartWindowId": 0,
+                    "repairWindowIds": list(range(4_097)),
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "reason": [],
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "reason": "CUDA_OUT_OF_MEMORY",
+                    "signature": "CUDA_OUT_OF_MEMORY:500:11",
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "signature": "END_BOUNDARY_CROSSES_HOLD:501:11",
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "effectiveCutMs": 511,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairStartWindowId": 8,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairTriggerReason": "CUDA_OUT_OF_MEMORY",
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairTriggerSourceWindowId": True,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairTriggerSourceWindowId": 1_000_001,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairWindowIds": [9, 11],
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairWindowIds": [9, 10, 10, 11],
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairWindowIds": [10],
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "earliestGeneratedSourceWindowId": None,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "requestedEndMs": 500,
+                    "effectiveCutMs": 490,
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "TAIL_REPAIR_REQUIRED",
+                "context": TAIL_FAILURE_CONTEXT,
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "UNRELATED_FAILURE",
+                "context": TAIL_FAILURE_CONTEXT,
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    key: value for key, value in TAIL_FAILURE_CONTEXT.items() if key != "signature"
+                },
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": TAIL_FAILURE_CONTEXT,
+                "unexpected": True,
+            },
+            17,
+            False,
+        ),
+        (
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": TAIL_FAILURE_CONTEXT,
+            },
+            0,
+            False,
+        ),
+    ],
+)
+def test_generator_rejects_untrustworthy_structured_terminal_results(
+    config, tmp_path, record, returncode, duplicate
+):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            record,
+            returncode=returncode,
+            duplicate=duplicate,
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.INFERENCE_PROTOCOL_FAILED
+
+
+def test_generator_never_classifies_tail_failure_from_stderr_text(config, tmp_path):
+    def run(argv):
+        return CommandResult(
+            argv,
+            17,
+            "",
+            "MANIA_TAIL_REPAIR_EXHAUSTED at boundary 500",
+        )
+
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=run,
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.CHART_GENERATION_FAILED
+
+
+def test_generator_normalizes_injected_command_runner_to_capture_terminal_result(
+    config, tmp_path, monkeypatch
+):
+    terminal = {
+        "version": 1,
+        "status": "FAILURE",
+        "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": TAIL_FAILURE_CONTEXT,
+    }
+    observed_checks = []
+
+    def fake_run_command(argv, **kwargs):
+        observed_checks.append(kwargs["check"])
+        return CommandResult(
+            argv,
+            17,
+            f"{INVOCATION_RESULT_PREFIX}{json.dumps(terminal)}\n",
+            "",
+        )
+
+    monkeypatch.setattr("chart_worker.audio.runner.run_command", fake_run_command)
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=CommandRunner(check=True),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert observed_checks == [False]
+    assert caught.value.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+    assert caught.value.context == TAIL_FAILURE_CONTEXT
 
 
 def test_generator_maps_parse_failure(config, tmp_path):
@@ -556,6 +1353,168 @@ def test_generator_rejects_v4_object_sidecar_that_disagrees_with_osu(config, tmp
 
     with pytest.raises(WorkerError, match="sidecar.*does not match"):
         generator.generate_map(_request(seed=11), tmp_path / "work")
+
+
+PARTIAL_REJOIN_CONTEXT = {
+    "scope": "REFERENCE",
+    "partialStartMs": 150,
+    "partialEndMs": 250,
+    "validationError": "reference Mania stream is invalid: unclosed HOLD lanes: [0]",
+    "earliestGeneratedSourceWindowId": None,
+}
+
+
+def test_generator_accepts_an_economically_bounded_single_tail_repair(
+    config, tmp_path
+):
+    """Rewinding to a distant fault window may only afford one suffix pass."""
+    context = {**TAIL_FAILURE_CONTEXT, "repairAttempts": 1}
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": context,
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+    assert caught.value.context["repairAttempts"] == 1
+
+
+@pytest.mark.parametrize("repair_attempts", [0, 3, -1])
+def test_generator_rejects_tail_repair_counts_outside_the_budget(
+    config, tmp_path, repair_attempts
+):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+                "context": {
+                    **TAIL_FAILURE_CONTEXT,
+                    "repairAttempts": repair_attempts,
+                },
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.INFERENCE_PROTOCOL_FAILED
+
+
+def test_generator_maps_typed_partial_rejoin_failure_with_exact_context(
+    config, tmp_path
+):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_PARTIAL_REJOIN_INVALID",
+                "context": PARTIAL_REJOIN_CONTEXT,
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_PARTIAL_REJOIN_INVALID
+    assert caught.value.context == PARTIAL_REJOIN_CONTEXT
+    assert caught.value.context is not PARTIAL_REJOIN_CONTEXT
+
+
+def test_generator_carries_the_generated_source_window_of_a_rejoin_failure(
+    config, tmp_path
+):
+    context = {
+        **PARTIAL_REJOIN_CONTEXT,
+        "scope": "REJOINED",
+        "earliestGeneratedSourceWindowId": 7,
+    }
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_PARTIAL_REJOIN_INVALID",
+                "context": context,
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.context["earliestGeneratedSourceWindowId"] == 7
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {**PARTIAL_REJOIN_CONTEXT, "scope": "SOMETHING_ELSE"},
+        {**PARTIAL_REJOIN_CONTEXT, "extra": 1},
+        {key: value for key, value in PARTIAL_REJOIN_CONTEXT.items() if key != "scope"},
+        {**PARTIAL_REJOIN_CONTEXT, "validationError": ""},
+        {**PARTIAL_REJOIN_CONTEXT, "partialStartMs": None, "partialEndMs": None},
+        {**PARTIAL_REJOIN_CONTEXT, "earliestGeneratedSourceWindowId": -1},
+        {**PARTIAL_REJOIN_CONTEXT, "partialStartMs": 300, "partialEndMs": 250},
+    ],
+)
+def test_generator_rejects_malformed_partial_rejoin_contexts(
+    config, tmp_path, context
+):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_PARTIAL_REJOIN_INVALID",
+                "context": context,
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.INFERENCE_PROTOCOL_FAILED
+
+
+def test_repair_window_cap_covers_every_window_a_legal_song_can_produce():
+    """꼬리 복구가 fault 창까지 되감으면 repairWindowIds 가 곡 전체만큼 길어질 수 있다.
+
+    되감기 폭이 3창으로 고정돼 있을 때는 닿을 수 없던 상한이다. MAX_DURATION_MS
+    를 올리면서 이 상한을 같이 올리지 않으면, 터미널 레코드 생성이 구조화되지
+    않은 예외로 죽는다.
+    """
+    # osuT5 configs: src_seq_len 2048, hop_length 128, sample_rate 16000,
+    # configs/inference/default.yaml lookback 0.5 + lookahead 0.4.
+    ms_per_sequence = (2048 - 1) * 128 * 1000 / 16000
+    ms_per_stride = int((2048 - 1) * 128 * 0.1) * 1000 / 16000
+    max_windows = math.ceil(profile.MAX_DURATION_MS / ms_per_stride) + 1
+
+    assert ms_per_sequence == 16_376.0
+    assert max_windows <= mapperatorinator._MAX_TAIL_REPAIR_WINDOW_COUNT
 
 
 def test_fake_generator_generates_standard_timing():

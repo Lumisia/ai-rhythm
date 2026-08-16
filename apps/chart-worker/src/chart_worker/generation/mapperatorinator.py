@@ -4,15 +4,18 @@
 같은 구조다.
 """
 
+import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal, Protocol
 
 from chart_worker.audio.runner import CommandError, CommandResult, CommandRunner
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.inference_session import InferenceSession, InvocationResult
 from chart_worker.generation.mapperatorinator_patch import require_mapperatorinator_patch
 from chart_worker.generation.osu_parser import OsuBeatmap, OsuBpmEvent, parse_osu_file
 from chart_worker.generation.osu_writer import notes_to_osu_mania
@@ -33,8 +36,48 @@ from chart_worker.schema.note import Chart
 INFERENCE_SCRIPT = "inference.py"
 CONFIG_NAME = "v32"
 END_BOUNDARY_TOLERANCE_MS = 10
+INVOCATION_RESULT_PREFIX = "MAPPERATORINATOR_INVOCATION_RESULT="
 RunCommand = Callable[[list[str]], CommandResult]
 PatchVerifier = Callable[[Path], None]
+
+_TAIL_FAILURE_CONTEXT_KEYS = {
+    "reason",
+    "signature",
+    "requestedEndMs",
+    "effectiveCutMs",
+    "earliestGeneratedSourceWindowId",
+    "repairTriggerReason",
+    "repairTriggerSourceWindowId",
+    "repairStartWindowId",
+    "repairWindowIds",
+    "repairAttempts",
+}
+_TAIL_FAILURE_REASONS = {
+    "END_BOUNDARY_CROSSES_HOLD",
+    "PRE_TRIM_INVALID",
+    "NO_LEGAL_MANIA_GROUP_COMPLETION",
+    "INCOMPLETE_MANIA_GROUP_BEFORE_SCROLL",
+    "INSUFFICIENT_HOLD_CLOSURE_BUDGET",
+    "TOKEN_BUDGET_EXHAUSTED",
+    "UNCLOSED_HOLD_AT_STREAM_END",
+}
+_PARTIAL_REJOIN_CONTEXT_KEYS = {
+    "scope",
+    "partialStartMs",
+    "partialEndMs",
+    "validationError",
+    "earliestGeneratedSourceWindowId",
+}
+_PARTIAL_REJOIN_SCOPES = {"REFERENCE", "REJOINED"}
+_MAX_PARTIAL_VALIDATION_ERROR_CHARS = 512
+_MAX_TAIL_WINDOW_ID = 1_000_000
+_MAX_TAIL_REPAIR_WINDOW_COUNT = 4_096
+# Two suffix passes are the ceiling.  One is the truthful count when rewinding
+# to the fault window would otherwise cost more than the attempt it replaces.
+_TAIL_REPAIR_ATTEMPT_COUNTS = (1, 2)
+# GenerationRequest has no duration ceiling.  The failure protocol therefore
+# uses a conservative 24-hour song bound, plus the finalizer's 10ms tolerance.
+_MAX_TAIL_REQUESTED_END_MS = 86_400_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +216,7 @@ def _common_generation_arguments(
     year: int,
     output_dir: Path,
 ) -> list[str]:
-    return [
+    arguments = [
         *_command_prefix(config, output_dir),
         f"audio_path={_hydra_path(audio_path)}",
         f"output_path={_hydra_path(output_dir)}",
@@ -185,7 +228,20 @@ def _common_generation_arguments(
         "hitsounded=false",
         "fast_decoder_loop=true",
         "resnap_events=true",
+        f"mania_hold_state_mode={config.mapperatorinator_hold_state_mode}",
     ]
+    if config.mapperatorinator_backend == "song_session":
+        if config.mapperatorinator_model_root is None:
+            raise ValueError("song_session requires mapperatorinator_model_root")
+        arguments.extend(
+            [
+                f"model_path={_hydra_path(config.mapperatorinator_model_root)}",
+                "use_server=false",
+                "parallel=false",
+                "generate_positions=false",
+            ]
+        )
+    return arguments
 
 
 def build_timing_command(
@@ -229,6 +285,11 @@ def build_map_command(
         request.year,
         output_dir,
     )
+    # The current upstream sidecar is MAP Processor telemetry. SuperTimingGenerator
+    # does not populate Processor.last_generation_stats, so requesting it for a
+    # TIMING-only invocation completes the expensive decode and then fails.
+    if config.mapperatorinator_write_generation_telemetry:
+        argv.append("write_generation_telemetry=true")
     argv.extend(
         [
             f"keycount={request.key_mode}",
@@ -289,39 +350,273 @@ def find_generated_osu(output_dir: Path) -> Path:
     return produced[0]
 
 
+def _protocol_failure(reason: str, *, returncode: int) -> WorkerError:
+    return WorkerError(
+        ErrorCode.INFERENCE_PROTOCOL_FAILED,
+        f"invalid Mapperatorinator invocation result: {reason}",
+        context={"reason": reason, "returnCode": returncode},
+    )
+
+
+def _require_tail_failure_context(
+    value: object,
+    *,
+    returncode: int,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != _TAIL_FAILURE_CONTEXT_KEYS:
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+
+    def is_nonnegative_int(field: str) -> bool:
+        item = value[field]
+        return type(item) is int and item >= 0
+
+    if not isinstance(value["reason"], str) or value["reason"] not in _TAIL_FAILURE_REASONS:
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    if not all(
+        is_nonnegative_int(field)
+        for field in (
+            "requestedEndMs",
+            "effectiveCutMs",
+            "repairStartWindowId",
+            "repairAttempts",
+        )
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    if (
+        value["requestedEndMs"] > _MAX_TAIL_REQUESTED_END_MS
+        or value["effectiveCutMs"] > _MAX_TAIL_REQUESTED_END_MS + 10
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    earliest_window = value["earliestGeneratedSourceWindowId"]
+    # A source-less typed failure may be ineligible for repair upstream, but it
+    # cannot truthfully claim that two source-window tail repairs were exhausted.
+    if not (
+        type(earliest_window) is int
+        and 0 <= earliest_window <= _MAX_TAIL_WINDOW_ID
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    if value["signature"] != (
+        f'{value["reason"]}:{value["requestedEndMs"]}:{earliest_window}'
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    trigger_reason = value["repairTriggerReason"]
+    if type(trigger_reason) is not str or trigger_reason not in _TAIL_FAILURE_REASONS:
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    trigger_window = value["repairTriggerSourceWindowId"]
+    if not (
+        type(trigger_window) is int
+        and 0 <= trigger_window <= _MAX_TAIL_WINDOW_ID
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    expected_repair_start = max(0, trigger_window - 2)
+    if (
+        value["repairStartWindowId"] != expected_repair_start
+        or value["repairStartWindowId"] > _MAX_TAIL_WINDOW_ID
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    repair_windows = value["repairWindowIds"]
+    if (
+        not isinstance(repair_windows, list)
+        or not repair_windows
+        or len(repair_windows) > _MAX_TAIL_REPAIR_WINDOW_COUNT
+        or not all(
+            type(window_id) is int
+            and 0 <= window_id <= _MAX_TAIL_WINDOW_ID
+            for window_id in repair_windows
+        )
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    if (
+        repair_windows[0] != expected_repair_start
+        or not all(right == left + 1 for left, right in pairwise(repair_windows))
+    ):
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    if value["repairAttempts"] not in _TAIL_REPAIR_ATTEMPT_COUNTS:
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    # Mapperatorinator's finalizer intentionally keeps its boundary tolerance
+    # past the requested end (currently end_time + 10ms).  A cut before the
+    # requested end is the contradictory/untrustworthy direction.
+    if not 0 <= value["effectiveCutMs"] - value["requestedEndMs"] <= 10:
+        raise _protocol_failure("INVALID_TAIL_FAILURE_CONTEXT", returncode=returncode)
+    return dict(value)
+
+
+def _require_partial_rejoin_context(
+    value: object,
+    *,
+    returncode: int,
+) -> dict[str, object]:
+    """PARTIAL_REMAP 은 창 컨트롤러도 복구 예산도 없다. 경계와 사유만 싣는다."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != _PARTIAL_REJOIN_CONTEXT_KEYS
+    ):
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+    if value["scope"] not in _PARTIAL_REJOIN_SCOPES or type(value["scope"]) is not str:
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+
+    detail = value["validationError"]
+    if (
+        type(detail) is not str
+        or not detail
+        or len(detail) > _MAX_PARTIAL_VALIDATION_ERROR_CHARS
+    ):
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+
+    def optional_nonnegative_int(field: str) -> bool:
+        item = value[field]
+        return item is None or (type(item) is int and item >= 0)
+
+    if not all(
+        optional_nonnegative_int(field)
+        for field in ("partialStartMs", "partialEndMs")
+    ):
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+    start_ms = value["partialStartMs"]
+    end_ms = value["partialEndMs"]
+    # finalize_mania_partial_interval rejects an interval with neither bound and
+    # rejects start > end before it ever inspects a stream.
+    if start_ms is None and end_ms is None:
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+    if start_ms is not None and end_ms is not None and start_ms > end_ms:
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+
+    window = value["earliestGeneratedSourceWindowId"]
+    if window is not None and not (
+        type(window) is int and 0 <= window <= _MAX_TAIL_WINDOW_ID
+    ):
+        raise _protocol_failure("INVALID_PARTIAL_REJOIN_CONTEXT", returncode=returncode)
+    return dict(value)
+
+
+_TERMINAL_FAILURE_CODES: dict[str, tuple[ErrorCode, str, Callable[..., dict[str, object]]]] = {
+    ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED.value: (
+        ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED,
+        "Mapperatorinator exhausted bounded Mania tail repair",
+        _require_tail_failure_context,
+    ),
+    ErrorCode.MANIA_PARTIAL_REJOIN_INVALID.value: (
+        ErrorCode.MANIA_PARTIAL_REJOIN_INVALID,
+        "Mapperatorinator could not rejoin the partial Mania interval",
+        _require_partial_rejoin_context,
+    ),
+}
+
+
+def _raise_structured_inference_failure(result: CommandResult) -> None:
+    records = [
+        line.removeprefix(INVOCATION_RESULT_PREFIX)
+        for line in result.stdout.splitlines()
+        if line.startswith(INVOCATION_RESULT_PREFIX)
+    ]
+    if not records:
+        return
+    if len(records) != 1:
+        raise _protocol_failure("DUPLICATE_TERMINAL_RESULT", returncode=result.returncode)
+    try:
+        record = json.loads(records[0])
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        raise _protocol_failure("MALFORMED_TERMINAL_RESULT", returncode=result.returncode) from None
+    if not isinstance(record, dict) or set(record) != {
+        "version",
+        "status",
+        "code",
+        "context",
+    }:
+        raise _protocol_failure("INVALID_TERMINAL_SCHEMA", returncode=result.returncode)
+    if type(record["version"]) is not int or record["version"] != 1:
+        raise _protocol_failure("UNSUPPORTED_TERMINAL_VERSION", returncode=result.returncode)
+    if result.returncode == 0:
+        raise _protocol_failure("FAILURE_WITH_ZERO_EXIT", returncode=result.returncode)
+    if record["status"] != "FAILURE":
+        raise _protocol_failure("INVALID_TERMINAL_STATUS", returncode=result.returncode)
+    terminal = _TERMINAL_FAILURE_CODES.get(record["code"])
+    if terminal is None:
+        raise _protocol_failure("UNSUPPORTED_TERMINAL_CODE", returncode=result.returncode)
+    code, message, require_context = terminal
+    context = require_context(record["context"], returncode=result.returncode)
+    raise WorkerError(code, message, context=context)
+
+
 @dataclass(frozen=True, slots=True)
 class MapperatorinatorGenerator:
     config: WorkerConfig
     run: RunCommand | None = None
+    session: InferenceSession | None = None
     verify_patch: PatchVerifier = require_mapperatorinator_patch
     require_bound_resnap_sidecar: bool = True
+
+    @staticmethod
+    def _bound_osu_path(result: InvocationResult, workdir: Path) -> Path:
+        artifacts = [
+            artifact
+            for artifact in result.artifacts
+            if artifact.relative_path.lower().endswith(".osu")
+        ]
+        if len(artifacts) != 1:
+            raise WorkerError(
+                ErrorCode.INFERENCE_PROTOCOL_FAILED,
+                f"resident terminal must bind exactly one .osu artifact, found {len(artifacts)}",
+                context={"artifacts": [artifact.relative_path for artifact in artifacts]},
+            )
+        return workdir.joinpath(*artifacts[0].relative_path.split("/"))
 
     def _run_and_parse(
         self, argv: list[str], workdir: Path
     ) -> tuple[str, OsuBeatmap, Path]:
         if self.config.mapperatorinator_home is None:
             raise ValueError("mapperatorinator_home must be configured")
+        resident = self.config.mapperatorinator_backend == "song_session"
+        if resident and self.session is None:
+            raise ValueError("song_session requires an attached inference session")
+        if not resident and self.session is not None:
+            raise ValueError("an inference session requires mapperatorinator_backend=song_session")
+        if resident and not workdir.is_absolute():
+            raise ValueError("song_session workdir must be absolute")
         self.verify_patch(self.config.mapperatorinator_home)
-        workdir.mkdir(parents=True, exist_ok=True)
-        _require_clean_output_dir(workdir)
-        run = self.run or CommandRunner(
-            shared_bin_dir=self.config.ffmpeg_shared_bin_dir,
-            timeout_sec=1800.0,
+        invocation_result: InvocationResult | None = None
+        if resident:
+            session = self.session
+            if session is None:
+                raise RuntimeError("resident session validation was not preserved")
+            invocation_result = session.invoke(argv, workdir)
+            result = invocation_result.command
+        else:
+            workdir.mkdir(parents=True, exist_ok=True)
+            _require_clean_output_dir(workdir)
+            run = self.run
+            if isinstance(run, CommandRunner):
+                run = replace(run, check=False)
+            run = run or CommandRunner(
+                shared_bin_dir=self.config.ffmpeg_shared_bin_dir,
+                timeout_sec=1800.0,
             # inference.py 는 상대 경로이고 Hydra 는 실행 위치에서 configs/ 를
             # 찾는다. 체크아웃 밖에서 돌리면 스크립트도 설정도 못 찾는다.
-            cwd=self.config.mapperatorinator_home,
-            env=inference_env(),
-        )
-        try:
-            run(argv)
-        except CommandError as error:
+                cwd=self.config.mapperatorinator_home,
+                env=inference_env(),
+                check=False,
+            )
+            try:
+                result = run(argv)
+            except CommandError as error:
+                raise WorkerError(
+                    ErrorCode.CHART_GENERATION_FAILED,
+                    f"inference failed: {error}",
+                    context={"stderr": error.stderr[-2000:]},
+                ) from error
+        _raise_structured_inference_failure(result)
+        if result.returncode != 0:
             raise WorkerError(
                 ErrorCode.CHART_GENERATION_FAILED,
-                f"inference failed: {error}",
-                context={"stderr": error.stderr[-2000:]},
-            ) from error
+                f"inference failed: exited with {result.returncode}",
+                context={"stderr": result.stderr[-2000:]},
+            )
 
-        osu_path = find_generated_osu(workdir)
+        osu_path = (
+            self._bound_osu_path(invocation_result, workdir)
+            if invocation_result is not None
+            else find_generated_osu(workdir)
+        )
         try:
             beatmap = parse_osu_file(osu_path)
         except ValueError as error:
@@ -362,6 +657,31 @@ class MapperatorinatorGenerator:
                 ErrorCode.CHART_GENERATION_FAILED,
                 f"asked for {request.key_mode}K but got {beatmap.key_mode}K",
             )
+        resnap_diagnostics = read_resnap_diagnostics(osu_path)
+        if self.require_bound_resnap_sidecar and (
+            resnap_diagnostics.version != RESNAP_DIAGNOSTICS_VERSION
+            or resnap_diagnostics.status in ("UNOBSERVED", "INVALID")
+        ):
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                "required bound resnap sidecar is missing, stale, or invalid",
+                context={
+                    "path": str(osu_path.with_suffix(".resnap.json")),
+                    "status": resnap_diagnostics.status,
+                    "version": resnap_diagnostics.version,
+                    "error": resnap_diagnostics.error,
+                },
+            )
+        sidecar_mismatch = mania_object_mismatch(
+            resnap_diagnostics,
+            beatmap.notes,
+        )
+        if sidecar_mismatch is not None:
+            raise WorkerError(
+                ErrorCode.CHART_GENERATION_FAILED,
+                sidecar_mismatch,
+                context={"path": str(osu_path.with_suffix(".resnap.json"))},
+            )
         notes, boundary_changed = _normalize_end_boundary(
             beatmap.notes,
             duration_ms=request.duration_ms,
@@ -382,28 +702,6 @@ class MapperatorinatorGenerator:
                 audio_filename=request.audio_path.name,
                 title=request.audio_path.stem,
                 bpm_events=beatmap.bpm_events,
-            )
-        resnap_diagnostics = read_resnap_diagnostics(osu_path)
-        if self.require_bound_resnap_sidecar and (
-            resnap_diagnostics.version != RESNAP_DIAGNOSTICS_VERSION
-            or resnap_diagnostics.status in ("UNOBSERVED", "INVALID")
-        ):
-            raise WorkerError(
-                ErrorCode.CHART_GENERATION_FAILED,
-                "required bound resnap sidecar is missing, stale, or invalid",
-                context={
-                    "path": str(osu_path.with_suffix(".resnap.json")),
-                    "status": resnap_diagnostics.status,
-                    "version": resnap_diagnostics.version,
-                    "error": resnap_diagnostics.error,
-                },
-            )
-        sidecar_mismatch = mania_object_mismatch(resnap_diagnostics, notes)
-        if sidecar_mismatch is not None:
-            raise WorkerError(
-                ErrorCode.CHART_GENERATION_FAILED,
-                sidecar_mismatch,
-                context={"path": str(osu_path.with_suffix(".resnap.json"))},
             )
         return GeneratedChart(
             notes=notes,

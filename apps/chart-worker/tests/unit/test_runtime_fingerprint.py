@@ -1,5 +1,6 @@
 from chart_worker.analysis.runtime_fingerprint import build_runtime_fingerprint
 from chart_worker.config import WorkerConfig
+from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION
 from tests.support import fake_dependencies
 
 
@@ -47,7 +48,7 @@ def test_runtime_fingerprint_is_stable_and_does_not_expose_absolute_paths(tmp_pa
     assert first["analyzer"]["sampleRateHz"] == analysis.sample_rate_hz
     assert first["analyzer"]["hopLength"] == analysis.hop_length
     assert first["analyzer"]["nFft"] == analysis.n_fft
-    assert first["qualityGateVersion"] == "quality-gate-v3-outro-review"
+    assert first["qualityGateVersion"] == QUALITY_GATE_VERSION
     assert first["outroPolicyVersion"] == "outro-policy-v1-provisional"
     assert first["songBoundaryContractVersion"] == "song-boundary-contract-v2"
     assert first["songBoundaryContractSha256"] is None
@@ -89,3 +90,54 @@ def test_runtime_fingerprint_changes_when_evaluation_context_changes(tmp_path):
     )
 
     assert base["id"] != changed["id"]
+
+
+def test_runtime_fingerprint_distinguishes_hold_state_mode(tmp_path):
+    dependencies = fake_dependencies()
+    prepared = dependencies.prepare(
+        tmp_path / "source.wav",
+        tmp_path / "run",
+        dependencies.config,
+    )
+    analysis = dependencies.analyze(prepared.normalized.path)
+    authority = dependencies.timing(
+        prepared,
+        analysis,
+        tmp_path / "run",
+        dependencies.select_generator("mapperatorinator", dependencies.config),
+        7,
+    )
+    full_scan = WorkerConfig(mapperatorinator_hold_state_mode="full_scan")
+    incremental = full_scan.model_copy(
+        update={"mapperatorinator_hold_state_mode": "incremental"}
+    )
+
+    base = build_runtime_fingerprint(
+        config=full_scan,
+        prepared=prepared,
+        analysis=analysis,
+        authority=authority,
+        generator="mapperatorinator",
+        worker_version="test-version",
+    )
+    unchanged = build_runtime_fingerprint(
+        config=full_scan.model_copy(),
+        prepared=prepared,
+        analysis=analysis,
+        authority=authority,
+        generator="mapperatorinator",
+        worker_version="test-version",
+    )
+    changed = build_runtime_fingerprint(
+        config=incremental,
+        prepared=prepared,
+        analysis=analysis,
+        authority=authority,
+        generator="mapperatorinator",
+        worker_version="test-version",
+    )
+
+    assert unchanged["policyConfigSha256"] == base["policyConfigSha256"]
+    assert unchanged["id"] == base["id"]
+    assert changed["policyConfigSha256"] != base["policyConfigSha256"]
+    assert changed["id"] != base["id"]

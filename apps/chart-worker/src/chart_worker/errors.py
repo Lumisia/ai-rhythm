@@ -31,6 +31,14 @@ class ErrorCode(StrEnum):
     CHART_CANDIDATES_EXHAUSTED = "CHART_CANDIDATES_EXHAUSTED"
     CHART_TARGET_RATING_UNREACHABLE = "CHART_TARGET_RATING_UNREACHABLE"
 
+    # Mapperatorinator 도메인·프로토콜
+    MANIA_TAIL_REPAIR_EXHAUSTED = "MANIA_TAIL_REPAIR_EXHAUSTED"
+    MANIA_PARTIAL_REJOIN_INVALID = "MANIA_PARTIAL_REJOIN_INVALID"
+    INFERENCE_PROTOCOL_FAILED = "INFERENCE_PROTOCOL_FAILED"
+    INFERENCE_START_FAILED = "INFERENCE_START_FAILED"
+    INFERENCE_COMPLETION_UNKNOWN = "INFERENCE_COMPLETION_UNKNOWN"
+    INFERENCE_INVOCATION_CONFLICT = "INFERENCE_INVOCATION_CONFLICT"
+
     # 인프라
     LEASE_INVALID = "LEASE_INVALID"
     LEASE_EXPIRED = "LEASE_EXPIRED"
@@ -76,6 +84,21 @@ _DISPOSITION: dict[ErrorCode, Disposition] = {
     ErrorCode.CHART_CANDIDATES_EXHAUSTED: Disposition.FINAL,
     # 목표 ★에 못 미쳤을 뿐 채보는 쓸 수 있다. 실제 ★를 표시한다.
     ErrorCode.CHART_TARGET_RATING_UNREACHABLE: Disposition.WARN,
+    # 같은 경계의 국소 tail 복구를 이미 모두 사용했다. 새 full-length seed는
+    # 같은 실패를 처음부터 반복하므로 호출자가 일반 생성 재시도로 보내면 안 된다.
+    ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED: Disposition.FINAL,
+    # PARTIAL_REMAP 은 변형당 한 번만 청구된다. 참조 자체가 깨졌으면 같은 참조로
+    # 다시 이어붙여도 결과가 같고, 이어붙이기가 실패했어도 다시 청구할 예산이 없다.
+    ErrorCode.MANIA_PARTIAL_REJOIN_INVALID: Disposition.FINAL,
+    # 구조화 결과가 깨지면 실행 완료 여부나 실패 종류를 신뢰할 수 없다.
+    ErrorCode.INFERENCE_PROTOCOL_FAILED: Disposition.FINAL_ALERT,
+    # Before ACCEPTED no model execution is known to have started. Existing bounded retry
+    # policy may retry this infrastructure start failure.
+    ErrorCode.INFERENCE_START_FAILED: Disposition.RETRYABLE,
+    # After ACCEPTED, absence of a validated terminal record cannot prove cancellation.
+    # Retrying could publish or charge for the same invocation twice.
+    ErrorCode.INFERENCE_COMPLETION_UNKNOWN: Disposition.FINAL_ALERT,
+    ErrorCode.INFERENCE_INVOCATION_CONFLICT: Disposition.FINAL_ALERT,
     ErrorCode.LEASE_INVALID: Disposition.FINAL,
     ErrorCode.LEASE_EXPIRED: Disposition.RETRYABLE,
     ErrorCode.STORAGE_UPLOAD_FAILED: Disposition.RETRYABLE,
