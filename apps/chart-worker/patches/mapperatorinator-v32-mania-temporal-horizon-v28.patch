@@ -1,0 +1,642 @@
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index da1345d..ac33fa4 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -320,6 +320,9 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_require_closed_holds_at_eos = generate_kwargs.pop(
+         'mania_require_closed_holds_at_eos', False
+     )
++    mania_effective_cut_time = generate_kwargs.pop(
++        'mania_effective_cut_time', None
++    )
+     mania_hold_state_mode = generate_kwargs.pop(
+         'mania_hold_state_mode', 'full_scan'
+     )
+@@ -358,6 +361,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+             and generate_kwargs.get('num_beams', 1) == 1
+             and cfg_scale <= 1.0
+         ),
++        mania_effective_cut_time,
+     )
+     # Hoist MonotonicTimeShift out of the per-step list into an O(1) incremental
+     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 8a4c168..f4dd7cf 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -22,6 +22,10 @@ MILISECONDS_PER_STEP = 10
+ 
+ def _max_decoded_time_shift_value(max_time_ms: float) -> int:
+     """Largest token value whose decoded center does not exceed a boundary."""
++    if type(max_time_ms) not in {int, float}:
++        raise TypeError("max_time_ms must be a finite exact integer or float")
++    if not math.isfinite(max_time_ms):
++        raise ValueError("max_time_ms must be finite")
+     half_step = MILISECONDS_PER_STEP // 2
+     if max_time_ms < half_step:
+         # Non-negative tokens decode at +5ms, while negative tokens do not
+@@ -30,6 +34,59 @@ def _max_decoded_time_shift_value(max_time_ms: float) -> int:
+     return math.floor((max_time_ms - half_step) / MILISECONDS_PER_STEP)
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class ManiaTemporalHorizon:
++    current_time_token: int | None
++    effective_cut_time_token: int
++    remaining_decoder_slots: int
++    minimum_close_tokens: int
++    can_start_hold: bool
++    can_advance_time: bool
++
++
++def compute_mania_temporal_horizon(
++        *,
++        current_time_token: int | None,
++        effective_cut_time_token: int,
++        remaining_decoder_slots: int,
++        minimum_close_tokens: int,
++) -> ManiaTemporalHorizon:
++    """Return whether a new HOLD can still advance and close before the cut.
++
++    ``remaining_decoder_slots`` is measured after the prospective HOLD_START.
++    A new HOLD requires a strictly later TIME_SHIFT plus its COLUMN and
++    HOLD_END. Existing open HOLDs may share that later TIME_SHIFT.
++    """
++    if current_time_token is not None and type(current_time_token) is not int:
++        raise TypeError("current_time_token must be an exact integer or None")
++    if type(effective_cut_time_token) is not int:
++        raise TypeError("effective_cut_time_token must be an exact integer")
++    if type(remaining_decoder_slots) is not int:
++        raise TypeError("remaining_decoder_slots must be an exact integer")
++    if remaining_decoder_slots < 0:
++        raise ValueError("remaining_decoder_slots must be non-negative")
++    if type(minimum_close_tokens) is not int:
++        raise TypeError("minimum_close_tokens must be an exact integer")
++    if minimum_close_tokens <= 0:
++        raise ValueError("minimum_close_tokens must be positive")
++    can_advance_time = (
++        current_time_token is None
++        or current_time_token < effective_cut_time_token
++    )
++    return ManiaTemporalHorizon(
++        current_time_token=current_time_token,
++        effective_cut_time_token=effective_cut_time_token,
++        remaining_decoder_slots=remaining_decoder_slots,
++        minimum_close_tokens=minimum_close_tokens,
++        can_start_hold=(
++            current_time_token is not None
++            and can_advance_time
++            and remaining_decoder_slots >= minimum_close_tokens
++        ),
++        can_advance_time=can_advance_time,
++    )
++
++
+ def get_beat_type_tokens(tokenizer: Tokenizer) -> tuple[int, ...]:
+     beat_range = [
+         tokenizer.event_start[EventType.BEAT],
+@@ -652,6 +709,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             require_closed_holds_at_eos: bool = False,
+             max_sequence_length: int | None = None,
+             max_note_start_time_token: int | None = None,
++            effective_cut_time_token: int | None = None,
+             hold_state_mode: HoldStateMode = "full_scan",
+             incremental_eligible: bool = True,
+     ):
+@@ -690,6 +748,12 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+         self.require_closed_holds_at_eos = require_closed_holds_at_eos
+         self.max_sequence_length = max_sequence_length
+         self.max_note_start_time_token = max_note_start_time_token
++        if (
++                effective_cut_time_token is not None
++                and type(effective_cut_time_token) is not int
++        ):
++            raise TypeError("effective_cut_time_token must be an exact integer or None")
++        self.effective_cut_time_token = effective_cut_time_token
+         self.prompt_length: int | None = None
+         self._incremental_state: _IncrementalManiaRowState | None = None
+         self.keycount_start = tokenizer.event_start[EventType.MANIA_KEYCOUNT]
+@@ -739,6 +803,8 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             "forcedGroupCompletionSteps": 0,
+             "impossibleGroupCompletionSteps": 0,
+             "startBoundaryColumnRestrictionSteps": 0,
++            "temporalTimeBoundarySteps": 0,
++            "temporalHoldStartBoundarySteps": 0,
+             "fullScanRows": 0,
+             "incrementalRows": 0,
+             "verificationRows": 0,
+@@ -1210,6 +1276,16 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     scores_processed[
+                         row, self.column_start:self.column_end
+                     ] = -torch.inf
++                if self.effective_cut_time_token is not None:
++                    first_forbidden_time = max(
++                        self.time_start,
++                        self.effective_cut_time_token + 1,
++                    )
++                    if first_forbidden_time < self.time_end:
++                        self._telemetry["temporalTimeBoundarySteps"] += 1
++                        scores_processed[
++                            row, first_forbidden_time:self.time_end
++                        ] = -torch.inf
+                 if self.require_closed_holds_at_eos and open_columns:
+                     self._telemetry["finalEosClosureSteps"] += 1
+                     scores_processed[row, list(self.eos_ids)] = -torch.inf
+@@ -1264,6 +1340,27 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 )
+                 for token, candidate_state in candidate_open_columns.items():
+                     required_after_candidate = 2 * len(candidate_state)
++                    if (
++                            token == self.hold_start_token
++                            and self.effective_cut_time_token is not None
++                    ):
++                        # A newly opened HOLD cannot legally end at the same
++                        # timestamp. One later TIME_SHIFT is shared by every
++                        # lane that remains open after this candidate.
++                        required_after_candidate += 1
++                        horizon = compute_mania_temporal_horizon(
++                            current_time_token=current_time_token,
++                            effective_cut_time_token=self.effective_cut_time_token,
++                            remaining_decoder_slots=max(0, remaining_after_candidate),
++                            minimum_close_tokens=required_after_candidate,
++                        )
++                        if not horizon.can_start_hold:
++                            self._telemetry[
++                                "temporalHoldStartBoundarySteps"
++                            ] += 1
++                            self._telemetry["unclosableHoldStartSteps"] += 1
++                            scores_processed[row, token] = -torch.inf
++                            continue
+                     if remaining_after_candidate < required_after_candidate:
+                         if token == self.hold_start_token:
+                             self._telemetry["unclosableHoldStartSteps"] += 1
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 8063916..6cb4ed1 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -656,6 +656,7 @@ class Processor(object):
+                     wi=wi,
+                     frame_time=float(frame_time.item()),
+                     n_windows=n_windows,
++                    song_length=song_length,
+                     mania_keycount=mania_keycount,
+                     progress_bar=iterator if verbose else None,
+                     tokens_per_second_meter=tokens_per_second_meter,
+@@ -675,6 +676,7 @@ class Processor(object):
+             wi: int,
+             frame_time: float,
+             n_windows: int,
++            song_length: float,
+             mania_keycount: int | None,
+             progress_bar: Any,
+             tokens_per_second_meter: dict[str, float | None],
+@@ -732,6 +734,16 @@ class Processor(object):
+                 mania_require_closed_holds_at_eos=(
+                     mania_open_hold_columns is not None and not trim_lookahead
+                 ),
++                mania_effective_cut_time=(
++                    (
++                        self.end_time + 10
++                        if self.end_time is not None
++                        else round(song_length)
++                    )
++                    - frame_time
++                    if mania_open_hold_columns is not None and not trim_lookahead
++                    else None
++                ),
+                 max_note_start_time=(
+                     self.last_attack_time - frame_time
+                     if self.last_attack_time is not None
+@@ -979,6 +991,7 @@ class Processor(object):
+                     wi=wi,
+                     frame_time=float(frame_times[wi].item()),
+                     n_windows=n_windows,
++                    song_length=song_length,
+                     mania_keycount=mania_keycount,
+                     progress_bar=progress_bar,
+                     tokens_per_second_meter=tokens_per_second_meter,
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index ca8adeb..88c8526 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -14,7 +14,7 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
+     get_mania_type_tokens, get_scroll_speed_tokens, TimeshiftBias, LookbackBiasLogitsWarper, \
+     MonotonicTimeShiftLogitsProcessor, ManiaKeycountLogitsProcessor, \
+     ManiaColumnBeforeTypeLogitsProcessor, ManiaHoldStateLogitsProcessor, \
+-    ManiaStartBoundaryLogitsProcessor
++    ManiaStartBoundaryLogitsProcessor, _max_decoded_time_shift_value
+ from .cache_utils import get_cache
+ from ..model import Mapperatorinator
+ from ..tokenizer import Tokenizer
+@@ -107,7 +107,8 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                             mania_require_closed_holds_at_eos=False,
+                             mania_max_sequence_length=None,
+                             mania_hold_state_mode="full_scan",
+-                            mania_hold_state_incremental_eligible=True):
++                            mania_hold_state_incremental_eligible=True,
++                            mania_effective_cut_time=None):
+     """Create the logits processors used by every generate path."""
+     if types_first and mania_open_hold_columns is not None:
+         raise ValueError(
+@@ -118,6 +119,15 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+         if max_note_start_time is None
+         else ManiaStartBoundaryLogitsProcessor(tokenizer, max_note_start_time)
+     )
++    effective_cut_time_token = (
++        None
++        if mania_effective_cut_time is None
++        else (
++            tokenizer.event_start[EventType.TIME_SHIFT]
++            + _max_decoded_time_shift_value(mania_effective_cut_time)
++            - tokenizer.event_range[EventType.TIME_SHIFT].min_value
++        )
++    )
+     logits_processor_list = LogitsProcessorList()
+     if cfg_scale > 1.0:
+         logits_processor_list.append(ClassifierFreeGuidanceLogitsProcessor(cfg_scale))
+@@ -136,6 +146,7 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                     prompt_current_time_token=mania_prompt_current_time_token,
+                     require_closed_holds_at_eos=mania_require_closed_holds_at_eos,
+                     max_sequence_length=mania_max_sequence_length,
++                    effective_cut_time_token=effective_cut_time_token,
+                     max_note_start_time_token=(
+                         None
+                         if start_boundary_processor is None
+@@ -339,6 +350,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_require_closed_holds_at_eos = generate_kwargs.pop(
+         'mania_require_closed_holds_at_eos', False
+     )
++    mania_effective_cut_time = generate_kwargs.pop(
++        'mania_effective_cut_time', None
++    )
+     mania_hold_state_mode = generate_kwargs.pop(
+         'mania_hold_state_mode', 'full_scan'
+     )
+@@ -367,6 +381,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+             and generate_kwargs.get('num_beams', 1) == 1
+             and cfg_scale <= 1.0
+         ),
++        mania_effective_cut_time,
+     )
+ 
+     # Prepare cache
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index 6d8fc4b..40ece71 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -15,6 +15,7 @@ from osuT5.osuT5.inference import server as server_module
+ from osuT5.osuT5.inference.logit_processors import (
+     ManiaColumnBeforeTypeLogitsProcessor,
+     ManiaHoldStateLogitsProcessor,
++    compute_mania_temporal_horizon,
+     mania_open_hold_columns_before,
+ )
+ from osuT5.osuT5.inference.mania_domain import ManiaDomainError
+@@ -54,6 +55,7 @@ class FakeTokenizer:
+     }
+     event_range = {
+         EventType.MANIA_KEYCOUNT: SimpleNamespace(min_value=1),
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=0),
+     }
+ 
+ 
+@@ -804,6 +806,7 @@ def test_stock_generate_passes_requested_mode_and_beam_ineligibility(monkeypatch
+     def capture_build(*args):
+         captured["mode"] = args[16]
+         captured["eligible"] = args[17]
++        captured["cut"] = args[18]
+         return []
+ 
+     class FakeModel:
+@@ -825,12 +828,13 @@ def test_stock_generate_passes_requested_mode_and_beam_ineligibility(monkeypatch
+         {"inputs": torch.zeros((1, 1, 1))},
+         {
+             "mania_hold_state_mode": "incremental",
++            "mania_effective_cut_time": 25,
+             "num_beams": 2,
+             "cfg_scale": 1.0,
+         },
+     )
+ 
+-    assert captured == {"mode": "incremental", "eligible": False}
++    assert captured == {"mode": "incremental", "eligible": False, "cut": 25}
+ 
+ 
+ def test_compiled_generate_passes_requested_mode_and_eligibility(monkeypatch):
+@@ -839,6 +843,7 @@ def test_compiled_generate_passes_requested_mode_and_eligibility(monkeypatch):
+     def capture_build(*args):
+         captured["mode"] = args[16]
+         captured["eligible"] = args[17]
++        captured["cut"] = args[18]
+         return []
+ 
+     class FakeDecoder:
+@@ -882,6 +887,7 @@ def test_compiled_generate_passes_requested_mode_and_eligibility(monkeypatch):
+         },
+         {
+             "mania_hold_state_mode": "incremental",
++            "mania_effective_cut_time": 25,
+             "num_beams": 1,
+             "cfg_scale": 1.0,
+             "max_length": 1,
+@@ -889,7 +895,7 @@ def test_compiled_generate_passes_requested_mode_and_eligibility(monkeypatch):
+     )
+ 
+     assert torch.equal(result, torch.tensor([[1]]))
+-    assert captured == {"mode": "incremental", "eligible": True}
++    assert captured == {"mode": "incremental", "eligible": True, "cut": 25}
+ 
+ 
+ def test_incremental_mode_matches_full_scan_masks_across_connected_prefixes():
+@@ -2437,6 +2443,8 @@ def test_hold_state_processor_reports_intervention_counts():
+         "forcedGroupCompletionSteps": 0,
+         "impossibleGroupCompletionSteps": 0,
+         "startBoundaryColumnRestrictionSteps": 0,
++        "temporalTimeBoundarySteps": 0,
++        "temporalHoldStartBoundarySteps": 0,
+         "fullScanRows": 2,
+         "incrementalRows": 0,
+         "verificationRows": 0,
+@@ -2663,7 +2671,7 @@ def test_processor_stack_propagates_final_window_hold_closure_contract():
+ 
+ 
+ def test_processor_stack_propagates_start_boundary_into_hold_grammar():
+-    FakeTokenizer.event_range[EventType.TIME_SHIFT] = SimpleNamespace(min_value=0)
++    original_range = FakeTokenizer.event_range[EventType.TIME_SHIFT]
+     try:
+         processors = build_logits_processors(
+             FakeTokenizer(),
+@@ -2680,7 +2688,7 @@ def test_processor_stack_propagates_start_boundary_into_hold_grammar():
+             mania_open_hold_columns=(),
+         )
+     finally:
+-        del FakeTokenizer.event_range[EventType.TIME_SHIFT]
++        FakeTokenizer.event_range[EventType.TIME_SHIFT] = original_range
+ 
+     processor = next(
+         item
+@@ -2690,6 +2698,75 @@ def test_processor_stack_propagates_start_boundary_into_hold_grammar():
+     assert processor.max_note_start_time_token == 30
+ 
+ 
++def test_processor_stack_converts_effective_cut_with_decoded_token_semantics():
++    def hold_processor(boundary_ms):
++        processors = build_logits_processors(
++            FakeTokenizer(),
++            cfg_scale=1.0,
++            timeshift_bias=0,
++            types_first=False,
++            temperature=1.0,
++            timing_temperature=1.0,
++            mania_column_temperature=1.0,
++            taiko_hit_temperature=1.0,
++            lookback_time=0,
++            device="cpu",
++            mania_open_hold_columns=(2,),
++            mania_require_closed_holds_at_eos=True,
++            mania_max_sequence_length=12,
++            mania_effective_cut_time=boundary_ms,
++        )
++        return next(
++            item
++            for item in processors
++            if isinstance(item, ManiaHoldStateLogitsProcessor)
++        )
++
++    inclusive = hold_processor(25)
++    below_center = hold_processor(24)
++    prefix = torch.tensor([[keycount_token(4), 1, 31]])
++
++    inclusive_result = inclusive(prefix, scores())
++    below_result = below_center(prefix, scores())
++
++    assert inclusive.effective_cut_time_token == 32
++    assert below_center.effective_cut_time_token == 31
++    assert not torch.isneginf(inclusive_result[0, 32])
++    assert torch.isneginf(below_result[0, 32])
++
++
++@pytest.mark.parametrize(
++    ("boundary", "error_type", "message"),
++    [
++        (True, TypeError, "finite exact integer or float"),
++        (float("nan"), ValueError, "must be finite"),
++        (float("inf"), ValueError, "must be finite"),
++    ],
++)
++def test_processor_stack_rejects_invalid_effective_cut_boundaries(
++        boundary,
++        error_type,
++        message,
++):
++    with pytest.raises(error_type, match=message):
++        build_logits_processors(
++            FakeTokenizer(),
++            cfg_scale=1.0,
++            timeshift_bias=0,
++            types_first=False,
++            temperature=1.0,
++            timing_temperature=1.0,
++            mania_column_temperature=1.0,
++            taiko_hit_temperature=1.0,
++            lookback_time=0,
++            device="cpu",
++            mania_open_hold_columns=(2,),
++            mania_require_closed_holds_at_eos=True,
++            mania_max_sequence_length=12,
++            mania_effective_cut_time=boundary,
++        )
++
++
+ def test_hold_state_contract_rejects_unsupported_types_first_grammar():
+     with pytest.raises(ValueError, match="types_first"):
+         build_logits_processors(
+@@ -2819,3 +2896,148 @@ def test_boundary_snapshot_orphan_error_records_empty_lane_history():
+     message = str(exc_info.value)
+     assert "offending=time=250,lane=3,type=HOLD_NOTE_END" in message
+     assert "laneHistory=[]" in message
++
++
++def test_temporal_horizon_reports_exact_time_and_token_reachability():
++    at_cut = compute_mania_temporal_horizon(
++        current_time_token=32,
++        effective_cut_time_token=32,
++        remaining_decoder_slots=4,
++        minimum_close_tokens=3,
++    )
++    before_cut = compute_mania_temporal_horizon(
++        current_time_token=31,
++        effective_cut_time_token=32,
++        remaining_decoder_slots=3,
++        minimum_close_tokens=3,
++    )
++
++    assert at_cut.can_start_hold is False
++    assert at_cut.can_advance_time is False
++    assert before_cut.can_start_hold is True
++    assert before_cut.can_advance_time is True
++
++
++@pytest.mark.parametrize("keycount", [4, 6, 7])
++def test_temporal_horizon_allows_tap_but_blocks_hold_start_at_exact_cut(keycount):
++    lane = keycount - 1
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=10,
++        effective_cut_time_token=32,
++    )
++    prefix = [keycount_token(keycount), 1, 32, 10 + lane]
++
++    result = processor(torch.tensor([prefix]), scores())
++
++    assert not torch.isneginf(result[0, 50])
++    assert torch.isneginf(result[0, 51])
++
++
++def test_temporal_horizon_keeps_exact_cut_hold_end_available_for_open_lane():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (2,),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=10,
++        effective_cut_time_token=32,
++    )
++
++    result = processor(
++        torch.tensor([[keycount_token(4), 1, 32, 12]]),
++        scores(),
++    )
++
++    assert not torch.isneginf(result[0, 52])
++    assert torch.isneginf(result[0, 50])
++    assert torch.isneginf(result[0, 51])
++
++
++def test_temporal_horizon_masks_time_shifts_beyond_effective_cut():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (2,),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=10,
++        effective_cut_time_token=32,
++    )
++
++    result = processor(
++        torch.tensor([[keycount_token(4), 1, 31]]),
++        scores(),
++    )
++
++    assert not torch.isneginf(result[0, 32])
++    assert torch.isneginf(result[0, 33:40]).all()
++
++
++def test_temporal_horizon_reserves_a_future_timeshift_for_new_hold():
++    prefix = [keycount_token(4), 1, 30, 12]
++    insufficient = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=len(prefix) + 3,
++        effective_cut_time_token=32,
++    )
++    exact = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=len(prefix) + 4,
++        effective_cut_time_token=32,
++    )
++
++    insufficient_result = insufficient(torch.tensor([prefix]), scores())
++    exact_result = exact(torch.tensor([prefix]), scores())
++
++    assert torch.isneginf(insufficient_result[0, 51])
++    assert not torch.isneginf(exact_result[0, 51])
++
++
++def test_temporal_horizon_is_inactive_without_explicit_cut():
++    prefix = [keycount_token(4), 1, 30, 12]
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=len(prefix) + 3,
++    )
++
++    result = processor(torch.tensor([prefix]), scores())
++
++    assert not torch.isneginf(result[0, 51])
++
++
++def test_temporal_horizon_incremental_and_rebuild_match_full_scan():
++    common = dict(
++        initial_open_columns=(2,),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=12,
++        effective_cut_time_token=32,
++    )
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), hold_state_mode="full_scan", **common
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), hold_state_mode="incremental", **common
++    )
++    prefixes = (
++        [keycount_token(4), 1, 31],
++        [keycount_token(4), 1, 31, 12],
++        [keycount_token(4), 1, 31, 12, 52],
++        [keycount_token(4), 1, 32],
++        [keycount_token(4), 1, 32, 13],
++    )
++
++    for prefix in prefixes:
++        oracle_error, oracle_result = _processor_call(oracle, prefix)
++        candidate_error, candidate_result = _processor_call(candidate, prefix)
++        assert candidate_error is oracle_error
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result)
++
++    assert candidate.telemetry()["stateResetRows"] >= 1
++    assert candidate.telemetry()["temporalHoldStartBoundarySteps"] >= 1
+diff --git a/tests/test_mania_tail_repair.py b/tests/test_mania_tail_repair.py
+index d1b5e18..317c625 100644
+--- a/tests/test_mania_tail_repair.py
++++ b/tests/test_mania_tail_repair.py
+@@ -468,6 +468,35 @@ def test_actual_sequential_generation_reuses_encoder_and_repairs_only_suffix(mon
+     assert {origin.source_window_id for origin in context["event_origins"]} == set(range(6))
+ 
+ 
++@pytest.mark.parametrize(
++    ("end_time", "expected_final_cut"),
++    [(500, 10.0), (None, 100.0)],
++)
++def test_sequential_generation_passes_temporal_cut_only_to_final_window(
++        monkeypatch,
++        end_time,
++        expected_final_cut,
++):
++    processor, context, sequences, _encoder_calls, _window_calls = _sequential_fixture(
++        monkeypatch,
++        fail_domain=False,
++        end_time=end_time,
++    )
++    observed: list[object] = []
++    original_generate = processor.model_generate
++
++    def capture(model_kwargs, **generate_kwargs):
++        observed.append(generate_kwargs.get("mania_effective_cut_time"))
++        return original_generate(model_kwargs, **generate_kwargs)
++
++    processor.model_generate = capture
++
++    _run_sequential(processor, context, sequences)
++
++    assert observed[:-1] == [None] * 5
++    assert observed[-1] == expected_final_cut
++
++
+ def test_fault_at_window_211_replays_from_209_without_regenerating_prefix(monkeypatch):
+     processor, context, sequences, encoder_calls, window_calls = _sequential_fixture(
+         monkeypatch,

@@ -1,0 +1,283 @@
+diff --git a/inference.py b/inference.py
+index d3fd0c7..f2ec844 100644
+--- a/inference.py
++++ b/inference.py
+@@ -651,6 +651,12 @@ def generate(
+         if verbose:
+             logger.info("Merged generated content with reference beatmap")
+ 
++    if args.gamemode == 3 and ContextType.MAP in output_type and args.resnap_events:
++        postprocessor.rebind_mania_objects_to_serialized_result(
++            result,
++            key_count=round(beatmap_config.circle_size),
++        )
++
+     if args.add_to_beatmap and args.overwrite_reference_beatmap:
+         output_osu_path = Path(beatmap_path)
+     else:
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index ba227e3..f0a442e 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -13,7 +13,7 @@ from string import Template
+ from typing import Optional
+ 
+ import numpy as np
+-from slider import TimingPoint, Beatmap
++from slider import Beatmap, Circle, HoldNote, TimingPoint
+ 
+ from config import InferenceConfig
+ from .origin import EventOrigin
+@@ -846,6 +846,137 @@ class Postprocessor(object):
+         ]
+         return objects, duplicate_group_ids, duplicates
+ 
++    def rebind_mania_objects_to_serialized_result(
++            self,
++            serialized_result: str,
++            *,
++            key_count: int,
++    ) -> None:
++        """Bind provenance records to the final serialized Mania objects.
++
++        Partial generation serializes a generated/reference composite and then
++        ``add_to_beatmap`` restores reference-owned objects outside the replaced
++        interval.  That second serialization may change reference timestamps,
++        so the pre-serialization object report cannot be published unchanged.
++        Generated or mixed-provenance objects must remain byte-equivalent; a
++        change there is a generation defect and fails before the sidecar is
++        written.
++        """
++        if type(serialized_result) is not str:
++            raise TypeError("serialized_result must be an exact string")
++        if type(key_count) is not int or key_count <= 0:
++            raise TypeError("key_count must be an exact positive integer")
++
++        source_objects = self.last_mania_objects_report.get("maniaObjects")
++        duplicates = self.last_mania_objects_report.get("duplicates")
++        if type(source_objects) is not list or type(duplicates) is not list:
++            raise TypeError("mania object report must contain exact arrays")
++
++        serialized_objects = []
++        for hit_object in Beatmap.parse(serialized_result)._hit_objects:
++            if isinstance(hit_object, HoldNote):
++                kind = "HOLD"
++                end_time_ms = int(round(hit_object.end_time.total_seconds() * 1000))
++            elif isinstance(hit_object, Circle):
++                kind = "TAP"
++                end_time_ms = None
++            else:
++                raise ValueError(
++                    "serialized Mania result contains an unsupported hit object: "
++                    f"{type(hit_object).__name__}"
++                )
++            serialized_objects.append({
++                "lane": self._mania_lane(hit_object.position.x, key_count),
++                "kind": kind,
++                "startTimeMs": int(round(hit_object.time.total_seconds() * 1000)),
++                "endTimeMs": end_time_ms,
++            })
++
++        source_by_lane = {}
++        for item in source_objects:
++            if type(item) is not dict:
++                raise TypeError("mania object report entries must be exact objects")
++            source_by_lane.setdefault(item.get("lane"), []).append(item)
++        serialized_by_lane = {}
++        for item in serialized_objects:
++            serialized_by_lane.setdefault(item["lane"], []).append(item)
++        if set(source_by_lane) != set(serialized_by_lane):
++            raise ValueError("serialized Mania lane set changed before sidecar binding")
++
++        rebound = []
++        for lane in sorted(source_by_lane):
++            source_lane = sorted(
++                source_by_lane[lane],
++                key=lambda item: (
++                    item.get("startTimeMs"),
++                    0 if item.get("kind") == "HOLD" else 1,
++                    item.get("objectId"),
++                ),
++            )
++            serialized_lane = sorted(
++                serialized_by_lane[lane],
++                key=lambda item: (
++                    item["startTimeMs"],
++                    0 if item["kind"] == "HOLD" else 1,
++                ),
++            )
++            if len(source_lane) != len(serialized_lane):
++                raise ValueError(
++                    "serialized Mania object count changed before sidecar binding: "
++                    f"lane={lane}, source={len(source_lane)}, "
++                    f"serialized={len(serialized_lane)}"
++                )
++            if [item.get("kind") for item in source_lane] != [
++                item["kind"] for item in serialized_lane
++            ]:
++                raise ValueError(
++                    "serialized Mania object kinds changed before sidecar binding: "
++                    f"lane={lane}"
++                )
++
++            for source, serialized in zip(source_lane, serialized_lane):
++                changed = (
++                    source.get("startTimeMs") != serialized["startTimeMs"]
++                    or source.get("endTimeMs") != serialized["endTimeMs"]
++                )
++                if changed:
++                    origins = [
++                        *source.get("startOrigins", []),
++                        *source.get("endOrigins", []),
++                    ]
++                    if not origins or any(
++                            type(origin) is not dict
++                            or origin.get("kind") != "REFERENCE"
++                            for origin in origins
++                    ):
++                        raise ValueError(
++                            "generated Mania object changed during final serialization: "
++                            f"lane={lane}, kind={source.get('kind')}, "
++                            f"source={source.get('startTimeMs')}.."
++                            f"{source.get('endTimeMs')}, "
++                            f"serialized={serialized['startTimeMs']}.."
++                            f"{serialized['endTimeMs']}"
++                        )
++                rebound_item = dict(source)
++                rebound_item["startTimeMs"] = serialized["startTimeMs"]
++                rebound_item["endTimeMs"] = serialized["endTimeMs"]
++                rebound.append(rebound_item)
++
++        rebound.sort(key=lambda item: (
++            item["startTimeMs"],
++            item["lane"],
++            0 if item["kind"] == "HOLD" else 1,
++            item["startGroupId"],
++        ))
++        rebound = [
++            {**item, "objectId": object_id}
++            for object_id, item in enumerate(rebound)
++        ]
++        self.last_mania_objects_report = {
++            "maniaObjects": rebound,
++            "duplicates": [dict(item) for item in duplicates],
++        }
++
+     def write_resnap_diagnostics(
+             self,
+             output_path: str | Path,
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index 15b57b0..a7e0b7e 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -1,12 +1,14 @@
+ import hashlib
+ import json
+ from datetime import timedelta
++from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+ from slider import TimingPoint
+ 
+ from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference.origin import EventOrigin
+ from osuT5.osuT5.inference.postprocessor import BeatmapConfig, Postprocessor
+ 
+ 
+@@ -66,6 +68,95 @@ def test_explicit_event_times_preserve_a_same_timestamp_second_group():
+     assert "192,192,0,128" not in result
+ 
+ 
++def test_serialized_mania_rebind_updates_only_reference_objects():
++    events = [
++        Event(EventType.TIME_SHIFT, 1_000),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE, 0),
++        Event(EventType.TIME_SHIFT, 2_000),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.HOLD_NOTE_END, 0),
++        Event(EventType.TIME_SHIFT, 2_500),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++    origins = [
++        *[EventOrigin.reference(index) for index in range(8)],
++        *[EventOrigin.generated(0, index) for index in range(4)],
++    ]
++    postprocessor = make_postprocessor()
++    result = postprocessor.generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++        event_times=[1_000] * 4 + [2_000] * 4 + [2_500] * 4,
++        event_origins=origins,
++    )
++    rebound_result = result.replace(
++        "64,192,1000,128,0,2000:",
++        "64,192,1000,128,0,2500:",
++    )
++
++    postprocessor.rebind_mania_objects_to_serialized_result(
++        rebound_result,
++        key_count=4,
++    )
++
++    objects = postprocessor.last_mania_objects_report["maniaObjects"]
++    assert [(item["kind"], item["startTimeMs"], item["endTimeMs"]) for item in objects] == [
++        ("HOLD", 1_000, 2_500),
++        ("TAP", 2_500, None),
++    ]
++    assert {origin["kind"] for origin in objects[0]["startOrigins"]} == {
++        "REFERENCE"
++    }
++    assert {origin["kind"] for origin in objects[1]["startOrigins"]} == {
++        "GENERATED"
++    }
++
++
++def test_serialized_mania_rebind_rejects_generated_drift_transactionally():
++    events = [
++        Event(EventType.TIME_SHIFT, 1_000),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++    postprocessor = make_postprocessor()
++    result = postprocessor.generate(
++        events,
++        BeatmapConfig(mode=3, circle_size=4),
++        event_times=[1_000] * 4,
++        event_origins=[EventOrigin.generated(0, index) for index in range(4)],
++    )
++    report_before = json.loads(json.dumps(postprocessor.last_mania_objects_report))
++    rebound_result = result.replace(",1000,1,", ",1100,1,")
++
++    with pytest.raises(ValueError, match="generated Mania object changed"):
++        postprocessor.rebind_mania_objects_to_serialized_result(
++            rebound_result,
++            key_count=4,
++        )
++
++    assert postprocessor.last_mania_objects_report == report_before
++
++
++def test_inference_rebinds_mania_objects_after_partial_merge_before_write():
++    source = (Path(__file__).parents[1] / "inference.py").read_text(
++        encoding="utf-8"
++    )
++
++    merge_index = source.index("result = postprocessor.add_to_beatmap")
++    rebind_index = source.index(
++        "postprocessor.rebind_mania_objects_to_serialized_result"
++    )
++    write_index = source.index("postprocessor.write_result")
++
++    assert merge_index < rebind_index < write_index
++
++
+ def test_resnap_updates_event_tokens_and_explicit_times_together():
+     events = [
+         Event(EventType.TIME_SHIFT, 110),

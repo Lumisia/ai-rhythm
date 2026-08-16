@@ -1,0 +1,64 @@
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index 1307713..ba227e3 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -31,6 +31,10 @@ _RESNAP_COLLISION_TIME_FIELDS = frozenset({
+     "rawEndMs",
+     "proposedStartMs",
+     "proposedEndMs",
++    "rawPreviousEndMs",
++    "rawCurrentStartMs",
++    "proposedPreviousEndMs",
++    "proposedCurrentStartMs",
+ })
+ 
+ 
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index 8904954..15b57b0 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -441,6 +441,44 @@ def test_resnap_sidecar_uses_osu_integer_milliseconds_for_collision_times(tmp_pa
+     assert collisions[1]["rawStartMs"] == 230_565.0
+ 
+ 
++def test_resnap_sidecar_uses_integer_milliseconds_for_lane_order_times(tmp_path):
++    osu_path = tmp_path / "beatmap.osu"
++    osu_path.write_bytes(b"osu-output")
++    collisions = [
++        {
++            "lane": 1,
++            "previousObjectId": 1308,
++            "currentObjectId": 1310,
++            "proposedPreviousEndMs": 360_800.0,
++            "proposedCurrentStartMs": 360_765.0,
++            "rawPreviousEndMs": 360_800.0,
++            "rawCurrentStartMs": 360_800.0,
++            "reason": "LANE_ORDER_RAW_RESTORED",
++        }
++    ]
++
++    sidecar_path = make_postprocessor().write_resnap_diagnostics(
++        osu_path,
++        seed=31,
++        collisions=collisions,
++    )
++    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
++    collision = payload["collisions"][0]
++
++    assert collision["proposedPreviousEndMs"] == 360_800
++    assert type(collision["proposedPreviousEndMs"]) is int
++    assert collision["proposedCurrentStartMs"] == 360_765
++    assert type(collision["proposedCurrentStartMs"]) is int
++    assert collision["rawPreviousEndMs"] == 360_800
++    assert type(collision["rawPreviousEndMs"]) is int
++    assert collision["rawCurrentStartMs"] == 360_800
++    assert type(collision["rawCurrentStartMs"]) is int
++    assert collisions[0]["proposedPreviousEndMs"] == 360_800.0
++    assert collisions[0]["proposedCurrentStartMs"] == 360_765.0
++    assert collisions[0]["rawPreviousEndMs"] == 360_800.0
++    assert collisions[0]["rawCurrentStartMs"] == 360_800.0
++
++
+ def test_resnap_sidecar_rejects_non_finite_collision_times(tmp_path):
+     osu_path = tmp_path / "beatmap.osu"
+     osu_path.write_bytes(b"osu-output")

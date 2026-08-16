@@ -1,0 +1,3292 @@
+diff --git a/inference.py b/inference.py
+index 7dc9d13..4bfddc3 100644
+--- a/inference.py
++++ b/inference.py
+@@ -1,42 +1,57 @@
++import hashlib
+ import logging
+ import multiprocessing
+-import sys
+-
+-import utils.excepthook  # noqa
+ import os.path
++import random
++import sys
+ import uuid
++from dataclasses import dataclass
+ from functools import reduce
++from importlib import metadata
+ from pathlib import Path
+-import random
++from typing import Any, Callable, Protocol
+ 
+ import hydra
++import osu_diffusion
+ import torch
++import utils.excepthook  # noqa
+ from accelerate.utils import set_seed
+-from omegaconf import OmegaConf, DictConfig
+-from slider import Beatmap
+-from transformers.utils import cached_file, is_flash_attn_2_available
+-from importlib import metadata
+-from packaging.version import Version
+-
+-import osu_diffusion
+-from utils import routed_pickle
+ from config import InferenceConfig
+ from diffusion_pipeline import DiffisionPipeline
++from omegaconf import DictConfig, OmegaConf
++from osu_diffusion import DiT_models
++from osu_diffusion.config import DiffusionTrainConfig
+ from osuT5.osuT5.config import TrainConfig
+-from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES
+-from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, BeatmapConfig, GenerationConfig, \
+-    generation_config_from_beatmap, beatmap_config_from_beatmap, background_line
+-from osuT5.osuT5.inference.server import InferenceClient
++from osuT5.osuT5.dataset.data_utils import TIMING_TYPES, events_of_type
++from osuT5.osuT5.inference import (
++    BeatmapConfig,
++    GenerationConfig,
++    Postprocessor,
++    Preprocessor,
++    Processor,
++    background_line,
++    beatmap_config_from_beatmap,
++    generation_config_from_beatmap,
++)
++from osuT5.osuT5.inference.encoder_cache import ExactEncoderCache
+ from osuT5.osuT5.inference.origin import merge_origin_streams
++from osuT5.osuT5.inference.server import InferenceClient
++from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
+ from osuT5.osuT5.inference.tail_repair import (
+     run_with_mania_tail_terminal,
+ )
+-from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
+ from osuT5.osuT5.model import Mapperatorinator
+ from osuT5.osuT5.tokenizer import ContextType
+-from osuT5.osuT5.utils import load_model_loaders, resolve_compatible_lora_path, resolve_model_checkpoint_path, get_model_checkpoint_subfolder
+-from osu_diffusion import DiT_models
+-from osu_diffusion.config import DiffusionTrainConfig
++from osuT5.osuT5.utils import (
++    get_model_checkpoint_subfolder,
++    load_model_loaders,
++    resolve_compatible_lora_path,
++    resolve_model_checkpoint_path,
++)
++from packaging.version import Version
++from slider import Beatmap
++from transformers.utils import cached_file, is_flash_attn_2_available
++from utils import routed_pickle
+ 
+ 
+ def get_default_logger():
+@@ -50,6 +65,14 @@ def get_default_logger():
+     return logger
+ 
+ 
++def _sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
+ def assert_package_version(package_name: str, required_version: str):
+     required_version = Version(required_version)
+     try:
+@@ -465,6 +488,8 @@ def generate(
+         refine_model=None,
+         verbose=True,
+         logger=None,
++        encoder_cache: ExactEncoderCache | None = None,
++        encoder_model_identity: tuple[str, str] | None = None,
+ ):
+     audio_path = args.audio_path if audio_path is None else audio_path
+     beatmap_path = args.beatmap_path if beatmap_path is None else beatmap_path
+@@ -485,7 +510,29 @@ def generate(
+         raise ValueError("Output path is required.")
+ 
+     preprocessor = Preprocessor(args, parallel=args.parallel)
+-    processor = Processor(args, model, tokenizer)
++    encoder_cache_identity = None
++    if encoder_cache is not None:
++        if (
++            type(encoder_model_identity) is not tuple
++            or len(encoder_model_identity) != 2
++            or any(type(value) is not str for value in encoder_model_identity)
++        ):
++            raise ValueError("encoder cache requires exact resident model identity")
++        encoder_cache_identity = {
++            "modelManifestSha256": encoder_model_identity[0],
++            "modelConfigSha256": encoder_model_identity[1],
++            "audioSha256": _sha256_file(Path(audio_path)),
++            "referenceSha256": (
++                _sha256_file(Path(beatmap_path)) if beatmap_path else None
++            ),
++        }
++    processor = Processor(
++        args,
++        model,
++        tokenizer,
++        encoder_cache=encoder_cache,
++        encoder_cache_identity=encoder_cache_identity,
++    )
+     postprocessor = Postprocessor(args, logger=logger)
+ 
+     audio = preprocessor.load(audio_path)
+@@ -594,7 +641,7 @@ def generate(
+     if args.add_to_beatmap:
+         result = postprocessor.add_to_beatmap(result, beatmap_path)
+         if verbose:
+-            logger.info(f"Merged generated content with reference beatmap")
++            logger.info("Merged generated content with reference beatmap")
+ 
+     if args.add_to_beatmap and args.overwrite_reference_beatmap:
+         output_osu_path = Path(beatmap_path)
+@@ -718,11 +765,37 @@ def load_diff_model(
+     return model, tokenizer
+ 
+ 
+-def _main_impl(args: InferenceConfig):
+-    args = OmegaConf.to_object(args) if isinstance(args, DictConfig) else args
+-    compile_args(args)
+-    setup_inference_environment(args.seed)
++@dataclass(frozen=True)
++class InferenceModelBundle:
++    model: Any
++    tokenizer: Any
++    timing_model: Any
++    timing_tokenizer: Any
++    diff_model: Any
++    diff_tokenizer: Any
++    refine_model: Any
++
++
++class InferenceRuntime(Protocol):
++    def prepare_invocation(self, args: InferenceConfig) -> None: ...
++
++    def model_bundle(
++        self,
++        args: InferenceConfig,
++        loader: Callable[[InferenceConfig], InferenceModelBundle],
++        *,
++        loads_separate_timing_model: bool,
++    ) -> InferenceModelBundle: ...
++
++    def encoder_cache_context(
++        self,
++        args: InferenceConfig,
++        *,
++        loads_separate_timing_model: bool,
++    ) -> tuple[ExactEncoderCache, str, str]: ...
++
+ 
++def load_inference_models(args: InferenceConfig) -> InferenceModelBundle:
+     model, tokenizer = load_model_with_server(args.model_path, args.train, args.device,
+                                               max_batch_size=args.max_batch_size, use_server=args.use_server,
+                                               precision=args.precision, attn_implementation=args.attn_implementation,
+@@ -756,13 +829,7 @@ def _main_impl(args: InferenceConfig):
+         if args.compile:
+             diff_model.forward = torch.compile(diff_model.forward, mode="reduce-overhead", fullgraph=True)
+ 
+-    generation_config, beatmap_config = get_config(args)
+-
+-    return generate(
+-        args,
+-        generation_config=generation_config,
+-        beatmap_path=args.beatmap_path,
+-        beatmap_config=beatmap_config,
++    return InferenceModelBundle(
+         model=model,
+         tokenizer=tokenizer,
+         timing_model=timing_model,
+@@ -773,6 +840,55 @@ def _main_impl(args: InferenceConfig):
+     )
+ 
+ 
++def execute_inference(
++    args: InferenceConfig,
++    *,
++    runtime: InferenceRuntime | None = None,
++):
++    args = OmegaConf.to_object(args) if isinstance(args, DictConfig) else args
++    compile_args(args)
++    if runtime is None:
++        setup_inference_environment(args.seed)
++        models = load_inference_models(args)
++        encoder_cache = None
++        encoder_model_identity = None
++    else:
++        runtime.prepare_invocation(args)
++        loads_separate_timing_model = should_load_separate_timing_model(args)
++        models = runtime.model_bundle(
++            args,
++            load_inference_models,
++            loads_separate_timing_model=loads_separate_timing_model,
++        )
++        encoder_cache, manifest_sha256, config_sha256 = runtime.encoder_cache_context(
++            args,
++            loads_separate_timing_model=loads_separate_timing_model,
++        )
++        encoder_model_identity = (manifest_sha256, config_sha256)
++
++    generation_config, beatmap_config = get_config(args)
++
++    return generate(
++        args,
++        generation_config=generation_config,
++        beatmap_path=args.beatmap_path,
++        beatmap_config=beatmap_config,
++        model=models.model,
++        tokenizer=models.tokenizer,
++        timing_model=models.timing_model,
++        timing_tokenizer=models.timing_tokenizer,
++        diff_model=models.diff_model,
++        diff_tokenizer=models.diff_tokenizer,
++        refine_model=models.refine_model,
++        encoder_cache=encoder_cache,
++        encoder_model_identity=encoder_model_identity,
++    )
++
++
++def _main_impl(args: InferenceConfig):
++    return execute_inference(args)
++
++
+ @hydra.main(config_path="configs/inference", config_name="v32", version_base="1.1")
+ def main(args: InferenceConfig):
+     return run_with_mania_tail_terminal(
+diff --git a/osuT5/osuT5/inference/encoder_cache.py b/osuT5/osuT5/inference/encoder_cache.py
+new file mode 100644
+index 0000000..9e4018d
+--- /dev/null
++++ b/osuT5/osuT5/inference/encoder_cache.py
+@@ -0,0 +1,246 @@
++"""Exact-key, song-bounded CPU cache for precomputed encoder tensors."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from collections import OrderedDict
++from collections.abc import Mapping
++from dataclasses import dataclass
++from threading import RLock
++
++import torch
++
++_HEX = frozenset("0123456789abcdef")
++
++
++def _require_digest(value: object, *, name: str, allow_none: bool = False) -> str | None:
++    if value is None and allow_none:
++        return None
++    if type(value) is not str or len(value) != 64 or any(char not in _HEX for char in value):
++        raise ValueError(f"{name} must be an exact lowercase SHA-256")
++    return value
++
++
++def _canonical_value(value: object, active: set[int]) -> object:
++    if value is None or type(value) in (str, bool, int):
++        return value
++    if type(value) is float:
++        if not math.isfinite(value):
++            raise ValueError("cache identity floats must be finite")
++        return {"floatHex": value.hex()}
++    if type(value) in (list, tuple):
++        identity = id(value)
++        if identity in active:
++            raise ValueError("cache identity must not contain cycles")
++        active.add(identity)
++        try:
++            return [_canonical_value(item, active) for item in value]
++        finally:
++            active.remove(identity)
++    if type(value) is dict:
++        if any(type(key) is not str for key in value):
++            raise TypeError("cache identity mapping keys must be plain strings")
++        identity = id(value)
++        if identity in active:
++            raise ValueError("cache identity must not contain cycles")
++        active.add(identity)
++        try:
++            return {key: _canonical_value(value[key], active) for key in sorted(value)}
++        finally:
++            active.remove(identity)
++    raise TypeError(f"unsupported cache identity value: {type(value).__name__}")
++
++
++def _json_digest(value: object) -> str:
++    encoded = json.dumps(
++        _canonical_value(value, set()),
++        ensure_ascii=True,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8")
++    return hashlib.sha256(encoded).hexdigest()
++
++
++def _tensor_digest(tensor: torch.Tensor) -> str:
++    if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
++        raise ValueError("cache identity tensors must be CPU tensors")
++    value = tensor.detach().contiguous()
++    digest = hashlib.sha256()
++    digest.update(str(value.dtype).encode("ascii"))
++    digest.update(json.dumps(list(value.shape), separators=(",", ":")).encode("ascii"))
++    if value.numel():
++        digest.update(value.view(torch.uint8).numpy().tobytes(order="C"))
++    return digest.hexdigest()
++
++
++def _tensor_mapping_digest(values: Mapping[str, torch.Tensor]) -> str:
++    if not isinstance(values, Mapping) or any(type(key) is not str for key in values):
++        raise TypeError("conditioning must be a string-to-tensor mapping")
++    return _json_digest({key: _tensor_digest(values[key]) for key in sorted(values)})
++
++
++@dataclass(frozen=True, slots=True)
++class EncoderCacheKey:
++    model_manifest_sha256: str
++    model_config_sha256: str
++    audio_sha256: str
++    reference_sha256: str | None
++    preprocessing_sha256: str
++    frames_sha256: str
++    conditioning_sha256: str
++    song_positions_sha256: str
++    precision: str
++    encoder_dtype: str
++
++    def __post_init__(self) -> None:
++        for field in (
++            "model_manifest_sha256",
++            "model_config_sha256",
++            "audio_sha256",
++            "preprocessing_sha256",
++            "frames_sha256",
++            "conditioning_sha256",
++            "song_positions_sha256",
++        ):
++            _require_digest(getattr(self, field), name=field)
++        _require_digest(self.reference_sha256, name="reference_sha256", allow_none=True)
++        if type(self.precision) is not str or not self.precision:
++            raise ValueError("precision must be a non-empty plain string")
++        if type(self.encoder_dtype) is not str or not self.encoder_dtype:
++            raise ValueError("encoder_dtype must be a non-empty plain string")
++
++
++def build_encoder_cache_key(
++    *,
++    model_manifest_sha256: str,
++    model_config_sha256: str,
++    audio_sha256: str,
++    reference_sha256: str | None,
++    preprocessing: Mapping[str, object],
++    frames: torch.Tensor,
++    conditioning: Mapping[str, torch.Tensor],
++    song_positions: torch.Tensor | None,
++    precision: str,
++    encoder_dtype: torch.dtype,
++) -> EncoderCacheKey:
++    if not isinstance(preprocessing, Mapping):
++        raise TypeError("preprocessing must be a mapping")
++    if not isinstance(encoder_dtype, torch.dtype):
++        raise TypeError("encoder_dtype must be a torch.dtype")
++    return EncoderCacheKey(
++        model_manifest_sha256=model_manifest_sha256,
++        model_config_sha256=model_config_sha256,
++        audio_sha256=audio_sha256,
++        reference_sha256=reference_sha256,
++        preprocessing_sha256=_json_digest(dict(preprocessing)),
++        frames_sha256=_tensor_digest(frames),
++        conditioning_sha256=_tensor_mapping_digest(conditioning),
++        song_positions_sha256=(
++            _tensor_digest(song_positions) if song_positions is not None else _json_digest(None)
++        ),
++        precision=precision,
++        encoder_dtype=str(encoder_dtype),
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class EncoderCacheStats:
++    hits: int
++    misses: int
++    puts: int
++    evictions: int
++    oversize_bypasses: int
++    entries: int
++    bytes: int
++
++    def to_dict(self) -> dict[str, int]:
++        return {
++            "hits": self.hits,
++            "misses": self.misses,
++            "puts": self.puts,
++            "evictions": self.evictions,
++            "oversizeBypasses": self.oversize_bypasses,
++            "entries": self.entries,
++            "bytes": self.bytes,
++        }
++
++
++class ExactEncoderCache:
++    def __init__(self, *, max_entries: int, max_bytes: int) -> None:
++        if type(max_entries) is not int or not 1 <= max_entries <= 1024:
++            raise ValueError("max_entries must be an exact int in [1, 1024]")
++        if type(max_bytes) is not int or max_bytes <= 0:
++            raise ValueError("max_bytes must be a positive exact int")
++        self._max_entries = max_entries
++        self._max_bytes = max_bytes
++        self._values: OrderedDict[EncoderCacheKey, torch.Tensor] = OrderedDict()
++        self._bytes = 0
++        self._hits = 0
++        self._misses = 0
++        self._puts = 0
++        self._evictions = 0
++        self._oversize_bypasses = 0
++        self._lock = RLock()
++
++    @staticmethod
++    def _tensor_bytes(value: torch.Tensor) -> int:
++        return value.numel() * value.element_size()
++
++    def get(self, key: EncoderCacheKey) -> torch.Tensor | None:
++        if not isinstance(key, EncoderCacheKey):
++            raise TypeError("key must be EncoderCacheKey")
++        with self._lock:
++            stored = self._values.get(key)
++            if stored is None:
++                self._misses += 1
++                return None
++            self._values.move_to_end(key)
++            self._hits += 1
++            return stored.clone()
++
++    def put(self, key: EncoderCacheKey, value: torch.Tensor) -> bool:
++        if not isinstance(key, EncoderCacheKey):
++            raise TypeError("key must be EncoderCacheKey")
++        if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
++            raise ValueError("encoder cache values must be CPU tensors")
++        if value.requires_grad:
++            raise ValueError("encoder cache values must not require gradients")
++        stored = value.detach().contiguous().clone()
++        size = self._tensor_bytes(stored)
++        with self._lock:
++            if size > self._max_bytes:
++                self._oversize_bypasses += 1
++                return False
++            existing = self._values.pop(key, None)
++            if existing is not None:
++                self._bytes -= self._tensor_bytes(existing)
++            while self._values and (
++                len(self._values) >= self._max_entries or self._bytes + size > self._max_bytes
++            ):
++                _, evicted = self._values.popitem(last=False)
++                self._bytes -= self._tensor_bytes(evicted)
++                self._evictions += 1
++            self._values[key] = stored
++            self._bytes += size
++            self._puts += 1
++            return True
++
++    def clear(self) -> None:
++        with self._lock:
++            self._values.clear()
++            self._bytes = 0
++
++    def stats(self) -> EncoderCacheStats:
++        with self._lock:
++            return EncoderCacheStats(
++                hits=self._hits,
++                misses=self._misses,
++                puts=self._puts,
++                evictions=self._evictions,
++                oversize_bypasses=self._oversize_bypasses,
++                entries=len(self._values),
++                bytes=self._bytes,
++            )
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index a7a7153..1307713 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -4,6 +4,7 @@ import dataclasses
+ import hashlib
+ import json
+ import logging
++import math
+ import os
+ import zipfile
+ from datetime import timedelta
+@@ -23,6 +24,36 @@ from ..tokenizer import Event, EventType
+ 
+ OSU_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.osu")
+ STEPS_PER_MILLISECOND = 0.1
++_RESNAP_COLLISION_TIME_FIELDS = frozenset({
++    "preTimeMs",
++    "postTimeMs",
++    "rawStartMs",
++    "rawEndMs",
++    "proposedStartMs",
++    "proposedEndMs",
++})
++
++
++def _canonical_resnap_collision(collision: dict) -> dict:
++    if type(collision) is not dict:
++        raise TypeError("resnap collision must be an exact dict")
++    normalized = dict(collision)
++    for field in _RESNAP_COLLISION_TIME_FIELDS:
++        if field not in normalized or normalized[field] is None:
++            continue
++        value = normalized[field]
++        if isinstance(value, bool):
++            raise TypeError(f"{field} must be a numeric millisecond value")
++        if isinstance(value, (int, np.integer)):
++            normalized[field] = int(value)
++            continue
++        if not isinstance(value, (float, np.floating)):
++            raise TypeError(f"{field} must be a numeric millisecond value")
++        numeric = float(value)
++        if not math.isfinite(numeric):
++            raise ValueError(f"{field} must be finite")
++        normalized[field] = int(round(numeric))
++    return normalized
+ 
+ 
+ @dataclasses.dataclass
+@@ -823,6 +854,10 @@ class Postprocessor(object):
+             raise FileNotFoundError(
+                 f"cannot bind resnap diagnostics to missing output: {output_path}"
+             )
++        normalized_collisions = [
++            _canonical_resnap_collision(collision)
++            for collision in collisions
++        ]
+         sidecar_path = output_path.with_suffix(".resnap.json")
+         temporary_path = sidecar_path.with_suffix(".json.tmp")
+         sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -832,7 +867,7 @@ class Postprocessor(object):
+                     "version": "mania-origin-v2-osu-bound",
+                     "osuSha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+                     "seed": seed,
+-                    "collisions": collisions,
++                    "collisions": normalized_collisions,
+                     **self.last_mania_objects_report,
+                 },
+                 ensure_ascii=False,
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index c1e395d..8063916 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -10,19 +10,37 @@ from typing import Any, Optional
+ import numpy as np
+ import torch
+ import torch.nn.functional as F
++from config import InferenceConfig
+ from slider import Beatmap, TimingPoint
+ from tqdm import tqdm
+ 
+-from config import InferenceConfig
++from ..dataset.data_utils import (
++    calculate_difficulty,
++    get_groups,
++    get_hitsounded_status,
++    get_hold_note_ratio,
++    get_scroll_speed_ratio,
++    remove_events_of_type,
++    update_event_times,
++)
++from ..dataset.osu_parser import OsuParser
++from ..model import Mapperatorinator
++from ..tokenizer import ContextType, Event, EventType, Tokenizer
+ from .compiled_decode import model_generate_compiled
+-from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
+-from .origin import EventOrigin
++from .encoder_cache import ExactEncoderCache, build_encoder_cache_key
+ from .generation_checkpoint import (
+     GenerationCheckpointStore,
+     reseed_for_domain_repair,
+     restore_rng_state,
+ )
+ from .mania_domain import ManiaDomainError
++from .mania_grammar import (
++    MANIA_NOTE_TYPES,
++    canonical_mania_groups,
++    replay_mania_hold_state,
++)
++from .origin import EventOrigin
++from .server import InferenceClient, model_forward, model_generate, precompute_encoder_outputs
+ from .tail_repair import (
+     ManiaTailRepairExhausted,
+     ManiaTailRepairRequired,
+@@ -33,17 +51,6 @@ from .tail_repair import (
+     open_hold_origin_windows,
+     validate_mania_stream_end,
+ )
+-from .mania_grammar import (
+-    MANIA_NOTE_TYPES,
+-    canonical_mania_groups,
+-    replay_mania_hold_state,
+-)
+-from ..dataset.osu_parser import OsuParser
+-from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
+-                                  get_scroll_speed_ratio, get_hitsounded_status, calculate_difficulty,
+-                                  get_groups)
+-from ..model import Mapperatorinator
+-from ..tokenizer import Event, EventType, Tokenizer, ContextType
+ 
+ MILISECONDS_PER_SECOND = 1000
+ MILISECONDS_PER_STEP = 10
+@@ -95,7 +102,9 @@ def generation_config_from_beatmap(beatmap: Beatmap, beatmap_path, tokenizer: Op
+ 
+ 
+ class Processor(object):
+-    def __init__(self, args: InferenceConfig, model: Mapperatorinator | InferenceClient, tokenizer: Tokenizer, cfg_scale: float = None):
++    def __init__(self, args: InferenceConfig, model: Mapperatorinator | InferenceClient, tokenizer: Tokenizer, cfg_scale: float = None,
++                 encoder_cache: ExactEncoderCache | None = None,
++                 encoder_cache_identity: dict[str, str | None] | None = None):
+         """Model inference stage that processes sequences."""
+         self.device = args.device
+         self.precision = args.precision
+@@ -183,6 +192,8 @@ class Processor(object):
+         # inference.py disables it on other devices. When the model is an
+         # InferenceClient this flag lives on the server instead.
+         self.fast_decoder_loop = args.fast_decoder_loop
++        self.encoder_cache = encoder_cache
++        self.encoder_cache_identity = encoder_cache_identity
+         self.last_generation_stats: dict[str, Any] | None = None
+ 
+     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
+@@ -447,6 +458,92 @@ class Processor(object):
+             for context in selected
+         ]
+ 
++    def _precompute_encoder_hidden(
++            self,
++            *,
++            all_frames: torch.Tensor,
++            frame_times: torch.Tensor,
++            song_length: float,
++            cond_kwargs: dict[str, torch.Tensor],
++            song_positions: torch.Tensor | None,
++    ) -> torch.Tensor:
++        def compute() -> torch.Tensor:
++            if isinstance(self.model, InferenceClient):
++                precompute_kwargs = {
++                    key: value.expand(all_frames.shape[0]).contiguous()
++                    for key, value in cond_kwargs.items()
++                }
++                precompute_kwargs["inputs"] = all_frames
++                if song_positions is not None:
++                    precompute_kwargs["song_position"] = song_positions
++                return self.model.precompute_encoder(precompute_kwargs)
++            with torch.no_grad():
++                return precompute_encoder_outputs(
++                    self.model,
++                    all_frames,
++                    cond_kwargs,
++                    song_positions,
++                    batch_size=self.max_batch_size,
++                )
++
++        # Some compatibility and test harnesses construct Processor through
++        # __new__ and populate the legacy fields directly.  Absence of the
++        # optional resident cache must therefore preserve the one-shot path.
++        cache = getattr(self, "encoder_cache", None)
++        identity = getattr(self, "encoder_cache_identity", None)
++        if cache is None:
++            return compute()
++        if isinstance(self.model, InferenceClient):
++            raise ValueError("encoder cache requires a direct resident model")
++        if type(identity) is not dict or set(identity) != {
++            "modelManifestSha256",
++            "modelConfigSha256",
++            "audioSha256",
++            "referenceSha256",
++        }:
++            raise ValueError("encoder cache identity is incomplete")
++        model_dtype = getattr(getattr(self.model, "transformer", None), "dtype", None)
++        if not isinstance(model_dtype, torch.dtype):
++            raise ValueError("direct resident model does not expose transformer dtype")
++        preprocessing = {
++            "doSongPositionEmbed": self.do_song_position_embed,
++            "frameSeqLen": self.frame_seq_len,
++            "frameSize": self.frame_size,
++            "frameTimes": [float(value) for value in frame_times.detach().cpu().tolist()],
++            "lookaheadTime": float(self.lookahead_time),
++            "lookbackTime": float(self.lookback_time),
++            "maxBatchSize": self.max_batch_size,
++            "millisecondsPerSequence": float(self.miliseconds_per_sequence),
++            "sampleRate": self.sample_rate,
++            "songLength": float(song_length),
++        }
++        key = build_encoder_cache_key(
++            model_manifest_sha256=identity["modelManifestSha256"],
++            model_config_sha256=identity["modelConfigSha256"],
++            audio_sha256=identity["audioSha256"],
++            reference_sha256=identity["referenceSha256"],
++            preprocessing=preprocessing,
++            frames=all_frames,
++            conditioning=cond_kwargs,
++            song_positions=song_positions,
++            precision=self.precision,
++            encoder_dtype=model_dtype,
++        )
++        cached = cache.get(key)
++        if cached is not None:
++            if self.last_generation_stats is not None:
++                self.last_generation_stats["encoderCache"] = cache.stats().to_dict()
++                self.last_generation_stats["encoderCacheHit"] = True
++            return cached
++        computed = compute()
++        if computed.device.type != "cpu" or computed.dtype != model_dtype:
++            raise ValueError("encoder output does not match the exact cache device/dtype identity")
++        cache.put(key, computed)
++        if self.last_generation_stats is not None:
++            self.last_generation_stats["encoderCache"] = cache.stats().to_dict()
++            self.last_generation_stats["encoderCacheHit"] = False
++        return computed
++
+     def generate_sequential(
+             self,
+             *,
+@@ -486,21 +583,13 @@ class Processor(object):
+         t0 = _time.perf_counter() if verbose else 0
+         if verbose:
+             print(f"Precomputing encoder outputs for {n_windows} windows...")
+-        if isinstance(self.model, InferenceClient):
+-            # The client doesn't own the model, so the server precomputes.
+-            # Conditioning is expanded per window because the server may split
+-            # the request into multiple batches.
+-            precompute_kwargs = {k: v.expand(n_windows).contiguous() for k, v in cond_kwargs.items()}
+-            precompute_kwargs["inputs"] = all_frames
+-            if song_positions is not None:
+-                precompute_kwargs["song_position"] = song_positions
+-            enc_hidden = self.model.precompute_encoder(precompute_kwargs)  # (N, L_enc, D)
+-        else:
+-            with torch.no_grad():
+-                enc_hidden = precompute_encoder_outputs(
+-                    self.model, all_frames, cond_kwargs, song_positions,
+-                    batch_size=self.max_batch_size,
+-                )
++        enc_hidden = self._precompute_encoder_hidden(
++            all_frames=all_frames,
++            frame_times=frame_times,
++            song_length=song_length,
++            cond_kwargs=cond_kwargs,
++            song_positions=song_positions,
++        )
+         if verbose:
+             print(f"Encoder precompute: {_time.perf_counter() - t0:.2f}s "
+                   f"({(_time.perf_counter() - t0) / n_windows * 1000:.1f} ms/window)")
+@@ -1335,7 +1424,7 @@ class Processor(object):
+                             return f"{sampleset_map[sampleset]}:{sampleset_map[additions]}-{':'.join(hitsounds) if hitsounds else 'none'}"
+                         # Convert EOS control events to string
+                         elif event.type == EventType.CONTROL and event.value in [self.tokenizer.eos_id] + list(self.tokenizer.context_eos.values()):
+-                            return f"End of sequence"
++                            return "End of sequence"
+                         else:
+                             return event
+ 
+@@ -2365,6 +2454,8 @@ class Processor(object):
+             "tailRepairSeeds": [],
+             "fullLengthRetryAvoided": False,
+             "tailRepairTerminalReason": None,
++            "encoderCache": None,
++            "encoderCacheHit": None,
+         }
+ 
+     def _record_tail_repair_start(
+diff --git a/osuT5/osuT5/inference/resident_runtime.py b/osuT5/osuT5/inference/resident_runtime.py
+new file mode 100644
+index 0000000..31d3f76
+--- /dev/null
++++ b/osuT5/osuT5/inference/resident_runtime.py
+@@ -0,0 +1,402 @@
++"""Fail-closed offline identity and process-lifetime model registry for resident inference."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import multiprocessing
++import os
++import random
++from collections.abc import Callable
++from dataclasses import asdict, dataclass, is_dataclass
++from enum import Enum
++from pathlib import Path, PurePosixPath
++from typing import Any, TypeVar
++
++import numpy as np
++import torch
++
++from .encoder_cache import ExactEncoderCache
++
++_MANIFEST_NAME = "model-manifest-v1.json"
++_MAX_MANIFEST_FILES = 100_000
++_HEX = frozenset("0123456789abcdef")
++_Bundle = TypeVar("_Bundle")
++_SONG_ENCODER_CACHE_MAX_ENTRIES = 8
++_SONG_ENCODER_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
++
++
++class ModelManifestError(ValueError):
++    """The local model snapshot is missing, floating, corrupt, or incompletely bound."""
++
++
++def _require_plain_sha(value: object, *, length: int, name: str) -> str:
++    if type(value) is not str or len(value) != length or any(c not in _HEX for c in value):
++        raise ModelManifestError(f"{name} must be an exact {length}-character lowercase hex SHA")
++    return value
++
++
++def _sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++    value: dict[str, Any] = {}
++    for key, item in pairs:
++        if key in value:
++            raise ModelManifestError(f"duplicate JSON key in model manifest: {key}")
++        value[key] = item
++    return value
++
++
++def _safe_relative_path(value: object) -> PurePosixPath:
++    if type(value) is not str or not value or "\\" in value:
++        raise ModelManifestError("manifest file path must be a non-empty POSIX relative path")
++    relative = PurePosixPath(value)
++    if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
++        raise ModelManifestError(f"unsafe manifest path: {value!r}")
++    if relative.as_posix() == _MANIFEST_NAME:
++        raise ModelManifestError("the manifest must not list itself")
++    return relative
++
++
++@dataclass(frozen=True, slots=True)
++class VerifiedModelManifest:
++    root: Path
++    revision: str
++    upstream_commit: str
++    patch_set_id: str
++    manifest_sha256: str
++    file_count: int
++    total_bytes: int
++
++
++def verify_model_manifest(
++    model_root: Path,
++    *,
++    expected_revision: str,
++    expected_upstream_commit: str,
++    expected_patch_set_id: str,
++) -> VerifiedModelManifest:
++    """Verify identity plus the exact regular-file set beneath an absolute local snapshot."""
++
++    if not isinstance(model_root, Path) or not model_root.is_absolute():
++        raise ModelManifestError("model_root must be an absolute Path")
++    if model_root.is_symlink() or not model_root.is_dir():
++        raise ModelManifestError("model_root must be an existing non-symlink directory")
++    root = model_root.resolve(strict=True)
++    revision = _require_plain_sha(expected_revision, length=40, name="expected_revision")
++    upstream_commit = _require_plain_sha(
++        expected_upstream_commit,
++        length=40,
++        name="expected_upstream_commit",
++    )
++    if type(expected_patch_set_id) is not str or not expected_patch_set_id:
++        raise ModelManifestError("expected_patch_set_id must be a non-empty plain string")
++
++    manifest_path = root / _MANIFEST_NAME
++    if manifest_path.is_symlink() or not manifest_path.is_file():
++        raise ModelManifestError(f"missing regular {_MANIFEST_NAME}")
++    manifest_bytes = manifest_path.read_bytes()
++    try:
++        manifest = json.loads(
++            manifest_bytes,
++            object_pairs_hook=_reject_duplicate_json_keys,
++        )
++    except ModelManifestError:
++        raise
++    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError) as error:
++        raise ModelManifestError("model manifest is not bounded valid JSON") from error
++    if type(manifest) is not dict or set(manifest) != {
++        "version",
++        "revision",
++        "upstreamCommit",
++        "patchSetId",
++        "files",
++    }:
++        raise ModelManifestError("model manifest has an unsupported schema")
++    if type(manifest["version"]) is not int or manifest["version"] != 1:
++        raise ModelManifestError("model manifest version must be 1")
++    if manifest["revision"] != revision:
++        raise ModelManifestError("model manifest revision does not match the pinned revision")
++    if manifest["upstreamCommit"] != upstream_commit:
++        raise ModelManifestError("model manifest upstream commit does not match")
++    if manifest["patchSetId"] != expected_patch_set_id:
++        raise ModelManifestError("model manifest patch set does not match")
++
++    files = manifest["files"]
++    if type(files) is not list or not files or len(files) > _MAX_MANIFEST_FILES:
++        raise ModelManifestError("model manifest files must be a bounded non-empty list")
++    expected_paths: set[str] = set()
++    total_bytes = 0
++    for entry in files:
++        if type(entry) is not dict or set(entry) != {"path", "size", "sha256"}:
++            raise ModelManifestError("model manifest file entry has an unsupported schema")
++        relative = _safe_relative_path(entry["path"])
++        relative_text = relative.as_posix()
++        if relative_text in expected_paths:
++            raise ModelManifestError(f"duplicate manifest path: {relative_text}")
++        expected_paths.add(relative_text)
++        size = entry["size"]
++        if type(size) is not int or size < 0:
++            raise ModelManifestError(f"invalid size for {relative_text}")
++        expected_sha = _require_plain_sha(
++            entry["sha256"],
++            length=64,
++            name=f"sha256 for {relative_text}",
++        )
++        path = root.joinpath(*relative.parts)
++        if path.is_symlink() or not path.is_file():
++            raise ModelManifestError(f"missing regular model file: {relative_text}")
++        resolved = path.resolve(strict=True)
++        if not resolved.is_relative_to(root):
++            raise ModelManifestError(f"model file escapes root: {relative_text}")
++        actual_size = path.stat().st_size
++        if actual_size != size:
++            raise ModelManifestError(f"size mismatch for {relative_text}")
++        if _sha256_file(path) != expected_sha:
++            raise ModelManifestError(f"SHA-256 mismatch for {relative_text}")
++        total_bytes += actual_size
++
++    actual_paths: set[str] = set()
++    for path in root.rglob("*"):
++        if path.is_symlink():
++            raise ModelManifestError(f"symlinks are not allowed in model root: {path}")
++        if path.is_file() and path != manifest_path:
++            actual_paths.add(path.relative_to(root).as_posix())
++    if actual_paths != expected_paths:
++        missing = sorted(expected_paths - actual_paths)
++        extra = sorted(actual_paths - expected_paths)
++        raise ModelManifestError(f"manifest file set mismatch: missing={missing}, extra={extra}")
++
++    return VerifiedModelManifest(
++        root=root,
++        revision=revision,
++        upstream_commit=upstream_commit,
++        patch_set_id=expected_patch_set_id,
++        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
++        file_count=len(expected_paths),
++        total_bytes=total_bytes,
++    )
++
++
++def _canonical_value(value: Any) -> Any:
++    if value is None or type(value) in (str, bool, int):
++        return value
++    if type(value) is float:
++        if not math.isfinite(value):
++            raise ValueError("model-load identity cannot contain non-finite floats")
++        return {"floatHex": value.hex()}
++    if isinstance(value, Path):
++        return {"path": value.as_posix()}
++    if isinstance(value, Enum):
++        return {"enum": f"{type(value).__module__}.{type(value).__qualname__}", "value": value.value}
++    if is_dataclass(value):
++        return _canonical_value(asdict(value))
++    if type(value) in (list, tuple):
++        return [_canonical_value(item) for item in value]
++    if type(value) is dict:
++        if any(type(key) is not str for key in value):
++            raise TypeError("model-load identity mappings require plain string keys")
++        return {key: _canonical_value(value[key]) for key in sorted(value)}
++    raise TypeError(f"unsupported model-load identity value: {type(value).__name__}")
++
++
++@dataclass(frozen=True, slots=True)
++class ModelKey:
++    manifest_sha256: str
++    config_sha256: str
++    loads_separate_timing_model: bool
++
++
++class ResidentInferenceRuntime:
++    """Process-lifetime exact-key registry; all song/request state remains outside it."""
++
++    def __init__(
++        self,
++        *,
++        model_root: Path,
++        revision: str,
++        upstream_commit: str,
++        patch_set_id: str,
++    ) -> None:
++        os.environ["HF_HUB_OFFLINE"] = "1"
++        os.environ["TRANSFORMERS_OFFLINE"] = "1"
++        self.manifest = verify_model_manifest(
++            model_root,
++            expected_revision=revision,
++            expected_upstream_commit=upstream_commit,
++            expected_patch_set_id=patch_set_id,
++        )
++        multiprocessing.set_start_method("spawn", force=True)
++        torch.set_grad_enabled(False)
++        torch.set_float32_matmul_precision("high")
++        self._registry: dict[ModelKey, Any] = {}
++        self._registry_load_count = 0
++        self._song_encoder_cache: ExactEncoderCache | None = None
++        self._song_identity: tuple[str, str] | None = None
++
++    @property
++    def registry_load_count(self) -> int:
++        return self._registry_load_count
++
++    def _require_local_path(self, value: object, *, name: str, allow_none: bool) -> str | None:
++        if value is None and allow_none:
++            return None
++        if type(value) is not str or not value:
++            raise ValueError(f"{name} must be a non-empty absolute local path")
++        path = Path(value)
++        if not path.is_absolute():
++            raise ValueError(f"{name} must be absolute")
++        resolved = path.resolve(strict=True)
++        if not resolved.is_relative_to(self.manifest.root):
++            raise ValueError(f"{name} must resolve beneath the verified model root")
++        return resolved.relative_to(self.manifest.root).as_posix() or "."
++
++    def _model_key(
++        self,
++        args: Any,
++        *,
++        loads_separate_timing_model: bool,
++    ) -> ModelKey:
++        if type(loads_separate_timing_model) is not bool:
++            raise TypeError("loads_separate_timing_model must be an exact bool")
++        model_path = self._require_local_path(args.model_path, name="model_path", allow_none=False)
++        lora_path = self._require_local_path(
++            getattr(args, "lora_path", None),
++            name="lora_path",
++            allow_none=True,
++        )
++        identity = {
++            "modelPath": model_path,
++            "loraPath": lora_path,
++            "revision": self.manifest.revision,
++            "upstreamCommit": self.manifest.upstream_commit,
++            "patchSetId": self.manifest.patch_set_id,
++            "precision": getattr(args, "precision", None),
++            "device": getattr(args, "device", None),
++            "attnImplementation": getattr(args, "attn_implementation", None),
++            "gamemode": getattr(args, "gamemode", None),
++            "autoSelectGamemodeModel": getattr(args, "auto_select_gamemode_model", None),
++            "fastDecoderLoop": getattr(args, "fast_decoder_loop", None),
++            "generatePositions": getattr(args, "generate_positions", None),
++        }
++        encoded = json.dumps(
++            _canonical_value(identity),
++            ensure_ascii=True,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        return ModelKey(
++            manifest_sha256=self.manifest.manifest_sha256,
++            config_sha256=hashlib.sha256(encoded).hexdigest(),
++            loads_separate_timing_model=loads_separate_timing_model,
++        )
++
++    def prepare_invocation(self, args: Any) -> None:
++        if getattr(args, "use_server", None) is not False:
++            raise ValueError("resident inference requires use_server=false")
++        if getattr(args, "mania_hold_state_mode", None) != "incremental":
++            raise ValueError("resident inference requires mania_hold_state_mode=incremental")
++        if getattr(args, "parallel", None) is not False:
++            raise ValueError("resident inference requires parallel=false")
++        if getattr(args, "generate_positions", False) is not False:
++            raise ValueError(
++                "resident inference requires generate_positions=false until diffusion "
++                "weights have a separate verified registry identity"
++            )
++        seed = getattr(args, "seed", None)
++        if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
++            raise ValueError("resident invocation seed must be an exact uint32")
++        random.seed(seed)
++        np.random.seed(seed)
++        torch.manual_seed(seed)
++        if torch.cuda.is_available():
++            torch.cuda.manual_seed_all(seed)
++
++    def begin_song(self, record: dict[str, object]) -> None:
++        if self._song_encoder_cache is not None:
++            raise RuntimeError("resident runtime already has an active song")
++        if type(record) is not dict:
++            raise TypeError("song identity must be a dict")
++        audio_sha256 = _require_plain_sha(
++            record.get("audioSha256"), length=64, name="audioSha256"
++        )
++        config_digest = _require_plain_sha(
++            record.get("configDigest"), length=64, name="configDigest"
++        )
++        self._song_identity = (audio_sha256, config_digest)
++        self._song_encoder_cache = ExactEncoderCache(
++            max_entries=_SONG_ENCODER_CACHE_MAX_ENTRIES,
++            max_bytes=_SONG_ENCODER_CACHE_MAX_BYTES,
++        )
++
++    def end_song(self) -> None:
++        cache = self._song_encoder_cache
++        if cache is None:
++            raise RuntimeError("resident runtime has no active song")
++        cache.clear()
++        self._song_encoder_cache = None
++        self._song_identity = None
++
++    def encoder_cache_context(
++        self,
++        args: Any,
++        *,
++        loads_separate_timing_model: bool,
++    ) -> tuple[ExactEncoderCache, str, str]:
++        cache = self._song_encoder_cache
++        if cache is None:
++            raise RuntimeError("encoder cache requires an active song")
++        key = self._model_key(
++            args,
++            loads_separate_timing_model=loads_separate_timing_model,
++        )
++        return cache, key.manifest_sha256, key.config_sha256
++
++    def validate_invocation_audio(self, path: Path) -> None:
++        if not isinstance(path, Path) or not path.is_absolute() or not path.is_file():
++            raise ValueError("invocation audio must be an existing absolute file")
++        if self._song_identity is None:
++            raise RuntimeError("invocation audio requires an active song")
++        if _sha256_file(path) != self._song_identity[0]:
++            raise ValueError("invocation audio does not match the active song")
++
++    def model_bundle(
++        self,
++        args: Any,
++        loader: Callable[[Any], _Bundle],
++        *,
++        loads_separate_timing_model: bool,
++    ) -> _Bundle:
++        key = self._model_key(
++            args,
++            loads_separate_timing_model=loads_separate_timing_model,
++        )
++        existing = self._registry.get(key)
++        if existing is not None:
++            return existing
++        if not loads_separate_timing_model:
++            # A bundle that already contains the exact same main model plus a
++            # separate timing model is a safe superset for a later MAP-only
++            # request. The reverse direction is intentionally not allowed.
++            superset_key = ModelKey(
++                manifest_sha256=key.manifest_sha256,
++                config_sha256=key.config_sha256,
++                loads_separate_timing_model=True,
++            )
++            superset = self._registry.get(superset_key)
++            if superset is not None:
++                return superset
++        loaded = loader(args)
++        if loaded is None:
++            raise RuntimeError("model loader returned no bundle")
++        self._registry[key] = loaded
++        self._registry_load_count += 1
++        return loaded
+diff --git a/osuT5/osuT5/inference/resident_worker.py b/osuT5/osuT5/inference/resident_worker.py
+new file mode 100644
+index 0000000..ef3478d
+--- /dev/null
++++ b/osuT5/osuT5/inference/resident_worker.py
+@@ -0,0 +1,573 @@
++"""Resident child protocol state and hash-bound terminal marker ownership."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import sys
++import traceback
++import uuid
++from collections.abc import Callable
++from dataclasses import dataclass
++from io import BufferedReader, BufferedWriter
++from pathlib import Path, PurePosixPath
++
++from .tail_repair import ManiaTailRepairExhausted, format_mania_tail_terminal_line
++
++TERMINAL_MARKER_NAME = "resident-terminal-v1.json"
++_MAX_TERMINAL_LINE_BYTES = 1_048_576
++_HEX = frozenset("0123456789abcdef")
++
++
++def _digest_json(value: dict[str, object]) -> str:
++    payload = json.dumps(
++        value,
++        ensure_ascii=True,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8")
++    return hashlib.sha256(payload).hexdigest()
++
++
++def _is_digest(value: object) -> bool:
++    return type(value) is str and len(value) == 64 and all(c in _HEX for c in value)
++
++
++def _sha256_path(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _json_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
++    result: dict[str, object] = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError(f"duplicate JSON key: {key}")
++        result[key] = value
++    return result
++
++
++@dataclass(frozen=True, slots=True)
++class ResidentExecutionResult:
++    returncode: int
++    stdout: str
++    stderr: str
++
++    def __post_init__(self) -> None:
++        if type(self.returncode) is not int:
++            raise TypeError("returncode must be a plain int")
++        if type(self.stdout) is not str or type(self.stderr) is not str:
++            raise TypeError("stdout and stderr must be plain strings")
++
++
++ExecuteResidentRequest = Callable[[list[str], Path], ResidentExecutionResult]
++
++
++class ResidentWorker:
++    """Synchronous one-owner worker; the model registry lives in the injected executor."""
++
++    def __init__(
++        self,
++        *,
++        job_root: Path,
++        execute: ExecuteResidentRequest,
++        begin_song: Callable[[dict[str, object]], None] | None = None,
++        end_song: Callable[[], None] | None = None,
++    ) -> None:
++        if not isinstance(job_root, Path) or not job_root.is_absolute():
++            raise ValueError("job_root must be absolute")
++        if job_root.is_symlink() or not job_root.is_dir():
++            raise ValueError("job_root must be an existing non-symlink directory")
++        self._job_root = job_root.resolve(strict=True)
++        self._execute = execute
++        self._begin_song_hook = begin_song
++        self._end_song_hook = end_song
++        self._song_hash: str | None = None
++
++    @staticmethod
++    def ready_record() -> dict[str, object]:
++        return {"version": 1, "type": "READY"}
++
++    @staticmethod
++    def _reject(request: dict[str, object], *, code: str, reason: str) -> list[dict[str, object]]:
++        invocation_id = request.get("invocationId")
++        request_hash = request.get("requestHash")
++        if not _is_digest(invocation_id):
++            invocation_id = "0" * 64
++        if not _is_digest(request_hash):
++            request_hash = "0" * 64
++        return [
++            {
++                "version": 1,
++                "type": "REJECTED",
++                "code": code,
++                "invocationId": invocation_id,
++                "requestHash": request_hash,
++                "reason": reason,
++            }
++        ]
++
++    def _begin_song(self, record: dict[str, object]) -> list[dict[str, object]]:
++        if set(record) != {
++            "version",
++            "type",
++            "songHash",
++            "songId",
++            "audioSha256",
++            "configDigest",
++        }:
++            raise ValueError("BEGIN_SONG schema is invalid")
++        if self._song_hash is not None:
++            raise ValueError("a song is already active")
++        if (
++            type(record["songId"]) is not str
++            or not record["songId"]
++            or not _is_digest(record["audioSha256"])
++            or not _is_digest(record["configDigest"])
++        ):
++            raise ValueError("BEGIN_SONG identity is invalid")
++        song_body = {
++            "audioSha256": record["audioSha256"],
++            "configDigest": record["configDigest"],
++            "songId": record["songId"],
++        }
++        song_hash = _digest_json(song_body)
++        if record["songHash"] != song_hash:
++            raise ValueError("BEGIN_SONG hash does not match its identity")
++        if self._begin_song_hook is not None:
++            self._begin_song_hook(dict(record))
++        self._song_hash = song_hash
++        return [{"version": 1, "type": "SONG_STARTED", "songHash": song_hash}]
++
++    def _end_song(self, record: dict[str, object]) -> list[dict[str, object]]:
++        if set(record) != {"version", "type", "songHash"}:
++            raise ValueError("END_SONG schema is invalid")
++        if self._song_hash is None or record["songHash"] != self._song_hash:
++            raise ValueError("END_SONG does not match the active song")
++        song_hash = self._song_hash
++        if self._end_song_hook is not None:
++            self._end_song_hook()
++        self._song_hash = None
++        return [{"version": 1, "type": "SONG_ENDED", "songHash": song_hash}]
++
++    def _resolve_workdir(self, value: object) -> Path:
++        if type(value) is not str or not value or "\\" in value:
++            raise ValueError("workdir must be a non-empty POSIX relative path")
++        relative = PurePosixPath(value)
++        if relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
++            raise ValueError("workdir is unsafe")
++        path = self._job_root.joinpath(*relative.parts)
++        if path.is_symlink():
++            raise ValueError("workdir must not be a symlink")
++        resolved = path.resolve(strict=False)
++        if not resolved.is_relative_to(self._job_root) or resolved == self._job_root:
++            raise ValueError("workdir escapes job_root")
++        return resolved
++
++    @staticmethod
++    def _read_marker(marker: Path) -> dict[str, object] | None:
++        try:
++            payload = marker.read_bytes()
++            if len(payload) > _MAX_TERMINAL_LINE_BYTES:
++                return None
++            record = json.loads(payload, object_pairs_hook=_json_without_duplicate_keys)
++        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError):
++            return None
++        if type(record) is not dict or set(record) != {
++            "version",
++            "type",
++            "invocationId",
++            "requestHash",
++            "returncode",
++            "stdout",
++            "stderr",
++            "replayed",
++            "artifacts",
++        }:
++            return None
++        if (
++            type(record["version"]) is not int
++            or record["version"] != 1
++            or record["type"] not in ("SUCCESS", "FAILURE")
++            or not _is_digest(record["invocationId"])
++            or not _is_digest(record["requestHash"])
++            or type(record["returncode"]) is not int
++            or type(record["stdout"]) is not str
++            or type(record["stderr"]) is not str
++            or record["replayed"] is not False
++            or type(record["artifacts"]) is not list
++        ):
++            return None
++        if (record["type"] == "SUCCESS") != (record["returncode"] == 0):
++            return None
++        return record
++
++    @staticmethod
++    def _collect_artifacts(workdir: Path) -> list[dict[str, object]]:
++        artifacts: list[dict[str, object]] = []
++        for path in sorted(workdir.rglob("*"), key=lambda item: item.as_posix()):
++            if path.is_symlink():
++                raise ValueError(f"artifact tree contains symlink: {path}")
++            if not path.is_file():
++                continue
++            relative = path.relative_to(workdir).as_posix()
++            if relative == TERMINAL_MARKER_NAME or (
++                relative.startswith(f".{TERMINAL_MARKER_NAME}.") and relative.endswith(".tmp")
++            ):
++                continue
++            artifacts.append(
++                {
++                    "relativePath": relative,
++                    "size": path.stat().st_size,
++                    "sha256": _sha256_path(path),
++                }
++            )
++        return artifacts
++
++    @classmethod
++    def _artifacts_match(cls, workdir: Path, expected: object) -> bool:
++        if type(expected) is not list:
++            return False
++        try:
++            actual = cls._collect_artifacts(workdir)
++        except (OSError, ValueError):
++            return False
++        return actual == expected
++
++    @staticmethod
++    def _write_marker(marker: Path, terminal: dict[str, object]) -> None:
++        payload = json.dumps(
++            terminal,
++            ensure_ascii=True,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        if len(payload) > _MAX_TERMINAL_LINE_BYTES:
++            raise ValueError("terminal marker exceeds 1 MiB")
++        temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
++        try:
++            with temporary.open("xb") as stream:
++                stream.write(payload)
++                stream.flush()
++                os.fsync(stream.fileno())
++            os.replace(temporary, marker)
++            if os.name == "posix":
++                directory_fd = os.open(marker.parent, os.O_RDONLY)
++                try:
++                    os.fsync(directory_fd)
++                finally:
++                    os.close(directory_fd)
++        finally:
++            if temporary.exists():
++                temporary.unlink()
++
++    @staticmethod
++    def _terminal(
++        request: dict[str, object],
++        result: ResidentExecutionResult,
++        artifacts: list[dict[str, object]],
++    ) -> dict[str, object]:
++        terminal = {
++            "version": 1,
++            "type": "SUCCESS" if result.returncode == 0 else "FAILURE",
++            "invocationId": request["invocationId"],
++            "requestHash": request["requestHash"],
++            "returncode": result.returncode,
++            "stdout": result.stdout,
++            "stderr": result.stderr,
++            "replayed": False,
++            "artifacts": artifacts,
++        }
++        payload = json.dumps(
++            terminal,
++            ensure_ascii=True,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        ).encode("utf-8")
++        if len(payload) > _MAX_TERMINAL_LINE_BYTES:
++            terminal.update(
++                {
++                    "type": "FAILURE",
++                    "returncode": 1,
++                    "stdout": "",
++                    "stderr": "resident terminal payload exceeded 1 MiB",
++                }
++            )
++        return terminal
++
++    def _invoke(self, request: dict[str, object]) -> list[dict[str, object]]:
++        required = {
++            "version",
++            "type",
++            "invocationId",
++            "requestHash",
++            "argv",
++            "songHash",
++            "workdir",
++        }
++        if set(request) != required or self._song_hash is None:
++            return self._reject(request, code="INVALID_REQUEST", reason="invalid schema or no song")
++        argv = request["argv"]
++        if (
++            type(argv) is not list
++            or not argv
++            or any(type(part) is not str or not part for part in argv)
++            or request["songHash"] != self._song_hash
++        ):
++            return self._reject(request, code="INVALID_REQUEST", reason="invalid argv or song")
++        body = {
++            "argv": argv,
++            "songHash": request["songHash"],
++            "workdir": request["workdir"],
++        }
++        request_hash = _digest_json(body)
++        invocation_id = hashlib.sha256(
++            f"chart-worker-resident-invocation-v1:{request_hash}".encode("ascii")
++        ).hexdigest()
++        if request["requestHash"] != request_hash or request["invocationId"] != invocation_id:
++            return self._reject(request, code="INVALID_REQUEST", reason="request identity mismatch")
++        try:
++            workdir = self._resolve_workdir(request["workdir"])
++        except ValueError as error:
++            return self._reject(request, code="INVALID_REQUEST", reason=str(error))
++        marker = workdir / TERMINAL_MARKER_NAME
++        if workdir.exists():
++            if not workdir.is_dir() or workdir.is_symlink():
++                return self._reject(request, code="UNKNOWN_COMPLETION", reason="unsafe workdir")
++            entries = list(workdir.iterdir())
++            if marker.exists():
++                existing = self._read_marker(marker)
++                if existing is None:
++                    return self._reject(request, code="UNKNOWN_COMPLETION", reason="corrupt marker")
++                if not self._artifacts_match(workdir, existing["artifacts"]):
++                    return self._reject(
++                        request,
++                        code="UNKNOWN_COMPLETION",
++                        reason="terminal artifact set or hash does not match",
++                    )
++                if (
++                    existing["invocationId"] != invocation_id
++                    or existing["requestHash"] != request_hash
++                ):
++                    return self._reject(
++                        request,
++                        code="INVOCATION_CONFLICT",
++                        reason="workdir belongs to a different invocation",
++                    )
++                replayed = dict(existing)
++                replayed["replayed"] = True
++                return [replayed]
++            if entries:
++                return self._reject(
++                    request,
++                    code="UNKNOWN_COMPLETION",
++                    reason="nonempty workdir has no terminal marker",
++                )
++        else:
++            workdir.mkdir(parents=True)
++
++        accepted = {
++            "version": 1,
++            "type": "ACCEPTED",
++            "invocationId": invocation_id,
++            "requestHash": request_hash,
++        }
++        try:
++            result = self._execute(list(argv), workdir)
++        except ManiaTailRepairExhausted as error:
++            result = ResidentExecutionResult(
++                returncode=1,
++                stdout=format_mania_tail_terminal_line(error),
++                stderr="",
++            )
++        except Exception as error:  # noqa: BLE001 - inference failures become definitive terminals
++            traceback.print_exc(file=sys.stderr)
++            result = ResidentExecutionResult(
++                returncode=1,
++                stdout="",
++                stderr=f"{type(error).__name__}: {error}"[-2000:],
++            )
++        artifacts = self._collect_artifacts(workdir)
++        if result.returncode == 0 and not any(
++            artifact["relativePath"].lower().endswith(".osu") for artifact in artifacts
++        ):
++            result = ResidentExecutionResult(
++                returncode=1,
++                stdout="",
++                stderr="resident success produced no .osu artifact",
++            )
++        terminal = self._terminal(request, result, artifacts)
++        self._write_marker(marker, terminal)
++        return [accepted, terminal]
++
++    def handle(self, record: dict[str, object]) -> list[dict[str, object]]:
++        if type(record) is not dict or record.get("version") != 1:
++            raise ValueError("resident record must be a version 1 object")
++        record_type = record.get("type")
++        if record_type == "BEGIN_SONG":
++            return self._begin_song(record)
++        if record_type == "END_SONG":
++            return self._end_song(record)
++        if record_type == "INVOKE":
++            return self._invoke(record)
++        if record_type == "SHUTDOWN" and set(record) == {"version", "type"}:
++            return [{"version": 1, "type": "SHUTDOWN_COMPLETE"}]
++        raise ValueError(f"unsupported resident record type: {record_type!r}")
++
++
++def _emit_record(stream: BufferedWriter, record: dict[str, object]) -> None:
++    payload = json.dumps(
++        record,
++        ensure_ascii=True,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("utf-8") + b"\n"
++    if len(payload) > _MAX_TERMINAL_LINE_BYTES:
++        raise ValueError("resident protocol record exceeds 1 MiB")
++    stream.write(payload)
++    stream.flush()
++
++
++def serve_resident_worker(
++    worker: ResidentWorker,
++    *,
++    input_stream: BufferedReader,
++    output_stream: BufferedWriter,
++) -> int:
++    """Serve strict bounded NDJSON until clean SHUTDOWN or input EOF."""
++
++    _emit_record(output_stream, worker.ready_record())
++    while True:
++        line = input_stream.readline(_MAX_TERMINAL_LINE_BYTES + 1)
++        if line == b"":
++            return 0
++        if len(line) > _MAX_TERMINAL_LINE_BYTES or not line.endswith(b"\n"):
++            return 2
++        try:
++            record = json.loads(
++                line.decode("utf-8", errors="strict"),
++                object_pairs_hook=_json_without_duplicate_keys,
++            )
++            if type(record) is not dict:
++                return 2
++            responses = worker.handle(record)
++        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
++            return 2
++        for response in responses:
++            _emit_record(output_stream, response)
++        if record.get("type") == "SHUTDOWN":
++            return 0
++
++
++def _parse_cli() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Mapperatorinator resident inference worker")
++    parser.add_argument("--home", type=Path, required=True)
++    parser.add_argument("--job-root", type=Path, required=True)
++    parser.add_argument("--model-root", type=Path, required=True)
++    parser.add_argument("--model-revision", required=True)
++    parser.add_argument("--upstream-commit", required=True)
++    parser.add_argument("--patch-set-id", required=True)
++    return parser.parse_args()
++
++
++def _validate_resolved_output_path(resolved_args: object, workdir: Path) -> Path:
++    """Bind a composed request to the already accepted invocation directory."""
++    raw_output_path = getattr(resolved_args, "output_path", None)
++    if type(raw_output_path) not in {str, Path}:
++        raise ValueError("resolved output_path must identify the accepted workdir")
++    output_path = Path(raw_output_path)
++    if not output_path.is_absolute():
++        raise ValueError("resolved output_path must identify the accepted workdir")
++    try:
++        resolved_output = output_path.resolve(strict=True)
++        resolved_workdir = workdir.resolve(strict=True)
++    except OSError as error:
++        raise ValueError("resolved output_path must identify the accepted workdir") from error
++    if resolved_output != resolved_workdir:
++        raise ValueError("resolved output_path does not match the accepted workdir")
++    return resolved_output
++
++
++def _validate_resolved_audio_path(resolved_args: object, job_root: Path) -> Path:
++    """Require the composed request audio to be an immutable job-root asset."""
++    raw_audio_path = getattr(resolved_args, "audio_path", None)
++    if type(raw_audio_path) is not str:
++        raise ValueError("resolved audio_path must be a file beneath the accepted job root")
++    audio_path = Path(raw_audio_path)
++    if not audio_path.is_absolute() or audio_path.is_symlink() or not audio_path.is_file():
++        raise ValueError("resolved audio_path must be a file beneath the accepted job root")
++    resolved_audio = audio_path.resolve(strict=True)
++    resolved_job_root = job_root.resolve(strict=True)
++    if not resolved_audio.is_relative_to(resolved_job_root):
++        raise ValueError("resolved audio_path must be a file beneath the accepted job root")
++    return resolved_audio
++
++
++def main() -> int:
++    args = _parse_cli()
++    home = args.home.resolve(strict=True)
++    job_root = args.job_root.resolve(strict=True)
++    protocol_input = sys.stdin.buffer
++    protocol_output = sys.stdout.buffer
++    # No imported inference code may write to protocol stdout.
++    sys.stdout = sys.stderr
++
++    from .resident_runtime import ResidentInferenceRuntime
++
++    runtime = ResidentInferenceRuntime(
++        model_root=args.model_root.resolve(strict=True),
++        revision=args.model_revision,
++        upstream_commit=args.upstream_commit,
++        patch_set_id=args.patch_set_id,
++    )
++    # Offline variables are now forced before importing inference/Transformers/HF helpers.
++    import inference
++    from hydra import compose, initialize_config_dir
++    from omegaconf import OmegaConf
++
++    config_dir = (home / "configs" / "inference").resolve(strict=True)
++
++    def execute(argv: list[str], workdir: Path) -> ResidentExecutionResult:
++        if (
++            len(argv) < 4
++            or Path(argv[1]).name != "inference.py"
++            or argv[2] != "-cn"
++            or type(argv[3]) is not str
++            or not argv[3]
++        ):
++            raise ValueError("resident argv must preserve the inference.py -cn contract")
++        with initialize_config_dir(config_dir=str(config_dir), version_base="1.1"):
++            config = compose(config_name=argv[3], overrides=argv[4:])
++        resolved_args = OmegaConf.to_object(config)
++        _validate_resolved_output_path(resolved_args, workdir)
++        resolved_audio = _validate_resolved_audio_path(resolved_args, job_root)
++        runtime.validate_invocation_audio(resolved_audio)
++        inference.execute_inference(resolved_args, runtime=runtime)
++        runtime.validate_invocation_audio(resolved_audio)
++        _validate_resolved_output_path(resolved_args, workdir)
++        return ResidentExecutionResult(returncode=0, stdout="", stderr="")
++
++    worker = ResidentWorker(
++        job_root=job_root,
++        execute=execute,
++        begin_song=runtime.begin_song,
++        end_song=runtime.end_song,
++    )
++    return serve_resident_worker(
++        worker,
++        input_stream=protocol_input,
++        output_stream=protocol_output,
++    )
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/osuT5/osuT5/inference/super_timing_generator.py b/osuT5/osuT5/inference/super_timing_generator.py
+index 3f013aa..887398b 100644
+--- a/osuT5/osuT5/inference/super_timing_generator.py
++++ b/osuT5/osuT5/inference/super_timing_generator.py
+@@ -99,7 +99,7 @@ class SuperTimingGenerator:
+             last_measure_time = None
+             measure_counter = None
+             for group in groups:
+-                time = group.time - audio_offset
++                time = int(round(group.time - audio_offset))
+                 if time < 0 or time >= num_miliseconds:
+                     continue
+                 if group.event_type not in BEAT_TYPES:
+diff --git a/osuT5/osuT5/utils/model_utils.py b/osuT5/osuT5/utils/model_utils.py
+index 62c8ebf..c120d1c 100644
+--- a/osuT5/osuT5/utils/model_utils.py
++++ b/osuT5/osuT5/utils/model_utils.py
+@@ -342,6 +342,7 @@ def load_model_loaders(
+         gamemode=gamemode,
+         auto_select_gamemode_model=auto_select_gamemode_model,
+     )
++    ckpt_subfolder = _normalize_ckpt_subfolder(ckpt_subfolder)
+ 
+     requested_source = _format_model_source(requested_ckpt_path)
+     resolved_source = _format_model_source(ckpt_path, ckpt_subfolder)
+diff --git a/tests/test_encoder_cache.py b/tests/test_encoder_cache.py
+new file mode 100644
+index 0000000..ec49841
+--- /dev/null
++++ b/tests/test_encoder_cache.py
+@@ -0,0 +1,211 @@
++from __future__ import annotations
++
++from dataclasses import replace
++from types import SimpleNamespace
++
++import pytest
++import torch
++from osuT5.osuT5.inference import processor as processor_module
++from osuT5.osuT5.inference.encoder_cache import (
++    EncoderCacheKey,
++    ExactEncoderCache,
++    build_encoder_cache_key,
++)
++from osuT5.osuT5.inference.processor import Processor
++
++
++def _key(**overrides) -> EncoderCacheKey:
++    values = {
++        "model_manifest_sha256": "a" * 64,
++        "model_config_sha256": "b" * 64,
++        "audio_sha256": "c" * 64,
++        "reference_sha256": "d" * 64,
++        "preprocessing_sha256": "e" * 64,
++        "frames_sha256": "f" * 64,
++        "conditioning_sha256": "1" * 64,
++        "song_positions_sha256": "2" * 64,
++        "precision": "fp16",
++        "encoder_dtype": "torch.float32",
++    }
++    return EncoderCacheKey(**(values | overrides))
++
++
++@pytest.mark.parametrize(
++    "field",
++    [
++        "model_manifest_sha256",
++        "model_config_sha256",
++        "audio_sha256",
++        "reference_sha256",
++        "preprocessing_sha256",
++        "frames_sha256",
++        "conditioning_sha256",
++        "song_positions_sha256",
++        "precision",
++        "encoder_dtype",
++    ],
++)
++def test_exact_key_changes_are_cache_misses(field: str):
++    cache = ExactEncoderCache(max_entries=4, max_bytes=1024)
++    original = _key()
++    cache.put(original, torch.arange(8, dtype=torch.float32))
++    value = "3" * 64 if field.endswith("sha256") else "different"
++
++    assert cache.get(replace(original, **{field: value})) is None
++
++
++def test_cache_returns_independent_cpu_values_and_tracks_hits():
++    cache = ExactEncoderCache(max_entries=4, max_bytes=1024)
++    key = _key()
++    source = torch.arange(8, dtype=torch.float32)
++
++    assert cache.get(key) is None
++    assert cache.put(key, source) is True
++    source[0] = 99
++    first = cache.get(key)
++    assert first is not None
++    first[1] = 88
++    second = cache.get(key)
++
++    assert second is not None
++    assert second.tolist() == list(map(float, range(8)))
++    assert second.device.type == "cpu"
++    assert second.is_contiguous()
++    assert cache.stats().to_dict() == {
++        "hits": 2,
++        "misses": 1,
++        "puts": 1,
++        "evictions": 0,
++        "oversizeBypasses": 0,
++        "entries": 1,
++        "bytes": 32,
++    }
++
++
++def test_lru_and_byte_limits_are_enforced_and_oversize_is_not_published():
++    cache = ExactEncoderCache(max_entries=2, max_bytes=64)
++    first, second, third = _key(), _key(audio_sha256="3" * 64), _key(audio_sha256="4" * 64)
++    cache.put(first, torch.zeros(8))
++    cache.put(second, torch.ones(8))
++    assert cache.get(first) is not None
++    cache.put(third, torch.full((8,), 2.0))
++
++    assert cache.get(second) is None
++    assert cache.get(first) is not None
++    assert cache.get(third) is not None
++    assert cache.put(_key(audio_sha256="5" * 64), torch.zeros(17)) is False
++    assert cache.stats().evictions == 1
++    assert cache.stats().oversize_bypasses == 1
++
++
++def test_clear_removes_song_values_but_preserves_cumulative_telemetry():
++    cache = ExactEncoderCache(max_entries=2, max_bytes=64)
++    cache.put(_key(), torch.zeros(8))
++
++    cache.clear()
++
++    assert cache.get(_key()) is None
++    assert cache.stats().entries == 0
++    assert cache.stats().bytes == 0
++    assert cache.stats().puts == 1
++
++
++def test_key_builder_hashes_actual_frames_conditioning_positions_and_layout():
++    frames = torch.arange(12, dtype=torch.float32).reshape(3, 4)
++    conditioning = {
++        "difficulty": torch.tensor([2.5]),
++        "mapper_idx": torch.tensor([-1], dtype=torch.long),
++    }
++    positions = torch.tensor([[0.0, 0.5], [0.5, 1.0]], dtype=torch.float32)
++    key = build_encoder_cache_key(
++        model_manifest_sha256="a" * 64,
++        model_config_sha256="b" * 64,
++        audio_sha256="c" * 64,
++        reference_sha256=None,
++        preprocessing={"sampleRate": 16_000, "frameCount": 3, "enabled": True},
++        frames=frames,
++        conditioning=conditioning,
++        song_positions=positions,
++        precision="fp16",
++        encoder_dtype=torch.float32,
++    )
++
++    assert key.reference_sha256 is None
++    assert key != build_encoder_cache_key(
++        model_manifest_sha256="a" * 64,
++        model_config_sha256="b" * 64,
++        audio_sha256="c" * 64,
++        reference_sha256=None,
++        preprocessing={"sampleRate": 16_000, "frameCount": 3, "enabled": True},
++        frames=frames + 1,
++        conditioning=conditioning,
++        song_positions=positions,
++        precision="fp16",
++        encoder_dtype=torch.float32,
++    )
++
++
++@pytest.mark.parametrize(
++    "value",
++    [torch.zeros(2, device="meta"), torch.zeros(2, requires_grad=True)],
++)
++def test_cache_rejects_non_cpu_or_gradient_values(value: torch.Tensor):
++    cache = ExactEncoderCache(max_entries=2, max_bytes=64)
++
++    with pytest.raises(ValueError):
++        cache.put(_key(), value)
++
++
++def test_processor_reuses_exact_encoder_result_without_a_second_model_call(monkeypatch):
++    calls: list[torch.Tensor] = []
++
++    def precompute(_model, frames, _conditioning, _positions, *, batch_size):
++        assert batch_size == 4
++        calls.append(frames.clone())
++        return (frames + 10).unsqueeze(-1)
++
++    monkeypatch.setattr(processor_module, "precompute_encoder_outputs", precompute)
++    processor = Processor.__new__(Processor)
++    processor.model = SimpleNamespace(transformer=SimpleNamespace(dtype=torch.float32))
++    processor.encoder_cache = ExactEncoderCache(max_entries=4, max_bytes=4096)
++    processor.encoder_cache_identity = {
++        "modelManifestSha256": "a" * 64,
++        "modelConfigSha256": "b" * 64,
++        "audioSha256": "c" * 64,
++        "referenceSha256": None,
++    }
++    processor.do_song_position_embed = True
++    processor.frame_seq_len = 4
++    processor.frame_size = 2
++    processor.lookahead_time = 1.0
++    processor.lookback_time = 2.0
++    processor.max_batch_size = 4
++    processor.miliseconds_per_sequence = 3.0
++    processor.sample_rate = 16_000
++    processor.precision = "fp32"
++    processor.last_generation_stats = {}
++    frames = torch.arange(8, dtype=torch.float32).reshape(2, 4)
++    times = torch.tensor([0.0, 3.0])
++    positions = torch.tensor([[0.0, 0.5], [0.5, 1.0]])
++    conditioning = {"difficulty": torch.tensor([2.5])}
++
++    first = processor._precompute_encoder_hidden(
++        all_frames=frames,
++        frame_times=times,
++        song_length=6.0,
++        cond_kwargs=conditioning,
++        song_positions=positions,
++    )
++    first[0, 0, 0] = -1
++    second = processor._precompute_encoder_hidden(
++        all_frames=frames,
++        frame_times=times,
++        song_length=6.0,
++        cond_kwargs=conditioning,
++        song_positions=positions,
++    )
++
++    assert len(calls) == 1
++    assert second[0, 0, 0].item() == 10.0
++    assert processor.last_generation_stats["encoderCacheHit"] is True
++    assert processor.last_generation_stats["encoderCache"]["hits"] == 1
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index 094ae68..8904954 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -396,3 +396,70 @@ def test_resnap_sidecar_is_written_next_to_generated_osu(tmp_path):
+         "duplicates": [],
+     }
+     assert not sidecar_path.with_suffix(".json.tmp").exists()
++
++
++def test_resnap_sidecar_uses_osu_integer_milliseconds_for_collision_times(tmp_path):
++    osu_path = tmp_path / "beatmap.osu"
++    osu_path.write_bytes(b"osu-output")
++    collisions = [
++        {
++            "lane": 0,
++            "noteKind": "TAP",
++            "preTimeMs": 110.6,
++            "postTimeMs": 125.4,
++            "snapDivisor": 4,
++            "reason": "SNAP_TARGET_CONFLICT_PRESERVED",
++        },
++        {
++            "lane": 1,
++            "noteKind": "HOLD_PAIR",
++            "rawStartMs": 230_565.0,
++            "rawEndMs": 230_755.0,
++            "proposedStartMs": 230_630.0,
++            "proposedEndMs": 230_630.0,
++            "reason": "HOLD_PAIR_RAW_RESTORED",
++        },
++    ]
++
++    sidecar_path = make_postprocessor().write_resnap_diagnostics(
++        osu_path,
++        seed=31,
++        collisions=collisions,
++    )
++    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
++
++    assert payload["collisions"][0]["preTimeMs"] == 111
++    assert type(payload["collisions"][0]["preTimeMs"]) is int
++    assert payload["collisions"][0]["postTimeMs"] == 125
++    assert type(payload["collisions"][0]["postTimeMs"]) is int
++    assert payload["collisions"][1]["rawStartMs"] == 230_565
++    assert type(payload["collisions"][1]["rawStartMs"]) is int
++    assert payload["collisions"][1]["rawEndMs"] == 230_755
++    assert payload["collisions"][1]["proposedStartMs"] == 230_630
++    assert payload["collisions"][1]["proposedEndMs"] == 230_630
++    assert collisions[0]["preTimeMs"] == 110.6
++    assert collisions[1]["rawStartMs"] == 230_565.0
++
++
++def test_resnap_sidecar_rejects_non_finite_collision_times(tmp_path):
++    osu_path = tmp_path / "beatmap.osu"
++    osu_path.write_bytes(b"osu-output")
++
++    with pytest.raises(ValueError, match="preTimeMs must be finite"):
++        make_postprocessor().write_resnap_diagnostics(
++            osu_path,
++            seed=31,
++            collisions=[
++                {
++                    "lane": 0,
++                    "noteKind": "TAP",
++                    "preTimeMs": float("nan"),
++                    "postTimeMs": 125,
++                    "snapDivisor": 4,
++                    "reason": "SNAP_TARGET_CONFLICT_PRESERVED",
++                }
++            ],
++        )
++
++    assert not osu_path.with_suffix(".resnap.json").exists()
++    assert not osu_path.with_suffix(".json.tmp").exists()
+diff --git a/tests/test_resident_runtime.py b/tests/test_resident_runtime.py
+new file mode 100644
+index 0000000..612a993
+--- /dev/null
++++ b/tests/test_resident_runtime.py
+@@ -0,0 +1,529 @@
++from __future__ import annotations
++
++import hashlib
++import importlib.machinery
++import json
++import os
++import random
++import sys
++import types
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++# The inference entrypoint imports training-only helpers through osuT5.utils.__init__.
++# This CPU contract test does not exercise W&B and the packaged chart runtime does not
++# install it, so prevent that unrelated optional training import from blocking collection.
++_wandb_stub = types.ModuleType("wandb")
++_wandb_stub.__spec__ = importlib.machinery.ModuleSpec("wandb", loader=None)
++sys.modules.setdefault("wandb", _wandb_stub)
++
++import inference
++from config import InferenceConfig
++from osuT5.osuT5.inference.encoder_cache import ExactEncoderCache
++from osuT5.osuT5.inference.resident_runtime import (
++    ModelManifestError,
++    ResidentInferenceRuntime,
++    verify_model_manifest,
++)
++from osuT5.osuT5.utils import model_utils
++
++_REVISION = "74f22583400d259bf424819e11027c17933efe54"
++_UPSTREAM = "2a70eb89004da20e39b0fcbaad2686b264d5a040"
++_PATCH_SET = "hold-v26"
++
++
++def _sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(65536), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _model_root(tmp_path: Path) -> Path:
++    root = tmp_path / "snapshot"
++    root.mkdir()
++    files = {
++        "config.json": b"{}\n",
++        "tokenizer.json": b'{"version":1}\n',
++        "model.safetensors": b"fixed-test-weights",
++    }
++    for relative, payload in files.items():
++        (root / relative).write_bytes(payload)
++    manifest = {
++        "version": 1,
++        "revision": _REVISION,
++        "upstreamCommit": _UPSTREAM,
++        "patchSetId": _PATCH_SET,
++        "files": [
++            {
++                "path": relative,
++                "size": (root / relative).stat().st_size,
++                "sha256": _sha256(root / relative),
++            }
++            for relative in sorted(files)
++        ],
++    }
++    (root / "model-manifest-v1.json").write_text(
++        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
++        encoding="utf-8",
++    )
++    return root.resolve()
++
++
++def _args(root: Path, **overrides):
++    values = {
++        "model_path": str(root),
++        "precision": "fp16",
++        "device": "cuda",
++        "gamemode": 3,
++        "auto_select_gamemode_model": True,
++        "lora_path": None,
++        "use_server": False,
++        "mania_hold_state_mode": "incremental",
++        "parallel": False,
++        "seed": 123,
++    }
++    values.update(overrides)
++    return SimpleNamespace(**values)
++
++
++def _runtime(root: Path) -> ResidentInferenceRuntime:
++    return ResidentInferenceRuntime(
++        model_root=root,
++        revision=_REVISION,
++        upstream_commit=_UPSTREAM,
++        patch_set_id=_PATCH_SET,
++    )
++
++
++def test_manifest_verification_binds_every_file_and_identity(tmp_path: Path):
++    root = _model_root(tmp_path)
++
++    verified = verify_model_manifest(
++        root,
++        expected_revision=_REVISION,
++        expected_upstream_commit=_UPSTREAM,
++        expected_patch_set_id=_PATCH_SET,
++    )
++
++    assert verified.root == root
++    assert verified.revision == _REVISION
++    assert verified.file_count == 3
++    assert len(verified.manifest_sha256) == 64
++
++
++@pytest.mark.parametrize("mutation", ["missing", "hash", "extra", "revision"])
++def test_manifest_verification_fails_closed(tmp_path: Path, mutation: str):
++    root = _model_root(tmp_path)
++    if mutation == "missing":
++        (root / "tokenizer.json").unlink()
++    elif mutation == "hash":
++        (root / "model.safetensors").write_bytes(b"changed")
++    elif mutation == "extra":
++        (root / "untracked.bin").write_bytes(b"not in manifest")
++
++    expected_revision = "0" * 40 if mutation == "revision" else _REVISION
++    with pytest.raises(ModelManifestError):
++        verify_model_manifest(
++            root,
++            expected_revision=expected_revision,
++            expected_upstream_commit=_UPSTREAM,
++            expected_patch_set_id=_PATCH_SET,
++        )
++
++
++def test_manifest_rejects_duplicate_json_keys(tmp_path: Path):
++    root = _model_root(tmp_path)
++    manifest_path = root / "model-manifest-v1.json"
++    original = manifest_path.read_text(encoding="utf-8")
++    manifest_path.write_text(original.replace('"version":1', '"version":1,"version":1'), encoding="utf-8")
++
++    with pytest.raises(ModelManifestError, match="duplicate"):
++        verify_model_manifest(
++            root,
++            expected_revision=_REVISION,
++            expected_upstream_commit=_UPSTREAM,
++            expected_patch_set_id=_PATCH_SET,
++        )
++
++
++def test_runtime_forces_offline_environment_and_rejects_legacy_server(tmp_path: Path, monkeypatch):
++    root = _model_root(tmp_path)
++    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
++    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
++
++    runtime = _runtime(root)
++
++    assert os.environ["HF_HUB_OFFLINE"] == "1"
++    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
++    with pytest.raises(ValueError, match="use_server=false"):
++        runtime.prepare_invocation(_args(root, use_server=True))
++    with pytest.raises(ValueError, match="incremental"):
++        runtime.prepare_invocation(_args(root, mania_hold_state_mode="full_scan"))
++    with pytest.raises(ValueError, match="parallel=false"):
++        runtime.prepare_invocation(_args(root, parallel=True))
++    with pytest.raises(ValueError, match="generate_positions=false"):
++        runtime.prepare_invocation(_args(root, generate_positions=True))
++
++
++def test_registry_rejects_model_path_outside_verified_root(tmp_path: Path):
++    root = _model_root(tmp_path)
++    outside = tmp_path / "outside"
++    outside.mkdir()
++    runtime = _runtime(root)
++
++    with pytest.raises(ValueError, match="verified model root"):
++        runtime.model_bundle(
++            _args(root, model_path=str(outside.resolve())),
++            lambda args: object(),
++            loads_separate_timing_model=False,
++        )
++
++
++def test_registry_reuses_a_after_b_without_cross_request_state(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    loads: list[tuple[int, int]] = []
++
++    def loader(args):
++        value = (args.gamemode, len(loads))
++        loads.append(value)
++        return {"identity": value}
++
++    args_a = _args(root, gamemode=3)
++    args_b = _args(root, gamemode=0)
++
++    result_a1 = runtime.model_bundle(args_a, loader, loads_separate_timing_model=False)
++    result_b = runtime.model_bundle(args_b, loader, loads_separate_timing_model=False)
++    result_a2 = runtime.model_bundle(args_a, loader, loads_separate_timing_model=False)
++
++    assert result_a1 is result_a2
++    assert result_a1 is not result_b
++    assert loads == [(3, 0), (0, 1)]
++    assert runtime.registry_load_count == 2
++
++
++def test_registry_reuses_bundle_when_only_generation_request_options_change(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    loads = 0
++
++    def loader(_args):
++        nonlocal loads
++        loads += 1
++        return object()
++
++    timing_request = _args(
++        root,
++        output_type=["TIMING"],
++        in_context=["TIMING"],
++        super_timing=False,
++    )
++    map_request = _args(
++        root,
++        output_type=["MAP"],
++        in_context=["TIMING"],
++        super_timing=False,
++    )
++
++    timing_bundle = runtime.model_bundle(
++        timing_request,
++        loader,
++        loads_separate_timing_model=False,
++    )
++    map_bundle = runtime.model_bundle(
++        map_request,
++        loader,
++        loads_separate_timing_model=False,
++    )
++    bundle_with_separate_timing_model = runtime.model_bundle(
++        map_request,
++        loader,
++        loads_separate_timing_model=True,
++    )
++
++    assert timing_bundle is map_bundle
++    assert bundle_with_separate_timing_model is not map_bundle
++    assert loads == 2
++    assert runtime.registry_load_count == 2
++
++
++def test_registry_reuses_timing_superset_for_later_map_request(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    loads = 0
++
++    def loader(_args):
++        nonlocal loads
++        loads += 1
++        return object()
++
++    args = _args(root)
++    timing_superset = runtime.model_bundle(
++        args,
++        loader,
++        loads_separate_timing_model=True,
++    )
++    map_subset = runtime.model_bundle(
++        args,
++        loader,
++        loads_separate_timing_model=False,
++    )
++
++    assert map_subset is timing_superset
++    assert loads == 1
++    assert runtime.registry_load_count == 1
++
++
++def test_registry_reuses_timing_superset_when_invocation_train_context_changes(
++    tmp_path: Path,
++):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    loads = 0
++
++    def loader(_args):
++        nonlocal loads
++        loads += 1
++        return object()
++
++    timing_request = _args(
++        root,
++        train={"data": {"context_types": ["TIMING"]}},
++    )
++    map_request = _args(
++        root,
++        train={"data": {"context_types": ["TIMING_TO_MAP"], "difficulty": 6.5}},
++    )
++
++    timing_superset = runtime.model_bundle(
++        timing_request,
++        loader,
++        loads_separate_timing_model=True,
++    )
++    map_subset = runtime.model_bundle(
++        map_request,
++        loader,
++        loads_separate_timing_model=False,
++    )
++
++    assert map_subset is timing_superset
++    assert loads == 1
++    assert runtime.registry_load_count == 1
++
++
++def test_failed_model_load_is_not_published_in_registry(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    attempts = 0
++
++    def loader(args):
++        nonlocal attempts
++        attempts += 1
++        if attempts == 1:
++            raise RuntimeError("load failed")
++        return object()
++
++    with pytest.raises(RuntimeError, match="load failed"):
++        runtime.model_bundle(_args(root), loader, loads_separate_timing_model=False)
++    loaded = runtime.model_bundle(_args(root), loader, loads_separate_timing_model=False)
++
++    assert loaded is not None
++    assert attempts == 2
++    assert runtime.registry_load_count == 1
++
++
++def test_prepare_invocation_resets_python_numpy_and_torch_rng(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    args = _args(root, device="cpu", seed=9876)
++
++    runtime.prepare_invocation(args)
++    first = (random.random(), float(np.random.rand()), torch.rand(3))
++    random.random()
++    np.random.rand()
++    torch.rand(4)
++    runtime.prepare_invocation(args)
++    second = (random.random(), float(np.random.rand()), torch.rand(3))
++
++    assert first[0] == second[0]
++    assert first[1] == second[1]
++    assert torch.equal(first[2], second[2])
++
++
++def test_encoder_cache_is_song_bounded_while_model_registry_survives(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    args = _args(root)
++    loaded = runtime.model_bundle(
++        args,
++        lambda _args: object(),
++        loads_separate_timing_model=False,
++    )
++
++    with pytest.raises(RuntimeError, match="active song"):
++        runtime.encoder_cache_context(args, loads_separate_timing_model=False)
++    runtime.begin_song({"audioSha256": "a" * 64, "configDigest": "b" * 64})
++    first_cache, manifest_digest, config_digest = runtime.encoder_cache_context(
++        args,
++        loads_separate_timing_model=False,
++    )
++    runtime.end_song()
++
++    runtime.begin_song({"audioSha256": "c" * 64, "configDigest": "d" * 64})
++    second_cache, second_manifest, second_config = runtime.encoder_cache_context(
++        args,
++        loads_separate_timing_model=False,
++    )
++    loaded_again = runtime.model_bundle(
++        args,
++        lambda _args: pytest.fail("model reloaded"),
++        loads_separate_timing_model=False,
++    )
++
++    assert first_cache is not second_cache
++    assert first_cache.stats().entries == 0
++    assert manifest_digest == second_manifest == runtime.manifest.manifest_sha256
++    assert config_digest == second_config
++    assert loaded_again is loaded
++    assert runtime.registry_load_count == 1
++    runtime.end_song()
++
++
++def test_runtime_rejects_audio_that_does_not_match_active_song(tmp_path: Path):
++    root = _model_root(tmp_path)
++    runtime = _runtime(root)
++    audio = tmp_path / "game.flac"
++    audio.write_bytes(b"bound audio")
++    expected = _sha256(audio)
++    runtime.begin_song({"audioSha256": expected, "configDigest": "b" * 64})
++
++    runtime.validate_invocation_audio(audio)
++    audio.write_bytes(b"changed")
++    with pytest.raises(ValueError, match="active song"):
++        runtime.validate_invocation_audio(audio)
++
++    runtime.end_song()
++
++
++def test_shared_execute_core_compiles_prepares_loads_and_generates_once(monkeypatch):
++    args = InferenceConfig(seed=42, use_server=False)
++    calls: list[object] = []
++    bundle = inference.InferenceModelBundle(
++        model="model",
++        tokenizer="tokenizer",
++        timing_model=None,
++        timing_tokenizer=None,
++        diff_model=None,
++        diff_tokenizer=None,
++        refine_model=None,
++    )
++
++    class FakeRuntime:
++        cache = ExactEncoderCache(max_entries=2, max_bytes=1024)
++
++        def prepare_invocation(self, observed):
++            calls.append(("prepare", observed.seed))
++
++        def model_bundle(self, observed, loader, *, loads_separate_timing_model):
++            assert loads_separate_timing_model is False
++            calls.append(("bundle", observed.seed, loader.__name__))
++            return bundle
++
++        def encoder_cache_context(self, observed, *, loads_separate_timing_model):
++            assert loads_separate_timing_model is False
++            calls.append(("encoder-cache", observed.seed))
++            return self.cache, "a" * 64, "b" * 64
++
++    monkeypatch.setattr(inference, "compile_args", lambda observed: calls.append("compile"))
++    monkeypatch.setattr(inference, "get_config", lambda observed: ("generation", "beatmap"))
++
++    def fake_generate(observed, **kwargs):
++        calls.append(("generate", kwargs))
++        return "result"
++
++    monkeypatch.setattr(inference, "generate", fake_generate)
++
++    result = inference.execute_inference(args, runtime=FakeRuntime())
++
++    assert result == "result"
++    assert calls[0:4] == [
++        "compile",
++        ("prepare", 42),
++        ("bundle", 42, "load_inference_models"),
++        ("encoder-cache", 42),
++    ]
++    generated = calls[4]
++    assert generated[0] == "generate"
++    assert generated[1]["model"] == "model"
++    assert generated[1]["tokenizer"] == "tokenizer"
++    assert generated[1]["encoder_cache"] is FakeRuntime.cache
++    assert generated[1]["encoder_model_identity"] == ("a" * 64, "b" * 64)
++
++
++def test_main_impl_uses_the_same_execute_core(monkeypatch):
++    args = InferenceConfig(seed=17)
++    observed = []
++    monkeypatch.setattr(
++        inference,
++        "execute_inference",
++        lambda value, runtime=None: observed.append((value, runtime)) or "same-core",
++    )
++
++    assert inference._main_impl(args) == "same-core"
++    assert observed == [(args, None)]
++
++
++def test_local_gamemode_checkpoint_passes_empty_subfolder_to_transformers(
++    tmp_path: Path,
++    monkeypatch,
++):
++    root = tmp_path / "snapshot"
++    selected = root / "gamemode=3"
++    selected.mkdir(parents=True)
++    observed: list[tuple[str, Path, str | None]] = []
++
++    def load_tokenizer(path, *, subfolder):
++        observed.append(("tokenizer", Path(path), subfolder))
++        return SimpleNamespace(num_tokens=16)
++
++    class LoadedModel:
++        generation_config = SimpleNamespace(disable_compile=False)
++
++        def eval(self):
++            return self
++
++    def load_model(path, *, subfolder, **_kwargs):
++        observed.append(("model", Path(path), subfolder))
++        return LoadedModel()
++
++    monkeypatch.setattr(
++        model_utils.Tokenizer,
++        "from_pretrained",
++        staticmethod(load_tokenizer),
++    )
++    monkeypatch.setattr(
++        model_utils.Mapperatorinator,
++        "from_pretrained",
++        staticmethod(load_model),
++    )
++
++    model_loader, _ = model_utils.load_model_loaders(
++        root,
++        SimpleNamespace(),
++        "cpu",
++        precision="fp32",
++        gamemode=3,
++        auto_select_gamemode_model=True,
++    )
++    model_loader()
++
++    assert observed == [
++        ("tokenizer", selected, ""),
++        ("model", selected, ""),
++    ]
+diff --git a/tests/test_resident_worker.py b/tests/test_resident_worker.py
+new file mode 100644
+index 0000000..275f60e
+--- /dev/null
++++ b/tests/test_resident_worker.py
+@@ -0,0 +1,269 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++from osuT5.osuT5.inference.resident_worker import (
++    TERMINAL_MARKER_NAME,
++    ResidentExecutionResult,
++    ResidentWorker,
++    _validate_resolved_audio_path,
++    _validate_resolved_output_path,
++)
++from osuT5.osuT5.inference.tail_repair import (
++    MAPPERATORINATOR_INVOCATION_RESULT_PREFIX,
++    ManiaTailRepairExhausted,
++)
++
++
++def _song_record(label: str = "song") -> dict[str, object]:
++    body = {
++        "audioSha256": "a" * 64,
++        "configDigest": "b" * 64,
++        "songId": label,
++    }
++    song_hash = hashlib.sha256(
++        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    ).hexdigest()
++    return {"version": 1, "type": "BEGIN_SONG", "songHash": song_hash, **body}
++
++
++def _request(
++    song_hash: str,
++    *,
++    workdir: str = "run-1",
++    argv: list[str] | None = None,
++) -> dict[str, object]:
++    body = {
++        "argv": ["inference.py", "seed=1"] if argv is None else argv,
++        "songHash": song_hash,
++        "workdir": workdir,
++    }
++    request_hash = hashlib.sha256(
++        json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    ).hexdigest()
++    invocation_id = hashlib.sha256(
++        f"chart-worker-resident-invocation-v1:{request_hash}".encode("ascii")
++    ).hexdigest()
++    return {
++        "version": 1,
++        "type": "INVOKE",
++        "invocationId": invocation_id,
++        "requestHash": request_hash,
++        **body,
++    }
++
++
++def test_resolved_output_path_is_validated_before_inference(tmp_path: Path):
++    workdir = tmp_path / "accepted"
++    workdir.mkdir()
++
++    assert (
++        _validate_resolved_output_path(
++            SimpleNamespace(output_path=str(workdir)),
++            workdir,
++        )
++        == workdir.resolve(strict=True)
++    )
++    with pytest.raises(ValueError, match="accepted workdir"):
++        _validate_resolved_output_path(
++            SimpleNamespace(output_path=str(tmp_path / "different")),
++            workdir,
++        )
++
++
++def test_resolved_audio_path_must_be_a_bound_job_root_file(tmp_path: Path):
++    job_root = tmp_path / "jobs"
++    audio = job_root / "audio" / "game.flac"
++    audio.parent.mkdir(parents=True)
++    audio.write_bytes(b"audio")
++
++    assert (
++        _validate_resolved_audio_path(SimpleNamespace(audio_path=str(audio)), job_root)
++        == audio.resolve(strict=True)
++    )
++    outside = tmp_path / "outside.flac"
++    outside.write_bytes(b"outside")
++    with pytest.raises(ValueError, match="job root"):
++        _validate_resolved_audio_path(SimpleNamespace(audio_path=str(outside)), job_root)
++
++
++def test_worker_commits_terminal_marker_and_replays_without_execution(tmp_path: Path):
++    calls: list[tuple[list[str], Path]] = []
++
++    def execute(argv: list[str], workdir: Path) -> ResidentExecutionResult:
++        calls.append((list(argv), workdir))
++        (workdir / "generated.osu").write_bytes(b"osu file")
++        return ResidentExecutionResult(returncode=0, stdout="done", stderr="")
++
++    worker = ResidentWorker(job_root=tmp_path.resolve(), execute=execute)
++    song = _song_record()
++    started = worker.handle(song)
++    request = _request(started[0]["songHash"])
++
++    first = worker.handle(request)
++    replay = worker.handle(request)
++
++    assert [record["type"] for record in first] == ["ACCEPTED", "SUCCESS"]
++    assert first[1]["replayed"] is False
++    assert first[1]["artifacts"][0]["relativePath"] == "generated.osu"
++    assert [record["type"] for record in replay] == ["SUCCESS"]
++    assert replay[0]["replayed"] is True
++    assert len(calls) == 1
++    marker = tmp_path / "run-1" / TERMINAL_MARKER_NAME
++    assert marker.is_file()
++    assert json.loads(marker.read_text(encoding="utf-8"))["requestHash"] == request["requestHash"]
++
++
++def test_worker_refuses_replay_when_hashed_artifact_changes(tmp_path: Path):
++    calls = 0
++
++    def execute(argv: list[str], workdir: Path) -> ResidentExecutionResult:
++        nonlocal calls
++        calls += 1
++        (workdir / "generated.osu").write_bytes(b"original")
++        return ResidentExecutionResult(returncode=0, stdout="done", stderr="")
++
++    worker = ResidentWorker(job_root=tmp_path.resolve(), execute=execute)
++    song_hash = worker.handle(_song_record())[0]["songHash"]
++    request = _request(song_hash)
++    worker.handle(request)
++    (tmp_path / "run-1" / "generated.osu").write_bytes(b"tampered")
++
++    replay = worker.handle(request)
++
++    assert replay[0]["type"] == "REJECTED"
++    assert replay[0]["code"] == "UNKNOWN_COMPLETION"
++    assert calls == 1
++
++
++def test_worker_rejects_different_request_for_existing_terminal(tmp_path: Path):
++    worker = ResidentWorker(
++        job_root=tmp_path.resolve(),
++        execute=lambda argv, workdir: (
++            (workdir / "generated.osu").write_bytes(b"osu")
++            and ResidentExecutionResult(0, "ok", "")
++        ),
++    )
++    song_hash = worker.handle(_song_record())[0]["songHash"]
++    first = _request(song_hash, workdir="same", argv=["inference.py", "seed=1"])
++    conflict = _request(song_hash, workdir="same", argv=["inference.py", "seed=2"])
++    worker.handle(first)
++
++    result = worker.handle(conflict)
++
++    assert result[0]["type"] == "REJECTED"
++    assert result[0]["code"] == "INVOCATION_CONFLICT"
++
++
++@pytest.mark.parametrize("contents", [b"partial output", b"{broken marker"])
++def test_worker_treats_nonempty_or_corrupt_output_as_unknown(
++    tmp_path: Path,
++    contents: bytes,
++):
++    calls = 0
++
++    def execute(argv, workdir):
++        nonlocal calls
++        calls += 1
++        return ResidentExecutionResult(0, "ok", "")
++
++    worker = ResidentWorker(job_root=tmp_path.resolve(), execute=execute)
++    song_hash = worker.handle(_song_record())[0]["songHash"]
++    request = _request(song_hash)
++    workdir = tmp_path / "run-1"
++    workdir.mkdir()
++    if contents.startswith(b"{"):
++        (workdir / TERMINAL_MARKER_NAME).write_bytes(contents)
++    else:
++        (workdir / "partial.osu").write_bytes(contents)
++
++    result = worker.handle(request)
++
++    assert result[0]["type"] == "REJECTED"
++    assert result[0]["code"] == "UNKNOWN_COMPLETION"
++    assert calls == 0
++
++
++def test_worker_serializes_tail_exhaustion_for_live_chart_parser(tmp_path: Path):
++    failure = ManiaTailRepairExhausted(
++        reason="UNCLOSED_HOLD_AT_STREAM_END",
++        requested_end_ms=1000,
++        effective_cut_ms=1000,
++        earliest_generated_source_window_id=1,
++        repair_trigger_reason="PRE_TRIM_INVALID",
++        repair_trigger_source_window_id=3,
++        repair_start_window_id=1,
++        repair_window_ids=[1],
++        repair_attempts=2,
++    )
++
++    def execute(argv, workdir):
++        raise failure
++
++    worker = ResidentWorker(job_root=tmp_path.resolve(), execute=execute)
++    song_hash = worker.handle(_song_record())[0]["songHash"]
++    records = worker.handle(_request(song_hash))
++
++    assert [record["type"] for record in records] == ["ACCEPTED", "FAILURE"]
++    terminal = records[1]
++    assert terminal["returncode"] == 1
++    assert terminal["stdout"].startswith(MAPPERATORINATOR_INVOCATION_RESULT_PREFIX)
++    payload = json.loads(terminal["stdout"].split("=", 1)[1])
++    assert payload == failure.to_terminal_record()
++
++
++def test_song_end_clears_request_identity_but_worker_accepts_next_song(tmp_path: Path):
++    worker = ResidentWorker(
++        job_root=tmp_path.resolve(),
++        execute=lambda argv, workdir: ResidentExecutionResult(1, "", "not invoked"),
++    )
++    first = worker.handle(_song_record("first"))[0]
++    ended = worker.handle(
++        {"version": 1, "type": "END_SONG", "songHash": first["songHash"]}
++    )
++    second = worker.handle(_song_record("second"))[0]
++
++    assert ended[0]["type"] == "SONG_ENDED"
++    assert second["type"] == "SONG_STARTED"
++    assert second["songHash"] != first["songHash"]
++
++
++def test_worker_forwards_exact_song_boundaries_to_runtime_hooks(tmp_path: Path):
++    boundaries: list[object] = []
++    worker = ResidentWorker(
++        job_root=tmp_path.resolve(),
++        execute=lambda argv, workdir: ResidentExecutionResult(1, "", "not invoked"),
++        begin_song=lambda record: boundaries.append(("begin", record)),
++        end_song=lambda: boundaries.append("end"),
++    )
++    song = _song_record("bounded")
++    started = worker.handle(song)[0]
++    worker.handle({"version": 1, "type": "END_SONG", "songHash": started["songHash"]})
++
++    assert boundaries[0][0] == "begin"
++    assert boundaries[0][1] == song
++    assert boundaries[1] == "end"
++
++
++def test_worker_rejects_forged_request_hash_before_acceptance(tmp_path: Path):
++    calls = 0
++
++    def execute(argv, workdir):
++        nonlocal calls
++        calls += 1
++        return ResidentExecutionResult(0, "ok", "")
++
++    worker = ResidentWorker(job_root=tmp_path.resolve(), execute=execute)
++    song_hash = worker.handle(_song_record())[0]["songHash"]
++    request = _request(song_hash)
++    request["requestHash"] = "0" * 64
++
++    result = worker.handle(request)
++
++    assert result[0]["type"] == "REJECTED"
++    assert result[0]["code"] == "INVALID_REQUEST"
++    assert calls == 0
+diff --git a/tests/test_super_timing_generator.py b/tests/test_super_timing_generator.py
+new file mode 100644
+index 0000000..d2b0773
+--- /dev/null
++++ b/tests/test_super_timing_generator.py
+@@ -0,0 +1,55 @@
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference import super_timing_generator
++
++
++def test_fractional_generated_time_is_binned_at_the_nearest_millisecond(monkeypatch):
++    class HistogramBuilt(RuntimeError):
++        pass
++
++    class FakeProcessor:
++        @staticmethod
++        def _create_tokens_per_second_meter():
++            return None
++
++        @staticmethod
++        def generate(**_kwargs):
++            return [
++                (
++                    [
++                        Event(EventType.TIME_SHIFT, 100.5),
++                        Event(EventType.BEAT),
++                    ],
++                    [],
++                )
++            ]
++
++    generator = object.__new__(super_timing_generator.SuperTimingGenerator)
++    generator.sample_rate = 1_000
++    generator.miliseconds_per_sequence = 2
++    generator.iterations = 1
++    generator.types_first = False
++    generator.bpm_change_threshold = 0.6
++    generator.args = SimpleNamespace(
++        train=SimpleNamespace(data=SimpleNamespace(add_timing=False))
++    )
++    generator.preprocessor = SimpleNamespace(segment=lambda *_args: object())
++    generator.processor = FakeProcessor()
++
++    monkeypatch.setattr(np.random, "randint", lambda *_args: 0)
++    monkeypatch.setattr(
++        super_timing_generator,
++        "gaussian_filter1d",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(HistogramBuilt()),
++    )
++
++    with pytest.raises(HistogramBuilt):
++        generator.generate(
++            np.zeros(1_000, dtype=np.float32),
++            SimpleNamespace(),
++            verbose=False,
++        )
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index a6886e1..8a4c168 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -105,7 +105,9 @@ class ManiaColumnBeforeTypeLogitsProcessor(LogitsProcessor):
+             tokenizer.event_start[EventType.CIRCLE],
+             tokenizer.event_start[EventType.HOLD_NOTE],
+             tokenizer.event_start[EventType.HOLD_NOTE_END],
+-        ])
++        ] + ([
++            tokenizer.event_start[EventType.HOLD_NOTE_SUSTAIN],
++        ] if EventType.HOLD_NOTE_SUSTAIN in tokenizer.event_start else []))
+         self.sos_ids = torch.tensor(
+             [tokenizer.sos_id]
+             + list(getattr(tokenizer, "context_sos", {}).values())
+@@ -407,6 +409,17 @@ class _IncrementalManiaRowState:
+             self.current_time_token = current_time_token
+             self.current_lane = token - processor.column_start
+             return
++        if token in processor.sustain_tokens:
++            if self.current_lane is None:
++                raise ValueError("mania sustain in prompt has no gameplay column")
++            if not 0 <= self.current_lane < self.keycount:
++                raise ValueError(
++                    f"current mania lane {self.current_lane} is outside "
++                    f"keycount {self.keycount}"
++                )
++            self.current_time_token = current_time_token
++            self.current_lane = None
++            return
+         if token not in processor.event_type_by_token:
+             self.current_time_token = current_time_token
+             return
+@@ -689,6 +702,11 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+         self.tap_token = tokenizer.event_start[EventType.CIRCLE]
+         self.hold_start_token = tokenizer.event_start[EventType.HOLD_NOTE]
+         self.hold_end_token = tokenizer.event_start[EventType.HOLD_NOTE_END]
++        self.sustain_tokens = tuple(
++            tokenizer.event_start[event_type]
++            for event_type in (EventType.HOLD_NOTE_SUSTAIN,)
++            if event_type in tokenizer.event_start
++        )
+         self.event_type_by_token = {
+             self.tap_token: EventType.CIRCLE,
+             self.hold_start_token: EventType.HOLD_NOTE,
+@@ -1003,6 +1021,17 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     current_lane = None
+                 elif self.column_start <= token < self.column_end:
+                     current_lane = token - self.column_start
++                elif token in self.sustain_tokens:
++                    if current_lane is None:
++                        raise ValueError(
++                            "mania sustain in prompt has no gameplay column"
++                        )
++                    if not 0 <= current_lane < keycount:
++                        raise ValueError(
++                            f"current mania lane {current_lane} is outside "
++                            f"keycount {keycount}"
++                        )
++                    current_lane = None
+                 elif token in self.event_type_by_token:
+                     if current_lane is None:
+                         raise ValueError(
+@@ -1111,6 +1140,8 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 scores_processed[row, self.tap_token] = -torch.inf
+                 scores_processed[row, self.hold_start_token] = -torch.inf
+                 scores_processed[row, self.hold_end_token] = -torch.inf
++                if self.sustain_tokens:
++                    scores_processed[row, list(self.sustain_tokens)] = -torch.inf
+                 missing_time = current_time_token is None
+                 if missing_time:
+                     # A column without an addressable time would inherit the
+@@ -1273,6 +1304,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     self.tap_token,
+                     self.hold_start_token,
+                     self.hold_end_token,
++                    *self.sustain_tokens,
+                 )
+                 note_scores = scores_processed[row, list(note_tokens)].clone()
+                 if torch.isneginf(note_scores).all():
+diff --git a/osuT5/osuT5/inference/tail_repair.py b/osuT5/osuT5/inference/tail_repair.py
+index c1c23fe..605faae 100644
+--- a/osuT5/osuT5/inference/tail_repair.py
++++ b/osuT5/osuT5/inference/tail_repair.py
+@@ -1022,17 +1022,52 @@ def finalize_mania_partial_interval(
+                 f"partial interval start exceeds end: "
+                 f"{start_time_ms}>{end_time_ms}"
+             )
++        if types_first:
++            raise ValueError(
++                "transactional Mania start rejoin does not support "
++                "types_first=True"
++            )
+ 
+-        reference_groups = _complete_serialization_groups(
+-            reference_events,
+-            reference_times,
+-            types_first=types_first,
+-        )
+-        current_groups = _complete_serialization_groups(
+-            current_events,
+-            current_times,
+-            types_first=types_first,
+-        )
++        try:
++            reference_groups = _complete_serialization_groups(
++                reference_events,
++                reference_times,
++                types_first=types_first,
++            )
++        except ValueError as error:
++            generated_windows = _generated_windows(reference_origins)
++            raise ManiaPartialRejoinInvalid(
++                scope="REFERENCE",
++                partial_start_ms=start_time_ms,
++                partial_end_ms=end_time_ms,
++                validation_error=(
++                    "reference Mania serialization is invalid: "
++                    f"{error}"
++                ),
++                earliest_generated_source_window_id=(
++                    min(generated_windows) if generated_windows else None
++                ),
++            ) from error
++        try:
++            current_groups = _complete_serialization_groups(
++                current_events,
++                current_times,
++                types_first=types_first,
++            )
++        except ValueError as error:
++            generated_windows = _generated_windows(current_origins)
++            raise ManiaPartialRejoinInvalid(
++                scope="REJOINED",
++                partial_start_ms=start_time_ms,
++                partial_end_ms=end_time_ms,
++                validation_error=(
++                    "generated Mania serialization is invalid: "
++                    f"{error}"
++                ),
++                earliest_generated_source_window_id=(
++                    min(generated_windows) if generated_windows else None
++                ),
++            ) from error
+ 
+         reference_inspection = _inspect_mania_stream(
+             reference_events,
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index bebd3b5..6d8fc4b 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -42,6 +42,7 @@ class FakeTokenizer:
+         EventType.CIRCLE: 50,
+         EventType.HOLD_NOTE: 51,
+         EventType.HOLD_NOTE_END: 52,
++        EventType.HOLD_NOTE_SUSTAIN: 53,
+         EventType.MANIA_KEYCOUNT: 100,
+         EventType.KIAI: 60,
+     }
+@@ -64,6 +65,68 @@ def scores() -> torch.Tensor:
+     return torch.zeros((1, 128), dtype=torch.float32)
+ 
+ 
++def test_column_before_type_treats_sustain_as_a_column_consuming_group():
++    processor = ManiaColumnBeforeTypeLogitsProcessor(FakeTokenizer())
++    sustain_token = FakeTokenizer.event_start[EventType.HOLD_NOTE_SUSTAIN]
++    prefix = [keycount_token(4), FakeTokenizer.sos_id, 30]
++
++    without_column = processor(torch.tensor([prefix]), scores())
++    assert torch.isneginf(without_column[0, sustain_token])
++
++    with_column = processor(torch.tensor([prefix + [12]]), scores())
++    assert not torch.isneginf(with_column[0, sustain_token])
++
++    after_sustain = processor(
++        torch.tensor([prefix + [12, sustain_token]]),
++        scores(),
++    )
++    assert torch.isneginf(after_sustain[0, sustain_token])
++    assert torch.isneginf(after_sustain[0, FakeTokenizer.event_start[EventType.CIRCLE]])
++
++
++@pytest.mark.parametrize("mode", ["full_scan", "incremental_verify", "incremental"])
++def test_hold_state_treats_sustain_as_a_transparent_group_completion(mode):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        hold_state_mode=mode,
++    )
++    sustain_token = FakeTokenizer.event_start[EventType.HOLD_NOTE_SUSTAIN]
++    prefix = [keycount_token(4), FakeTokenizer.sos_id, 30, 12]
++
++    processor(torch.tensor([prefix]), scores())
++    after_sustain = processor(
++        torch.tensor([prefix + [sustain_token]]),
++        scores(),
++    )
++
++    for token in (50, 51, 52, sustain_token):
++        assert torch.isneginf(after_sustain[0, token])
++
++    next_group = processor(
++        torch.tensor([prefix + [sustain_token, 31, 12]]),
++        scores(),
++    )
++    assert not torch.isneginf(next_group[0, sustain_token])
++    assert not torch.isneginf(next_group[0, 50])
++
++
++def test_hold_state_can_force_sustain_as_the_last_group_completion_token():
++    prefix = [keycount_token(4), FakeTokenizer.sos_id, 30, 12]
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        max_sequence_length=len(prefix) + 1,
++    )
++    candidate_scores = scores()
++    candidate_scores[0, 50:53] = -torch.inf
++    sustain_token = FakeTokenizer.event_start[EventType.HOLD_NOTE_SUSTAIN]
++
++    result = processor(torch.tensor([prefix]), candidate_scores)
++
++    assert not torch.isneginf(result[0, sustain_token])
++
++
+ def test_hold_transition_composition_applies_left_then_right():
+     assert hold_logits._compose_hold_transitions((1, -1), (-1, 0)) == (0, -1)
+ 
+diff --git a/tests/test_mania_tail_repair.py b/tests/test_mania_tail_repair.py
+index a51901d..d1b5e18 100644
+--- a/tests/test_mania_tail_repair.py
++++ b/tests/test_mania_tail_repair.py
+@@ -1073,6 +1073,81 @@ def test_partial_rejoin_reports_an_invalid_reference_as_typed_reference_scope():
+     assert "unclosed HOLD" in caught.value.validation_error
+ 
+ 
++def test_partial_rejoin_types_incomplete_reference_serialization():
++    reference_events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 0),
++    ]
++    reference_times = [100, 100]
++    reference_origins = [EventOrigin.reference(0), EventOrigin.reference(1)]
++    current = _origin_stream((200, 1, EventType.CIRCLE, 5))
++
++    with pytest.raises(tail_repair.ManiaPartialRejoinInvalid) as caught:
++        tail_repair.finalize_mania_partial_interval(
++            *current,
++            reference_events,
++            reference_times,
++            reference_origins,
++            start_time_ms=150,
++            end_time_ms=250,
++            keycount=4,
++            types_first=False,
++        )
++
++    assert caught.value.scope == "REFERENCE"
++    assert caught.value.earliest_generated_source_window_id is None
++    assert "incomplete serialization group" in caught.value.validation_error
++
++
++def test_partial_rejoin_types_incomplete_generated_serialization():
++    reference = _reference_stream(
++        (100, 0, EventType.CIRCLE, 0),
++        (400, 0, EventType.CIRCLE, 0),
++    )
++    current_events = [
++        Event(EventType.TIME_SHIFT, 200),
++        Event(EventType.MANIA_COLUMN, 1),
++    ]
++    current_times = [200, 200]
++    current_origins = [
++        EventOrigin.generated(7, 0),
++        EventOrigin.generated(7, 1),
++    ]
++
++    with pytest.raises(tail_repair.ManiaPartialRejoinInvalid) as caught:
++        tail_repair.finalize_mania_partial_interval(
++            current_events,
++            current_times,
++            current_origins,
++            *reference,
++            start_time_ms=150,
++            end_time_ms=250,
++            keycount=4,
++            types_first=False,
++        )
++
++    assert caught.value.scope == "REJOINED"
++    assert caught.value.earliest_generated_source_window_id == 7
++    assert "incomplete serialization group" in caught.value.validation_error
++
++
++def test_partial_rejoin_keeps_unsupported_types_first_as_input_error():
++    reference = _reference_stream((100, 0, EventType.CIRCLE, 0))
++    current = _origin_stream((200, 1, EventType.CIRCLE, 5))
++
++    with pytest.raises(ValueError, match="does not support types_first=True") as caught:
++        tail_repair.finalize_mania_partial_interval(
++            *current,
++            *reference,
++            start_time_ms=150,
++            end_time_ms=250,
++            keycount=4,
++            types_first=True,
++        )
++
++    assert not isinstance(caught.value, tail_repair.ManiaPartialRejoinInvalid)
++
++
+ def test_partial_rejoin_reports_an_invalid_candidate_as_typed_rejoined_scope():
+     reference = _reference_stream(
+         (100, 0, EventType.CIRCLE, 0),

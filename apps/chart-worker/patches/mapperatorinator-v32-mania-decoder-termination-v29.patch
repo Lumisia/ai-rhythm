@@ -1,0 +1,377 @@
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index ac33fa4..61e614c 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -24,6 +24,8 @@ from transformers.modeling_outputs import BaseModelOutput
+ from transformers import LogitsProcessorList
+ 
+ from .cache_utils import get_cache
++from .generation_checkpoint import capture_rng_state, restore_rng_state
++from .mania_domain import ManiaDomainError
+ from .server import get_eos_token_id, _build_generation_stats, build_logits_processors, \
+     effective_generation_limit, get_mania_hold_grammar_telemetry, model_generate, \
+     reset_mania_hold_grammar_state
+@@ -311,6 +313,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     context_type = generate_kwargs.pop('context_type', None)
+     max_note_start_time = generate_kwargs.pop('max_note_start_time', None)
+     mania_open_hold_columns = generate_kwargs.pop('mania_open_hold_columns', None)
++    is_mania_generation = mania_open_hold_columns is not None
+     mania_prompt_group_signatures = generate_kwargs.pop(
+         'mania_prompt_group_signatures', ()
+     )
+@@ -452,9 +455,20 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         return generated, truncated
+ 
+     start_time = time.perf_counter()
++    initial_cache_len = None
++    final_cache_len = None
++    bucket_restarted = False
++    generated_before_restart = 0
+     try:
+         # Start with a small bucket sized for the common short-generation case.
+         cache_len = _pick_bucket(prompt_len, model_max)
++        initial_cache_len = cache_len
++        final_cache_len = cache_len
++        retry_rng = (
++            capture_rng_state()
++            if do_sample and cache_len < hard_cap
++            else None
++        )
+         generated, truncated = _run_window(cache_len)
+         # If the window filled its bucket without hitting EOS while the model was still
+         # allowed to generate (bucket < hard_cap), the bucket was too small and we'd
+@@ -462,7 +476,12 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         # generate far more than the default headroom). Retry once with a cache big
+         # enough for the full budget so compiled output matches the non-compiled path.
+         if truncated and cache_len < hard_cap:
++            generated_before_restart = len(generated)
++            bucket_restarted = True
++            if retry_rng is not None:
++                restore_rng_state(retry_rng)
+             cache_len = _bucket_ceil(hard_cap, model_max)
++            final_cache_len = cache_len
+             generated, truncated = _run_window(cache_len)
+     except CaptureError as e:
+         _capture_unsupported = True
+@@ -471,10 +490,37 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         return model_generate(model, tokenizer, *fallback_args)
+     elapsed = time.perf_counter() - start_time
+ 
++    if truncated and is_mania_generation:
++        raise ManiaDomainError(
++            reason="TOKEN_BUDGET_EXHAUSTED",
++            message=(
++                "compiled Mania generation exhausted its token budget without "
++                f"EOS: prompt={prompt_len}, hardCap={hard_cap}, "
++                f"generated={len(generated)}, bucketRestarted={bucket_restarted}"
++            ),
++            decoder_token_index=hard_cap,
++            generated_token_index=max(0, hard_cap - prompt_len),
++            context={
++                "hardCap": hard_cap,
++                "initialBucket": initial_cache_len,
++                "finalBucket": final_cache_len,
++                "bucketRestarted": int(bucket_restarted),
++                "generatedBeforeRestart": generated_before_restart,
++                "generatedAtFailure": len(generated),
++            },
++        )
++
+     gen_tensor = torch.cat(generated, dim=1) if generated else torch.empty(
+         (decoder_input_ids.shape[0], 0), dtype=torch.long, device=device)
+     result = torch.cat([decoder_input_ids, gen_tensor], dim=1).cpu()
+     stats = _build_generation_stats(result, model_kwargs, pad_token_id, elapsed)
++    stats["compiledDecode"] = {
++        "initialBucket": initial_cache_len,
++        "finalBucket": final_cache_len,
++        "bucketRestarted": bucket_restarted,
++        "generatedBeforeRestart": generated_before_restart,
++        "terminationReason": "EOS" if not truncated else "TOKEN_BUDGET_EXHAUSTED",
++    }
+     grammar_telemetry = get_mania_hold_grammar_telemetry(logits_processor_list)
+     if grammar_telemetry is not None:
+         stats["mania_hold_grammar"] = grammar_telemetry
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index f4dd7cf..80b5734 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -797,6 +797,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             "duplicateTokensMasked": 0,
+             "finalEosClosureSteps": 0,
+             "budgetBoundarySteps": 0,
++            "forcedTerminalEosSteps": 0,
+             "forcedClosureSteps": 0,
+             "insufficientClosureBudgetSteps": 0,
+             "unclosableHoldStartSteps": 0,
+@@ -1276,6 +1277,19 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     scores_processed[
+                         row, self.column_start:self.column_end
+                     ] = -torch.inf
++                if (
++                        self.require_closed_holds_at_eos
++                        and not open_columns
++                        and remaining_tokens == 1
++                ):
++                    # A one-token tail can only terminate.  Allowing TIME_SHIFT,
++                    # KIAI, SCROLL, or another group starter here guarantees that
++                    # the compiled loop reaches its hard cap without EOS.
++                    self._telemetry["forcedTerminalEosSteps"] += 1
++                    scores_processed[row, :] = -torch.inf
++                    scores_processed[row, list(self.eos_ids)] = scores[
++                        row, list(self.eos_ids)
++                    ]
+                 if self.effective_cut_time_token is not None:
+                     first_forbidden_time = max(
+                         self.time_start,
+diff --git a/osuT5/osuT5/inference/mania_domain.py b/osuT5/osuT5/inference/mania_domain.py
+index e08042b..e2548a7 100644
+--- a/osuT5/osuT5/inference/mania_domain.py
++++ b/osuT5/osuT5/inference/mania_domain.py
+@@ -11,6 +11,7 @@ ManiaDomainReason = Literal[
+     "NO_LEGAL_MANIA_GROUP_COMPLETION",
+     "INCOMPLETE_MANIA_GROUP_BEFORE_SCROLL",
+     "INSUFFICIENT_HOLD_CLOSURE_BUDGET",
++    "TOKEN_BUDGET_EXHAUSTED",
+ ]
+ 
+ _MANIA_DOMAIN_REASONS = frozenset(
+@@ -18,6 +19,7 @@ _MANIA_DOMAIN_REASONS = frozenset(
+         "NO_LEGAL_MANIA_GROUP_COMPLETION",
+         "INCOMPLETE_MANIA_GROUP_BEFORE_SCROLL",
+         "INSUFFICIENT_HOLD_CLOSURE_BUDGET",
++        "TOKEN_BUDGET_EXHAUSTED",
+     }
+ )
+ 
+diff --git a/osuT5/osuT5/inference/tail_repair.py b/osuT5/osuT5/inference/tail_repair.py
+index 605faae..aa47131 100644
+--- a/osuT5/osuT5/inference/tail_repair.py
++++ b/osuT5/osuT5/inference/tail_repair.py
+@@ -32,6 +32,7 @@ _TERMINAL_TAIL_REASONS = frozenset({
+     "NO_LEGAL_MANIA_GROUP_COMPLETION",
+     "INCOMPLETE_MANIA_GROUP_BEFORE_SCROLL",
+     "INSUFFICIENT_HOLD_CLOSURE_BUDGET",
++    "TOKEN_BUDGET_EXHAUSTED",
+     "UNCLOSED_HOLD_AT_STREAM_END",
+ })
+ _MAX_TAIL_WINDOW_ID = 1_000_000
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index 40ece71..97adad0 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -1177,6 +1177,182 @@ def test_compiled_retry_resets_hold_state_between_cache_attempts(monkeypatch):
+     assert processor.telemetry()["stateResetRows"] == 0
+ 
+ 
++def test_compiled_mania_hard_cap_without_eos_is_typed_failure(monkeypatch):
++    class Cache:
++        @staticmethod
++        def reset():
++            return None
++
++    class FakeDecoder:
++        @staticmethod
++        def set_encoder_hidden(_hidden):
++            return None
++
++        @staticmethod
++        def replay(_token, _cache_position):
++            return scores()
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=5)
++
++        @staticmethod
++        def prepare_inputs_for_generation(*_args, **_kwargs):
++            return {}
++
++        @staticmethod
++        def __call__(**_kwargs):
++            return SimpleNamespace(logits=scores().unsqueeze(1))
++
++    monkeypatch.setattr(
++        compiled_decode_module, "neutralize_dynamic_rope", lambda _model: None
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "build_logits_processors",
++        lambda *_args: compiled_decode_module.LogitsProcessorList(),
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_get_decoder",
++        lambda *_args: (FakeDecoder(), Cache()),
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_sample",
++        lambda *_args: torch.tensor([[30]], dtype=torch.long),
++    )
++
++    with pytest.raises(ManiaDomainError) as caught:
++        compiled_decode_module.model_generate_compiled(
++            FakeModel(),
++            FakeTokenizer(),
++            {
++                "encoder_outputs": torch.zeros((1, 1, 1)),
++                "decoder_input_ids": torch.tensor(
++                    [[keycount_token(4), FakeTokenizer.sos_id, 30]]
++                ),
++            },
++            {
++                "context_type": "map",
++                "mania_open_hold_columns": (),
++                "max_length": 5,
++                "do_sample": False,
++            },
++        )
++
++    assert caught.value.reason == "TOKEN_BUDGET_EXHAUSTED"
++    assert caught.value.decoder_token_index == 5
++    assert caught.value.generated_token_index == 2
++    assert caught.value.context == {
++        "hardCap": 5,
++        "initialBucket": 5,
++        "finalBucket": 5,
++        "bucketRestarted": 0,
++        "generatedBeforeRestart": 0,
++        "generatedAtFailure": 2,
++    }
++
++
++def test_compiled_sampling_bucket_retry_restores_rng_and_reports_restart(monkeypatch):
++    events = []
++
++    class Cache:
++        @staticmethod
++        def reset():
++            return None
++
++    class FakeDecoder:
++        @staticmethod
++        def set_encoder_hidden(_hidden):
++            return None
++
++        @staticmethod
++        def replay(_token, _cache_position):
++            return scores()
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=5)
++
++        @staticmethod
++        def prepare_inputs_for_generation(*_args, **_kwargs):
++            return {}
++
++        @staticmethod
++        def __call__(**_kwargs):
++            return SimpleNamespace(logits=scores().unsqueeze(1))
++
++    sampled_tokens = iter((30, FakeTokenizer.eos_id))
++    sentinel = object()
++    monkeypatch.setattr(
++        compiled_decode_module, "neutralize_dynamic_rope", lambda _model: None
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "build_logits_processors",
++        lambda *_args: compiled_decode_module.LogitsProcessorList(),
++    )
++    monkeypatch.setattr(compiled_decode_module, "_pick_bucket", lambda *_args: 4)
++    monkeypatch.setattr(compiled_decode_module, "_bucket_ceil", lambda *_args: 5)
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_get_decoder",
++        lambda *_args: (FakeDecoder(), Cache()),
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "capture_rng_state",
++        lambda: events.append("capture") or sentinel,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "restore_rng_state",
++        lambda snapshot: events.append(("restore", snapshot)),
++        raising=False,
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_sample",
++        lambda *_args: torch.tensor([[next(sampled_tokens)]], dtype=torch.long),
++    )
++
++    result, stats = compiled_decode_module.model_generate_compiled(
++        FakeModel(),
++        FakeTokenizer(),
++        {
++            "encoder_outputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": torch.tensor(
++                [[keycount_token(4), FakeTokenizer.sos_id, 30]]
++            ),
++        },
++        {
++            "context_type": "map",
++            "mania_open_hold_columns": (),
++            "max_length": 5,
++            "do_sample": True,
++        },
++    )
++
++    assert events == ["capture", ("restore", sentinel)]
++    assert torch.equal(
++        result,
++        torch.tensor(
++            [[keycount_token(4), FakeTokenizer.sos_id, 30, FakeTokenizer.eos_id]]
++        ),
++    )
++    assert stats["compiledDecode"] == {
++        "initialBucket": 4,
++        "finalBucket": 5,
++        "bucketRestarted": True,
++        "generatedBeforeRestart": 1,
++        "terminationReason": "EOS",
++    }
++
++
+ def test_stock_generate_constructs_clean_hold_state_without_reset(monkeypatch):
+     observations = {}
+ 
+@@ -2387,6 +2563,24 @@ def test_final_window_rejects_already_insufficient_hold_closure_budget():
+         processor(torch.tensor([[keycount_token(4), 1, 30]]), scores())
+ 
+ 
++def test_final_token_budget_forces_eos_instead_of_starting_another_group():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        require_closed_holds_at_eos=True,
++        max_sequence_length=4,
++    )
++
++    result = processor(
++        torch.tensor([[keycount_token(4), FakeTokenizer.sos_id, 30]]),
++        scores(),
++    )
++
++    allowed = torch.isfinite(result[0]).nonzero(as_tuple=False).flatten().tolist()
++    assert allowed == [FakeTokenizer.eos_id]
++    assert processor.telemetry()["forcedTerminalEosSteps"] == 1
++
++
+ def test_final_window_masks_a_hold_start_that_cannot_later_be_closed():
+     processor = ManiaHoldStateLogitsProcessor(
+         FakeTokenizer(),
+@@ -2437,6 +2631,7 @@ def test_hold_state_processor_reports_intervention_counts():
+         "duplicateTokensMasked": 0,
+         "finalEosClosureSteps": 1,
+         "budgetBoundarySteps": 0,
++        "forcedTerminalEosSteps": 0,
+         "forcedClosureSteps": 0,
+         "insufficientClosureBudgetSteps": 0,
+         "unclosableHoldStartSteps": 0,

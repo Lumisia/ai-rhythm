@@ -1,0 +1,80 @@
+diff --git a/osuT5/osuT5/dataset/data_utils.py b/osuT5/osuT5/dataset/data_utils.py
+index f55b2ff..1d396f2 100644
+--- a/osuT5/osuT5/dataset/data_utils.py
++++ b/osuT5/osuT5/dataset/data_utils.py
+@@ -974,6 +974,10 @@ def get_groups(
+         groups.append(group)
+         group_indices.append(indices)
+     elif len(indices) > 0:
++        if len(group_indices) == 0:
++            raise ValueError(
++                "trailing event fragment has no completed group owner"
++            )
+         group_indices[-1].extend(indices)
+ 
+     return groups, group_indices
+diff --git a/tests/test_mania_event_origins.py b/tests/test_mania_event_origins.py
+index cc9aee3..5f2dfa9 100644
+--- a/tests/test_mania_event_origins.py
++++ b/tests/test_mania_event_origins.py
+@@ -3,6 +3,7 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ 
++from osuT5.osuT5.dataset.data_utils import get_groups
+ from osuT5.osuT5.event import Event, EventType
+ from osuT5.osuT5.inference.origin import EventOrigin, merge_origin_streams
+ from osuT5.osuT5.inference.processor import GenerationConfig, Processor
+@@ -34,6 +35,52 @@ def make_processor() -> Processor:
+     return processor
+ 
+ 
++def test_get_groups_rejects_trailing_fragment_without_completed_owner():
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 2),
++    ]
++
++    with pytest.raises(
++        ValueError,
++        match="trailing event fragment has no completed group owner",
++    ):
++        get_groups(events, event_times=[100, 100], types_first=False)
++
++
++def test_processor_trim_rejects_ownerless_fragment_without_mutation():
++    processor = make_processor()
++    events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.MANIA_COLUMN, 2),
++    ]
++    event_times = [100, 100]
++    event_origins = [
++        EventOrigin.generated(7, 0),
++        EventOrigin.generated(7, 1),
++    ]
++    original = (
++        list(events),
++        list(event_times),
++        list(event_origins),
++    )
++
++    with pytest.raises(
++        ValueError,
++        match="trailing event fragment has no completed group owner",
++    ):
++        processor._trim_events_after_time(
++            events,
++            event_times,
++            50,
++            event_origins,
++        )
++
++    assert events == original[0]
++    assert event_times == original[1]
++    assert event_origins == original[2]
++
++
+ def test_generated_event_origins_survive_decode_and_time_update():
+     processor = make_processor()
+     context = {

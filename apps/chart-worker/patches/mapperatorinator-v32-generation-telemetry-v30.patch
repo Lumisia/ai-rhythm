@@ -1,0 +1,660 @@
+diff --git a/config.py b/config.py
+index 615f0f1..6630e14 100644
+--- a/config.py
++++ b/config.py
+@@ -80,6 +80,7 @@ class InferenceConfig:
+     snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
+     fast_decoder_loop: bool = False  # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+     super_timing_fast_loop: bool = False  # Use the fast decoder loop for super timing instead of the batched-parallel path. Separate from fast_decoder_loop because super timing's parallel path may be faster on some GPUs; benchmark before enabling.
++    write_generation_telemetry: bool = False  # Write a hash-bound evidence sidecar for bounded experiments.
+ 
+     # Metadata settings
+     bpm: Optional[int] = None  # Beats per minute of input audio
+diff --git a/configs/inference/default.yaml b/configs/inference/default.yaml
+index 19217ba..83db7c9 100644
+--- a/configs/inference/default.yaml
++++ b/configs/inference/default.yaml
+@@ -65,6 +65,7 @@ use_server: false        # Use server for optimized multiprocess inference (adds
+ max_batch_size: 16       # Maximum batch size for inference
+ fast_decoder_loop: false # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+ super_timing_fast_loop: false # Use the fast decoder loop for super timing instead of the batched-parallel path; benchmark on your GPU before enabling
++write_generation_telemetry: false # Opt-in hash-bound evidence sidecar for bounded experiments
+ resnap_events: true      # Resnap events to the timing after generation
+ snap_near_perfect_overlaps: true  # Snap nearly overlapping positions to each other
+ 
+diff --git a/inference.py b/inference.py
+index 4bfddc3..d3fd0c7 100644
+--- a/inference.py
++++ b/inference.py
+@@ -4,6 +4,7 @@ import multiprocessing
+ import os.path
+ import random
+ import sys
++import time
+ import uuid
+ from dataclasses import dataclass
+ from functools import reduce
+@@ -34,6 +35,7 @@ from osuT5.osuT5.inference import (
+     generation_config_from_beatmap,
+ )
+ from osuT5.osuT5.inference.encoder_cache import ExactEncoderCache
++from osuT5.osuT5.inference.generation_telemetry import write_generation_telemetry
+ from osuT5.osuT5.inference.origin import merge_origin_streams
+ from osuT5.osuT5.inference.server import InferenceClient
+ from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
+@@ -490,6 +492,7 @@ def generate(
+         logger=None,
+         encoder_cache: ExactEncoderCache | None = None,
+         encoder_model_identity: tuple[str, str] | None = None,
++        runtime_stats: dict[str, Any] | None = None,
+ ):
+     audio_path = args.audio_path if audio_path is None else audio_path
+     beatmap_path = args.beatmap_path if beatmap_path is None else beatmap_path
+@@ -576,6 +579,7 @@ def generate(
+ 
+     # Generate beatmap
+     if len(output_type) > 0:
++        processor_started = time.perf_counter()
+         result = processor.generate(
+             sequences=sequences,
+             generation_config=generation_config,
+@@ -586,6 +590,10 @@ def generate(
+             verbose=verbose,
+             include_origins=True,
+         )
++        if processor.last_generation_stats is not None:
++            processor.last_generation_stats["processorWallSeconds"] = float(
++                time.perf_counter() - processor_started
++            )
+ 
+         events, event_times, event_origins = reduce(merge_origin_streams, result)
+ 
+@@ -664,6 +672,32 @@ def generate(
+                 seed=args.seed,
+                 collisions=resnap_collisions,
+             )
++        if args.write_generation_telemetry:
++            if type(processor.last_generation_stats) is not dict:
++                raise ValueError("generation telemetry requires processor statistics")
++            write_generation_telemetry(
++                result_path,
++                audio_path=Path(audio_path),
++                reference_path=Path(beatmap_path) if beatmap_path else None,
++                generation={
++                    "seed": args.seed,
++                    "gamemode": args.gamemode,
++                    "keycount": args.keycount,
++                    "difficulty": args.difficulty,
++                    "outputTypes": [value.value for value in args.output_type],
++                    "maniaHoldStateMode": args.mania_hold_state_mode,
++                    "useServer": args.use_server,
++                    "parallel": args.parallel,
++                    "fastDecoderLoop": args.fast_decoder_loop,
++                    "precision": args.precision,
++                    "startTimeMs": args.start_time,
++                    "endTimeMs": args.end_time,
++                    "lastAttackTimeMs": args.last_attack_time,
++                    "addToBeatmap": args.add_to_beatmap,
++                },
++                processor_stats=processor.last_generation_stats,
++                runtime_stats=runtime_stats,
++            )
+         if verbose:
+             logger.info(f"Generated beatmap saved to {result_path}")
+ 
+@@ -777,6 +811,9 @@ class InferenceModelBundle:
+ 
+ 
+ class InferenceRuntime(Protocol):
++    @property
++    def registry_load_count(self) -> int: ...
++
+     def prepare_invocation(self, args: InferenceConfig) -> None: ...
+ 
+     def model_bundle(
+@@ -852,6 +889,7 @@ def execute_inference(
+         models = load_inference_models(args)
+         encoder_cache = None
+         encoder_model_identity = None
++        runtime_stats = None
+     else:
+         runtime.prepare_invocation(args)
+         loads_separate_timing_model = should_load_separate_timing_model(args)
+@@ -865,6 +903,12 @@ def execute_inference(
+             loads_separate_timing_model=loads_separate_timing_model,
+         )
+         encoder_model_identity = (manifest_sha256, config_sha256)
++        runtime_stats = {
++            "resident": True,
++            "registryLoadCount": runtime.registry_load_count,
++            "modelManifestSha256": manifest_sha256,
++            "modelConfigSha256": config_sha256,
++        }
+ 
+     generation_config, beatmap_config = get_config(args)
+ 
+@@ -882,6 +926,7 @@ def execute_inference(
+         refine_model=models.refine_model,
+         encoder_cache=encoder_cache,
+         encoder_model_identity=encoder_model_identity,
++        runtime_stats=runtime_stats,
+     )
+ 
+ 
+diff --git a/osuT5/osuT5/inference/generation_telemetry.py b/osuT5/osuT5/inference/generation_telemetry.py
+new file mode 100644
+index 0000000..1fdc0f4
+--- /dev/null
++++ b/osuT5/osuT5/inference/generation_telemetry.py
+@@ -0,0 +1,131 @@
++"""Opt-in, hash-bound generation evidence for bounded performance experiments."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import os
++import uuid
++from pathlib import Path
++from typing import Any
++
++
++GENERATION_TELEMETRY_SUFFIX = ".generation.json"
++_MAX_TELEMETRY_BYTES = 1_048_576
++
++
++def _sha256_path(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _plain_json(value: Any, *, path: str) -> Any:
++    if value is None or type(value) in (bool, int, str):
++        return value
++    if type(value) is float:
++        if not math.isfinite(value):
++            raise ValueError(f"{path} contains a non-finite float")
++        return value
++    if type(value) in (list, tuple):
++        return [
++            _plain_json(item, path=f"{path}[{index}]")
++            for index, item in enumerate(value)
++        ]
++    if type(value) is dict:
++        if any(type(key) is not str for key in value):
++            raise TypeError(f"{path} contains a non-string key")
++        return {
++            key: _plain_json(value[key], path=f"{path}.{key}")
++            for key in sorted(value)
++        }
++    raise TypeError(f"{path} contains unsupported type {type(value).__name__}")
++
++
++def write_generation_telemetry(
++    output_osu_path: Path,
++    *,
++    audio_path: Path,
++    reference_path: Path | None,
++    generation: dict[str, Any],
++    processor_stats: dict[str, Any],
++    runtime_stats: dict[str, Any] | None,
++) -> Path:
++    """Write one canonical sidecar only after the bound .osu exists.
++
++    This is deliberately opt-in at the inference configuration layer. It is an
++    evidence artifact, not an alternative success signal: the .osu SHA-256 and
++    both input identities are embedded so stale or cross-run telemetry cannot be
++    mistaken for the current output.
++    """
++
++    for name, path in (("output_osu_path", output_osu_path), ("audio_path", audio_path)):
++        if not isinstance(path, Path) or not path.is_file() or path.is_symlink():
++            raise FileNotFoundError(f"{name} must be an existing regular file")
++    if output_osu_path.suffix.lower() != ".osu":
++        raise ValueError("generation telemetry requires an .osu output")
++    if reference_path is not None and (
++        not isinstance(reference_path, Path)
++        or not reference_path.is_file()
++        or reference_path.is_symlink()
++    ):
++        raise FileNotFoundError("reference_path must be an existing regular file or None")
++    if type(generation) is not dict or type(processor_stats) is not dict:
++        raise TypeError("generation and processor_stats must be plain dicts")
++    if runtime_stats is not None and type(runtime_stats) is not dict:
++        raise TypeError("runtime_stats must be a plain dict or None")
++
++    payload = _plain_json(
++        {
++            "version": 1,
++            "output": {
++                "fileName": output_osu_path.name,
++                "size": output_osu_path.stat().st_size,
++                "sha256": _sha256_path(output_osu_path),
++            },
++            "input": {
++                "audioSha256": _sha256_path(audio_path),
++                "referenceSha256": (
++                    _sha256_path(reference_path) if reference_path is not None else None
++                ),
++            },
++            "generation": generation,
++            "processorStats": processor_stats,
++            "runtimeStats": runtime_stats,
++        },
++        path="telemetry",
++    )
++    encoded = (
++        json.dumps(
++            payload,
++            ensure_ascii=True,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        )
++        + "\n"
++    ).encode("utf-8")
++    if len(encoded) > _MAX_TELEMETRY_BYTES:
++        raise ValueError("generation telemetry exceeds 1 MiB")
++
++    sidecar = output_osu_path.with_suffix(GENERATION_TELEMETRY_SUFFIX)
++    temporary = sidecar.with_name(f".{sidecar.name}.{uuid.uuid4().hex}.tmp")
++    try:
++        with temporary.open("xb") as stream:
++            stream.write(encoded)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, sidecar)
++        if os.name == "posix":
++            directory_fd = os.open(sidecar.parent, os.O_RDONLY)
++            try:
++                os.fsync(directory_fd)
++            finally:
++                os.close(directory_fd)
++    finally:
++        if temporary.exists():
++            temporary.unlink()
++    return sidecar
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 6cb4ed1..7bde8ec 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -580,7 +580,7 @@ class Processor(object):
+             song_positions = None
+ 
+         # Precompute encoder outputs for all windows in one batched pass
+-        t0 = _time.perf_counter() if verbose else 0
++        t0 = _time.perf_counter()
+         if verbose:
+             print(f"Precomputing encoder outputs for {n_windows} windows...")
+         enc_hidden = self._precompute_encoder_hidden(
+@@ -590,9 +590,15 @@ class Processor(object):
+             cond_kwargs=cond_kwargs,
+             song_positions=song_positions,
+         )
++        encoder_elapsed = _time.perf_counter() - t0
++        if self.last_generation_stats is not None:
++            self.last_generation_stats["encoderWindows"] = int(n_windows)
++            self.last_generation_stats["encoderPrecomputeSeconds"] = float(
++                encoder_elapsed
++            )
+         if verbose:
+-            print(f"Encoder precompute: {_time.perf_counter() - t0:.2f}s "
+-                  f"({(_time.perf_counter() - t0) / n_windows * 1000:.1f} ms/window)")
++            print(f"Encoder precompute: {encoder_elapsed:.2f}s "
++                  f"({encoder_elapsed / n_windows * 1000:.1f} ms/window)")
+ 
+         repair_context = eligible_mania_tail_context(
+             is_inference_client=isinstance(self.model, InferenceClient),
+@@ -2469,6 +2475,10 @@ class Processor(object):
+             "tailRepairTerminalReason": None,
+             "encoderCache": None,
+             "encoderCacheHit": None,
++            "encoderWindows": 0,
++            "encoderPrecomputeSeconds": 0.0,
++            "processorWallSeconds": 0.0,
++            "compiledDecode": [],
+         }
+ 
+     def _record_tail_repair_start(
+@@ -2515,6 +2525,9 @@ class Processor(object):
+             )
+             for key, value in grammar_stats.items():
+                 aggregate[key] = int(aggregate.get(key, 0)) + int(value or 0)
++        compiled_decode = stats.get("compiledDecode")
++        if isinstance(compiled_decode, dict):
++            self.last_generation_stats["compiledDecode"].append(dict(compiled_decode))
+ 
+     @staticmethod
+     def _create_tokens_per_second_meter(alpha: float = 0.1) -> dict[str, float | None]:
+diff --git a/tests/test_encoder_cache.py b/tests/test_encoder_cache.py
+index ec49841..fdbc28f 100644
+--- a/tests/test_encoder_cache.py
++++ b/tests/test_encoder_cache.py
+@@ -209,3 +209,54 @@ def test_processor_reuses_exact_encoder_result_without_a_second_model_call(monke
+     assert second[0, 0, 0].item() == 10.0
+     assert processor.last_generation_stats["encoderCacheHit"] is True
+     assert processor.last_generation_stats["encoderCache"]["hits"] == 1
++
++
++def test_processor_aggregates_compiled_decode_evidence_per_attempt():
++    processor = Processor.__new__(Processor)
++    processor._reset_generation_stats()
++
++    processor._record_generation_stats(
++        {
++            "generated_tokens": 5,
++            "elapsed_seconds": 0.5,
++            "compiledDecode": {
++                "initialBucket": 256,
++                "finalBucket": 512,
++                "bucketRestarted": True,
++                "generatedBeforeRestart": 200,
++                "terminationReason": "EOS",
++            },
++        }
++    )
++    processor._record_generation_stats(
++        {
++            "generated_tokens": 3,
++            "elapsed_seconds": 0.25,
++            "compiledDecode": {
++                "initialBucket": 256,
++                "finalBucket": 256,
++                "bucketRestarted": False,
++                "generatedBeforeRestart": 0,
++                "terminationReason": "EOS",
++            },
++        }
++    )
++
++    assert processor.last_generation_stats["generated_tokens"] == 8
++    assert processor.last_generation_stats["elapsed_seconds"] == 0.75
++    assert processor.last_generation_stats["compiledDecode"] == [
++        {
++            "initialBucket": 256,
++            "finalBucket": 512,
++            "bucketRestarted": True,
++            "generatedBeforeRestart": 200,
++            "terminationReason": "EOS",
++        },
++        {
++            "initialBucket": 256,
++            "finalBucket": 256,
++            "bucketRestarted": False,
++            "generatedBeforeRestart": 0,
++            "terminationReason": "EOS",
++        },
++    ]
+diff --git a/tests/test_generation_telemetry.py b/tests/test_generation_telemetry.py
+new file mode 100644
+index 0000000..2a6d06f
+--- /dev/null
++++ b/tests/test_generation_telemetry.py
+@@ -0,0 +1,126 @@
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++
++from osuT5.osuT5.inference.generation_telemetry import (
++    GENERATION_TELEMETRY_SUFFIX,
++    write_generation_telemetry,
++)
++
++
++def _sha256(payload: bytes) -> str:
++    return hashlib.sha256(payload).hexdigest()
++
++
++def test_generation_telemetry_is_hash_bound_and_canonical(tmp_path: Path):
++    audio = tmp_path / "clip.flac"
++    reference = tmp_path / "timing.osu"
++    output = tmp_path / "generated.osu"
++    audio.write_bytes(b"bounded audio")
++    reference.write_bytes(b"timing authority")
++    output.write_bytes(b"osu file")
++    generation = {
++        "seed": 7,
++        "gamemode": 3,
++        "keycount": 4,
++        "difficulty": 1.0,
++        "outputTypes": ["map"],
++        "maniaHoldStateMode": "incremental",
++        "useServer": False,
++        "parallel": False,
++        "fastDecoderLoop": True,
++        "precision": "fp16",
++        "startTimeMs": None,
++        "endTimeMs": None,
++        "lastAttackTimeMs": 47_000,
++        "addToBeatmap": False,
++    }
++    processor_stats = {
++        "encoderWindows": 20,
++        "encoderCacheHit": False,
++        "tailRepairAttempts": 0,
++        "compiledDecode": [{"terminationReason": "EOS"}],
++    }
++    runtime_stats = {
++        "resident": True,
++        "registryLoadCount": 1,
++        "modelManifestSha256": "a" * 64,
++        "modelConfigSha256": "b" * 64,
++    }
++
++    sidecar = write_generation_telemetry(
++        output,
++        audio_path=audio,
++        reference_path=reference,
++        generation=generation,
++        processor_stats=processor_stats,
++        runtime_stats=runtime_stats,
++    )
++
++    assert sidecar == output.with_suffix(GENERATION_TELEMETRY_SUFFIX)
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    assert payload == {
++        "version": 1,
++        "output": {
++            "fileName": output.name,
++            "size": len(b"osu file"),
++            "sha256": _sha256(b"osu file"),
++        },
++        "input": {
++            "audioSha256": _sha256(b"bounded audio"),
++            "referenceSha256": _sha256(b"timing authority"),
++        },
++        "generation": generation,
++        "processorStats": processor_stats,
++        "runtimeStats": runtime_stats,
++    }
++    assert sidecar.read_bytes().endswith(b"\n")
++
++
++@pytest.mark.parametrize(
++    "processor_stats",
++    [
++        {"elapsed": float("nan")},
++        {"bad": {1, 2}},
++        {"bad": {1: "non-string key"}},
++    ],
++)
++def test_generation_telemetry_rejects_non_json_evidence_atomically(
++    tmp_path: Path,
++    processor_stats: dict,
++):
++    audio = tmp_path / "clip.flac"
++    output = tmp_path / "generated.osu"
++    audio.write_bytes(b"audio")
++    output.write_bytes(b"osu")
++
++    with pytest.raises((TypeError, ValueError)):
++        write_generation_telemetry(
++            output,
++            audio_path=audio,
++            reference_path=None,
++            generation={"maniaHoldStateMode": "incremental"},
++            processor_stats=processor_stats,
++            runtime_stats=None,
++        )
++
++    assert not output.with_suffix(GENERATION_TELEMETRY_SUFFIX).exists()
++
++
++def test_generation_telemetry_requires_existing_osu_and_audio(tmp_path: Path):
++    audio = tmp_path / "missing.flac"
++    output = tmp_path / "missing.osu"
++
++    with pytest.raises(FileNotFoundError):
++        write_generation_telemetry(
++            output,
++            audio_path=audio,
++            reference_path=None,
++            generation={},
++            processor_stats={},
++            runtime_stats=None,
++        )
+diff --git a/tests/test_resident_runtime.py b/tests/test_resident_runtime.py
+index 612a993..2c74aa1 100644
+--- a/tests/test_resident_runtime.py
++++ b/tests/test_resident_runtime.py
+@@ -29,6 +29,7 @@ from osuT5.osuT5.inference.resident_runtime import (
+     ResidentInferenceRuntime,
+     verify_model_manifest,
+ )
++from osuT5.osuT5.tokenizer import ContextType
+ from osuT5.osuT5.utils import model_utils
+ 
+ _REVISION = "74f22583400d259bf424819e11027c17933efe54"
+@@ -426,6 +427,7 @@ def test_shared_execute_core_compiles_prepares_loads_and_generates_once(monkeypa
+ 
+     class FakeRuntime:
+         cache = ExactEncoderCache(max_entries=2, max_bytes=1024)
++        registry_load_count = 1
+ 
+         def prepare_invocation(self, observed):
+             calls.append(("prepare", observed.seed))
+@@ -464,6 +466,116 @@ def test_shared_execute_core_compiles_prepares_loads_and_generates_once(monkeypa
+     assert generated[1]["tokenizer"] == "tokenizer"
+     assert generated[1]["encoder_cache"] is FakeRuntime.cache
+     assert generated[1]["encoder_model_identity"] == ("a" * 64, "b" * 64)
++    assert generated[1]["runtime_stats"] == {
++        "resident": True,
++        "registryLoadCount": 1,
++        "modelManifestSha256": "a" * 64,
++        "modelConfigSha256": "b" * 64,
++    }
++
++
++def test_generate_writes_opt_in_hash_bound_processor_telemetry(
++    tmp_path: Path,
++    monkeypatch,
++):
++    audio = tmp_path / "clip.flac"
++    output_dir = tmp_path / "output"
++    audio.write_bytes(b"bounded audio")
++    output_dir.mkdir()
++    args = InferenceConfig(
++        audio_path=str(audio),
++        output_path=str(output_dir),
++        seed=11,
++        gamemode=3,
++        keycount=4,
++        difficulty=1.0,
++        in_context=[ContextType.NONE],
++        output_type=[ContextType.MAP],
++        use_server=False,
++        parallel=False,
++        generate_positions=False,
++        resnap_events=False,
++        fast_decoder_loop=True,
++        mania_hold_state_mode="incremental",
++        precision="fp16",
++        write_generation_telemetry=True,
++    )
++    args.train.data.context_types = [
++        {"in": [ContextType.NONE], "out": [ContextType.MAP]}
++    ]
++
++    class FakePreprocessor:
++        def __init__(self, observed, *, parallel):
++            assert observed is args
++            assert parallel is False
++
++        @staticmethod
++        def load(path):
++            assert path == str(audio)
++            return "audio"
++
++        @staticmethod
++        def segment(observed):
++            assert observed == "audio"
++            return "sequences"
++
++    class FakeProcessor:
++        def __init__(self, observed, model, tokenizer, **kwargs):
++            assert observed is args
++            assert model == "model"
++            assert tokenizer == "tokenizer"
++            self.last_generation_stats = None
++
++        def generate(self, **kwargs):
++            assert kwargs["sequences"] == "sequences"
++            self.last_generation_stats = {
++                "encoderWindows": 20,
++                "encoderCacheHit": False,
++                "tailRepairAttempts": 0,
++                "compiledDecode": [{"terminationReason": "EOS"}],
++            }
++            return [([], [], [])]
++
++    class FakePostprocessor:
++        def __init__(self, observed, *, logger):
++            assert observed is args
++
++        @staticmethod
++        def generate(**kwargs):
++            assert kwargs["events"] == []
++            return "serialized beatmap"
++
++        @staticmethod
++        def write_result(path: Path, result):
++            assert result == "serialized beatmap"
++            path.write_text("osu output", encoding="utf-8")
++
++    monkeypatch.setattr(inference, "Preprocessor", FakePreprocessor)
++    monkeypatch.setattr(inference, "Processor", FakeProcessor)
++    monkeypatch.setattr(inference, "Postprocessor", FakePostprocessor)
++
++    _result, osu_path = inference.generate(
++        args,
++        generation_config=SimpleNamespace(gamemode=3, keycount=4),
++        beatmap_config=SimpleNamespace(),
++        model="model",
++        tokenizer="tokenizer",
++        verbose=False,
++        runtime_stats={
++            "resident": True,
++            "registryLoadCount": 1,
++            "modelManifestSha256": "a" * 64,
++            "modelConfigSha256": "b" * 64,
++        },
++    )
++
++    sidecar = osu_path.with_suffix(".generation.json")
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    assert payload["processorStats"]["encoderWindows"] == 20
++    assert payload["processorStats"]["processorWallSeconds"] >= 0
++    assert payload["generation"]["maniaHoldStateMode"] == "incremental"
++    assert payload["runtimeStats"]["registryLoadCount"] == 1
++    assert payload["output"]["fileName"] == osu_path.name
+ 
+ 
+ def test_main_impl_uses_the_same_execute_core(monkeypatch):

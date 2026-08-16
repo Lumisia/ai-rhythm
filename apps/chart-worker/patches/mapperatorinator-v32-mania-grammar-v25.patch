@@ -1,0 +1,2742 @@
+diff --git a/config.py b/config.py
+index 1447f5f..615f0f1 100644
+--- a/config.py
++++ b/config.py
+@@ -52,6 +52,7 @@ class InferenceConfig:
+     start_time: Optional[int] = None  # Start time of audio to generate beatmap for
+     end_time: Optional[int] = None  # End time of audio to generate beatmap for
+     last_attack_time: Optional[int] = None  # Last absolute time for new mania TAP/HOLD starts
++    mania_hold_state_mode: str = 'full_scan'  # Mania hold-state decoder contract
+     lookback: float = 0.5  # Fraction of audio sequence to fill with tokens from previous inference window
+     lookahead: float = 0.4  # Fraction of audio sequence to skip at the end of the audio window
+     timing_leniency: int = 20  # Number of milliseconds of error to allow for timing generation
+@@ -113,6 +114,17 @@ class InferenceConfig:
+     diffusion: DiffusionTrainConfig = field(default_factory=DiffusionTrainConfig)  # Training settings for diffusion model
+     hydra: Any = MISSING
+ 
++    def __post_init__(self):
++        if self.mania_hold_state_mode not in {
++            'full_scan',
++            'incremental_verify',
++            'incremental',
++        }:
++            raise ValueError(
++                "mania_hold_state_mode must be one of: full_scan, "
++                "incremental_verify, incremental"
++            )
++
+ 
+ @dataclass
+ class FidConfig:
+diff --git a/configs/inference/default.yaml b/configs/inference/default.yaml
+index d78bb27..19217ba 100644
+--- a/configs/inference/default.yaml
++++ b/configs/inference/default.yaml
+@@ -39,6 +39,7 @@ export_osz: false         # Export beatmap as .osz file
+ start_time: null          # Start time of audio to generate beatmap for
+ end_time: null            # End time of audio to generate beatmap for
+ last_attack_time: null    # Last absolute time for new mania TAP/HOLD starts
++mania_hold_state_mode: full_scan # Mania hold-state decoder contract
+ lookback: 0.5             # Fraction of audio sequence to fill with tokens from previous inference window
+ lookahead: 0.4            # Fraction of audio sequence to skip at the end of the audio window
+ timing_leniency: 20     # Number of milliseconds of error to allow for timing generation
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index bc4aa32..da1345d 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -25,7 +25,8 @@ from transformers import LogitsProcessorList
+ 
+ from .cache_utils import get_cache
+ from .server import get_eos_token_id, _build_generation_stats, build_logits_processors, \
+-    effective_generation_limit, get_mania_hold_grammar_telemetry, model_generate
++    effective_generation_limit, get_mania_hold_grammar_telemetry, model_generate, \
++    reset_mania_hold_grammar_state
+ from ..event import ContextType, EventType
+ from .logit_processors import MonotonicTimeShiftLogitsProcessor
+ 
+@@ -319,6 +320,9 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_require_closed_holds_at_eos = generate_kwargs.pop(
+         'mania_require_closed_holds_at_eos', False
+     )
++    mania_hold_state_mode = generate_kwargs.pop(
++        'mania_hold_state_mode', 'full_scan'
++    )
+     do_sample = generate_kwargs.pop('do_sample', True)
+     top_p = generate_kwargs.pop('top_p', 0.95)
+     top_k = generate_kwargs.pop('top_k', 0)
+@@ -348,6 +352,12 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         mania_prompt_current_time_token,
+         mania_require_closed_holds_at_eos,
+         hard_cap,
++        mania_hold_state_mode,
++        (
++            decoder_input_ids.shape[0] == 1
++            and generate_kwargs.get('num_beams', 1) == 1
++            and cfg_scale <= 1.0
++        ),
+     )
+     # Hoist MonotonicTimeShift out of the per-step list into an O(1) incremental
+     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
+@@ -381,6 +391,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+         decoder, cache = _get_decoder(model, eff_batch, cfg_scale, enc_hidden.shape,
+                                       model.dtype, cache_len)
+         _reset_cache(cache)                    # fresh generation for this window
++        reset_mania_hold_grammar_state(logits_processor_list)
+         decoder.set_encoder_hidden(enc_hidden)  # write this window's encoder state
+         if mono_mask is not None:
+             mono_mask.init_from_prompt(decoder_input_ids)  # reset per (re)attempt
+diff --git a/osuT5/osuT5/inference/logit_processors.py b/osuT5/osuT5/inference/logit_processors.py
+index 9e16f87..3bae72a 100644
+--- a/osuT5/osuT5/inference/logit_processors.py
++++ b/osuT5/osuT5/inference/logit_processors.py
+@@ -1,4 +1,6 @@
+ import math
++from dataclasses import dataclass
++from typing import Literal
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -168,6 +170,454 @@ def mania_open_hold_columns_before(
+ 
+ 
+ _PROMPT_TIME_UNSET = object()
++HoldStateMode = Literal["full_scan", "incremental_verify", "incremental"]
++
++
++_CLOSED = 0
++_OPEN = 1
++_INVALID = -1
++_IDENTITY_TRANSITION = (_CLOSED, _OPEN)
++HoldTransition = tuple[int, int]
++
++
++def _compose_hold_transitions(
++        left: HoldTransition,
++        right: HoldTransition,
++) -> HoldTransition:
++    """Apply left, then right, for CLOSED and OPEN inputs."""
++    def apply(state: int) -> int:
++        intermediate = left[state]
++        return _INVALID if intermediate == _INVALID else right[intermediate]
++
++    return apply(_CLOSED), apply(_OPEN)
++
++
++def _mania_bucket_transition(
++        event_types: frozenset[EventType],
++) -> HoldTransition:
++    """Summarize one time/lane bucket in END, START, TAP order."""
++    transition = _IDENTITY_TRANSITION
++    ordered_events = (
++        (EventType.HOLD_NOTE_END, (_INVALID, _CLOSED)),
++        (EventType.HOLD_NOTE, (_OPEN, _INVALID)),
++        (EventType.CIRCLE, (_CLOSED, _INVALID)),
++    )
++    for event_type, event_transition in ordered_events:
++        if event_type in event_types:
++            transition = _compose_hold_transitions(
++                transition,
++                event_transition,
++            )
++    return transition
++
++
++class _LaneHoldTransitionTree:
++    def __init__(self, time_start: int, time_end: int) -> None:
++        if time_end < time_start:
++            raise ValueError("time_end must be greater than or equal to time_start")
++        self.time_start = time_start
++        self.time_end = time_end
++        leaf_count = 1 + time_end - time_start
++        self._size = 1
++        while self._size < leaf_count:
++            self._size *= 2
++        self._tree = [_IDENTITY_TRANSITION] * (2 * self._size)
++        self._event_types = [frozenset() for _ in range(leaf_count)]
++
++    def _leaf_index(self, time_token: int | None) -> int:
++        if time_token is None:
++            return 0
++        if not self.time_start <= time_token < self.time_end:
++            raise ValueError(
++                f"time token {time_token} is outside "
++                f"[{self.time_start}, {self.time_end})"
++            )
++        return 1 + time_token - self.time_start
++
++    @property
++    def transition(self) -> HoldTransition:
++        return self._tree[1]
++
++    def add(self, time_token: int | None, event_type: EventType) -> None:
++        leaf_index = self._leaf_index(time_token)
++        event_types = self._event_types[leaf_index] | {event_type}
++        self._event_types[leaf_index] = event_types
++        node = self._size + leaf_index
++        self._tree[node] = _mania_bucket_transition(event_types)
++        while node > 1:
++            node //= 2
++            self._tree[node] = _compose_hold_transitions(
++                self._tree[2 * node],
++                self._tree[2 * node + 1],
++            )
++
++    def query_with_candidate(
++            self,
++            time_token: int | None,
++            event_type: EventType,
++    ) -> HoldTransition:
++        leaf_index = self._leaf_index(time_token)
++        transition = _mania_bucket_transition(
++            self._event_types[leaf_index] | {event_type}
++        )
++        node = self._size + leaf_index
++        while node > 1:
++            if node % 2 == 0:
++                transition = _compose_hold_transitions(
++                    transition,
++                    self._tree[node + 1],
++                )
++            else:
++                transition = _compose_hold_transitions(
++                    self._tree[node - 1],
++                    transition,
++                )
++            node //= 2
++        return transition
++
++
++@dataclass
++class _IncrementalManiaRowState:
++    keycount: int
++    prompt_length: int
++    processed_length: int
++    last_terminal_token: int | None
++    sos_epoch: int
++    token_log: list[int]
++    current_time_token: int | None
++    current_lane: int | None
++    seen_groups: set[tuple[int | None, int, EventType]]
++    generated_groups: set[tuple[int | None, int, EventType]]
++    lane_trees: tuple[_LaneHoldTransitionTree, ...]
++
++    @staticmethod
++    def _token_values(tokens: torch.LongTensor) -> list[int]:
++        if tokens.ndim != 1:
++            raise ValueError("incremental mania row tokens must be one-dimensional")
++        return [int(token) for token in tokens.detach().cpu().tolist()]
++
++    @staticmethod
++    def _keycount_from_tokens(
++            processor: "ManiaHoldStateLogitsProcessor",
++            token_values: list[int],
++    ) -> int:
++        keycount_tokens = [
++            token
++            for token in token_values
++            if processor.keycount_start <= token < processor.keycount_end
++        ]
++        if not keycount_tokens:
++            raise ValueError("mania row has no keycount token")
++        return (
++            keycount_tokens[-1]
++            - processor.keycount_start
++            + processor.keycount_min
++        )
++
++    @classmethod
++    def from_prompt(
++            cls,
++            processor: "ManiaHoldStateLogitsProcessor",
++            tokens: torch.LongTensor,
++    ) -> "_IncrementalManiaRowState":
++        return cls.from_decoder_prefix(
++            processor,
++            tokens,
++            prompt_length=int(tokens.shape[0]),
++        )
++
++    @classmethod
++    def from_decoder_prefix(
++            cls,
++            processor: "ManiaHoldStateLogitsProcessor",
++            tokens: torch.LongTensor,
++            *,
++            prompt_length: int,
++    ) -> "_IncrementalManiaRowState":
++        """Build from a later prefix while preserving the decoder boundary."""
++        token_values = cls._token_values(tokens)
++        if prompt_length < 0:
++            raise ValueError(
++                "incremental prompt boundary must not be negative"
++            )
++        state = cls(
++            keycount=cls._keycount_from_tokens(processor, token_values),
++            prompt_length=prompt_length,
++            processed_length=0,
++            last_terminal_token=None,
++            sos_epoch=0,
++            token_log=[],
++            current_time_token=processor.prompt_current_time_token,
++            current_lane=None,
++            seen_groups=set(),
++            generated_groups=set(),
++            lane_trees=(),
++        )
++        state._rebuild(processor, token_values, increment_sos_epoch=False)
++        return state
++
++    def _new_lane_trees(
++            self,
++            processor: "ManiaHoldStateLogitsProcessor",
++            keycount: int | None = None,
++    ) -> tuple[_LaneHoldTransitionTree, ...]:
++        tree_count = self.keycount if keycount is None else keycount
++        return tuple(
++            _LaneHoldTransitionTree(processor.time_start, processor.time_end)
++            for _ in range(tree_count)
++        )
++
++    def _reset_parser(
++            self,
++            processor: "ManiaHoldStateLogitsProcessor",
++    ) -> None:
++        seen_groups = set(processor.prompt_group_signatures)
++        lane_trees = self._new_lane_trees(processor)
++        for time_token, lane, event_type in seen_groups:
++            if not 0 <= lane < self.keycount:
++                raise ValueError(
++                    f"prompt mania lane {lane} is outside keycount {self.keycount}"
++                )
++            lane_trees[lane].add(time_token, event_type)
++        self.current_time_token = processor.prompt_current_time_token
++        self.current_lane = None
++        self.seen_groups = seen_groups
++        self.generated_groups = set()
++        self.lane_trees = lane_trees
++
++    def _ingest_token(
++            self,
++            processor: "ManiaHoldStateLogitsProcessor",
++            token: int,
++            position: int,
++    ) -> None:
++        if token == processor.sos_id:
++            self._reset_parser(processor)
++            self.sos_epoch += 1
++            return
++        current_time_token = self.current_time_token
++        if position == self.prompt_length and processor.has_prompt_current_time_contract:
++            current_time_token = processor.prompt_current_time_token
++        if processor.time_start <= token < processor.time_end:
++            self.current_time_token = token
++            self.current_lane = None
++            return
++        if processor.column_start <= token < processor.column_end:
++            self.current_time_token = current_time_token
++            self.current_lane = token - processor.column_start
++            return
++        if token not in processor.event_type_by_token:
++            self.current_time_token = current_time_token
++            return
++        if self.current_lane is None:
++            raise ValueError("mania note type in prompt has no gameplay column")
++        if not 0 <= self.current_lane < self.keycount:
++            raise ValueError(
++                f"current mania lane {self.current_lane} is outside "
++                f"keycount {self.keycount}"
++            )
++
++        event_type = processor.event_type_by_token[token]
++        signature = (current_time_token, self.current_lane, event_type)
++        is_generated = position >= self.prompt_length
++        if signature not in self.seen_groups:
++            tree = self.lane_trees[self.current_lane]
++            tree.query_with_candidate(
++                current_time_token,
++                event_type,
++            )
++            tree.add(current_time_token, event_type)
++            self.seen_groups.add(signature)
++            if is_generated:
++                self.generated_groups.add(signature)
++        elif is_generated and signature in self.generated_groups:
++            raise ValueError("duplicate mania group generated within one window")
++        self.current_time_token = current_time_token
++        self.current_lane = None
++
++    def _update_keycount_from_suffix(
++            self,
++            processor: "ManiaHoldStateLogitsProcessor",
++            token: int,
++    ) -> None:
++        if not processor.keycount_start <= token < processor.keycount_end:
++            return
++        new_keycount = token - processor.keycount_start + processor.keycount_min
++        if new_keycount == self.keycount:
++            return
++        lane_trees = self._new_lane_trees(processor, new_keycount)
++        for time_token, lane, event_type in self.seen_groups:
++            if not 0 <= lane < new_keycount:
++                raise ValueError(
++                    f"mania lane {lane} is outside keycount {new_keycount}"
++                )
++            lane_trees[lane].add(time_token, event_type)
++        self.keycount = new_keycount
++        self.lane_trees = lane_trees
++
++    def _rebuild(
++            self,
++            processor: "ManiaHoldStateLogitsProcessor",
++            token_values: list[int],
++            *,
++            increment_sos_epoch: bool,
++    ) -> None:
++        old_sos_positions = [
++            position
++            for position, token in enumerate(self.token_log)
++            if token == processor.sos_id
++        ]
++        new_sos_positions = [
++            position
++            for position, token in enumerate(token_values)
++            if token == processor.sos_id
++        ]
++        if not new_sos_positions:
++            raise ValueError("mania row has no SOS token")
++        old_sos_position_set = set(old_sos_positions)
++        sos_epoch = self.sos_epoch
++        if increment_sos_epoch and any(
++                position not in old_sos_position_set
++                for position in new_sos_positions
++        ):
++            sos_epoch += 1
++
++        rebuilt = _IncrementalManiaRowState(
++            keycount=self._keycount_from_tokens(processor, token_values),
++            prompt_length=self.prompt_length,
++            processed_length=0,
++            last_terminal_token=None,
++            sos_epoch=sos_epoch,
++            token_log=[],
++            current_time_token=processor.prompt_current_time_token,
++            current_lane=None,
++            seen_groups=set(),
++            generated_groups=set(),
++            lane_trees=(),
++        )
++        rebuilt._reset_parser(processor)
++        start = new_sos_positions[-1] + 1
++        for position in range(start, len(token_values)):
++            rebuilt._ingest_token(processor, token_values[position], position)
++        if (
++                len(token_values) <= self.prompt_length
++                and processor.has_prompt_current_time_contract
++        ):
++            rebuilt.current_time_token = processor.prompt_current_time_token
++        rebuilt.token_log = list(token_values)
++        rebuilt.processed_length = len(token_values)
++        rebuilt.last_terminal_token = token_values[-1] if token_values else None
++
++        self.keycount = rebuilt.keycount
++        self.processed_length = rebuilt.processed_length
++        self.last_terminal_token = rebuilt.last_terminal_token
++        self.sos_epoch = rebuilt.sos_epoch
++        self.token_log = rebuilt.token_log
++        self.current_time_token = rebuilt.current_time_token
++        self.current_lane = rebuilt.current_lane
++        self.seen_groups = rebuilt.seen_groups
++        self.generated_groups = rebuilt.generated_groups
++        self.lane_trees = rebuilt.lane_trees
++
++    def ingest_suffix(
++            self,
++            processor: "ManiaHoldStateLogitsProcessor",
++            tokens: torch.LongTensor,
++    ) -> None:
++        current_length = int(tokens.shape[0])
++        if current_length == self.processed_length:
++            token_values = self._token_values(tokens)
++            if token_values == self.token_log:
++                return
++            self._rebuild(processor, token_values, increment_sos_epoch=True)
++            return
++
++        if current_length == self.processed_length + 1:
++            connection_matches = (
++                self.processed_length == 0
++                or int(tokens[-2].item()) == self.last_terminal_token
++            )
++            if connection_matches:
++                suffix = self._token_values(tokens[self.processed_length:])
++                position = self.processed_length
++                self._update_keycount_from_suffix(processor, suffix[0])
++                self._ingest_token(processor, suffix[0], position)
++                self.token_log.append(suffix[0])
++                self.processed_length = current_length
++                self.last_terminal_token = suffix[0]
++                return
++
++        self._rebuild(
++            processor,
++            self._token_values(tokens),
++            increment_sos_epoch=True,
++        )
++
++    @staticmethod
++    def _initial_state(
++            initial_open_columns: frozenset[int],
++            lane: int,
++            keycount: int,
++    ) -> int:
++        if any(not 0 <= column < keycount for column in initial_open_columns):
++            raise ValueError(
++                f"initial open HOLD lane is outside keycount {keycount}: "
++                f"{sorted(initial_open_columns)}"
++            )
++        return _OPEN if lane in initial_open_columns else _CLOSED
++
++    def final_open_columns(
++            self,
++            initial_open_columns: frozenset[int],
++    ) -> tuple[int, ...]:
++        open_columns = []
++        for lane, tree in enumerate(self.lane_trees):
++            initial_state = self._initial_state(
++                initial_open_columns,
++                lane,
++                self.keycount,
++            )
++            final_state = tree.transition[initial_state]
++            if final_state == _INVALID:
++                raise ValueError(f"invalid mania HOLD transition in lane {lane}")
++            if final_state == _OPEN:
++                open_columns.append(lane)
++        return tuple(open_columns)
++
++    def candidate_final_open_columns(
++            self,
++            initial_open_columns: frozenset[int],
++            event_type: EventType,
++    ) -> tuple[int, ...]:
++        if self.current_lane is None:
++            raise ValueError("mania note type in prompt has no gameplay column")
++        if not 0 <= self.current_lane < self.keycount:
++            raise ValueError(
++                f"current mania lane {self.current_lane} is outside "
++                f"keycount {self.keycount}"
++            )
++        signature = (self.current_time_token, self.current_lane, event_type)
++        if signature in self.generated_groups:
++            raise ValueError("duplicate mania group generated within one window")
++
++        open_columns = []
++        for lane, tree in enumerate(self.lane_trees):
++            initial_state = self._initial_state(
++                initial_open_columns,
++                lane,
++                self.keycount,
++            )
++            transition = (
++                tree.query_with_candidate(self.current_time_token, event_type)
++                if lane == self.current_lane
++                else tree.transition
++            )
++            final_state = transition[initial_state]
++            if final_state == _INVALID:
++                raise ValueError(f"invalid mania HOLD transition in lane {lane}")
++            if final_state == _OPEN:
++                open_columns.append(lane)
++        return tuple(open_columns)
+ 
+ 
+ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+@@ -188,7 +638,18 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             require_closed_holds_at_eos: bool = False,
+             max_sequence_length: int | None = None,
+             max_note_start_time_token: int | None = None,
++            hold_state_mode: HoldStateMode = "full_scan",
++            incremental_eligible: bool = True,
+     ):
++        if hold_state_mode not in {
++                "full_scan", "incremental_verify", "incremental"
++        }:
++            raise ValueError(
++                "hold_state_mode must be one of: full_scan, "
++                "incremental_verify, incremental"
++            )
++        self.hold_state_mode = hold_state_mode
++        self.incremental_eligible = bool(incremental_eligible)
+         self.initial_open_columns = (
+             None
+             if initial_open_columns is None
+@@ -216,6 +677,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+         self.max_sequence_length = max_sequence_length
+         self.max_note_start_time_token = max_note_start_time_token
+         self.prompt_length: int | None = None
++        self._incremental_state: _IncrementalManiaRowState | None = None
+         self.keycount_start = tokenizer.event_start[EventType.MANIA_KEYCOUNT]
+         self.keycount_end = tokenizer.event_end[EventType.MANIA_KEYCOUNT]
+         self.keycount_min = tokenizer.event_range[EventType.MANIA_KEYCOUNT].min_value
+@@ -258,11 +720,27 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             "forcedGroupCompletionSteps": 0,
+             "impossibleGroupCompletionSteps": 0,
+             "startBoundaryColumnRestrictionSteps": 0,
++            "fullScanRows": 0,
++            "incrementalRows": 0,
++            "verificationRows": 0,
++            "verificationMismatches": 0,
++            "unsupportedFallbackRows": 0,
++            "stateResetRows": 0,
++            "suffixTokensParsed": 0,
++            "candidateTreeQueries": 0,
+         }
+ 
+     def telemetry(self) -> dict[str, int]:
+         return dict(self._telemetry)
+ 
++    def reset_incremental_state(self) -> None:
++        self._incremental_state = None
++        self.prompt_length = None
++
++    def _discard_incremental_state(self) -> None:
++        """Discard a failed candidate without changing the decoder boundary."""
++        self._incremental_state = None
++
+     def __call__(
+             self,
+             input_ids: torch.LongTensor,
+@@ -275,6 +753,197 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+         if self.prompt_length is None:
+             self.prompt_length = input_ids.shape[1]
+ 
++        if self.hold_state_mode == "full_scan":
++            return self._apply_full_scan(input_ids, scores)
++
++        if input_ids.shape[0] != 1 or not self.incremental_eligible:
++            self._telemetry["unsupportedFallbackRows"] += input_ids.shape[0]
++            return self._apply_full_scan(input_ids, scores)
++
++        tokens = input_ids[0]
++        if (
++                self._incremental_state is None
++                and not self._row_has_grammar_contract(tokens)
++        ):
++            return self._apply_full_scan(input_ids, scores)
++
++        if self.hold_state_mode == "incremental_verify":
++            return self._apply_verified(input_ids, scores)
++        return self._apply_incremental(input_ids, scores)
++
++    def _row_has_grammar_contract(
++            self,
++            tokens: torch.LongTensor,
++    ) -> bool:
++        """Scan only at state activation or after a discontinuity."""
++        has_keycount = bool(
++            ((tokens >= self.keycount_start) & (tokens < self.keycount_end))
++            .any()
++            .item()
++        )
++        has_sos = bool((tokens == self.sos_id).any().item())
++        return has_keycount and has_sos
++
++    @staticmethod
++    def _capture_apply(callback):
++        try:
++            return None, callback()
++        except Exception as error:
++            return error, None
++
++    def _verification_context(
++            self,
++            input_ids: torch.LongTensor,
++    ) -> str:
++        state = self._incremental_state
++        current_time = None if state is None else state.current_time_token
++        current_lane = None if state is None else state.current_lane
++        return (
++            f"inputLength={input_ids.shape[1]}; "
++            f"currentTime={current_time}; currentLane={current_lane}"
++        )
++
++    def _apply_verified(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
++        # Incremental telemetry is authoritative. The oracle is observational:
++        # its counters are restored before the candidate path is evaluated.
++        telemetry_before_oracle = dict(self._telemetry)
++        oracle_error, oracle_result = self._capture_apply(
++            lambda: self._apply_full_scan(input_ids, scores)
++        )
++        self._telemetry = telemetry_before_oracle
++
++        candidate_error, candidate_result = self._capture_apply(
++            lambda: self._apply_incremental(input_ids, scores)
++        )
++        self._telemetry["verificationRows"] += 1
++        verification_context = self._verification_context(input_ids)
++
++        exception_mismatch = (
++            (oracle_error is None) != (candidate_error is None)
++            or (
++                oracle_error is not None
++                and candidate_error is not None
++                and type(oracle_error) is not type(candidate_error)
++            )
++        )
++        if exception_mismatch:
++            self._telemetry["verificationMismatches"] += 1
++            self._discard_incremental_state()
++            raise AssertionError(
++                "mania HOLD incremental verification mismatch; "
++                f"{verification_context}; "
++                f"oracleException={type(oracle_error).__name__ if oracle_error else None}; "
++                f"candidateException={type(candidate_error).__name__ if candidate_error else None}"
++            )
++        if oracle_error is not None:
++            raise candidate_error
++
++        if not torch.equal(oracle_result, candidate_result):
++            differing = torch.nonzero(
++                oracle_result != candidate_result,
++                as_tuple=False,
++            )[:, -1].unique().detach().cpu().tolist()
++            self._telemetry["verificationMismatches"] += 1
++            self._discard_incremental_state()
++            raise AssertionError(
++                "mania HOLD incremental verification mismatch; "
++                f"{verification_context}; "
++                f"differingTokenIndices={differing}"
++            )
++        return candidate_result
++
++    def _is_connected_incremental_call(
++            self,
++            tokens: torch.LongTensor,
++    ) -> tuple[bool, bool]:
++        """Return (can_reuse, has_one_token_suffix) without scanning history."""
++        state = self._incremental_state
++        if state is None:
++            return True, False
++        current_length = int(tokens.shape[0])
++        if current_length == state.processed_length:
++            token_values = _IncrementalManiaRowState._token_values(tokens)
++            return token_values == state.token_log, False
++        if current_length == state.processed_length + 1:
++            return (
++                state.processed_length == 0
++                or int(tokens[-2].item()) == state.last_terminal_token
++            ), True
++        return False, False
++
++    def _apply_incremental(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
++        tokens = input_ids[0]
++        connected, has_suffix = self._is_connected_incremental_call(tokens)
++        if not connected:
++            self._telemetry["stateResetRows"] += 1
++            result = self._apply_full_scan(input_ids, scores)
++            if not self._row_has_grammar_contract(tokens):
++                self._incremental_state = None
++                return result
++            rebuilt = _IncrementalManiaRowState.from_decoder_prefix(
++                self,
++                tokens,
++                prompt_length=self.prompt_length,
++            )
++            self._incremental_state = rebuilt
++            return result
++
++        if self._incremental_state is None:
++            self._incremental_state = (
++                _IncrementalManiaRowState.from_decoder_prefix(
++                    self,
++                    tokens,
++                    prompt_length=self.prompt_length,
++                )
++            )
++        else:
++            self._incremental_state.ingest_suffix(self, tokens)
++            if has_suffix:
++                self._telemetry["suffixTokensParsed"] += 1
++
++        state = self._incremental_state
++        self._telemetry["rows"] += 1
++        self._telemetry["incrementalRows"] += 1
++        open_columns = set(
++            state.final_open_columns(self.initial_open_columns)
++        )
++        scores_processed = scores.clone()
++
++        def candidate_open_columns_for(event_type: EventType) -> tuple[int, ...]:
++            self._telemetry["candidateTreeQueries"] += 1
++            return state.candidate_final_open_columns(
++                self.initial_open_columns,
++                event_type,
++            )
++
++        self._apply_row_policy(
++            input_ids,
++            scores,
++            scores_processed,
++            0,
++            state.keycount,
++            state.current_time_token,
++            state.current_lane,
++            state.seen_groups,
++            state.generated_groups,
++            open_columns,
++            candidate_open_columns_for,
++        )
++        return scores_processed
++
++    def _apply_full_scan(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
+         scores_processed = scores.clone()
+         for row in range(input_ids.shape[0]):
+             tokens = input_ids[row]
+@@ -285,6 +954,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+             if keycount_tokens.numel() == 0 or sos_indices.numel() == 0:
+                 continue
+             self._telemetry["rows"] += 1
++            self._telemetry["fullScanRows"] += 1
+             keycount = (
+                 int(keycount_tokens[-1].item())
+                 - self.keycount_start
+@@ -390,6 +1060,38 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     f"parsedExtraTail={signature_tail(parsed_extra)}"
+                 ) from error
+ 
++            self._apply_row_policy(
++                input_ids,
++                scores,
++                scores_processed,
++                row,
++                keycount,
++                current_time_token,
++                current_lane,
++                seen_groups,
++                generated_groups,
++                open_columns,
++                lambda event_type: replay_signatures(
++                    seen_groups
++                    | {(current_time_token, current_lane, event_type)}
++                ),
++            )
++        return scores_processed
++
++    def _apply_row_policy(
++            self,
++            input_ids: torch.LongTensor,
++            scores: torch.FloatTensor,
++            scores_processed: torch.FloatTensor,
++            row: int,
++            keycount: int,
++            current_time_token: int | None,
++            current_lane: int | None,
++            seen_groups: set[tuple[int | None, int, EventType]],
++            generated_groups: set[tuple[int | None, int, EventType]],
++            open_columns: set[int],
++            candidate_open_columns_for,
++    ) -> None:
+             if current_lane is None:
+                 self._telemetry["missingColumnSteps"] += 1
+                 scores_processed[row, self.tap_token] = -torch.inf
+@@ -463,7 +1165,7 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     for lane in open_columns:
+                         token = self.column_start + lane
+                         scores_processed[row, token] = scores[row, token]
+-                continue
++                return
+             if not 0 <= current_lane < keycount:
+                 raise ValueError(
+                     f"current mania lane {current_lane} is outside keycount {keycount}"
+@@ -480,8 +1182,8 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                     scores_processed[row, token] = -torch.inf
+                     continue
+                 try:
+-                    candidate_open_columns[token] = replay_signatures(
+-                        seen_groups | {signature}
++                    candidate_open_columns[token] = (
++                        candidate_open_columns_for(signature[2])
+                     )
+                 except ValueError:
+                     invalid_transition = True
+@@ -530,13 +1232,13 @@ class ManiaHoldStateLogitsProcessor(LogitsProcessor):
+                 self._telemetry["forcedGroupCompletionSteps"] += 1
+                 scores_processed[row, :] = -torch.inf
+                 scores_processed[row, list(note_tokens)] = note_scores
+-                continue
++                return
+             for start, end in self.non_mania_type_token_ranges:
+                 scores_processed[row, start:end] = -torch.inf
+             scores_processed[row, self.column_start:self.column_end] = -torch.inf
+             scores_processed[row, self.time_start:self.time_end] = -torch.inf
+             scores_processed[row, list(self.eos_ids)] = -torch.inf
+-        return scores_processed
++            return
+ 
+ 
+ class ManiaStartBoundaryLogitsProcessor(LogitsProcessor):
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 51f8948..53a2c0b 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -155,6 +155,7 @@ class Processor(object):
+         self.taiko_hit_temperature = args.taiko_hit_temperature
+         self.do_sample = args.do_sample
+         self.num_beams = args.num_beams
++        self.mania_hold_state_mode = args.mania_hold_state_mode
+         self.parallel = args.parallel
+         self.max_batch_size = args.max_batch_size
+ 
+@@ -181,6 +182,7 @@ class Processor(object):
+             timing_temperature=self.timing_temperature,
+             mania_column_temperature=self.mania_column_temperature,
+             taiko_hit_temperature=self.taiko_hit_temperature,
++            mania_hold_state_mode=self.mania_hold_state_mode,
+         )
+ 
+         if isinstance(self.model, InferenceClient):
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index 3b4bcb6..ca8adeb 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -105,7 +105,9 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                             mania_prompt_group_signatures=(),
+                             mania_prompt_current_time_token=None,
+                             mania_require_closed_holds_at_eos=False,
+-                            mania_max_sequence_length=None):
++                            mania_max_sequence_length=None,
++                            mania_hold_state_mode="full_scan",
++                            mania_hold_state_incremental_eligible=True):
+     """Create the logits processors used by every generate path."""
+     if types_first and mania_open_hold_columns is not None:
+         raise ValueError(
+@@ -139,6 +141,11 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                         if start_boundary_processor is None
+                         else start_boundary_processor.max_time_token
+                     ),
++                    hold_state_mode=mania_hold_state_mode,
++                    incremental_eligible=(
++                        mania_hold_state_incremental_eligible
++                        and cfg_scale <= 1.0
++                    ),
+                 )
+             )
+     if start_boundary_processor is not None:
+@@ -177,6 +184,12 @@ def get_mania_hold_grammar_telemetry(logits_processors) -> dict[str, int] | None
+     return None
+ 
+ 
++def reset_mania_hold_grammar_state(logits_processors) -> None:
++    for processor in logits_processors:
++        if isinstance(processor, ManiaHoldStateLogitsProcessor):
++            processor.reset_incremental_state()
++
++
+ @torch.no_grad()
+ def precompute_encoder_outputs(model, frames: torch.Tensor, cond_kwargs: dict,
+                                song_positions: torch.Tensor | None = None,
+@@ -326,6 +339,9 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_require_closed_holds_at_eos = generate_kwargs.pop(
+         'mania_require_closed_holds_at_eos', False
+     )
++    mania_hold_state_mode = generate_kwargs.pop(
++        'mania_hold_state_mode', 'full_scan'
++    )
+     if context_type is not None:
+         context_type = ContextType(context_type)  # Convert to ContextType enum
+ 
+@@ -345,6 +361,12 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+         mania_prompt_current_time_token,
+         mania_require_closed_holds_at_eos,
+         effective_max_length,
++        mania_hold_state_mode,
++        (
++            batch_size == 1
++            and generate_kwargs.get('num_beams', 1) == 1
++            and cfg_scale <= 1.0
++        ),
+     )
+ 
+     # Prepare cache
+diff --git a/tests/test_mania_hold_state_grammar.py b/tests/test_mania_hold_state_grammar.py
+index 8ecf602..9baedea 100644
+--- a/tests/test_mania_hold_state_grammar.py
++++ b/tests/test_mania_hold_state_grammar.py
+@@ -1,9 +1,15 @@
++import random
+ from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+ 
++from config import InferenceConfig
+ from osuT5.osuT5.event import Event, EventType
++from osuT5.osuT5.inference import logit_processors as hold_logits
++from osuT5.osuT5.inference import compiled_decode as compiled_decode_module
++from osuT5.osuT5.inference import processor as processor_module
++from osuT5.osuT5.inference import server as server_module
+ from osuT5.osuT5.inference.logit_processors import (
+     ManiaColumnBeforeTypeLogitsProcessor,
+     ManiaHoldStateLogitsProcessor,
+@@ -13,6 +19,7 @@ from osuT5.osuT5.inference.server import (
+     build_logits_processors,
+     effective_generation_limit,
+     get_mania_hold_grammar_telemetry,
++    reset_mania_hold_grammar_state,
+ )
+ from osuT5.osuT5.inference.mania_grammar import (
+     CanonicalManiaGroup,
+@@ -54,6 +61,1726 @@ def scores() -> torch.Tensor:
+     return torch.zeros((1, 128), dtype=torch.float32)
+ 
+ 
++def test_hold_transition_composition_applies_left_then_right():
++    assert hold_logits._compose_hold_transitions((1, -1), (-1, 0)) == (0, -1)
++
++
++@pytest.mark.parametrize(
++    ("event_types", "expected"),
++    [
++        (frozenset(), (0, 1)),
++        (frozenset({EventType.CIRCLE}), (0, -1)),
++        (frozenset({EventType.HOLD_NOTE}), (1, -1)),
++        (frozenset({EventType.HOLD_NOTE_END}), (-1, 0)),
++        (
++            frozenset({EventType.HOLD_NOTE_END, EventType.HOLD_NOTE}),
++            (-1, 1),
++        ),
++        (
++            frozenset({EventType.HOLD_NOTE_END, EventType.CIRCLE}),
++            (-1, 0),
++        ),
++        (frozenset({EventType.HOLD_NOTE, EventType.CIRCLE}), (-1, -1)),
++        (
++            frozenset(
++                {
++                    EventType.HOLD_NOTE_END,
++                    EventType.HOLD_NOTE,
++                    EventType.CIRCLE,
++                }
++            ),
++            (-1, -1),
++        ),
++    ],
++)
++def test_mania_bucket_transition_uses_end_start_tap_order(
++        event_types,
++        expected,
++):
++    assert hold_logits._mania_bucket_transition(event_types) == expected
++
++
++def test_lane_hold_transition_tree_composes_by_time_not_insertion_order():
++    tree = hold_logits._LaneHoldTransitionTree(30, 34)
++
++    tree.add(32, EventType.HOLD_NOTE_END)
++    tree.add(30, EventType.HOLD_NOTE)
++
++    assert tree.transition == (0, -1)
++
++
++def test_lane_hold_transition_tree_orders_none_before_real_times():
++    tree = hold_logits._LaneHoldTransitionTree(30, 34)
++
++    tree.add(30, EventType.HOLD_NOTE_END)
++    tree.add(None, EventType.HOLD_NOTE)
++
++    assert tree.transition == (0, -1)
++
++
++def test_lane_hold_transition_tree_candidate_interleaves_without_mutation():
++    tree = hold_logits._LaneHoldTransitionTree(30, 34)
++    tree.add(30, EventType.HOLD_NOTE)
++    tree.add(32, EventType.HOLD_NOTE_END)
++    original_tree = tuple(tree._tree)
++    original_event_types = tuple(tree._event_types)
++
++    candidates = [
++        (31, EventType.CIRCLE, (-1, -1)),
++        (None, EventType.CIRCLE, (0, -1)),
++        (32, EventType.HOLD_NOTE, (1, -1)),
++    ]
++    for time_token, event_type, expected in candidates:
++        assert tree.query_with_candidate(time_token, event_type) == expected
++        assert tuple(tree._tree) == original_tree
++        assert tuple(tree._event_types) == original_event_types
++        assert tree.transition == (0, -1)
++
++
++@pytest.mark.parametrize("time_token", [29, 34])
++def test_lane_hold_transition_tree_rejects_out_of_range_add(time_token):
++    tree = hold_logits._LaneHoldTransitionTree(30, 34)
++
++    with pytest.raises(ValueError, match=r"\[30, 34\)"):
++        tree.add(time_token, EventType.CIRCLE)
++
++
++@pytest.mark.parametrize("time_token", [29, 34])
++def test_lane_hold_transition_tree_rejects_out_of_range_candidate(time_token):
++    tree = hold_logits._LaneHoldTransitionTree(30, 34)
++
++    with pytest.raises(ValueError, match=r"\[30, 34\)"):
++        tree.query_with_candidate(time_token, EventType.CIRCLE)
++
++
++def _full_scan_row_oracle(processor, tokens, prompt_length):
++    token_log = [int(token) for token in tokens.tolist()]
++    keycount_tokens = [
++        token
++        for token in token_log
++        if processor.keycount_start <= token < processor.keycount_end
++    ]
++    if not keycount_tokens:
++        raise ValueError("mania row has no keycount token")
++    keycount = keycount_tokens[-1] - processor.keycount_start + processor.keycount_min
++    sos_positions = [
++        position for position, token in enumerate(token_log)
++        if token == processor.sos_id
++    ]
++    if not sos_positions:
++        raise ValueError("mania row has no SOS token")
++
++    current_time_token = processor.prompt_current_time_token
++    current_lane = None
++    seen_groups = set(processor.prompt_group_signatures)
++    generated_groups = set()
++    for position in range(sos_positions[-1] + 1, len(token_log)):
++        if position == prompt_length and processor.has_prompt_current_time_contract:
++            current_time_token = processor.prompt_current_time_token
++        token = token_log[position]
++        if processor.time_start <= token < processor.time_end:
++            current_time_token = token
++            current_lane = None
++        elif processor.column_start <= token < processor.column_end:
++            current_lane = token - processor.column_start
++        elif token in processor.event_type_by_token:
++            if current_lane is None:
++                raise ValueError("mania note type in prompt has no gameplay column")
++            signature = (
++                current_time_token,
++                current_lane,
++                processor.event_type_by_token[token],
++            )
++            if signature not in seen_groups:
++                seen_groups.add(signature)
++                if position >= prompt_length:
++                    generated_groups.add(signature)
++            elif position >= prompt_length and signature in generated_groups:
++                raise ValueError("duplicate mania group generated within one window")
++            current_lane = None
++
++    if len(token_log) <= prompt_length and processor.has_prompt_current_time_contract:
++        current_time_token = processor.prompt_current_time_token
++
++    groups = [
++        CanonicalManiaGroup(
++            -1 if time_token is None else time_token,
++            lane,
++            event_type,
++            (),
++        )
++        for time_token, lane, event_type in seen_groups
++    ]
++    final_open_columns = replay_mania_hold_state(
++        groups,
++        keycount=keycount,
++        initial_open_columns=processor.initial_open_columns,
++    )
++    return {
++        "keycount": keycount,
++        "current_time_token": current_time_token,
++        "current_lane": current_lane,
++        "seen_groups": seen_groups,
++        "generated_groups": generated_groups,
++        "final_open_columns": final_open_columns,
++    }
++
++
++def _oracle_candidate_final_open_columns(processor, oracle, event_type):
++    if oracle["current_lane"] is None:
++        raise ValueError("mania note type in prompt has no gameplay column")
++    signature = (
++        oracle["current_time_token"],
++        oracle["current_lane"],
++        event_type,
++    )
++    if signature in oracle["generated_groups"]:
++        raise ValueError("duplicate mania group generated within one window")
++    groups = [
++        CanonicalManiaGroup(
++            -1 if time_token is None else time_token,
++            lane,
++            group_event_type,
++            (),
++        )
++        for time_token, lane, group_event_type in oracle["seen_groups"] | {signature}
++    ]
++    return replay_mania_hold_state(
++        groups,
++        keycount=oracle["keycount"],
++        initial_open_columns=processor.initial_open_columns,
++    )
++
++
++def _capture_result(callback):
++    try:
++        return None, callback()
++    except Exception as error:  # The differential contract includes exception class.
++        return type(error), None
++
++
++def test_incremental_state_orders_generated_candidate_inside_prompt_timeline():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([
++        keycount_token(4), 1,
++        30, 12, 51,
++        32, 12, 52,
++    ])
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++
++    state.ingest_suffix(processor, torch.cat((prompt, torch.tensor([31]))))
++    pending = torch.cat((prompt, torch.tensor([31, 12])))
++    state.ingest_suffix(processor, pending)
++
++    assert state.final_open_columns(frozenset()) == ()
++    with pytest.raises(ValueError):
++        state.candidate_final_open_columns(frozenset(), EventType.CIRCLE)
++
++
++def test_incremental_state_rejects_generated_duplicate_but_keeps_prompt_duplicate_idempotent():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    generated_state = hold_logits._IncrementalManiaRowState.from_prompt(
++        processor,
++        torch.tensor([keycount_token(4), 1]),
++    )
++    generated = torch.tensor([keycount_token(4), 1, 30, 12, 50])
++    generated_state.ingest_suffix(processor, generated)
++    generated_pending = torch.tensor([
++        keycount_token(4), 1, 30, 12, 50, 30, 12,
++    ])
++    generated_state.ingest_suffix(processor, generated_pending)
++    with pytest.raises(ValueError, match="duplicate mania group"):
++        generated_state.candidate_final_open_columns(
++            frozenset(), EventType.CIRCLE
++        )
++
++    prompt = torch.tensor([keycount_token(4), 1, 30, 12, 50])
++    prompt_state = hold_logits._IncrementalManiaRowState.from_prompt(
++        processor,
++        prompt,
++    )
++    prompt_duplicate = torch.tensor([
++        keycount_token(4), 1, 30, 12, 50, 30, 12, 50,
++    ])
++    prompt_state.ingest_suffix(processor, prompt_duplicate)
++
++    assert prompt_state.generated_groups == set()
++    assert prompt_state.final_open_columns(frozenset()) == ()
++
++
++def test_incremental_state_reuses_only_identical_or_connected_one_token_growth():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([keycount_token(4), 1, 30])
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++    original_trees = state.lane_trees
++
++    state.ingest_suffix(processor, prompt.clone())
++    assert state.lane_trees is original_trees
++
++    connected = torch.tensor([keycount_token(4), 1, 30, 12])
++    state.ingest_suffix(processor, connected)
++    assert state.lane_trees is original_trees
++
++    changed_same_length = torch.tensor([keycount_token(4), 1, 31, 12])
++    state.ingest_suffix(processor, changed_same_length)
++    assert state.lane_trees is not original_trees
++    assert state.current_time_token == 31
++    assert state.current_lane == 2
++
++    rebuilt_trees = state.lane_trees
++    broken_connection = torch.tensor([keycount_token(4), 1, 32, 13, 50])
++    state.ingest_suffix(processor, broken_connection)
++    assert state.lane_trees is not rebuilt_trees
++
++
++def test_incremental_state_rebuilds_jumps_and_shorter_rows_with_original_prompt_boundary():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([keycount_token(4), 1, 30, 12, 51])
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++    prompt_length = len(prompt)
++    original_trees = state.lane_trees
++
++    jumped = torch.tensor([
++        keycount_token(4), 1,
++        30, 12, 51,
++        32, 12, 52,
++    ])
++    state.ingest_suffix(processor, jumped)
++
++    assert state.prompt_length == prompt_length
++    assert state.lane_trees is not original_trees
++    assert (30, 2, EventType.HOLD_NOTE) not in state.generated_groups
++    assert (32, 2, EventType.HOLD_NOTE_END) in state.generated_groups
++    assert state.final_open_columns(frozenset()) == ()
++
++    jumped_trees = state.lane_trees
++    shorter = torch.tensor([keycount_token(4), 1, 31, 12])
++    state.ingest_suffix(processor, shorter)
++    oracle = _full_scan_row_oracle(processor, shorter, prompt_length)
++
++    assert state.lane_trees is not jumped_trees
++    assert state.current_time_token == oracle["current_time_token"]
++    assert state.current_lane == oracle["current_lane"]
++    assert state.seen_groups == oracle["seen_groups"]
++
++
++def test_incremental_state_new_sos_discards_parsed_groups_and_increments_epoch():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([keycount_token(4), 1, 30, 12, 51])
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++
++    with_new_sos = torch.tensor([keycount_token(4), 1, 30, 12, 51, 1])
++    state.ingest_suffix(processor, with_new_sos)
++
++    assert state.sos_epoch == 1
++    assert state.seen_groups == set(processor.prompt_group_signatures)
++    assert state.generated_groups == set()
++    assert state.final_open_columns(frozenset()) == ()
++    assert state.current_time_token == processor.prompt_current_time_token
++    assert state.current_lane is None
++
++
++def test_incremental_state_uses_last_keycount_without_replaying_older_keycounts():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    tokens = torch.tensor([
++        1,
++        keycount_token(2),
++        30, 13, 50,
++        keycount_token(4),
++    ])
++    oracle = _full_scan_row_oracle(processor, tokens, len(tokens))
++
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, tokens)
++
++    assert state.keycount == 4
++    assert state.seen_groups == oracle["seen_groups"]
++    assert state.final_open_columns(frozenset()) == oracle["final_open_columns"]
++
++
++def test_incremental_state_updates_last_keycount_on_connected_append():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([
++        1,
++        keycount_token(2),
++        30, 11, 50,
++    ])
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++    appended = torch.cat((prompt, torch.tensor([keycount_token(4)])))
++
++    state.ingest_suffix(processor, appended)
++    oracle = _full_scan_row_oracle(processor, appended, len(prompt))
++
++    assert state.keycount == 4
++    assert state.seen_groups == oracle["seen_groups"]
++    assert state.final_open_columns(frozenset()) == oracle["final_open_columns"]
++
++
++def test_incremental_state_failed_keycount_append_is_atomic_and_repeatable():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([
++        keycount_token(4), 1,
++        30, 13, 50,
++    ])
++    appended = torch.cat((prompt, torch.tensor([keycount_token(2)])))
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++    original_trees = state.lane_trees
++    original_seen = set(state.seen_groups)
++    original_generated = set(state.generated_groups)
++    original_log = list(state.token_log)
++
++    errors = []
++    for _ in range(2):
++        with pytest.raises(ValueError) as exc_info:
++            state.ingest_suffix(processor, appended)
++        errors.append(str(exc_info.value))
++        assert state.keycount == 4
++        assert state.lane_trees is original_trees
++        assert state.seen_groups == original_seen
++        assert state.generated_groups == original_generated
++        assert state.token_log == original_log
++        assert state.processed_length == len(prompt)
++        assert state.last_terminal_token == 50
++
++    assert errors[0] == errors[1]
++    with pytest.raises(ValueError):
++        _full_scan_row_oracle(processor, appended, len(prompt))
++
++
++def test_incremental_state_failed_duplicate_append_preserves_pending_group():
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    prompt = torch.tensor([keycount_token(4), 1])
++    pending = torch.tensor([
++        keycount_token(4), 1,
++        30, 12, 50,
++        30, 12,
++    ])
++    duplicate = torch.cat((pending, torch.tensor([50])))
++    state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++    state.ingest_suffix(processor, pending)
++    original_trees = state.lane_trees
++    original_seen = set(state.seen_groups)
++    original_generated = set(state.generated_groups)
++    original_log = list(state.token_log)
++
++    for _ in range(2):
++        with pytest.raises(ValueError, match="duplicate mania group"):
++            state.ingest_suffix(processor, duplicate)
++        assert state.lane_trees is original_trees
++        assert state.current_time_token == 30
++        assert state.current_lane == 2
++        assert state.seen_groups == original_seen
++        assert state.generated_groups == original_generated
++        assert state.token_log == original_log
++        assert state.processed_length == len(pending)
++        assert state.last_terminal_token == 12
++
++
++def test_incremental_state_matches_full_scan_oracle_for_1024_seeded_cases():
++    rng = random.Random(20260812)
++    event_tokens = {
++        EventType.CIRCLE: 50,
++        EventType.HOLD_NOTE: 51,
++        EventType.HOLD_NOTE_END: 52,
++    }
++
++    for case_index in range(1024):
++        keycount = rng.randint(1, 4)
++        lane = rng.randrange(keycount)
++        column = 10 + lane
++        time_token = rng.randint(30, 34)
++        scenario = case_index % 10
++        initial_open = (lane,) if scenario in {3, 6} else ()
++        processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), initial_open)
++
++        if scenario == 0:  # Candidate time is inside a prompt HOLD timeline.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1,
++                time_token, column, 51,
++                time_token + 2, column, 52,
++            ])
++            current = torch.cat((prompt, torch.tensor([time_token + 1, column])))
++        elif scenario == 1:  # A generated exact duplicate remains illegal.
++            prompt = torch.tensor([keycount_token(keycount), 1])
++            current = torch.tensor([
++                keycount_token(keycount), 1,
++                time_token, column, 50,
++                time_token, column,
++            ])
++        elif scenario == 2:  # A fixed prompt duplicate remains idempotent.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1, time_token, column, 50,
++            ])
++            current = torch.tensor([
++                keycount_token(keycount), 1,
++                time_token, column, 50,
++                time_token, column, 50,
++                time_token, column,
++            ])
++        elif scenario == 3:  # END+START is legal; adding TAP is not.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1,
++                time_token, column, 52,
++                time_token, column, 51,
++            ])
++            current = torch.cat((prompt, torch.tensor([time_token, column])))
++        elif scenario == 4:  # Prompt events after the candidate are replayed later.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1,
++                time_token + 2, column, 51,
++                time_token + 4, column, 52,
++            ])
++            current = torch.cat((prompt, torch.tensor([time_token, column])))
++        elif scenario == 5:  # A new SOS drops the pre-SOS parsed timeline.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1, time_token, column, 51,
++            ])
++            current = torch.cat((prompt, torch.tensor([1, time_token, column])))
++        elif scenario == 6:  # Orphan/overlap failures compare by exception class.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1, time_token, column, 51,
++            ])
++            current = prompt.clone()
++        elif scenario == 7:  # Same-length replacement forces a rebuild.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1, time_token, column,
++            ])
++            current = torch.tensor([
++                keycount_token(keycount), 1, time_token + 1, column,
++            ])
++        elif scenario == 8:  # Shorter replacement cannot retain stale groups.
++            prompt = torch.tensor([
++                keycount_token(keycount), 1,
++                time_token, column, 51,
++                time_token + 2, column, 52,
++            ])
++            current = torch.tensor([
++                keycount_token(keycount), 1, time_token + 1, column,
++            ])
++        else:  # Normal one-token growth exercises the suffix-only path.
++            prompt = torch.tensor([keycount_token(keycount), 1])
++            current = prompt.clone()
++
++        state = hold_logits._IncrementalManiaRowState.from_prompt(processor, prompt)
++        if scenario == 9:
++            for token in (time_token, column):
++                current = torch.cat((current, torch.tensor([token])))
++                state.ingest_suffix(processor, current)
++        else:
++            state.ingest_suffix(processor, current)
++
++        oracle_error, oracle = _capture_result(
++            lambda: _full_scan_row_oracle(processor, current, len(prompt))
++        )
++        state_error, state_final = _capture_result(
++            lambda: state.final_open_columns(frozenset(initial_open))
++        )
++        assert state_error is oracle_error, case_index
++        if oracle_error is not None:
++            continue
++
++        assert state.keycount == oracle["keycount"], case_index
++        assert state.current_time_token == oracle["current_time_token"], case_index
++        assert state.current_lane == oracle["current_lane"], case_index
++        assert state.seen_groups == oracle["seen_groups"], case_index
++        assert state.generated_groups == oracle["generated_groups"], case_index
++        assert state_final == oracle["final_open_columns"], case_index
++
++        candidate_event = rng.choice(tuple(event_tokens))
++        oracle_candidate_error, oracle_candidate = _capture_result(
++            lambda: _oracle_candidate_final_open_columns(
++                processor, oracle, candidate_event
++            )
++        )
++        state_candidate_error, state_candidate = _capture_result(
++            lambda: state.candidate_final_open_columns(
++                frozenset(initial_open), candidate_event
++            )
++        )
++        assert state_candidate_error is oracle_candidate_error, case_index
++        assert state_candidate == oracle_candidate, case_index
++
++
++@pytest.mark.parametrize(
++    "mode", ["full_scan", "incremental_verify", "incremental"]
++)
++def test_inference_config_accepts_supported_hold_state_modes_before_generation(mode):
++    assert InferenceConfig(mania_hold_state_mode=mode).mania_hold_state_mode == mode
++
++
++def test_inference_config_rejects_unknown_hold_state_mode_before_generation():
++    with pytest.raises(ValueError, match="mania_hold_state_mode"):
++        InferenceConfig(mania_hold_state_mode="fast")
++
++
++def _processor_call(processor, token_values, *, batch_size=1):
++    input_ids = torch.tensor([token_values] * batch_size)
++    input_scores = scores().repeat(batch_size, 1)
++    try:
++        return None, processor(input_ids, input_scores)
++    except Exception as error:
++        return type(error), None
++
++
++def test_full_scan_default_never_constructs_incremental_state(monkeypatch):
++    def unexpected_state(*_args, **_kwargs):
++        raise AssertionError("full_scan constructed incremental state")
++
++    monkeypatch.setattr(
++        hold_logits._IncrementalManiaRowState,
++        "from_prompt",
++        unexpected_state,
++    )
++    processor = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++
++    result = processor(torch.tensor([[keycount_token(4), 1, 30, 12]]), scores())
++
++    assert not torch.isneginf(result[0, 50])
++
++
++@pytest.mark.parametrize(
++    ("eligible", "expected_fallback_rows"),
++    [(True, 0), (False, 1)],
++)
++def test_processor_stack_propagates_requested_mode_and_external_eligibility(
++        eligible,
++        expected_fallback_rows,
++):
++    processors = build_logits_processors(
++        FakeTokenizer(),
++        cfg_scale=1.0,
++        timeshift_bias=0,
++        types_first=False,
++        temperature=1.0,
++        timing_temperature=1.0,
++        mania_column_temperature=1.0,
++        taiko_hit_temperature=1.0,
++        lookback_time=0,
++        device="cpu",
++        mania_open_hold_columns=(),
++        mania_hold_state_mode="incremental",
++        mania_hold_state_incremental_eligible=eligible,
++    )
++    processor = next(
++        item for item in processors
++        if isinstance(item, ManiaHoldStateLogitsProcessor)
++    )
++
++    processor(torch.tensor([[keycount_token(4), 1, 30]]), scores())
++
++    assert processor.hold_state_mode == "incremental"
++    assert processor.incremental_eligible is eligible
++    assert processor.telemetry()["unsupportedFallbackRows"] == expected_fallback_rows
++
++
++def test_cfg_fast_request_remains_requested_but_is_ineligible_and_falls_back():
++    processors = build_logits_processors(
++        FakeTokenizer(),
++        cfg_scale=1.5,
++        timeshift_bias=0,
++        types_first=False,
++        temperature=1.0,
++        timing_temperature=1.0,
++        mania_column_temperature=1.0,
++        taiko_hit_temperature=1.0,
++        lookback_time=0,
++        device="cpu",
++        mania_open_hold_columns=(),
++        mania_hold_state_mode="incremental",
++        mania_hold_state_incremental_eligible=True,
++    )
++    processor = next(
++        item for item in processors
++        if isinstance(item, ManiaHoldStateLogitsProcessor)
++    )
++
++    processor(torch.tensor([[keycount_token(4), 1, 30]]), scores())
++
++    assert processor.hold_state_mode == "incremental"
++    assert processor.incremental_eligible is False
++    assert processor.telemetry()["unsupportedFallbackRows"] == 1
++    assert processor.telemetry()["fullScanRows"] == 1
++
++
++def test_processor_threads_requested_hold_mode_into_generate_kwargs(monkeypatch):
++    processor = processor_module.Processor.__new__(processor_module.Processor)
++    processor.precision = "fp32"
++    processor.do_sample = True
++    processor.num_beams = 1
++    processor.top_p = 0.95
++    processor.top_k = 0
++    processor.tgt_seq_len = 64
++    processor.cfg_scale = 1.0
++    processor.timeshift_bias = 0
++    processor.types_first = False
++    processor.temperature = 1.0
++    processor.timing_temperature = 1.0
++    processor.mania_column_temperature = 1.0
++    processor.taiko_hit_temperature = 1.0
++    processor.mania_hold_state_mode = "incremental_verify"
++    processor.fast_decoder_loop = False
++    processor.model = object()
++    processor.tokenizer = FakeTokenizer()
++    captured = {}
++
++    def capture_generate(_model, _tokenizer, _model_kwargs, generate_kwargs):
++        captured.update(generate_kwargs)
++        return "result", "stats"
++
++    monkeypatch.setattr(processor_module, "model_generate", capture_generate)
++
++    assert processor.model_generate({}) == ("result", "stats")
++    assert captured["mania_hold_state_mode"] == "incremental_verify"
++
++
++def test_stock_generate_passes_requested_mode_and_beam_ineligibility(monkeypatch):
++    captured = {}
++
++    def capture_build(*args):
++        captured["mode"] = args[16]
++        captured["eligible"] = args[17]
++        return []
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=8)
++        generation_config = SimpleNamespace(max_length=8)
++
++        @staticmethod
++        def generate(**_kwargs):
++            return torch.tensor([[1, 2]])
++
++    monkeypatch.setattr(server_module, "build_logits_processors", capture_build)
++    monkeypatch.setattr(server_module, "get_cache", lambda *_args: None)
++
++    server_module.model_generate(
++        FakeModel(),
++        FakeTokenizer(),
++        {"inputs": torch.zeros((1, 1, 1))},
++        {
++            "mania_hold_state_mode": "incremental",
++            "num_beams": 2,
++            "cfg_scale": 1.0,
++        },
++    )
++
++    assert captured == {"mode": "incremental", "eligible": False}
++
++
++def test_compiled_generate_passes_requested_mode_and_eligibility(monkeypatch):
++    captured = {}
++
++    def capture_build(*args):
++        captured["mode"] = args[16]
++        captured["eligible"] = args[17]
++        return []
++
++    class FakeDecoder:
++        @staticmethod
++        def set_encoder_hidden(_hidden):
++            return None
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=1)
++
++        @staticmethod
++        def prepare_inputs_for_generation(*_args, **_kwargs):
++            return {}
++
++        def __call__(self, **_kwargs):
++            return SimpleNamespace(logits=torch.zeros((1, 1, 128)))
++
++    monkeypatch.setattr(
++        compiled_decode_module, "neutralize_dynamic_rope", lambda _model: None
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "build_logits_processors",
++        capture_build,
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_get_decoder",
++        lambda *_args: (FakeDecoder(), object()),
++    )
++    monkeypatch.setattr(compiled_decode_module, "_reset_cache", lambda _cache: None)
++
++    result, _stats = compiled_decode_module.model_generate_compiled(
++        FakeModel(),
++        FakeTokenizer(),
++        {
++            "encoder_outputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": torch.tensor([[1]]),
++        },
++        {
++            "mania_hold_state_mode": "incremental",
++            "num_beams": 1,
++            "cfg_scale": 1.0,
++            "max_length": 1,
++        },
++    )
++
++    assert torch.equal(result, torch.tensor([[1]]))
++    assert captured == {"mode": "incremental", "eligible": True}
++
++
++def test_incremental_mode_matches_full_scan_masks_across_connected_prefixes():
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="full_scan"
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prefixes = [
++        [keycount_token(4), 1, 30],
++        [keycount_token(4), 1, 30, 12],
++        [keycount_token(4), 1, 30, 12, 51],
++        [keycount_token(4), 1, 30, 12, 51, 31],
++        [keycount_token(4), 1, 30, 12, 51, 31, 12],
++    ]
++
++    for prefix in prefixes:
++        oracle_error, oracle_result = _processor_call(oracle, prefix)
++        candidate_error, candidate_result = _processor_call(candidate, prefix)
++        assert candidate_error is oracle_error
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result)
++
++    telemetry = candidate.telemetry()
++    assert telemetry["incrementalRows"] == len(prefixes)
++    assert telemetry["suffixTokensParsed"] == len(prefixes) - 1
++    assert telemetry["candidateTreeQueries"] > 0
++
++
++@pytest.mark.parametrize("batch_size,eligible", [(2, True), (1, False)])
++def test_unsupported_fast_request_falls_back_to_full_scan_and_counts_rows(
++        batch_size,
++        eligible,
++):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        hold_state_mode="incremental",
++        incremental_eligible=eligible,
++    )
++    token_values = [keycount_token(4), 1, 30, 12]
++    error, result = _processor_call(
++        processor, token_values, batch_size=batch_size
++    )
++
++    assert error is None
++    assert result.shape[0] == batch_size
++    assert processor.telemetry()["unsupportedFallbackRows"] == batch_size
++    assert processor.telemetry()["incrementalRows"] == 0
++
++
++def test_discontinuity_uses_full_scan_then_rejoins_incremental_path():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    processor(torch.tensor([[keycount_token(4), 1, 30]]), scores())
++    processor(torch.tensor([[keycount_token(4), 1, 30, 12]]), scores())
++
++    discontinuous = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 51, 31]]
++    )
++    fallback_result = processor(discontinuous, scores())
++    fresh_oracle = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++    oracle_result = fresh_oracle(discontinuous, scores())
++    assert torch.equal(fallback_result, oracle_result)
++    assert processor.telemetry()["stateResetRows"] == 1
++
++    connected = torch.tensor(
++        [[keycount_token(4), 1, 30, 12, 51, 31, 12]]
++    )
++    processor(connected, scores())
++    assert processor.telemetry()["incrementalRows"] == 3
++    assert processor.telemetry()["stateResetRows"] == 1
++
++
++@pytest.mark.parametrize(
++    "discontinuous",
++    [
++        [keycount_token(4), 1, 31, 12],
++        [keycount_token(4), 1, 30, 12, 51, 31],
++        [keycount_token(4), 1, 30],
++        [keycount_token(4), 1, 31, 11, 50],
++    ],
++    ids=["changed-same-length", "length-jump", "shorter", "broken-append"],
++)
++def test_each_discontinuity_class_falls_back_and_resets(discontinuous):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    processor(torch.tensor([[keycount_token(4), 1, 30]]), scores())
++    processor(torch.tensor([[keycount_token(4), 1, 30, 12]]), scores())
++    oracle = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++
++    candidate_error, candidate_result = _processor_call(
++        processor, discontinuous
++    )
++    oracle_error, oracle_result = _processor_call(oracle, discontinuous)
++
++    assert candidate_error is oracle_error
++    if oracle_error is None:
++        assert torch.equal(candidate_result, oracle_result)
++    assert processor.telemetry()["stateResetRows"] == 1
++    assert processor.telemetry()["fullScanRows"] == 1
++
++def test_reset_incremental_state_matches_a_fresh_first_call():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prompt = torch.tensor([[keycount_token(4), 1, 30, 12]])
++    processor(prompt, scores())
++    processor(
++        torch.tensor([[keycount_token(4), 1, 30, 12, 51]]),
++        scores(),
++    )
++
++    processor.reset_incremental_state()
++    reset_result = processor(prompt, scores())
++    fresh_result = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )(prompt, scores())
++
++    assert torch.equal(reset_result, fresh_result)
++
++
++def test_reset_helper_resets_every_hold_processor_and_ignores_unrelated():
++    first = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    second = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (2,), hold_state_mode="incremental"
++    )
++    prompt = torch.tensor([[keycount_token(4), 1, 30]])
++    first(prompt, scores())
++    second(prompt, scores())
++
++    class UnrelatedProcessor:
++        @staticmethod
++        def reset_incremental_state():
++            raise AssertionError("unrelated processor was reset")
++
++    unrelated = UnrelatedProcessor()
++
++    reset_mania_hold_grammar_state([first, unrelated, second])
++
++    for processor in (first, second):
++        assert processor._incremental_state is None
++        assert processor.prompt_length is None
++
++
++def test_compiled_retry_resets_hold_state_between_cache_attempts(monkeypatch):
++    events = []
++    masks_by_attempt = []
++    active_attempt = {"cache_len": None}
++
++    class RecordingHoldProcessor(ManiaHoldStateLogitsProcessor):
++        def __call__(self, input_ids, input_scores):
++            result = super().__call__(input_ids, input_scores)
++            if input_ids.shape[1] == 3:
++                masks_by_attempt.append(result.clone())
++            return result
++
++    processor = RecordingHoldProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_current_time_token=None,
++        max_sequence_length=6,
++        hold_state_mode="incremental",
++    )
++
++    class Cache:
++        def __init__(self, cache_len):
++            self.cache_len = cache_len
++
++    class FakeDecoder:
++        def __init__(self, cache_len):
++            self.cache_len = cache_len
++
++        def set_encoder_hidden(self, _hidden):
++            events.append(("encoder", self.cache_len))
++
++        @staticmethod
++        def replay(_token, _cache_position):
++            return scores()
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=6)
++
++        @staticmethod
++        def prepare_inputs_for_generation(*_args, **kwargs):
++            events.append(("prefill", kwargs["past_key_values"].cache_len))
++            return {}
++
++        @staticmethod
++        def __call__(**_kwargs):
++            return SimpleNamespace(logits=scores().unsqueeze(1))
++
++    def get_decoder(*args):
++        cache_len = args[-1]
++        active_attempt["cache_len"] = cache_len
++        events.append(("get", cache_len))
++        return FakeDecoder(cache_len), Cache(cache_len)
++
++    def reset_cache(cache):
++        events.append(("kv_reset", cache.cache_len))
++
++    def reset_hold(processors):
++        cache_len = active_attempt["cache_len"]
++        events.append(("hold_reset", cache_len))
++        server_module.reset_mania_hold_grammar_state(processors)
++
++    sampled_tokens = iter((12, 51, FakeTokenizer.eos_id))
++
++    monkeypatch.setattr(
++        compiled_decode_module, "neutralize_dynamic_rope", lambda _model: None
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "build_logits_processors",
++        lambda *_args: compiled_decode_module.LogitsProcessorList([processor]),
++    )
++    monkeypatch.setattr(compiled_decode_module, "_pick_bucket", lambda *_args: 5)
++    monkeypatch.setattr(compiled_decode_module, "_bucket_ceil", lambda *_args: 6)
++    monkeypatch.setattr(compiled_decode_module, "_get_decoder", get_decoder)
++    monkeypatch.setattr(compiled_decode_module, "_reset_cache", reset_cache)
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "reset_mania_hold_grammar_state",
++        reset_hold,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_sample",
++        lambda *_args: torch.tensor([[next(sampled_tokens)]], dtype=torch.long),
++    )
++
++    compiled_decode_module.model_generate_compiled(
++        FakeModel(),
++        FakeTokenizer(),
++        {
++            "encoder_outputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": torch.tensor(
++                [[keycount_token(4), FakeTokenizer.sos_id, 30]]
++            ),
++        },
++        {
++            "mania_open_hold_columns": (),
++            "mania_hold_state_mode": "incremental",
++            "max_length": 6,
++            "do_sample": False,
++        },
++    )
++
++    assert events == [
++        ("get", 5),
++        ("kv_reset", 5),
++        ("hold_reset", 5),
++        ("encoder", 5),
++        ("prefill", 5),
++        ("get", 6),
++        ("kv_reset", 6),
++        ("hold_reset", 6),
++        ("encoder", 6),
++        ("prefill", 6),
++    ]
++    assert len(masks_by_attempt) == 2
++    prompt = torch.tensor([[keycount_token(4), FakeTokenizer.sos_id, 30]])
++    fresh_mask = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_current_time_token=None,
++        max_sequence_length=6,
++        hold_state_mode="incremental",
++    )(prompt, scores())
++    assert torch.equal(masks_by_attempt[1], fresh_mask)
++    assert processor.telemetry()["stateResetRows"] == 0
++
++
++def test_stock_generate_constructs_clean_hold_state_without_reset(monkeypatch):
++    observations = {}
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=6)
++        generation_config = SimpleNamespace(max_length=6)
++
++        @staticmethod
++        def generate(**kwargs):
++            processor = next(
++                item for item in kwargs["logits_processor"]
++                if isinstance(item, ManiaHoldStateLogitsProcessor)
++            )
++            observations["clean_before_first_call"] = (
++                processor._incremental_state is None
++                and processor.prompt_length is None
++            )
++            observations["processor"] = processor
++            prompt = kwargs["decoder_input_ids"]
++            observations["first_mask"] = processor(prompt, scores())
++            return torch.cat(
++                [prompt, torch.tensor([[FakeTokenizer.eos_id]])], dim=1
++            )
++
++    original_build = server_module.build_logits_processors
++
++    def build_without_allowing_reset(*args):
++        processors = original_build(*args)
++        processor = next(
++            item for item in processors
++            if isinstance(item, ManiaHoldStateLogitsProcessor)
++        )
++
++        def unexpected_reset():
++            raise AssertionError("stock construction performed a redundant reset")
++
++        processor.reset_incremental_state = unexpected_reset
++        return processors
++
++    monkeypatch.setattr(server_module, "build_logits_processors", build_without_allowing_reset)
++    monkeypatch.setattr(server_module, "get_cache", lambda *_args: None)
++
++    prompt = torch.tensor([[keycount_token(4), FakeTokenizer.sos_id, 30]])
++    server_module.model_generate(
++        FakeModel(),
++        FakeTokenizer(),
++        {
++            "encoder_outputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": prompt,
++        },
++        {
++            "mania_open_hold_columns": (),
++            "mania_hold_state_mode": "incremental",
++            "max_length": 6,
++        },
++    )
++
++    fresh_mask = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_current_time_token=None,
++        max_sequence_length=6,
++        hold_state_mode="incremental",
++    )(prompt, scores())
++    assert observations["clean_before_first_call"] is True
++    assert torch.equal(observations["first_mask"], fresh_mask)
++
++
++def test_capture_error_fallback_uses_independent_fresh_hold_processor(monkeypatch):
++    observations = {}
++    prompt = torch.tensor([[keycount_token(4), FakeTokenizer.sos_id, 30]])
++
++    class RecordingHoldProcessor(ManiaHoldStateLogitsProcessor):
++        pass
++
++    compiled_processor = RecordingHoldProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_current_time_token=None,
++        max_sequence_length=6,
++        hold_state_mode="incremental",
++    )
++
++    class Cache:
++        @staticmethod
++        def reset():
++            return None
++
++    class CaptureFailDecoder:
++        def __init__(self):
++            self.replays = 0
++
++        @staticmethod
++        def set_encoder_hidden(_hidden):
++            return None
++
++        def replay(self, _token, _cache_position):
++            self.replays += 1
++            if self.replays == 2:
++                observations["compiled_partial_before_fallback"] = (
++                    compiled_processor._incremental_state is not None
++                    and compiled_processor.prompt_length == prompt.shape[1]
++                )
++                raise compiled_decode_module.CaptureError("forced after partial state")
++            return scores()
++
++    decoder = CaptureFailDecoder()
++
++    class FakeModel:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=6)
++        generation_config = SimpleNamespace(max_length=6)
++
++        @staticmethod
++        def prepare_inputs_for_generation(*_args, **_kwargs):
++            return {}
++
++        @staticmethod
++        def __call__(**_kwargs):
++            return SimpleNamespace(logits=scores().unsqueeze(1))
++
++        @staticmethod
++        def generate(**kwargs):
++            stock_processor = next(
++                item for item in kwargs["logits_processor"]
++                if isinstance(item, ManiaHoldStateLogitsProcessor)
++            )
++            observations["stock_processor"] = stock_processor
++            observations["stock_clean_before_first_call"] = (
++                stock_processor._incremental_state is None
++                and stock_processor.prompt_length is None
++            )
++            observations["stock_first_mask"] = stock_processor(
++                kwargs["decoder_input_ids"], scores()
++            )
++            return torch.cat(
++                [kwargs["decoder_input_ids"], torch.tensor([[FakeTokenizer.eos_id]])],
++                dim=1,
++            )
++
++    monkeypatch.setattr(compiled_decode_module, "_capture_unsupported", False)
++    monkeypatch.setattr(
++        compiled_decode_module, "neutralize_dynamic_rope", lambda _model: None
++    )
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "build_logits_processors",
++        lambda *_args: compiled_decode_module.LogitsProcessorList(
++            [compiled_processor]
++        ),
++    )
++    monkeypatch.setattr(compiled_decode_module, "_pick_bucket", lambda *_args: 6)
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_get_decoder",
++        lambda *_args: (decoder, Cache()),
++    )
++    monkeypatch.setattr(server_module, "get_cache", lambda *_args: None)
++    sampled_tokens = iter((12, 51))
++    monkeypatch.setattr(
++        compiled_decode_module,
++        "_sample",
++        lambda *_args: torch.tensor([[next(sampled_tokens)]], dtype=torch.long),
++    )
++
++    compiled_decode_module.model_generate_compiled(
++        FakeModel(),
++        FakeTokenizer(),
++        {
++            "encoder_outputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": prompt,
++        },
++        {
++            "mania_open_hold_columns": (),
++            "mania_hold_state_mode": "incremental",
++            "max_length": 6,
++            "do_sample": False,
++        },
++    )
++
++    fresh_mask = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        prompt_current_time_token=None,
++        max_sequence_length=6,
++        hold_state_mode="incremental",
++    )(prompt, scores())
++    assert observations["compiled_partial_before_fallback"] is True
++    assert observations["stock_processor"] is not compiled_processor
++    assert observations["stock_clean_before_first_call"] is True
++    assert torch.equal(observations["stock_first_mask"], fresh_mask)
++
++
++def test_incremental_noop_rows_preserve_full_scan_contract():
++    for token_values in ([1, 30, 12], [keycount_token(4), 30, 12]):
++        oracle = ManiaHoldStateLogitsProcessor(FakeTokenizer(), ())
++        candidate = ManiaHoldStateLogitsProcessor(
++            FakeTokenizer(), (), hold_state_mode="incremental"
++        )
++        original = scores()
++
++        assert torch.equal(
++            candidate(torch.tensor([token_values]), original),
++            oracle(torch.tensor([token_values]), original),
++        )
++
++
++def test_incremental_verify_fails_closed_on_wrong_transition(monkeypatch):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental_verify"
++    )
++    monkeypatch.setattr(
++        hold_logits,
++        "_mania_bucket_transition",
++        lambda _events: hold_logits._IDENTITY_TRANSITION,
++    )
++
++    with pytest.raises(
++        AssertionError,
++        match=r"inputLength=4.*currentTime=30.*currentLane=2.*differingTokenIndices=.*52",
++    ):
++        processor(
++            torch.tensor([[keycount_token(4), 1, 30, 12]]),
++            scores(),
++        )
++
++    assert processor._incremental_state is None
++    assert processor.prompt_length == 4
++
++    telemetry = processor.telemetry()
++    assert telemetry["verificationRows"] == 1
++    assert telemetry["verificationMismatches"] == 1
++
++
++def test_incremental_verify_compares_exception_presence_and_class(monkeypatch):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental_verify"
++    )
++    monkeypatch.setattr(
++        hold_logits._IncrementalManiaRowState,
++        "candidate_final_open_columns",
++        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("wrong")),
++    )
++
++    with pytest.raises(
++        AssertionError,
++        match=r"oracleException=None.*candidateException=RuntimeError",
++    ):
++        processor(
++            torch.tensor([[keycount_token(4), 1, 30, 12]]),
++            scores(),
++        )
++
++    assert processor._incremental_state is None
++    assert processor.prompt_length == 4
++
++
++def test_verify_mismatch_discards_poisoned_state_but_preserves_prompt_boundary(
++        monkeypatch,
++):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        hold_state_mode="incremental_verify",
++        require_closed_holds_at_eos=True,
++        max_sequence_length=20,
++    )
++    prompt = [keycount_token(4), 1, 30]
++    pending_prefix = prompt + [10]
++    poisoned_prefix = pending_prefix + [51]
++    processor(torch.tensor([prompt]), scores())
++    processor(torch.tensor([pending_prefix]), scores())
++    original_prompt_length = processor.prompt_length
++    original_transition = hold_logits._mania_bucket_transition
++    monkeypatch.setattr(
++        hold_logits,
++        "_mania_bucket_transition",
++        lambda _events: hold_logits._IDENTITY_TRANSITION,
++    )
++
++    with pytest.raises(AssertionError, match="verification mismatch"):
++        processor(torch.tensor([poisoned_prefix]), scores())
++
++    assert processor._incremental_state is None
++    assert processor.prompt_length == original_prompt_length
++    assert processor.telemetry()["verificationMismatches"] == 1
++    monkeypatch.setattr(
++        hold_logits,
++        "_mania_bucket_transition",
++        original_transition,
++    )
++    recovered = processor(torch.tensor([poisoned_prefix]), scores())
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        (),
++        hold_state_mode="full_scan",
++        require_closed_holds_at_eos=True,
++        max_sequence_length=20,
++    )
++    oracle.prompt_length = original_prompt_length
++    expected = oracle(torch.tensor([poisoned_prefix]), scores())
++
++    assert torch.equal(recovered, expected)
++    assert processor.prompt_length == original_prompt_length
++
++
++def test_hold_state_mode_telemetry_is_integer_only():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental_verify"
++    )
++    processor(torch.tensor([[keycount_token(4), 1, 30]]), scores())
++
++    telemetry = processor.telemetry()
++    assert set(
++        (
++            "fullScanRows",
++            "incrementalRows",
++            "verificationRows",
++            "verificationMismatches",
++            "unsupportedFallbackRows",
++            "stateResetRows",
++            "suffixTokensParsed",
++            "candidateTreeQueries",
++        )
++    ).issubset(telemetry)
++    assert all(type(value) is int for value in telemetry.values())
++
++
++def test_actual_processor_masks_match_over_1000_seeded_prefix_candidates():
++    rng = random.Random(419_003)
++    event_tokens = [50, 51, 52]
++    generated_templates = (
++        (),
++        (30,),
++        (30, 10),
++        (30, 10, 50),
++        (30, 10, 51),
++        (30, 10, 52),
++        (30, 10, 51, 31, 10),
++        (32, 10, 52, 31, 10),
++        (30, 10, 50, 30, 10),
++        (30, 10, 50, 30, 10, 50),
++        (10,),
++        (10, 51),
++        (30, 10, 51, 30, 10),
++        (30, 10, 52, 30, 10),
++        (30, 10, 51, 32, 10, 52, 31, 10),
++    )
++
++    incremental_rows = 0
++    candidate_queries = 0
++    compared_calls = 0
++    for case_index in range(1_024):
++        keycount = rng.randint(1, 4)
++        lane = rng.randrange(keycount)
++        initial_open = (lane,) if rng.randrange(4) == 0 else ()
++        prompt_time = rng.choice((None, 30, 31))
++        future_prompt = rng.randrange(5) == 0
++        prompt_signatures = (
++            (
++                32,
++                lane,
++                rng.choice(
++                    (EventType.HOLD_NOTE.value, EventType.HOLD_NOTE_END.value)
++                ),
++            ),
++        ) if future_prompt else ()
++        prompt = [keycount_token(keycount), 1]
++        if rng.randrange(3) == 0:
++            prompt += [30, 10 + lane, rng.choice(event_tokens)]
++        template = list(rng.choice(generated_templates))
++        template = [10 + lane if token == 10 else token for token in template]
++        if rng.randrange(8) == 0:
++            template += [rng.choice((30, 31, 32)), 10 + lane]
++        prefix = prompt + template
++
++        kwargs = dict(
++            prompt_group_signatures=prompt_signatures,
++            prompt_current_time_token=prompt_time,
++            require_closed_holds_at_eos=bool(rng.randrange(2)),
++            max_sequence_length=len(prefix) + rng.randrange(0, 7),
++        )
++        oracle = ManiaHoldStateLogitsProcessor(
++            FakeTokenizer(), initial_open, hold_state_mode="full_scan", **kwargs
++        )
++        candidate = ManiaHoldStateLogitsProcessor(
++            FakeTokenizer(), initial_open, hold_state_mode="incremental", **kwargs
++        )
++        connected_prefixes = [prompt]
++        for end in range(len(prompt) + 1, len(prefix) + 1):
++            connected_prefixes.append(prefix[:end])
++
++        for call_index, connected_prefix in enumerate(connected_prefixes):
++            oracle_error, oracle_result = _processor_call(
++                oracle, connected_prefix
++            )
++            candidate_error, candidate_result = _processor_call(
++                candidate, connected_prefix
++            )
++            compared_calls += 1
++            assert candidate_error is oracle_error, (case_index, call_index)
++            if oracle_error is not None:
++                break
++            assert torch.equal(candidate_result, oracle_result), (
++                case_index,
++                call_index,
++            )
++
++        telemetry = candidate.telemetry()
++        assert telemetry["stateResetRows"] == 0, case_index
++        assert telemetry["unsupportedFallbackRows"] == 0, case_index
++        incremental_rows += telemetry["incrementalRows"]
++        candidate_queries += telemetry["candidateTreeQueries"]
++
++    assert compared_calls >= 1_024
++    assert incremental_rows >= 1_500
++    assert candidate_queries >= 300
++
++
++@pytest.mark.parametrize(
++    "event_types",
++    [
++        frozenset(),
++        frozenset({EventType.CIRCLE}),
++        frozenset({EventType.HOLD_NOTE}),
++        frozenset({EventType.HOLD_NOTE_END}),
++        frozenset({EventType.CIRCLE, EventType.HOLD_NOTE}),
++        frozenset({EventType.CIRCLE, EventType.HOLD_NOTE_END}),
++        frozenset({EventType.HOLD_NOTE, EventType.HOLD_NOTE_END}),
++        frozenset(
++            {EventType.CIRCLE, EventType.HOLD_NOTE, EventType.HOLD_NOTE_END}
++        ),
++    ],
++)
++@pytest.mark.parametrize("initial_open", [(), (0,)])
++def test_actual_processor_differential_enumerates_same_time_event_subsets(
++        event_types,
++        initial_open,
++):
++    prompt_signatures = tuple(
++        (30, 0, event_type.value)
++        for event_type in event_types
++    )
++    kwargs = dict(
++        prompt_group_signatures=prompt_signatures,
++        prompt_current_time_token=30,
++    )
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), initial_open, hold_state_mode="full_scan", **kwargs
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), initial_open, hold_state_mode="incremental", **kwargs
++    )
++    prefix = [keycount_token(4), 1, 30, 10]
++
++    oracle_error, oracle_result = _processor_call(oracle, prefix)
++    candidate_error, candidate_result = _processor_call(candidate, prefix)
++
++    assert candidate_error is oracle_error
++    if oracle_error is None:
++        assert torch.equal(candidate_result, oracle_result)
++        assert candidate.telemetry()["candidateTreeQueries"] > 0
++
++
++@pytest.mark.parametrize(
++    ("initial_open", "prompt_signatures", "prefix"),
++    [
++        ((4,), (), [keycount_token(4), 1, 30]),
++        ((), ((30, 4, EventType.HOLD_NOTE.value),), [keycount_token(4), 1, 30]),
++        ((), (), [keycount_token(2), 1, 30, 13]),
++    ],
++    ids=["initial-lane", "canonical-prompt-lane", "pending-lane"],
++)
++def test_actual_processor_differential_covers_lane_and_keycount_failures(
++        initial_open,
++        prompt_signatures,
++        prefix,
++):
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        initial_open,
++        prompt_group_signatures=prompt_signatures,
++        hold_state_mode="full_scan",
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(),
++        initial_open,
++        prompt_group_signatures=prompt_signatures,
++        hold_state_mode="incremental",
++    )
++
++    oracle_error, oracle_result = _processor_call(oracle, prefix)
++    candidate_error, candidate_result = _processor_call(candidate, prefix)
++
++    assert candidate_error is oracle_error
++    if oracle_error is None:
++        assert torch.equal(candidate_result, oracle_result)
++
++
++def test_actual_processor_differential_handles_connected_sos_epoch_reset():
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="full_scan"
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prefixes = [
++        [keycount_token(4), 1, 30, 10, 51],
++        [keycount_token(4), 1, 30, 10, 51, 1],
++        [keycount_token(4), 1, 30, 10, 51, 1, 31],
++        [keycount_token(4), 1, 30, 10, 51, 1, 31, 10],
++    ]
++
++    for prefix in prefixes:
++        oracle_error, oracle_result = _processor_call(oracle, prefix)
++        candidate_error, candidate_result = _processor_call(candidate, prefix)
++        assert candidate_error is oracle_error
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result)
++
++    assert candidate._incremental_state.sos_epoch == 1
++    assert candidate.telemetry()["stateResetRows"] == 0
++
++
++def test_late_keycount_activation_preserves_original_prompt_boundary():
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="full_scan"
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prefixes = [
++        [1, 30],
++        [1, 30, 10],
++        [1, 30, 10, 50],
++        [1, 30, 10, 50, keycount_token(4)],
++        [1, 30, 10, 50, keycount_token(4), 30],
++        [1, 30, 10, 50, keycount_token(4), 30, 10],
++        [1, 30, 10, 50, keycount_token(4), 30, 10, 50],
++    ]
++
++    for call_index, prefix in enumerate(prefixes):
++        oracle_error, oracle_result = _processor_call(oracle, prefix)
++        candidate_error, candidate_result = _processor_call(candidate, prefix)
++        assert candidate_error is oracle_error, call_index
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result), call_index
++
++    assert candidate.prompt_length == 2
++    assert candidate._incremental_state.prompt_length == 2
++
++
++def test_first_decoder_call_complete_group_remains_prompt_history():
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prompt = [keycount_token(4), 1, 30, 10, 50]
++    first_generated_duplicate = prompt + [30, 10, 50]
++
++    processor(torch.tensor([prompt]), scores())
++    result = processor(
++        torch.tensor([first_generated_duplicate[:-2]]), scores()
++    )
++    result = processor(
++        torch.tensor([first_generated_duplicate[:-1]]), scores()
++    )
++    result = processor(torch.tensor([first_generated_duplicate]), scores())
++
++    assert result.shape == scores().shape
++    assert processor._incremental_state.prompt_length == len(prompt)
++
++
++def test_connected_append_does_not_rescan_or_transfer_historical_row(monkeypatch):
++    processor = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prefix = torch.tensor([[keycount_token(4), 1, 30]])
++    processor(prefix, scores())
++
++    def unexpected_contract_scan(_tokens):
++        raise AssertionError("connected append rescanned keycount/SOS history")
++
++    monkeypatch.setattr(
++        processor,
++        "_row_has_grammar_contract",
++        unexpected_contract_scan,
++    )
++    token_transfer_sizes = []
++    original_token_values = hold_logits._IncrementalManiaRowState._token_values
++
++    def record_token_values(tokens):
++        token_transfer_sizes.append(int(tokens.numel()))
++        return original_token_values(tokens)
++
++    monkeypatch.setattr(
++        hold_logits._IncrementalManiaRowState,
++        "_token_values",
++        staticmethod(record_token_values),
++    )
++
++    processor(
++        torch.tensor([[keycount_token(4), 1, 30, 10]]),
++        scores(),
++    )
++
++    assert token_transfer_sizes == [1]
++
++
++def test_discontinuity_without_contract_clears_state_and_later_reactivates():
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="full_scan"
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prefixes = [
++        [keycount_token(4), 1, 30],
++        [keycount_token(4), 1, 30, 10],
++        [1, 30],
++    ]
++    for prefix in prefixes:
++        oracle_error, oracle_result = _processor_call(oracle, prefix)
++        candidate_error, candidate_result = _processor_call(candidate, prefix)
++        assert candidate_error is oracle_error
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result)
++
++    assert candidate._incremental_state is None
++    assert candidate.telemetry()["stateResetRows"] == 1
++
++    reactivated = [1, 30, 10, 50, keycount_token(4)]
++    oracle_error, oracle_result = _processor_call(oracle, reactivated)
++    candidate_error, candidate_result = _processor_call(candidate, reactivated)
++    assert candidate_error is oracle_error
++    assert torch.equal(candidate_result, oracle_result)
++    assert candidate._incremental_state.prompt_length == 3
++
++    connected = reactivated + [30, 10, 50]
++    for end in range(len(reactivated) + 1, len(connected) + 1):
++        oracle_error, oracle_result = _processor_call(oracle, connected[:end])
++        candidate_error, candidate_result = _processor_call(
++            candidate, connected[:end]
++        )
++        assert candidate_error is oracle_error
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result)
++
++
++def test_shorter_valid_activation_preserves_larger_original_prompt_boundary():
++    oracle = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="full_scan"
++    )
++    candidate = ManiaHoldStateLogitsProcessor(
++        FakeTokenizer(), (), hold_state_mode="incremental"
++    )
++    prefixes = [
++        [1, 30, 10, 50],
++        [keycount_token(4), 1],
++        [keycount_token(4), 1, 30],
++        [keycount_token(4), 1, 30, 10],
++        [keycount_token(4), 1, 30, 10, 50],
++    ]
++
++    for call_index, prefix in enumerate(prefixes):
++        oracle_error, oracle_result = _processor_call(oracle, prefix)
++        candidate_error, candidate_result = _processor_call(candidate, prefix)
++        assert candidate_error is oracle_error, call_index
++        if oracle_error is None:
++            assert torch.equal(candidate_result, oracle_result), call_index
++
++    assert candidate.prompt_length == 4
++    assert candidate._incremental_state.prompt_length == 4
++
+ def test_effective_generation_limit_never_exceeds_model_capacity():
+     model = SimpleNamespace(
+         config=SimpleNamespace(max_target_positions=128),
+@@ -433,6 +2160,14 @@ def test_hold_state_processor_reports_intervention_counts():
+         "forcedGroupCompletionSteps": 0,
+         "impossibleGroupCompletionSteps": 0,
+         "startBoundaryColumnRestrictionSteps": 0,
++        "fullScanRows": 2,
++        "incrementalRows": 0,
++        "verificationRows": 0,
++        "verificationMismatches": 0,
++        "unsupportedFallbackRows": 0,
++        "stateResetRows": 0,
++        "suffixTokensParsed": 0,
++        "candidateTreeQueries": 0,
+     }
+     assert get_mania_hold_grammar_telemetry([processor]) == processor.telemetry()
+ 

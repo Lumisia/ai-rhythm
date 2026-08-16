@@ -1,4 +1,8 @@
+import hashlib
+import os
+import shutil
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -49,9 +53,85 @@ def test_required_patch_manifest_includes_hold_state_grammar():
         "mania-grammar-v22-canonical-column-authority",
         "mania-grammar-v23-start-boundary-feasibility",
         "mania-grammar-v24-resnap-boundary-contract",
+        "mania-grammar-v25-incremental-hold-state",
+        "mania-tail-repair-v26-checkpointed-suffix",
+        "resident-runtime-v27-offline-session-cache",
+        "mania-temporal-horizon-v28-time-and-token-reachability",
+        "mania-decoder-termination-v29-hard-cap-eos",
+        "generation-telemetry-v30-hash-bound-evidence",
+        "resnap-lane-order-v31-integer-milliseconds",
+        "canonical-sidecar-v32-final-serialization",
+        "mania-terminal-budget-v33-reserve-eos",
+        "mania-group-fragment-v34-explicit-failure",
     ]
     assert all(path.is_file() for _, path in REQUIRED_PATCHES)
-    assert mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES == REQUIRED_PATCHES[:-1]
+    assert (
+        mapperatorinator_patch.MANIA_GROUP_FRAGMENT_V34_PATCH_PATH
+        == REQUIRED_PATCHES[-1][1]
+    )
+    assert REQUIRED_PATCHES[-2][0] == (
+        "mania-terminal-budget-v33-reserve-eos"
+    )
+    assert (
+        mapperatorinator_patch.MANIA_TERMINAL_BUDGET_V33_PATCH_PATH
+        == REQUIRED_PATCHES[-2][1]
+    )
+    assert REQUIRED_PATCHES[-3][0] == (
+        "canonical-sidecar-v32-final-serialization"
+    )
+    assert (
+        mapperatorinator_patch.CANONICAL_SIDECAR_V32_PATCH_PATH
+        == REQUIRED_PATCHES[-3][1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
+        == REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V32_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES[:-1]
+    )
+    assert REQUIRED_PATCHES[-4][0] == (
+        "resnap-lane-order-v31-integer-milliseconds"
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V31_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V32_REQUIRED_PATCHES[:-1]
+    )
+    assert REQUIRED_PATCHES[-5][0] == (
+        "generation-telemetry-v30-hash-bound-evidence"
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V30_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V31_REQUIRED_PATCHES[:-1]
+    )
+    assert REQUIRED_PATCHES[-6][0] == (
+        "mania-decoder-termination-v29-hard-cap-eos"
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V29_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V30_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V28_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V29_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V27_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V28_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V26_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V27_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V25_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V26_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V25_REQUIRED_PATCHES[:-1]
+    )
     assert (
         mapperatorinator_patch.LEGACY_V23_REQUIRED_PATCHES
         == mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES[:-1]
@@ -134,7 +214,19 @@ def test_required_patch_manifest_includes_hold_state_grammar():
     )
     assert (
         mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[0]
-        == mapperatorinator_patch.LEGACY_V24_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[1]
+        == mapperatorinator_patch.LEGACY_V32_REQUIRED_PATCHES
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[2]
+        == mapperatorinator_patch.LEGACY_V31_REQUIRED_PATCHES
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[3]
+        == mapperatorinator_patch.LEGACY_V30_REQUIRED_PATCHES
     )
 
 
@@ -149,6 +241,173 @@ def test_required_patch_files_are_syntactically_valid():
         assert result.returncode == 0, (
             f"{patch_id} is not a valid git patch: {result.stderr.strip()}"
         )
+
+
+def _clone_pinned_upstream(source: Path, destination: Path) -> Path:
+    destination.mkdir()
+    shutil.copytree(source / ".git", destination / ".git", copy_function=shutil.copy2)
+    _git(destination, "remote", "set-url", "origin", str(source))
+    _git(destination, "config", "core.autocrlf", "false")
+    _git(destination, "config", "core.eol", "lf")
+    _git(
+        destination,
+        "checkout",
+        "--detach",
+        "--force",
+        mapperatorinator_patch.EXPECTED_MAPPERATORINATOR_HEAD,
+    )
+    assert (
+        _git(destination, "rev-parse", "HEAD").stdout.strip()
+        == mapperatorinator_patch.EXPECTED_MAPPERATORINATOR_HEAD
+    )
+    return destination
+
+
+def _patch_paths(patches: tuple[tuple[str, Path], ...]) -> set[str]:
+    paths: set[str] = set()
+    for patch_id, patch_path in patches:
+        result = subprocess.run(
+            ["git", "apply", "--numstat", "-z", str(patch_path)],
+            check=False,
+            capture_output=True,
+        )
+        assert result.returncode == 0, (
+            f"could not inspect paths for {patch_id}: "
+            f"{result.stderr.decode('utf-8', errors='replace')}"
+        )
+        for entry in result.stdout.split(b"\0"):
+            if entry:
+                paths.add(entry.split(b"\t", 2)[2].decode("utf-8"))
+    return paths
+
+
+def _path_snapshot(home: Path, paths: set[str]) -> dict[str, tuple[str, str, str]]:
+    snapshot: dict[str, tuple[str, str, str]] = {}
+    for relative in sorted(paths):
+        path = home.joinpath(*relative.split("/"))
+        if not path.exists():
+            snapshot[relative] = ("ABSENT", "ABSENT", "ABSENT")
+            continue
+        raw = path.read_bytes()
+        snapshot[relative] = (
+            hashlib.sha256(raw).hexdigest(),
+            hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest(),
+            _git(home, "hash-object", f"--path={relative}", relative).stdout.strip(),
+        )
+    return snapshot
+
+
+def test_v34_patch_chain_round_trips_from_pinned_local_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_value = os.environ.get("MAPPERATORINATOR_INTEGRATION_SOURCE")
+    root_value = os.environ.get("MAPPERATORINATOR_INTEGRATION_ROOT")
+    if not source_value:
+        pytest.fail(
+            "MAPPERATORINATOR_INTEGRATION_SOURCE is required and must point "
+            "to the local Mapperatorinator checkout at the pinned commit"
+        )
+    if not root_value:
+        pytest.fail(
+            "MAPPERATORINATOR_INTEGRATION_ROOT is required and must name a "
+            "new, absent evidence directory"
+        )
+    source = Path(source_value).resolve()
+    integration_root = Path(root_value).resolve()
+    if not source.is_dir():
+        pytest.fail(
+            "MAPPERATORINATOR_INTEGRATION_SOURCE does not exist or is not a "
+            f"directory: {source}"
+        )
+    source_head = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if source_head.returncode != 0:
+        pytest.fail(
+            "MAPPERATORINATOR_INTEGRATION_SOURCE must be a local Git checkout: "
+            f"{source_head.stderr.strip()}"
+        )
+    actual_source_head = source_head.stdout.strip()
+    if actual_source_head != mapperatorinator_patch.EXPECTED_MAPPERATORINATOR_HEAD:
+        pytest.fail(
+            "MAPPERATORINATOR_INTEGRATION_SOURCE must be pinned to "
+            f"{mapperatorinator_patch.EXPECTED_MAPPERATORINATOR_HEAD}, got "
+            f"{actual_source_head}"
+        )
+    if integration_root.exists():
+        pytest.fail(
+            "MAPPERATORINATOR_INTEGRATION_ROOT must be absent before the proof: "
+            f"{integration_root}"
+        )
+    integration_root.mkdir(parents=True)
+    assert source.resolve() != integration_root.resolve()
+
+    temp_index = 0
+
+    @contextmanager
+    def accessible_temporary_directory(*, prefix: str):
+        nonlocal temp_index
+        path = integration_root / f"{prefix}{temp_index}"
+        temp_index += 1
+        path.mkdir()
+        yield str(path)
+
+    monkeypatch.setattr(
+        mapperatorinator_patch.tempfile,
+        "TemporaryDirectory",
+        accessible_temporary_directory,
+    )
+    legacy_v33 = mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
+    v34_patch = REQUIRED_PATCHES[-1][1]
+    all_paths = _patch_paths(REQUIRED_PATCHES)
+    v34_paths = _patch_paths((REQUIRED_PATCHES[-1],))
+    earlier_only_paths = all_paths - v34_paths
+
+    full_home = _clone_pinned_upstream(source, integration_root / "full-v34")
+    assert (full_home / ".git" / "objects").resolve() != (
+        source / ".git" / "objects"
+    ).resolve()
+    apply_required_mapperatorinator_patches(full_home)
+    expected_statuses = dict.fromkeys(
+        (patch_id for patch_id, _ in REQUIRED_PATCHES),
+        "APPLIED",
+    )
+    assert required_patch_statuses(full_home) == expected_statuses
+    full_snapshot = _path_snapshot(full_home, all_paths)
+    first_status = _git(full_home, "status", "--porcelain=v1").stdout
+
+    apply_required_mapperatorinator_patches(full_home)
+    assert required_patch_statuses(full_home) == expected_statuses
+    assert _path_snapshot(full_home, all_paths) == full_snapshot
+    assert _git(full_home, "status", "--porcelain=v1").stdout == first_status
+
+    v33_home = _clone_pinned_upstream(source, integration_root / "exact-v33")
+    apply_required_mapperatorinator_patches(
+        v33_home,
+        patches=legacy_v33,
+    )
+    v33_snapshot = _path_snapshot(v33_home, all_paths)
+
+    reverse = _git(full_home, "apply", "--reverse", str(v34_patch))
+    assert reverse.returncode == 0
+    reversed_snapshot = _path_snapshot(full_home, all_paths)
+    assert reversed_snapshot == v33_snapshot
+    assert {
+        path: reversed_snapshot[path] for path in earlier_only_paths
+    } == {
+        path: full_snapshot[path] for path in earlier_only_paths
+    }
+
+    reapply = _git(full_home, "apply", str(v34_patch))
+    assert reapply.returncode == 0
+    assert _path_snapshot(full_home, all_paths) == full_snapshot
+
+    apply_required_mapperatorinator_patches(v33_home)
+    assert required_patch_statuses(v33_home) == expected_statuses
+    assert _path_snapshot(v33_home, all_paths) == full_snapshot
 
 
 def _git(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
