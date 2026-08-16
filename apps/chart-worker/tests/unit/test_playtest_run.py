@@ -6,7 +6,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from chart_worker.schema.export import export_schemas
+from chart_worker.schema.export import export_schemas, schemas
 from chart_worker.schema.playtest_run import (
     AudioFileRef,
     MissingChartRef,
@@ -17,6 +17,7 @@ from chart_worker.schema.playtest_run import (
     ReportFileRef,
     RunAudioRefs,
     RunChartRef,
+    RunChartRefV2,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
@@ -165,6 +166,31 @@ def test_v2_manifest_json_binds_report_and_round_trips():
     assert PlaytestRunManifestV2.model_validate_json(payload) == manifest
 
 
+def test_v2_chart_ref_requires_playtest_tier_for_safe_fallback():
+    fallback = RunChartRefV2(
+        key_mode=4,
+        difficulty="EASY",
+        path="charts/4k-easy.chart.json",
+        sha256=SHA,
+        provenance="SAFE_FALLBACK",
+        production_eligible=False,
+        distribution_tier="PLAYTEST_ONLY",
+    )
+
+    assert fallback.production_eligible is False
+    assert fallback.distribution_tier == "PLAYTEST_ONLY"
+    with pytest.raises(ValidationError, match="fallback provenance"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="EASY",
+            path="charts/4k-easy.chart.json",
+            sha256=SHA,
+            provenance="SAFE_FALLBACK",
+            production_eligible=True,
+            distribution_tier="PRODUCTION_CANDIDATE",
+        )
+
+
 def test_v2_manifest_accepts_review_only_with_matching_publication_decision():
     outcome = OutcomeStatusSnapshot(
         execution="SUCCEEDED",
@@ -259,3 +285,13 @@ def test_export_schemas_writes_six_parseable_contracts(tmp_path: Path):
         "primaryContentEnd",
         "acceptableReleaseEnd",
     } <= v2_annotation.keys()
+
+
+def test_committed_playtest_v2_schema_matches_the_python_contract():
+    project_root = Path(__file__).resolve().parents[4]
+    committed = json.loads(
+        (project_root / "packages/chart-schema/playtest-run-v2.schema.json")
+        .read_text(encoding="utf-8")
+    )
+
+    assert committed == schemas()["playtest-run-v2.schema.json"]

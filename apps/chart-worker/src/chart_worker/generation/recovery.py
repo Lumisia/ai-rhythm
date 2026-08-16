@@ -78,15 +78,23 @@ def _tempo_rows(
     events = authority.bpm_events
     if not events:
         raise ValueError("recovery requires timing authority BPM events")
+    note_start_end_ms = min(
+        request.duration_ms,
+        (
+            request.max_note_start_ms
+            if request.max_note_start_ms is not None
+            else request.duration_ms
+        ),
+    )
 
     for index, event in enumerate(events):
         segment_start = event.time_ms
         segment_end = (
             events[index + 1].time_ms
             if index + 1 < len(events)
-            else request.duration_ms
+            else note_start_end_ms
         )
-        if segment_end <= 0 or segment_start >= request.duration_ms:
+        if segment_end <= 0 or segment_start >= note_start_end_ms:
             continue
         beat_ms = 60_000.0 / event.bpm
         first_beat = event.time_ms
@@ -94,13 +102,13 @@ def _tempo_rows(
             first_beat += ceil(-first_beat / beat_ms) * beat_ms
 
         beat_time = first_beat
-        while beat_time < min(segment_end, request.duration_ms):
+        while beat_time < min(segment_end, note_start_end_ms):
             for subdivision in range(budget.subdivisions):
                 time_ms = round(
                     beat_time + subdivision * beat_ms / budget.subdivisions
                 )
                 if time_ms < max(0, segment_start) or time_ms >= min(
-                    segment_end, request.duration_ms
+                    segment_end, note_start_end_ms
                 ):
                     continue
                 if subdivision and not _has_nearby_onset(time_ms, active_onsets):

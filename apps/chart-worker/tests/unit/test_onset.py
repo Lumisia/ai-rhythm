@@ -6,6 +6,7 @@ from chart_worker.analysis.beat import build_beat_grid
 from chart_worker.analysis.onset import (
     BAND_NAMES,
     OnsetAnalysis,
+    _canonical_onset_ms,
     analyze_onsets,
     annotate_notes,
     normalize_envelope,
@@ -145,6 +146,15 @@ def test_backend_failure_becomes_a_worker_error():
     with pytest.raises(WorkerError) as caught:
         analyze_onsets(AudioSignal(np.zeros((100, 2)), SAMPLE_RATE), backend=backend)
     assert caught.value.code is ErrorCode.CHART_ANALYSIS_FAILED
+
+
+def test_backtracked_peak_times_are_sorted_and_deduplicated():
+    observed = _canonical_onset_ms(
+        np.array([3, 1, 1, 2], dtype=np.int64),
+        frame_ms=FRAME_MS,
+    )
+
+    assert observed == (11, 21, 32)
 
 
 # --- annotate_notes -----------------------------------------------------------

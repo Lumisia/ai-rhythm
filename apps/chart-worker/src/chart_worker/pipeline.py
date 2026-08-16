@@ -1,5 +1,6 @@
 """Direct Mapperatorinator chart generation pipeline."""
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -21,14 +22,36 @@ from chart_worker.analysis.runtime_fingerprint import build_runtime_fingerprint
 from chart_worker.config import WorkerConfig, load_config
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.attempt_journal import build_attempt_journal_projection
+from chart_worker.generation.diagnostic_fallback import (
+    DIAGNOSTIC_FALLBACK_VERSION,
+    DiagnosticFallbackExport,
+    DiagnosticFallbackIdentity,
+    export_diagnostic_fallback,
+)
 from chart_worker.generation.fake import FakeGenerator
 from chart_worker.generation.generation_control import (
     MAX_CRASH_ATTEMPTS,
     MAX_TOTAL_ATTEMPTS,
     MAX_VARIANT_ATTEMPTS,
 )
-from chart_worker.generation.mapperatorinator import ChartGenerator, MapperatorinatorGenerator
-from chart_worker.generation.mapperatorinator_patch import CONSTRAINT_PATCH_ID
+from chart_worker.generation.inference_session import (
+    InferenceSession,
+    ResidentProcessSession,
+    SessionState,
+    SongIdentity,
+    SubprocessResidentTransport,
+)
+from chart_worker.generation.mapperatorinator import (
+    ChartGenerator,
+    GeneratedChart,
+    MapperatorinatorGenerator,
+    inference_env,
+)
+from chart_worker.generation.mapperatorinator_patch import (
+    CONSTRAINT_PATCH_ID,
+    EXPECTED_MAPPERATORINATOR_HEAD,
+)
+from chart_worker.generation.osu_parser import parse_osu_mania
 from chart_worker.generation.params import DESCRIPTORS
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.playtest_run import (
@@ -39,7 +62,7 @@ from chart_worker.schema.playtest_run import (
     PublicationDecisionSnapshot,
     ReportFileRef,
     RunAudioRefs,
-    RunChartRef,
+    RunChartRefV2,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.authority_epoch import AuthorityEpochRecord
@@ -59,6 +82,7 @@ from chart_worker.stages.types import (
     SongTimingAuthority,
 )
 from chart_worker.validation.difficulty_selector import DifficultySelectionComparison
+from chart_worker.validation.generated_chart import validate_generated_chart
 from chart_worker.validation.intro_phrase_family import IntroPhraseFamilyReview
 from chart_worker.validation.intro_start_contract import (
     IntroContractReview,
@@ -74,8 +98,9 @@ from chart_worker.validation.publication_policy import (
     assess_boundary_publication,
     decide_publication,
 )
-from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateAction
+from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateAction, GateAxis
 from chart_worker.validation.song_family_selector import SongSelectionComparison
+from chart_worker.validation.timing_authority import validate_timing_identity
 from chart_worker.validation.timing_family_review import TimingFamilyReview
 from chart_worker.validation.timing_review import TimingAuthorityAction
 
@@ -97,6 +122,16 @@ ExportStage = Callable[
     [PreparedAudio, tuple[GeneratedVariant, ...], Path, str],
     tuple[ExportedVariant, ...],
 ]
+OpenInferenceSession = Callable[[WorkerConfig, Path], InferenceSession]
+BindInferenceSession = Callable[[ChartGenerator, InferenceSession], ChartGenerator]
+_REPORTABLE_INFERENCE_FAILURES = frozenset(
+    {
+        ErrorCode.INFERENCE_PROTOCOL_FAILED,
+        ErrorCode.INFERENCE_START_FAILED,
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+        ErrorCode.INFERENCE_INVOCATION_CONFLICT,
+    }
+)
 
 
 def _prepare_stage(source: Path, run_dir: Path, config: WorkerConfig) -> PreparedAudio:
@@ -192,6 +227,92 @@ def _select_generator(name: GeneratorName, config: WorkerConfig) -> ChartGenerat
     return MapperatorinatorGenerator(config)
 
 
+def _open_inference_session(
+    config: WorkerConfig,
+    run_dir: Path,
+    *,
+    stderr_path: Path | None = None,
+) -> InferenceSession:
+    if config.mapperatorinator_backend != "song_session":
+        raise ValueError("resident session factory requires song_session backend")
+    if (
+        config.mapperatorinator_home is None
+        or config.mapperatorinator_python is None
+        or config.mapperatorinator_model_root is None
+        or config.mapperatorinator_model_revision is None
+    ):
+        raise ValueError("song_session configuration is incomplete")
+    home = config.mapperatorinator_home.resolve(strict=True)
+    python = config.mapperatorinator_python.resolve(strict=True)
+    worker_source = home / "osuT5" / "osuT5" / "inference" / "resident_worker.py"
+    if not worker_source.is_file():
+        raise ValueError("patched Mapperatorinator resident_worker.py is missing")
+    command = [
+        str(python),
+        "-u",
+        "-m",
+        "osuT5.osuT5.inference.resident_worker",
+        "--home",
+        str(home),
+        "--job-root",
+        str(run_dir),
+        "--model-root",
+        str(config.mapperatorinator_model_root),
+        "--model-revision",
+        config.mapperatorinator_model_revision,
+        "--upstream-commit",
+        EXPECTED_MAPPERATORINATOR_HEAD,
+        "--patch-set-id",
+        CONSTRAINT_PATCH_ID,
+    ]
+    transport = SubprocessResidentTransport(
+        command=command,
+        cwd=home,
+        job_root=run_dir,
+        stderr_path=stderr_path or run_dir / "resident-stderr.log",
+        env=inference_env(),
+        startup_timeout_sec=config.mapperatorinator_resident_startup_timeout_sec,
+        invocation_timeout_sec=config.mapperatorinator_resident_invocation_timeout_sec,
+        shutdown_timeout_sec=config.mapperatorinator_resident_close_timeout_sec,
+        max_line_bytes=config.mapperatorinator_protocol_max_line_bytes,
+    )
+    return ResidentProcessSession(
+        transport=transport,
+        close_timeout_sec=config.mapperatorinator_resident_close_timeout_sec,
+    )
+
+
+def _bind_inference_session(
+    generator: ChartGenerator,
+    session: InferenceSession,
+) -> ChartGenerator:
+    if not isinstance(generator, MapperatorinatorGenerator):
+        raise TypeError("song_session requires MapperatorinatorGenerator")
+    return replace(generator, session=session)
+
+
+def _song_config_digest(config: WorkerConfig) -> str:
+    payload = {
+        "backend": config.mapperatorinator_backend,
+        "checkpointIntervalWindows": config.mapperatorinator_checkpoint_interval_windows,
+        "holdStateMode": config.mapperatorinator_hold_state_mode,
+        "modelRevision": config.mapperatorinator_model_revision,
+        "modelRoot": str(config.mapperatorinator_model_root),
+        "patchSetId": CONSTRAINT_PATCH_ID,
+        "precision": config.mapperatorinator_precision,
+        "tailRepairs": config.mapperatorinator_tail_repairs,
+        "upstreamCommit": EXPECTED_MAPPERATORINATOR_HEAD,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -202,6 +323,9 @@ class PipelineDependencies:
     prepare: PrepareStage = _prepare_stage
     analyze: AnalysisStage = _analysis_stage
     select_generator: Callable[[GeneratorName, WorkerConfig], ChartGenerator] = _select_generator
+    open_inference_session: OpenInferenceSession = _open_inference_session
+    bind_inference_session: BindInferenceSession = _bind_inference_session
+    attached_inference_session: InferenceSession | None = None
     timing: TimingStage = _timing_stage
     super_timing: SuperTimingStage = _super_timing_stage
     generation: GenerationStage = _generation_stage
@@ -424,8 +548,13 @@ def _generation_report(
     timing_family_reviews: tuple[TimingFamilyReview, ...] = (),
     outro_family_review: OutroFamilyReview | None = None,
     additional_inference_calls: int = 0,
+    additional_inference_work_ms: int = 0,
+    additional_inference_work_limit_ms: int = 0,
     missing: tuple[MissingVariant, ...] = (),
     music_bounds: dict[str, object] | None = None,
+    diagnostic_fallbacks: tuple[DiagnosticFallbackExport, ...] = (),
+    diagnostic_fallback_failures: tuple[dict[str, object], ...] = (),
+    diagnostic_fallback_manifest: Path | None = None,
 ) -> dict[str, object]:
     strict_blockers = boundary_publication_assessment.strict_blockers
     charts = []
@@ -433,6 +562,10 @@ def _generation_report(
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
         acceptance = variant.acceptance.to_report()
+        playtest_only = variant.provenance in {
+            "RAW_UNVERIFIED",
+            "SAFE_FALLBACK",
+        }
         quality_profile = acceptance["qualityProfile"]
         resnap_diagnostics = variant.generated.resnap_diagnostics.to_report()
         hold_lane_state_trace = analyze_hold_lane_state(
@@ -463,6 +596,10 @@ def _generation_report(
                 "generationAttemptCount": variant.generation_attempt_count,
                 "provenance": variant.provenance,
                 "recoveryReason": variant.recovery_reason,
+                "productionEligible": not playtest_only,
+                "distributionTier": (
+                    "PLAYTEST_ONLY" if playtest_only else "PRODUCTION_CANDIDATE"
+                ),
                 "attemptErrors": list(variant.attempt_errors),
                 "attemptEvidence": list(variant.attempt_evidence),
                 "acceptanceStatus": acceptance["action"],
@@ -505,14 +642,23 @@ def _generation_report(
         or any(review.status == "OUTLIER" for review in timing_family_reviews)
         or (outro_family_review is not None and outro_family_review.status == "REVIEW")
     )
-    has_raw = any(variant.provenance == "RAW_UNVERIFIED" for variant in generated)
+    has_playtest_fallback = any(
+        variant.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+        for variant in generated
+    )
+    has_order_retry = any(
+        variant.difficulty_order is not None
+        and variant.difficulty_order.status == "RETRY"
+        for variant in generated
+    )
     # timingReviewRequired 는 진단 플래그로 남긴다 (배치 실측상 잦고,
     # 사람 판정과 자주 어긋난다). 곡 상태를 낮추는 것은 실제 계약 위반
     # 두 가지뿐이다: 조합 누락(PARTIAL), 품질 축 우회 발행(REVIEW).
     if missing:
         status = "PARTIAL"
     elif (
-        has_raw
+        has_playtest_fallback
+        or has_order_retry
         or (intro_contract_review is not None and intro_contract_review.status == "REVIEW")
         or any(review.should_block_publication for review in intro_phrase_family_reviews)
         or any(review.status == "OUTLIER" for review in timing_family_reviews)
@@ -524,7 +670,12 @@ def _generation_report(
     outcome_status_v2 = success_outcome_status(
         expected_slots=len(KEY_MODES) * len(DIFFICULTIES),
         generated_slots=len(generated),
-        requires_review=timing_review_required or has_raw or bool(missing),
+        requires_review=(
+            timing_review_required
+            or has_playtest_fallback
+            or has_order_retry
+            or bool(missing)
+        ),
     )
     publication_decision = decide_publication(
         outcome=outcome_status_v2,
@@ -562,6 +713,11 @@ def _generation_report(
         "mapperatorinatorConstraintPatch": (
             CONSTRAINT_PATCH_ID if options.generator == "mapperatorinator" else None
         ),
+        "mapperatorinatorHoldStateMode": (
+            config.mapperatorinator_hold_state_mode
+            if options.generator == "mapperatorinator"
+            else None
+        ),
         "attemptsPerChartMax": MAX_TOTAL_ATTEMPTS,
         "qualityAttemptsPerChartMax": MAX_VARIANT_ATTEMPTS,
         "crashAttemptsPerChartMax": MAX_CRASH_ATTEMPTS,
@@ -598,15 +754,35 @@ def _generation_report(
             outro_family_review.to_report() if outro_family_review is not None else None
         ),
         "additionalInferenceCalls": additional_inference_calls,
+        "additionalInferenceWorkMs": additional_inference_work_ms,
+        "additionalInferenceWorkLimitMs": additional_inference_work_limit_ms,
         "musicBounds": music_bounds,
         "availableCharts": len(charts),
         "missingCharts": [entry.to_report() for entry in missing],
+        "diagnosticRawFallbacks": [
+            {
+                **entry.to_report(relative_to=run_dir),
+                "decision": "PLAYTEST_ONLY",
+                "productionEligible": False,
+            }
+            for entry in diagnostic_fallbacks
+        ],
+        "diagnosticRawFallbackFailures": list(diagnostic_fallback_failures),
+        "diagnosticFallbackManifest": (
+            {
+                "path": _relative(diagnostic_fallback_manifest, run_dir),
+                "sha256": sha256_file(diagnostic_fallback_manifest),
+            }
+            if diagnostic_fallback_manifest is not None
+            else None
+        ),
         "charts": charts,
     }
 
 
 def _failure_generation_report(
     options: PipelineOptions,
+    config: WorkerConfig,
     run_id: UUID,
     elapsed: dict[str, int],
     run_dir: Path,
@@ -625,12 +801,20 @@ def _failure_generation_report(
         ErrorCode.CHART_TIMING_CANDIDATE_FAILED: "EXHAUSTED",
         ErrorCode.CHART_CANDIDATES_EXHAUSTED: "EXHAUSTED",
         ErrorCode.CHART_VALIDATION_FAILED: "FAILED",
+        ErrorCode.INFERENCE_PROTOCOL_FAILED: "FAILED",
+        ErrorCode.INFERENCE_START_FAILED: "FAILED",
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN: "FAILED",
+        ErrorCode.INFERENCE_INVOCATION_CONFLICT: "FAILED",
     }[error.code]
     failure_category = {
         ErrorCode.CHART_TIMING_REVIEW_REQUIRED: "POLICY",
         ErrorCode.CHART_TIMING_CANDIDATE_FAILED: "GENERATION",
         ErrorCode.CHART_CANDIDATES_EXHAUSTED: "GENERATION",
         ErrorCode.CHART_VALIDATION_FAILED: "VALIDATION",
+        ErrorCode.INFERENCE_PROTOCOL_FAILED: "INFRA",
+        ErrorCode.INFERENCE_START_FAILED: "INFRA",
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN: "INFRA",
+        ErrorCode.INFERENCE_INVOCATION_CONFLICT: "INFRA",
     }[error.code]
     outcome_status_v2 = failure_outcome_status(category=failure_category)
     publication_decision = decide_publication(
@@ -646,6 +830,11 @@ def _failure_generation_report(
         "sourceName": options.source.name,
         "generator": options.generator,
         "strategy": "MAPPERATORINATOR_SHARED_TIMING",
+        "mapperatorinatorHoldStateMode": (
+            config.mapperatorinator_hold_state_mode
+            if options.generator == "mapperatorinator"
+            else None
+        ),
         "attemptJournal": build_attempt_journal_projection(
             run_dir / "attempt-journal.jsonl",
             relative_to=run_dir,
@@ -685,6 +874,110 @@ def _write_generation_report(path: Path, report: dict[str, object]) -> None:
     temporary.replace(path)
 
 
+def _export_diagnostic_raw_fallbacks(
+    outcome: GenerationOutcome,
+    *,
+    options: PipelineOptions,
+    config: WorkerConfig,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    run_dir: Path,
+) -> tuple[
+    tuple[DiagnosticFallbackExport, ...],
+    tuple[dict[str, object], ...],
+    Path | None,
+]:
+    candidates = outcome.diagnostic_raw_candidates
+    if not candidates:
+        return (), (), None
+    failures: list[dict[str, object]] = []
+    exports: list[DiagnosticFallbackExport] = []
+    if options.generator != "mapperatorinator":
+        failures.extend(
+            {
+                "keyMode": candidate.key_mode,
+                "difficulty": candidate.difficulty,
+                "reason": "DIAGNOSTIC_FALLBACK_REQUIRES_MAPPERATORINATOR",
+            }
+            for candidate in candidates
+        )
+    elif (
+        config.mapperatorinator_hold_state_mode != "incremental"
+        or config.mapperatorinator_model_root is None
+        or config.mapperatorinator_model_revision is None
+    ):
+        failures.extend(
+            {
+                "keyMode": candidate.key_mode,
+                "difficulty": candidate.difficulty,
+                "reason": "DIAGNOSTIC_FALLBACK_IDENTITY_NOT_PINNED",
+            }
+            for candidate in candidates
+        )
+    else:
+        identity = DiagnosticFallbackIdentity(
+            audio_sha256=prepared.normalized.sha256,
+            timing_sha256=authority.sha256,
+            model_identity=(
+                f"{config.mapperatorinator_model_root.resolve(strict=False)}"
+                f"@{config.mapperatorinator_model_revision}"
+            ),
+            patch_set_id=CONSTRAINT_PATCH_ID,
+            hold_state_mode=config.mapperatorinator_hold_state_mode,
+        )
+        for candidate in candidates:
+            def validate_osu(text: str, *, _candidate=candidate) -> None:
+                beatmap = parse_osu_mania(text)
+                generated = GeneratedChart(
+                    notes=beatmap.notes,
+                    key_mode=beatmap.key_mode,
+                    osu_text=text,
+                    generator_name="diagnostic-raw-fallback",
+                    seed=_candidate.seed,
+                    bpm_events=beatmap.bpm_events,
+                )
+                validate_generated_chart(
+                    generated,
+                    key_mode=_candidate.key_mode,
+                    duration_ms=prepared.normalized.duration_ms,
+                )
+                validate_timing_identity(beatmap.bpm_events, authority.bpm_events)
+
+            try:
+                exports.append(
+                    export_diagnostic_fallback(
+                        candidate,
+                        run_dir=run_dir,
+                        identity=identity,
+                        validate_osu=validate_osu,
+                    )
+                )
+            except (OSError, TypeError, ValueError, WorkerError) as error:
+                failures.append(
+                    {
+                        "keyMode": candidate.key_mode,
+                        "difficulty": candidate.difficulty,
+                        "reason": "DIAGNOSTIC_FALLBACK_EXPORT_FAILED",
+                        "errorType": type(error).__name__,
+                        "message": str(error),
+                    }
+                )
+    root = run_dir / "diagnostic-raw-fallback"
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = root / "manifest-v1.json"
+    _write_generation_report(
+        manifest_path,
+        {
+            "version": DIAGNOSTIC_FALLBACK_VERSION,
+            "decision": "PLAYTEST_ONLY",
+            "productionEligible": False,
+            "entries": [entry.to_report(relative_to=run_dir) for entry in exports],
+            "failures": failures,
+        },
+    )
+    return tuple(exports), tuple(failures), manifest_path
+
+
 def _write_playtest_manifest(path: Path, manifest: PlaytestRunManifestV2) -> None:
     temporary = path.with_suffix(f"{path.suffix}.tmp")
     temporary.write_text(
@@ -695,15 +988,23 @@ def _write_playtest_manifest(path: Path, manifest: PlaytestRunManifestV2) -> Non
 
 
 def _require_publishable_acceptance(generated: tuple[GeneratedVariant, ...]) -> None:
-    """Reject every active quality-gate failure before promotion.
-
-    Raw model output remains useful audit evidence, but provenance is not a
-    quality waiver.  Exhausted retry budgets must not turn a rejected chart
-    into a playable one.
-    """
+    """Allow soft-gate playtest fallbacks, but never waive hard safety axes."""
     rejected = []
     for variant in generated:
         if variant.acceptance.action is not GateAction.RETRY_MAP:
+            continue
+        hard_safe = all(
+            variant.acceptance.decision(axis).action is GateAction.PASS
+            for axis in (
+                GateAxis.STRUCTURE,
+                GateAxis.TIMING_IDENTITY,
+                GateAxis.SONG_BOUNDS,
+            )
+        )
+        if (
+            variant.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+            and hard_safe
+        ):
             continue
         rejected.append(
             {
@@ -722,13 +1023,13 @@ def _require_publishable_acceptance(generated: tuple[GeneratedVariant, ...]) -> 
     )
 
 
-def run_pipeline(
+def _run_pipeline(
     options: PipelineOptions,
     *,
-    dependencies: PipelineDependencies | None = None,
+    dependencies: PipelineDependencies,
+    run_dir: Path,
+    inference_session: InferenceSession | None,
 ) -> PipelineResult:
-    dependencies = dependencies or PipelineDependencies()
-    run_dir = _prepare_run_dir(options)
     run_id = dependencies.new_run_id()
     elapsed: dict[str, int] = {}
 
@@ -768,6 +1069,15 @@ def run_pipeline(
     )
 
     generator = dependencies.select_generator(options.generator, dependencies.config)
+    if inference_session is not None:
+        inference_session.begin_song(
+            SongIdentity(
+                song_id=str(run_id),
+                audio_sha256=prepared.normalized.sha256,
+                config_digest=_song_config_digest(dependencies.config),
+            )
+        )
+        generator = dependencies.bind_inference_session(generator, inference_session)
 
     started = perf_counter_ns()
     try:
@@ -776,13 +1086,14 @@ def run_pipeline(
         if error.code not in {
             ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
             ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
-        }:
+        } and error.code not in _REPORTABLE_INFERENCE_FAILURES:
             raise
         elapsed["timing"] = _elapsed_ms(started)
         _write_generation_report(
             run_dir / "generation-report.json",
             _failure_generation_report(
                 options,
+                dependencies.config,
                 run_id,
                 elapsed,
                 run_dir,
@@ -846,6 +1157,7 @@ def run_pipeline(
                     run_dir / "generation-report.json",
                     _failure_generation_report(
                         options,
+                        dependencies.config,
                         run_id,
                         elapsed,
                         run_dir,
@@ -883,7 +1195,7 @@ def run_pipeline(
                 if error.code not in {
                     ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
                     ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
-                }:
+                } and error.code not in _REPORTABLE_INFERENCE_FAILURES:
                     raise
                 elapsed["timing"] += _elapsed_ms(started)
                 elapsed["generation"] = generation_elapsed_ms
@@ -891,6 +1203,7 @@ def run_pipeline(
                     run_dir / "generation-report.json",
                     _failure_generation_report(
                         options,
+                        dependencies.config,
                         run_id,
                         elapsed,
                         run_dir,
@@ -912,7 +1225,7 @@ def run_pipeline(
                 ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
                 ErrorCode.CHART_CANDIDATES_EXHAUSTED,
                 ErrorCode.CHART_VALIDATION_FAILED,
-            }:
+            } and error.code not in _REPORTABLE_INFERENCE_FAILURES:
                 raise
             generation_elapsed_ms += _elapsed_ms(started)
             authority_epochs.append(
@@ -928,6 +1241,7 @@ def run_pipeline(
                 run_dir / "generation-report.json",
                 _failure_generation_report(
                     options,
+                    dependencies.config,
                     run_id,
                     elapsed,
                     run_dir,
@@ -969,6 +1283,24 @@ def run_pipeline(
     )
     elapsed["export"] = _elapsed_ms(started)
 
+    if outcome.diagnostic_raw_candidates:
+        started = perf_counter_ns()
+        diagnostic_fallbacks, diagnostic_fallback_failures, diagnostic_manifest = (
+            _export_diagnostic_raw_fallbacks(
+                outcome,
+                options=options,
+                config=dependencies.config,
+                prepared=prepared,
+                authority=authority,
+                run_dir=run_dir,
+            )
+        )
+        elapsed["diagnosticFallback"] = _elapsed_ms(started)
+    else:
+        diagnostic_fallbacks = ()
+        diagnostic_fallback_failures = ()
+        diagnostic_manifest = None
+
     report_path = run_dir / "generation-report.json"
     assert outcome is not None
     outro_observation = (
@@ -1009,6 +1341,10 @@ def run_pipeline(
         timing_family_reviews=outcome.timing_family_reviews,
         outro_family_review=outcome.outro_family_review,
         additional_inference_calls=outcome.additional_inference_calls,
+        additional_inference_work_ms=outcome.additional_inference_work_ms,
+        additional_inference_work_limit_ms=(
+            outcome.additional_inference_work_limit_ms
+        ),
         missing=outcome.missing,
         music_bounds={
             "audioDurationMs": prepared.normalized.duration_ms,
@@ -1046,6 +1382,9 @@ def run_pipeline(
                 else None
             ),
         },
+        diagnostic_fallbacks=diagnostic_fallbacks,
+        diagnostic_fallback_failures=diagnostic_fallback_failures,
+        diagnostic_fallback_manifest=diagnostic_manifest,
     )
     _write_generation_report(report_path, generation_report)
     manifest = PlaytestRunManifestV2(
@@ -1060,13 +1399,23 @@ def run_pipeline(
             )
         ),
         charts=[
-            RunChartRef(
+            RunChartRefV2(
                 path=_relative(result.path, run_dir),
                 sha256=result.sha256,
                 key_mode=result.document.key_mode,
                 difficulty=result.document.difficulty,
+                provenance=variant.provenance,
+                production_eligible=(
+                    variant.provenance
+                    not in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+                ),
+                distribution_tier=(
+                    "PLAYTEST_ONLY"
+                    if variant.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+                    else "PRODUCTION_CANDIDATE"
+                ),
             )
-            for result in exported
+            for variant, result in zip(generated, exported, strict=True)
         ],
         missing_charts=[
             MissingChartRef(
@@ -1096,3 +1445,39 @@ def run_pipeline(
         raw_osu_paths=tuple(variant.raw_osu_path for variant in generated),
         elapsed_ms_by_stage=elapsed,
     )
+
+
+def run_pipeline(
+    options: PipelineOptions,
+    *,
+    dependencies: PipelineDependencies | None = None,
+) -> PipelineResult:
+    dependencies = dependencies or PipelineDependencies()
+    run_dir = _prepare_run_dir(options)
+    resident_requested = (
+        options.generator == "mapperatorinator"
+        and dependencies.config.mapperatorinator_backend == "song_session"
+    )
+    if dependencies.attached_inference_session is not None and not resident_requested:
+        raise ValueError("an attached inference session requires mapperatorinator song_session")
+
+    session = dependencies.attached_inference_session
+    owns_session = False
+    if resident_requested and session is None:
+        session = dependencies.open_inference_session(dependencies.config, run_dir)
+        owns_session = True
+    try:
+        return _run_pipeline(
+            options,
+            dependencies=dependencies,
+            run_dir=run_dir,
+            inference_session=session,
+        )
+    finally:
+        if session is not None:
+            try:
+                if session.state is SessionState.SONG_ACTIVE:
+                    session.end_song()
+            finally:
+                if owns_session:
+                    session.close()

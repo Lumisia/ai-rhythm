@@ -199,7 +199,10 @@ PASS = ("PASS", ())
                 "STRUCTURE": PASS,
                 "TIMING_IDENTITY": PASS,
                 "TIMING_ALIGNMENT": PASS,
-                "COVERAGE": ("RETRY_MAP", ("ACTIVE_LEADING_GAP",)),
+                    "COVERAGE": (
+                        "RETRY_MAP",
+                        ("ATTACK_REQUIRED_LEADING_GAP",),
+                    ),
                 "PATTERN": PASS,
             },
             id="front-12-seconds-deleted",
@@ -211,7 +214,10 @@ PASS = ("PASS", ())
                 "STRUCTURE": PASS,
                 "TIMING_IDENTITY": PASS,
                 "TIMING_ALIGNMENT": PASS,
-                "COVERAGE": ("RETRY_MAP", ("ACTIVE_MIDDLE_GAP",)),
+                    "COVERAGE": (
+                        "RETRY_MAP",
+                        ("ATTACK_REQUIRED_MIDDLE_GAP",),
+                    ),
                 "PATTERN": PASS,
             },
             id="middle-10-seconds-deleted",

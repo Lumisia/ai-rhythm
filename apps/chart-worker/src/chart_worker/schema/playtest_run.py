@@ -5,7 +5,7 @@ from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from pydantic import AfterValidator, Field, model_validator
+from pydantic import AfterValidator, Field, field_validator, model_validator
 
 from chart_worker.schema.chart import CamelModel, Sha256
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES, Difficulty
@@ -49,6 +49,42 @@ class AudioFileRef(CamelModel):
 class RunChartRef(AudioFileRef):
     key_mode: Literal[4, 6, 7]
     difficulty: Difficulty
+
+
+class RunChartRefV2(RunChartRef):
+    """A chart reference whose trust tier cannot be hidden from consumers."""
+
+    provenance: Literal[
+        "PRIMARY",
+        "RETRY",
+        "PARTIAL_REMAP",
+        "INTRO_RECOVERY",
+        "INTRO_ALIGNED",
+        "RAW_UNVERIFIED",
+        "SAFE_FALLBACK",
+    ] = "PRIMARY"
+    production_eligible: bool = True
+    distribution_tier: Literal["PRODUCTION_CANDIDATE", "PLAYTEST_ONLY"] = (
+        "PRODUCTION_CANDIDATE"
+    )
+
+    @model_validator(mode="after")
+    def _check_distribution_tier(self) -> Self:
+        is_fallback = self.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+        if is_fallback and (
+            self.production_eligible or self.distribution_tier != "PLAYTEST_ONLY"
+        ):
+            raise ValueError(
+                "fallback provenance must be PLAYTEST_ONLY and not production eligible"
+            )
+        if not is_fallback and (
+            not self.production_eligible
+            or self.distribution_tier != "PRODUCTION_CANDIDATE"
+        ):
+            raise ValueError(
+                "model-backed provenance must remain a production candidate"
+            )
+        return self
 
 
 class MissingChartRef(CamelModel):
@@ -158,13 +194,27 @@ class PlaytestRunManifestV2(CamelModel):
     generated_at: datetime
     worker_version: str = Field(min_length=1)
     audio: RunAudioRefs
-    charts: list[RunChartRef] = Field(min_length=1)
+    charts: list[RunChartRefV2] = Field(min_length=1)
     missing_charts: list[MissingChartRef] = Field(default_factory=list)
     keysound_manifest_path: SafeRelativePath | None = None
     generation_report: ReportFileRef
     outcome: OutcomeStatusSnapshot
     strict_blockers: list[PublicationStrictBlocker] = Field(default_factory=list)
     publication: PublicationDecisionSnapshot
+
+    @field_validator("charts", mode="before")
+    @classmethod
+    def _upgrade_v1_chart_refs(cls, value: object) -> object:
+        """Keep the in-process V1->V2 migration API backward compatible."""
+        if not isinstance(value, list):
+            return value
+        return [
+            chart.model_dump()
+            if isinstance(chart, RunChartRef)
+            and not isinstance(chart, RunChartRefV2)
+            else chart
+            for chart in value
+        ]
 
     @model_validator(mode="after")
     def _check_run(self) -> Self:

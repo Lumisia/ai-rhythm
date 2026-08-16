@@ -68,12 +68,15 @@ class VariantState:
     attempt_errors: list[str] = field(default_factory=list)
     attempt_evidence: list[dict[str, object]] = field(default_factory=list)
     timing_failures: list[MapTimingFailureSignature] = field(default_factory=list)
+    partial_attempts: list[int] = field(default_factory=list)
+    partial_seeds: list[int] = field(default_factory=list)
+    full_length_retry_blocked_by: dict[str, object] | None = None
     publication_block_reason: str | None = None
     exhausted_error: WorkerError | None = None
 
     @property
     def budget_left(self) -> bool:
-        return self.budget.can_attempt
+        return self.full_length_retry_blocked_by is None and self.budget.can_attempt
 
 
 def candidate_quality_snapshot(candidate: Candidate) -> CandidateQualitySnapshot:

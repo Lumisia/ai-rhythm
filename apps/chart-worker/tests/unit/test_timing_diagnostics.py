@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.coverage_opportunity import CoverageKind
+from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing_diagnostics import diagnose_chart_timing
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import NoteEvent
@@ -9,6 +11,29 @@ from chart_worker.schema.note import NoteEvent
 
 def tap(time_ms: int, lane: int = 0) -> NoteEvent:
     return NoteEvent(time_ms=time_ms, lane=lane)
+
+
+def _coverage_analysis(
+    onset_strengths: dict[int, float], *, duration_ms: int = 40_000
+) -> OnsetAnalysis:
+    strength = np.zeros(duration_ms // 1_000 + 2)
+    for time_ms, value in onset_strengths.items():
+        strength[time_ms // 1_000] = value
+    onset_ms = tuple(sorted(onset_strengths))
+    return OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=1_000,
+        strength=strength,
+        band_strength=np.zeros((3, strength.size)),
+        onset_ms=onset_ms,
+        n_fft=1_000,
+        activity=AudioActivity(
+            frame_ms=1_000.0,
+            rms_db=np.full(strength.size, -10.0),
+            floor_db=-20.0,
+            active_onset_ms=onset_ms,
+        ),
+    )
 
 
 def test_diagnoses_unique_rows_in_fifteen_second_sections():
@@ -233,6 +258,55 @@ def test_marks_only_sustained_active_gap_for_review():
     assert result.quiet_coverage_gaps == ()
     assert result.coverage_gaps[0].active_onset_count == 20
     assert result.coverage_gaps[0].active_frame_ratio == 1.0
+
+
+def test_reports_hold_covered_low_attack_gap_as_sustain_opportunity():
+    analysis = _coverage_analysis(
+        {
+            1_000: 1.0,
+            **{time_ms: 0.1 for time_ms in range(5_000, 21_000, 1_000)},
+            30_000: 1.0,
+        }
+    )
+    result = diagnose_chart_timing(
+        [
+            NoteEvent(4_000, 0, kind="HOLD", duration_ms=26_000),
+            tap(30_000),
+        ],
+        analysis.onset_ms,
+        duration_ms=40_000,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+        activity=analysis.activity,
+        onset_analysis=analysis,
+        difficulty="EASY",
+    )
+
+    gap = next(gap for gap in result.quiet_coverage_gaps if gap.start_ms == 4_000)
+    assert gap.opportunity is not None
+    assert gap.opportunity.kind is CoverageKind.SUSTAIN_REPRESENTABLE
+    assert gap.to_report()["opportunity"]["holdOccupancyRatio"] == 1.0
+
+
+def test_reports_hold_covered_strong_attack_gap_as_attack_required():
+    analysis = _coverage_analysis(
+        {time_ms: 0.9 for time_ms in range(5_000, 21_000, 1_000)}
+    )
+    result = diagnose_chart_timing(
+        [
+            NoteEvent(4_000, 0, kind="HOLD", duration_ms=26_000),
+            tap(30_000),
+        ],
+        analysis.onset_ms,
+        duration_ms=40_000,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+        activity=analysis.activity,
+        onset_analysis=analysis,
+        difficulty="EXPERT",
+    )
+
+    gap = next(gap for gap in result.coverage_gaps if gap.start_ms == 4_000)
+    assert gap.opportunity is not None
+    assert gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
 
 
 def test_reports_quiet_gap_without_forcing_review():

@@ -106,6 +106,26 @@ class OnsetAnalysis:
 OnsetBackend = Callable[[np.ndarray, int], OnsetAnalysis]
 
 
+def _canonical_onset_ms(peaks: np.ndarray, *, frame_ms: float) -> tuple[int, ...]:
+    """Return exact, increasing timestamps after librosa peak backtracking.
+
+    Backtracking can map adjacent detected peaks onto the same earlier energy
+    minimum.  Downstream interval classification requires one canonical time
+    per onset and must not depend on backend ordering.
+    """
+    if type(frame_ms) not in {int, float}:
+        raise TypeError("frame_ms must be an exact integer or float")
+    if not np.isfinite(frame_ms) or frame_ms <= 0:
+        raise ValueError("frame_ms must be finite and positive")
+    frames = np.asarray(peaks)
+    if frames.ndim != 1:
+        raise ValueError("onset peak frames must be one-dimensional")
+    rounded = np.rint(frames.astype(np.float64) * frame_ms)
+    if not np.all(np.isfinite(rounded)):
+        raise ValueError("onset peak times must be finite")
+    return tuple(sorted({int(time_ms) for time_ms in rounded if time_ms >= 0}))
+
+
 def analyze_onsets(signal: AudioSignal, *, backend: OnsetBackend) -> OnsetAnalysis:
     try:
         return backend(signal.to_mono(), signal.sample_rate_hz)
@@ -202,7 +222,7 @@ def librosa_backend(
             strength=normalized_strength,
             # 대역마다 mel bin 수가 달라 원값 argmax 는 고역으로 쏠린다.
             band_strength=np.vstack([normalize_envelope(band) for band in bands]),
-            onset_ms=tuple(np.round(np.asarray(peaks) * frame_ms).astype(np.int64).tolist()),
+            onset_ms=_canonical_onset_ms(peaks, frame_ms=frame_ms),
             n_fft=n_fft,
             activity=activity,
         )

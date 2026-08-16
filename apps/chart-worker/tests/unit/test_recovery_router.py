@@ -46,7 +46,7 @@ def test_router_chooses_completeness_before_code_or_input_order():
         difficulty="EASY",
     )
 
-    plan = plan_recoveries((timing, missing), available_slots=1)
+    plan = plan_recoveries((timing, missing), available_generation_ms=180_000)
 
     assert plan.selected == (missing,)
     assert plan.deferred == (timing,)
@@ -68,7 +68,7 @@ def test_router_uses_smaller_generation_scope_for_equal_priority():
         difficulty="NORMAL",
     )
 
-    plan = plan_recoveries((full_map, partial), available_slots=1)
+    plan = plan_recoveries((full_map, partial), available_generation_ms=180_000)
 
     assert plan.selected == (partial,)
     assert plan.deferred == (full_map,)
@@ -90,8 +90,8 @@ def test_router_is_deterministic_when_priority_and_cost_tie():
         key_mode=4,
     )
 
-    forward = plan_recoveries((seven_key, four_key), available_slots=1)
-    reverse = plan_recoveries((four_key, seven_key), available_slots=1)
+    forward = plan_recoveries((seven_key, four_key), available_generation_ms=10_000)
+    reverse = plan_recoveries((four_key, seven_key), available_generation_ms=10_000)
 
     assert forward.selected == reverse.selected == (four_key,)
 
@@ -105,9 +105,83 @@ def test_router_rejects_duplicate_request_ids_and_negative_capacity():
     )
 
     with pytest.raises(ValueError, match="duplicate recovery request id"):
-        plan_recoveries((request, request), available_slots=1)
-    with pytest.raises(ValueError, match="available_slots"):
-        plan_recoveries((request,), available_slots=-1)
+        plan_recoveries((request, request), available_generation_ms=10_000)
+    with pytest.raises(ValueError, match="available_generation_ms"):
+        plan_recoveries((request,), available_generation_ms=-1)
+
+
+def test_router_can_admit_multiple_small_partial_repairs_within_song_work_budget():
+    requests = (
+        _request(
+            "partial-20s",
+            kind=RecoveryKind.PARTIAL_REMAP,
+            priority=RecoveryPriority.COMPLETENESS_BLOCKING,
+            estimated_generation_ms=20_000,
+        ),
+        _request(
+            "partial-30s",
+            kind=RecoveryKind.PARTIAL_REMAP,
+            priority=RecoveryPriority.COMPLETENESS_BLOCKING,
+            estimated_generation_ms=30_000,
+            key_mode=6,
+        ),
+        _request(
+            "whole-song",
+            kind=RecoveryKind.INTRO,
+            priority=RecoveryPriority.COMPLETENESS_BLOCKING,
+            estimated_generation_ms=180_000,
+            key_mode=7,
+        ),
+    )
+
+    plan = plan_recoveries(requests, available_generation_ms=180_000)
+
+    assert [request.request_id for request in plan.selected] == [
+        "partial-20s",
+        "partial-30s",
+    ]
+    assert [request.request_id for request in plan.deferred] == ["whole-song"]
+    assert plan.selected_generation_ms == 50_000
+    assert plan.remaining_generation_ms == 130_000
+    report = plan.to_report()
+    assert report["policyVersion"] == "RECOVERY_WORK_BUDGET_V2"
+    assert report["availableGenerationMs"] == 180_000
+    assert report["remainingGenerationMs"] == 130_000
+    assert report["requests"][-1]["decision"] == "DEFERRED_WORK_BUDGET"
+
+
+def test_router_does_not_spend_on_quality_while_completeness_is_deferred():
+    completeness = _request(
+        "missing-100s",
+        kind=RecoveryKind.PARTIAL_REMAP,
+        priority=RecoveryPriority.COMPLETENESS_BLOCKING,
+        estimated_generation_ms=100_000,
+    )
+    second_completeness = _request(
+        "missing-another-100s",
+        kind=RecoveryKind.PARTIAL_REMAP,
+        priority=RecoveryPriority.COMPLETENESS_BLOCKING,
+        estimated_generation_ms=100_000,
+        key_mode=6,
+    )
+    quality = _request(
+        "quality-40s",
+        kind=RecoveryKind.TIMING_FAMILY,
+        priority=RecoveryPriority.QUALITY_BLOCKING,
+        estimated_generation_ms=40_000,
+        key_mode=7,
+    )
+
+    plan = plan_recoveries(
+        (quality, second_completeness, completeness),
+        available_generation_ms=150_000,
+    )
+
+    assert [request.request_id for request in plan.selected] == ["missing-100s"]
+    assert {request.request_id for request in plan.deferred} == {
+        "missing-another-100s",
+        "quality-40s",
+    }
 
 
 def test_domain_request_builders_make_policy_explicit():

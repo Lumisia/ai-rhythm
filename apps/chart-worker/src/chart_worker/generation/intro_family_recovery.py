@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from chart_worker.analysis.intro_anchor import GRID_SUPPORT_WINDOW_MS
@@ -378,14 +379,25 @@ def apply_intro_phrase_family_recovery(
         state.publication_block_reason = "INTRO_PHRASE_DEFECT_UNRESOLVED"
         state.attempt_evidence.append(
             {
-                "reason": "INTRO_PHRASE_DEFECT_PUBLICATION_BLOCKED",
+                "reason": "INTRO_PHRASE_DEFECT_PLAYTEST_ONLY",
                 "selectedSeed": source.seed if source is not None else None,
+                "selectedProvenance": source.provenance if source is not None else None,
                 "review": review.to_report(),
             }
         )
         blocked[key_mode] = review
         assignment = dict(assignment)
-        assignment["EXPERT"] = None
+        if source is not None:
+            if source.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}:
+                degraded = source
+            else:
+                degraded = replace(
+                    source,
+                    provenance="RAW_UNVERIFIED",
+                    recovery_reason="INTRO_PHRASE_DEFECT_UNRESOLVED",
+                )
+                state.candidates.reject(degraded)
+            assignment["EXPERT"] = degraded
         updated[family_index] = (states, assignment, _family_review(assignment))
 
     final_reviews = intro_phrase_family_reviews(

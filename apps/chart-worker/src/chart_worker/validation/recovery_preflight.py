@@ -80,6 +80,7 @@ def _diagnose_rows(
     authority: SongTimingAuthority,
     duration_ms: int,
     boundary_policy_mode: BoundaryPolicyMode,
+    difficulty: str,
 ):
     notes = [NoteEvent(time_ms=time_ms, lane=0) for time_ms in rows]
     coverage_end_ms = (
@@ -99,6 +100,8 @@ def _diagnose_rows(
         coverage_end_ms=coverage_end_ms,
         bpm_events=authority.bpm_events,
         activity=onsets.activity,
+        onset_analysis=onsets,
+        difficulty=difficulty,
     )
 
 
@@ -120,6 +123,7 @@ def review_recovery_preflight(
             authority,
             duration_ms,
             boundary_policy_mode,
+            difficulty,
         )
 
         viable_divisors = []
@@ -136,6 +140,7 @@ def review_recovery_preflight(
                 authority,
                 duration_ms,
                 boundary_policy_mode,
+                difficulty,
             )
             if candidate.rows and not diagnostics.coverage_gaps:
                 viable_divisors.append(divisor)

@@ -141,14 +141,23 @@ def execute_intro_retry(
 ) -> Candidate | None:
     """Generate one full-map alternate seed for an unresolved intro policy."""
 
+    if state.full_length_retry_blocked_by is not None:
+        state.attempt_evidence.append(
+            {
+                "reason": f"{evidence_prefix}_RETRY_SUPPRESSED_BY_TAIL_EXHAUSTION",
+                "blockedBy": dict(state.full_length_retry_blocked_by),
+            }
+        )
+        return None
     if state.recovery.was_attempted(RecoveryKind.INTRO):
         return None
-    if not inference_budget.consume():
+    if not inference_budget.consume(prepared.normalized.duration_ms):
         state.attempt_evidence.append(
             {
                 "reason": f"{evidence_prefix}_RETRY_BUDGET_EXHAUSTED",
                 "budgetLimit": inference_budget.limit,
                 "budgetUsed": inference_budget.used,
+                "budget": inference_budget.to_report(),
             }
         )
         return None

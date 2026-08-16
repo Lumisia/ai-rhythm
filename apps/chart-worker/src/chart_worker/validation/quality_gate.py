@@ -8,6 +8,7 @@ from chart_worker.analysis.chart_profile import (
     ChartQualityProfile,
     build_chart_quality_profile,
 )
+from chart_worker.analysis.coverage_opportunity import CoverageKind
 from chart_worker.analysis.grid_alignment import NoteGridMetrics, measure_note_grid_alignment
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.timing_diagnostics import (
@@ -30,7 +31,7 @@ from chart_worker.validation.timing_authority import (
     validate_timing_identity,
 )
 
-QUALITY_GATE_VERSION = "quality-gate-v3-outro-review"
+QUALITY_GATE_VERSION = "quality-gate-v4-beat-aware-coverage"
 QUIET_TRAILING_REVIEW_PROXIMITY = 0.5
 
 
@@ -150,13 +151,45 @@ def _song_bounds_decision(
 
 
 def _coverage_decision(timing: TimingDiagnostics) -> GateDecision:
-    active_reasons = tuple(f"ACTIVE_{gap.position}_GAP" for gap in timing.coverage_gaps)
+    active_reasons = tuple(
+        (
+            f"ATTACK_REQUIRED_{gap.position}_GAP"
+            if gap.opportunity is not None
+            and gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
+            else f"ACTIVE_{gap.position}_GAP"
+        )
+        for gap in timing.coverage_gaps
+        if gap.opportunity is None
+        or gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
+    )
     if active_reasons:
         return GateDecision(GateAxis.COVERAGE, GateAction.RETRY_MAP, active_reasons)
-    quiet_reasons = tuple(
-        f"QUIET_{gap.position}_GAP" for gap in timing.quiet_coverage_gaps
+    insufficient_active_reasons = tuple(
+        f"INSUFFICIENT_COVERAGE_EVIDENCE_{gap.position}_GAP"
+        for gap in timing.coverage_gaps
+        if gap.opportunity is not None
+        and gap.opportunity.kind is CoverageKind.INSUFFICIENT_EVIDENCE
     )
+    quiet_reasons = tuple(
+        (
+            f"SUSTAIN_REPRESENTABLE_{gap.position}_GAP"
+            if gap.opportunity is not None
+            and gap.opportunity.kind is CoverageKind.SUSTAIN_REPRESENTABLE
+            else f"INSUFFICIENT_COVERAGE_EVIDENCE_{gap.position}_GAP"
+            if gap.opportunity is not None
+            else f"QUIET_{gap.position}_GAP"
+        )
+        for gap in timing.quiet_coverage_gaps
+    )
+    if insufficient_active_reasons:
+        return GateDecision(
+            GateAxis.COVERAGE,
+            GateAction.REVIEW,
+            (*insufficient_active_reasons, *quiet_reasons),
+        )
     if quiet_reasons:
+        if any(gap.opportunity is not None for gap in timing.quiet_coverage_gaps):
+            return GateDecision(GateAxis.COVERAGE, GateAction.REVIEW, quiet_reasons)
         near_active_trailing = any(
             gap.position == "TRAILING"
             and min(
@@ -312,6 +345,8 @@ def evaluate_chart_candidate(
         coverage_end_ms=coverage_end_ms,
         bpm_events=authority.bpm_events,
         activity=onset_analysis.activity,
+        onset_analysis=onset_analysis,
+        difficulty=requested_difficulty,
     )
     unique_rows = tuple(sorted({note.time_ms for note in chart.notes}))
     note_grid = measure_note_grid_alignment(unique_rows, authority.bpm_events)

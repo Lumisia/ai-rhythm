@@ -50,6 +50,9 @@ def request(
     key_mode: int = 4,
     difficulty: str = "NORMAL",
     duration_ms: int = DURATION_MS,
+    generation_end_ms: int | None = None,
+    last_attack_ms: int | None = None,
+    max_note_start_ms: int | None = None,
 ) -> GenerationRequest:
     return GenerationRequest(
         audio_path=Path("audio.flac"),
@@ -58,6 +61,9 @@ def request(
         difficulty=difficulty,
         duration_ms=duration_ms,
         seed=7,
+        generation_end_ms=generation_end_ms,
+        last_attack_ms=last_attack_ms,
+        max_note_start_ms=max_note_start_ms,
     )
 
 
@@ -84,6 +90,29 @@ def onsets(*, sustained: bool = True) -> OnsetAnalysis:
     )
 
 
+def corpus_onsets(duration_ms: int, *, onset_step_ms: int) -> OnsetAnalysis:
+    frame_ms = 100
+    frame_count = max(1, duration_ms // frame_ms)
+    onset_ms = tuple(range(0, duration_ms, onset_step_ms))
+    strength = np.zeros(frame_count, dtype=np.float64)
+    for time_ms in onset_ms:
+        strength[min(frame_count - 1, round(time_ms / frame_ms))] = 1.0
+    activity = AudioActivity(
+        frame_ms=frame_ms,
+        rms_db=np.full(frame_count, -12.0),
+        floor_db=-40.0,
+        active_onset_ms=onset_ms,
+    )
+    return OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.vstack((strength, strength, strength)),
+        onset_ms=onset_ms,
+        activity=activity,
+    )
+
+
 def test_recovery_uses_every_tempo_segment_and_audio_bounds():
     chart = build_recovery_chart(
         request(),
@@ -95,6 +124,30 @@ def test_recovery_uses_every_tempo_segment_and_audio_bounds():
     assert any(note.time_ms < 10_000 for note in chart.notes)
     assert any(note.time_ms >= 10_000 for note in chart.notes)
     assert chart.bpm_events == authority((0, 120.0), (10_000, 180.0)).bpm_events
+
+
+def test_recovery_never_starts_notes_after_the_canonical_music_boundary():
+    generation_request = request(
+        generation_end_ms=13_000,
+        last_attack_ms=11_500,
+        max_note_start_ms=12_000,
+    )
+
+    chart = build_recovery_chart(
+        generation_request,
+        authority((0, 90.0), (10_000, 210.0)),
+        onsets(),
+    )
+
+    validate_generated_chart(
+        chart,
+        key_mode=4,
+        duration_ms=DURATION_MS,
+        max_note_start_ms=12_000,
+        max_hold_end_ms=13_000,
+    )
+    assert chart.notes
+    assert max(note.time_ms for note in chart.notes) <= 12_000
 
 
 @pytest.mark.parametrize("difficulty", DIFFICULTIES)
@@ -215,3 +268,51 @@ def test_no_viable_alternate_keeps_default_for_final_gate_decision():
     assert plan.subdivisions == RECOVERY_BUDGETS["EASY"].subdivisions
     assert plan.selection_reason == "NO_VIABLE_ALTERNATE"
     assert plan.viable_divisors == ()
+
+
+@pytest.mark.parametrize(
+    ("duration_ms", "tempo_events", "onset_step_ms"),
+    (
+        (30_000, ((0, 60.0),), 500),
+        (180_000, ((0, 120.0),), 250),
+        (600_000, ((0, 240.0),), 125),
+        (
+            180_000,
+            ((0, 90.0), (60_000, 180.0), (120_000, 72.0)),
+            250,
+        ),
+    ),
+)
+def test_recovery_is_structurally_stable_across_duration_tempo_and_keycount(
+    duration_ms: int,
+    tempo_events: tuple[tuple[int, float], ...],
+    onset_step_ms: int,
+):
+    timing_authority = authority(*tempo_events)
+    analysis = corpus_onsets(duration_ms, onset_step_ms=onset_step_ms)
+
+    for key_mode in (4, 6, 7):
+        for difficulty in DIFFICULTIES:
+            generation_request = request(
+                key_mode=key_mode,
+                difficulty=difficulty,
+                duration_ms=duration_ms,
+            )
+            first = build_recovery_chart(
+                generation_request,
+                timing_authority,
+                analysis,
+            )
+            second = build_recovery_chart(
+                generation_request,
+                timing_authority,
+                analysis,
+            )
+
+            validate_generated_chart(
+                first,
+                key_mode=key_mode,
+                duration_ms=duration_ms,
+            )
+            assert first == second
+            assert {note.lane for note in first.notes} == set(range(key_mode))

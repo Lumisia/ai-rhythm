@@ -38,6 +38,18 @@ def test_rejects_verified_pass_to_raw_unverified():
     assert "RAW_UNVERIFIED_CHALLENGER" in decision.reasons
 
 
+def test_rejects_verified_pass_to_safe_fallback():
+    decision = decide_candidate_replacement(
+        _snapshot(),
+        _snapshot(provenance="SAFE_FALLBACK"),
+        stage="TIMING_FAMILY_RESELECT",
+        objective_improved=True,
+    )
+
+    assert decision.accepted is False
+    assert "SAFE_FALLBACK_CHALLENGER" in decision.reasons
+
+
 def test_rejects_pass_to_new_review_axis():
     decision = decide_candidate_replacement(
         _snapshot(),

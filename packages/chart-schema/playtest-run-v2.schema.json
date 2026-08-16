@@ -210,8 +210,9 @@
       "title": "RunAudioRefs",
       "type": "object"
     },
-    "RunChartRef": {
+    "RunChartRefV2": {
       "additionalProperties": false,
+      "description": "A chart reference whose trust tier cannot be hidden from consumers.",
       "properties": {
         "path": {
           "title": "Path",
@@ -240,6 +241,34 @@
           ],
           "title": "Difficulty",
           "type": "string"
+        },
+        "provenance": {
+          "default": "PRIMARY",
+          "enum": [
+            "PRIMARY",
+            "RETRY",
+            "PARTIAL_REMAP",
+            "INTRO_RECOVERY",
+            "INTRO_ALIGNED",
+            "RAW_UNVERIFIED",
+            "SAFE_FALLBACK"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "productionEligible": {
+          "default": true,
+          "title": "Productioneligible",
+          "type": "boolean"
+        },
+        "distributionTier": {
+          "default": "PRODUCTION_CANDIDATE",
+          "enum": [
+            "PRODUCTION_CANDIDATE",
+            "PLAYTEST_ONLY"
+          ],
+          "title": "Distributiontier",
+          "type": "string"
         }
       },
       "required": [
@@ -248,7 +277,7 @@
         "keyMode",
         "difficulty"
       ],
-      "title": "RunChartRef",
+      "title": "RunChartRefV2",
       "type": "object"
     }
   },
@@ -285,7 +314,7 @@
     },
     "charts": {
       "items": {
-        "$ref": "#/$defs/RunChartRef"
+        "$ref": "#/$defs/RunChartRefV2"
       },
       "minItems": 1,
       "title": "Charts",

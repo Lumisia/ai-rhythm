@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from chart_worker.bench import BenchmarkReport, _model_inference_calls, run_benchmark
-from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions
 from tests.support import fake_dependencies
@@ -122,10 +121,10 @@ def test_benchmark_rejects_generation_report_hash_mismatch(tmp_path: Path, monke
         )
 
 
-def test_benchmark_rejects_raw_model_output_when_quality_gates_reject(
+def test_benchmark_exports_hard_safe_raw_output_as_playtest_only(
     tmp_path: Path,
 ):
-    """품질 축이 거절한 raw 출력은 benchmark에서도 배포하지 않는다."""
+    """품질 축만 거절한 raw 출력은 12슬롯 PLAYTEST_ONLY로 보존한다."""
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     dependencies = fake_dependencies()
@@ -133,25 +132,35 @@ def test_benchmark_rejects_raw_model_output_when_quality_gates_reject(
     review_analysis = replace(aligned, onset_ms=(1_937,))
 
     output_dir = tmp_path / "run"
-    with pytest.raises(WorkerError) as captured:
-        run_benchmark(
-            PipelineOptions(
-                source=source,
-                output_dir=output_dir,
-                title="fixture",
-                generator="fake",
-            ),
-            dependencies=replace(
-                dependencies,
-                analyze=lambda _path: review_analysis,
-            ),
-        )
+    result = run_benchmark(
+        PipelineOptions(
+            source=source,
+            output_dir=output_dir,
+            title="fixture",
+            generator="fake",
+        ),
+        dependencies=replace(
+            dependencies,
+            analyze=lambda _path: review_analysis,
+        ),
+    )
 
     generation = json.loads((output_dir / "generation-report.json").read_text())
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert generation["publishable"] is False
-    assert generation["status"] == "EXHAUSTED"
-    assert generation["charts"] == []
+    assert generation["status"] == "REVIEW"
+    assert generation["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
+    assert generation["outcomeStatusV2"]["quality"] == "REVIEW"
+    assert generation["missingCharts"] == []
+    assert len(generation["charts"]) == 12
+    assert all(
+        chart["provenance"] == "RAW_UNVERIFIED"
+        and chart["productionEligible"] is False
+        and chart["distributionTier"] == "PLAYTEST_ONLY"
+        for chart in generation["charts"]
+    )
+    assert result.report.status == "REVIEW"
+    assert result.report.missing_charts == []
+    assert result.report_path.is_file()
 
 
 def test_insufficient_onset_evidence_is_a_diagnostic_not_a_status_downgrade(

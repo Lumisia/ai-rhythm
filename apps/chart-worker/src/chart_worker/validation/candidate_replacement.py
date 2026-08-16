@@ -67,6 +67,8 @@ def decide_candidate_replacement(
     reasons: list[str] = []
     if challenger.provenance == "RAW_UNVERIFIED":
         reasons.append("RAW_UNVERIFIED_CHALLENGER")
+    if challenger.provenance == "SAFE_FALLBACK":
+        reasons.append("SAFE_FALLBACK_CHALLENGER")
     if not challenger.structure_pass:
         reasons.append("STRUCTURE_NOT_PASS")
     if not challenger.timing_identity_pass:

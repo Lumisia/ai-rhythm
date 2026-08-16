@@ -7,7 +7,15 @@ from typing import Literal
 import numpy as np
 
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.coverage_opportunity import (
+    MIN_PHRASE_DURATION_MS,
+    MIN_STRONG_ATTACKS,
+    CoverageKind,
+    CoverageOpportunity,
+    classify_coverage_interval,
+)
 from chart_worker.analysis.event_matching import maximum_ordered_match_count
+from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.song_context import LocalTempoMap
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import Chart
@@ -83,9 +91,10 @@ class TimingCoverageGap:
     active_onset_count: int
     active_frame_ratio: float
     position: Literal["LEADING", "POST_FIRST", "MIDDLE", "TRAILING"]
+    opportunity: CoverageOpportunity | None = None
 
     def to_report(self) -> dict[str, int | float | str]:
-        return {
+        report: dict[str, object] = {
             "startMs": self.start_ms,
             "endMs": self.end_ms,
             "durationMs": self.end_ms - self.start_ms,
@@ -94,6 +103,9 @@ class TimingCoverageGap:
             "activeFrameRatio": self.active_frame_ratio,
             "position": self.position,
         }
+        if self.opportunity is not None:
+            report["opportunity"] = self.opportunity.to_report()
+        return report
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,12 +226,16 @@ def _section_status(
 
 
 def _coverage_gaps(
+    notes: Chart,
     rows: tuple[int, ...],
     onsets: np.ndarray,
     active_onsets: np.ndarray,
     *,
     duration_ms: int,
     activity: AudioActivity | None,
+    onset_analysis: OnsetAnalysis | None,
+    tempo_map: LocalTempoMap | None,
+    difficulty: str | None,
 ) -> tuple[tuple[TimingCoverageGap, ...], tuple[TimingCoverageGap, ...]]:
     coverage_rows = tuple(row for row in rows if 0 <= row <= duration_ms)
     boundaries = tuple(sorted({0, duration_ms, *coverage_rows}))
@@ -228,20 +244,67 @@ def _coverage_gaps(
     active_gaps = []
     quiet_gaps = []
     for start_ms, end_ms in pairwise(boundaries):
-        if end_ms - start_ms < ACTIVE_GAP_MIN_MS:
-            continue
         onset_start = int(np.searchsorted(onsets, start_ms, side="right"))
         onset_end = int(np.searchsorted(onsets, end_ms, side="left"))
         onset_count = onset_end - onset_start
-        if onset_count >= ACTIVE_GAP_MIN_ONSETS:
-            active_start = int(np.searchsorted(active_onsets, start_ms, side="right"))
-            active_end = int(np.searchsorted(active_onsets, end_ms, side="left"))
-            active_onset_count = active_end - active_start
-            active_frame_ratio = (
-                1.0
-                if activity is None
-                else round(activity.active_frame_ratio(start_ms, end_ms), 6)
+        active_start = int(np.searchsorted(active_onsets, start_ms, side="right"))
+        active_end = int(np.searchsorted(active_onsets, end_ms, side="left"))
+        active_onset_count = active_end - active_start
+        active_frame_ratio = (
+            1.0
+            if activity is None
+            else round(activity.active_frame_ratio(start_ms, end_ms), 6)
+        )
+        opportunity = None
+        if (
+            onset_analysis is not None
+            and activity is not None
+            and tempo_map is not None
+            and difficulty is not None
+            and end_ms - start_ms >= MIN_PHRASE_DURATION_MS
+            and active_onset_count >= min(MIN_STRONG_ATTACKS.values())
+            and active_frame_ratio >= ACTIVE_GAP_MIN_FRAME_RATIO
+        ):
+            opportunity = classify_coverage_interval(
+                notes,
+                onset_analysis,
+                tempo_map,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                difficulty=difficulty,
             )
+            # Insufficient evidence must not erase a legacy active gap.  The
+            # quality gate can downgrade it to REVIEW, while recovery/timing
+            # preflight still sees that the generated grid has not proved
+            # coverage.  Only positive sustain evidence moves a gap to quiet.
+            target = (
+                quiet_gaps
+                if opportunity.kind is CoverageKind.SUSTAIN_REPRESENTABLE
+                else active_gaps
+            )
+            target.append(
+                TimingCoverageGap(
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    onset_count=onset_count,
+                    active_onset_count=active_onset_count,
+                    active_frame_ratio=active_frame_ratio,
+                    position=(
+                        "POST_FIRST"
+                        if start_ms == first_row_ms and end_ms == second_row_ms
+                        else "LEADING"
+                        if start_ms == 0 and end_ms == first_row_ms
+                        else "TRAILING"
+                        if end_ms == duration_ms
+                        else "MIDDLE"
+                    ),
+                    opportunity=opportunity,
+                )
+            )
+            continue
+        if end_ms - start_ms < ACTIVE_GAP_MIN_MS:
+            continue
+        if onset_count >= ACTIVE_GAP_MIN_ONSETS:
             gap = TimingCoverageGap(
                 start_ms=start_ms,
                 end_ms=end_ms,
@@ -345,6 +408,8 @@ def diagnose_chart_timing(
     bpm_events: tuple[OsuBpmEvent, ...] | None = None,
     minimum_section_rows: int = MIN_SECTION_ROWS,
     activity: AudioActivity | None = None,
+    onset_analysis: OnsetAnalysis | None = None,
+    difficulty: str | None = None,
 ) -> TimingDiagnostics:
     """Compare unique note rows with nearest onsets without changing the chart."""
     if duration_ms < 0:
@@ -357,6 +422,15 @@ def diagnose_chart_timing(
         raise ValueError("section_ms must be positive")
     if minimum_section_rows <= 0:
         raise ValueError("minimum_section_rows must be positive")
+    if onset_analysis is not None:
+        if onset_analysis.onset_ms != onset_ms:
+            raise ValueError("onset_analysis.onset_ms must match onset_ms")
+        if onset_analysis.activity is not activity:
+            raise ValueError("onset_analysis.activity must be the supplied activity")
+        if difficulty is None:
+            raise ValueError("difficulty is required with onset_analysis")
+    elif difficulty is not None:
+        raise ValueError("onset_analysis is required with difficulty")
 
     rows = tuple(sorted({note.time_ms for note in notes}))
     onsets = np.asarray(sorted(set(onset_ms)), dtype=np.int64)
@@ -370,11 +444,15 @@ def diagnose_chart_timing(
     )
     overall = _metrics(rows, onsets)
     coverage_gaps, quiet_coverage_gaps = _coverage_gaps(
+        notes,
         rows,
         onsets,
         active_onsets,
         duration_ms=coverage_end_ms,
         activity=activity,
+        onset_analysis=onset_analysis,
+        tempo_map=(LocalTempoMap(bpm_events) if bpm_events else None),
+        difficulty=difficulty,
     )
     sections = []
     for start_ms, end_ms in _section_boundaries(

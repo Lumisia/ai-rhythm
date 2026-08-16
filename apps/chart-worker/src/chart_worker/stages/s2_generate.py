@@ -57,6 +57,9 @@ from chart_worker.generation.generation_control import (
     RecoveryKind,
 )
 from chart_worker.generation.inference_execution import (
+    error_report as _error_report,
+)
+from chart_worker.generation.inference_execution import (
     error_report_json as _error_report_json,
 )
 from chart_worker.generation.inference_execution import (
@@ -96,6 +99,10 @@ from chart_worker.generation.partial_recovery import (
     plan_partial_repair as _plan_partial_repair,
 )
 from chart_worker.generation.publication_assembler import assemble_publication
+from chart_worker.generation.recovery import (
+    build_recovery_chart,
+    select_recovery_plan,
+)
 from chart_worker.generation.recovery_router import (
     RecoveryRequest,
     intro_phrase_recovery_request,
@@ -177,6 +184,39 @@ def _is_crash(error: Exception) -> bool:
     )
 
 
+def _is_tail_repair_exhausted(error: Exception) -> bool:
+    return isinstance(error, WorkerError) and error.code is ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED
+
+
+def _block_full_length_retry_after_tail_exhaustion(
+    state: _VariantState,
+    error: WorkerError,
+    *,
+    partial_attempt: int | None = None,
+    partial_seed: int | None = None,
+) -> None:
+    if (partial_attempt is None) != (partial_seed is None):
+        raise AssertionError("partial attempt and seed must be reported together")
+    if partial_attempt is not None and partial_seed is not None:
+        state.partial_attempts.append(partial_attempt)
+        state.partial_seeds.append(partial_seed)
+    state.full_length_retry_blocked_by = dict(error.context)
+    state.publication_block_reason = error.code.value
+    state.attempt_errors.append(_error_report_json(error))
+    evidence: dict[str, object] = {
+        "reason": error.code.value,
+        "context": dict(error.context),
+        "outerFullLengthRetrySuppressed": True,
+        "totalAttempts": state.budget.next_attempt - 1 + len(state.partial_attempts),
+        "qualityAttempts": state.budget.quality_attempts,
+        "crashAttempts": state.budget.crash_attempts,
+    }
+    if partial_attempt is not None and partial_seed is not None:
+        evidence["partialAttempt"] = partial_attempt
+        evidence["partialSeed"] = partial_seed
+    state.attempt_evidence.append(evidence)
+
+
 _Selection = tuple[
     dict[str, _VariantState],
     dict[str, _Candidate | None],
@@ -185,23 +225,40 @@ _Selection = tuple[
 
 
 def _exhausted_error(state: _VariantState) -> WorkerError:
+    tail_blocked = state.full_length_retry_blocked_by is not None
+    stop_reason = (
+        state.full_length_retry_blocked_by.get("reason")
+        if state.full_length_retry_blocked_by is not None
+        else None
+    )
+    stop_description = {
+        "HARD_SAFE_RAW_AVAILABLE": "stopped after preserving a hard-safe raw result",
+        "SERIALIZATION_CONTRACT_FAILED": "stopped after deterministic serialization failure",
+    }.get(stop_reason, "stopped after bounded Mania tail repair")
+    context: dict[str, object] = {
+        "key_mode": state.key_mode,
+        "difficulty": state.difficulty,
+        "seeds": [*state.budget.attempted_seeds, *state.partial_seeds],
+        "qualityAttempts": state.budget.quality_attempts,
+        "crashAttempts": state.budget.crash_attempts,
+        "totalAttempts": state.budget.next_attempt - 1 + len(state.partial_attempts),
+        "errors": list(state.attempt_errors),
+        "attempts": list(state.attempt_evidence),
+    }
+    if state.partial_attempts:
+        context["partialAttempts"] = list(state.partial_attempts)
+        context["partialSeeds"] = list(state.partial_seeds)
+    if tail_blocked:
+        context["fullLengthRetryBlockedBy"] = state.full_length_retry_blocked_by
     return WorkerError(
         ErrorCode.CHART_CANDIDATES_EXHAUSTED,
         (
-            f"{state.key_mode}K {state.difficulty} exhausted its attempt budget "
+            f"{state.key_mode}K {state.difficulty} "
+            f"{stop_description if tail_blocked else 'exhausted its attempt budget'} "
             f"(quality {state.budget.quality_attempts}/{MAX_VARIANT_ATTEMPTS}, "
             f"crash {state.budget.crash_attempts}/{MAX_CRASH_ATTEMPTS})"
         ),
-        context={
-            "key_mode": state.key_mode,
-            "difficulty": state.difficulty,
-            "seeds": list(state.budget.attempted_seeds),
-            "qualityAttempts": state.budget.quality_attempts,
-            "crashAttempts": state.budget.crash_attempts,
-            "totalAttempts": state.budget.next_attempt - 1,
-            "errors": list(state.attempt_errors),
-            "attempts": list(state.attempt_evidence),
-        },
+        context=context,
     )
 
 
@@ -374,32 +431,16 @@ def _capture_raw_candidate(
     seed: int,
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
-) -> None:
-    """품질 축만 거절된 모델 원본 출력을 raw fallback 으로 보존한다.
-
-    룰 기반 채보 생성은 금지 정책이다. 구조와 timing identity 를 통과한
-    출력이라면 음악성 판정(COVERAGE/PATTERN/TIMING_ALIGNMENT)이 거절해도
-    "쌩 Mapperatorinator" 결과로 발행할 수 있게 남겨 둔다. 선택기는 이
-    후보를 항상 정상 후보보다 뒤 순위에 둔다.
-    """
-    if acceptance.decision(GateAxis.STRUCTURE).action is not GateAction.PASS:
-        return
-    if acceptance.decision(GateAxis.TIMING_IDENTITY).action is not GateAction.PASS:
-        return
-    try:
-        osu_text = _serialized_candidate_text(
-            generated,
-            authority=authority,
-            prepared=prepared,
-            key_mode=state.key_mode,
-        )
-    except (
-        GeneratedChartValidationError,
-        TimingAuthorityValidationError,
-        WorkerError,
-    ):
-        # 직렬화까지 통과하지 못하면 플레이 가능성을 보장할 수 없다.
-        return
+) -> bool:
+    """Keep a model result only when every playability-critical axis passed."""
+    if not _is_hard_safe_playtest_candidate(acceptance):
+        return False
+    osu_text = _serialized_candidate_text(
+        generated,
+        authority=authority,
+        prepared=prepared,
+        key_mode=state.key_mode,
+    )
     state.candidates.reject(
         _Candidate(
             request=request,
@@ -414,21 +455,201 @@ def _capture_raw_candidate(
             intro_anchor_covered=_intro_anchor_covered(generated, authority),
         )
     )
+    return True
 
 
-def _generate_next_pass(
+def _block_full_length_retry(
+    state: _VariantState,
+    *,
+    reason: str,
+    seed: int,
+    attempt: int,
+) -> None:
+    state.full_length_retry_blocked_by = {
+        "reason": reason,
+        "policyVersion": "FULL_LENGTH_RETRY_SUPPRESSION_V1",
+        "seed": seed,
+        "attempt": attempt,
+    }
+    state.publication_block_reason = (
+        "QUALITY_GATE_REJECTED"
+        if reason == "HARD_SAFE_RAW_AVAILABLE"
+        else reason
+    )
+
+
+def _is_hard_safe_playtest_candidate(acceptance: ChartAcceptance) -> bool:
+    return all(
+        acceptance.decision(axis).action is GateAction.PASS
+        for axis in (
+            GateAxis.STRUCTURE,
+            GateAxis.TIMING_IDENTITY,
+            GateAxis.SONG_BOUNDS,
+        )
+    )
+
+
+def _raw_playtest_score(candidate: _Candidate) -> tuple[int, int, float, int, int]:
+    acceptance = candidate.acceptance
+    noncoverage_retries = sum(
+        decision.action is GateAction.RETRY_MAP
+        for decision in acceptance.decisions
+        if decision.axis
+        not in {GateAxis.STRUCTURE, GateAxis.TIMING_IDENTITY, GateAxis.COVERAGE}
+    )
+    attack_gaps = sum(
+        gap.opportunity is not None and gap.opportunity.kind.value == "ATTACK_REQUIRED"
+        for gap in acceptance.timing.coverage_gaps
+    )
+    precision = acceptance.timing.overall.matched_precision_50
+    return (
+        noncoverage_retries,
+        attack_gaps,
+        -precision if precision is not None else 0.0,
+        candidate.attempt,
+        candidate.seed,
+    )
+
+
+def _safe_fallback_candidate(
     state: _VariantState,
     *,
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
     onset_analysis: OnsetAnalysis,
     run_dir: Path,
-    generator: ChartGenerator,
     base_seed: int,
     authority_epoch: int,
-    allow_timing_escalation: bool = True,
 ) -> _Candidate:
-    last_error: Exception | None = None
+    seed = base_seed + state.flat_index
+    boundary, music_end_ms = _generation_bounds(prepared, onset_analysis)
+    request = GenerationRequest(
+        audio_path=prepared.normalized.path,
+        timing_reference_path=authority.reference_path,
+        key_mode=state.key_mode,
+        difficulty=state.difficulty,
+        seed=seed,
+        duration_ms=prepared.normalized.duration_ms,
+        music_end_ms=music_end_ms,
+        generation_end_ms=(boundary.generation_end_ms if boundary else None),
+        last_attack_ms=(boundary.last_attack_ms if boundary else None),
+        max_note_start_ms=(boundary.max_note_start_ms if boundary else None),
+    )
+    plan = select_recovery_plan(request, authority, onset_analysis)
+    generated = build_recovery_chart(
+        request,
+        authority,
+        onset_analysis,
+        plan=plan,
+    )
+    acceptance = evaluate_chart_candidate(
+        generated,
+        authority,
+        onset_analysis,
+        requested_key_mode=state.key_mode,
+        requested_difficulty=state.difficulty,
+        duration_ms=prepared.normalized.duration_ms,
+        boundary_policy_mode=prepared.boundary_policy_mode,
+    )
+    if not _is_hard_safe_playtest_candidate(acceptance):
+        raise WorkerError(
+            ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+            f"{state.key_mode}K {state.difficulty} safe fallback failed hard gates",
+            context={
+                "key_mode": state.key_mode,
+                "difficulty": state.difficulty,
+                "gateReport": acceptance.to_report(),
+                "recoveryPlan": plan.to_report(),
+            },
+        )
+    osu_text = _serialized_candidate_text(
+        generated,
+        authority=authority,
+        prepared=prepared,
+        key_mode=state.key_mode,
+    )
+    candidate = _Candidate(
+        request=request,
+        generated=generated,
+        acceptance=acceptance,
+        osu_text=osu_text,
+        workdir=(
+            run_dir
+            / "raw"
+            / "work"
+            / f"epoch-{authority_epoch}"
+            / f"{state.key_mode}k-{state.difficulty.lower()}"
+            / "safe-fallback"
+        ),
+        attempt=max(1, state.budget.next_attempt - 1),
+        seed=seed,
+        provenance="SAFE_FALLBACK",
+        recovery_reason="NO_STRUCTURALLY_SAFE_MODEL_CANDIDATE",
+        intro_anchor_covered=_intro_anchor_covered(generated, authority),
+    )
+    state.candidates.add_safe_fallback(candidate)
+    state.attempt_evidence.append(
+        {
+            "reason": "SAFE_FALLBACK_CREATED",
+            "recoveryPlan": plan.to_report(),
+            "modelAttemptCount": state.budget.next_attempt - 1,
+            "sourceFailure": state.publication_block_reason,
+        }
+    )
+    return candidate
+
+
+def _complete_playtest_selections(
+    selections: list[_Selection],
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    base_seed: int,
+    authority_epoch: int,
+) -> list[_Selection]:
+    """Fill every absent slot without another model invocation.
+
+    Trust order is admitted model output, hard-safe raw model output, then a
+    deterministic canonical-timing fallback. Difficulty-order defects remain
+    visible in the family review instead of deleting an otherwise playable map.
+    """
+    completed: list[_Selection] = []
+    for states, original_assignment, _review in selections:
+        assignment = dict(original_assignment)
+        for difficulty in DIFFICULTIES:
+            if assignment[difficulty] is not None:
+                continue
+            state = states[difficulty]
+            admitted = sorted(
+                state.candidates.admitted,
+                key=lambda candidate: (candidate.attempt, candidate.seed),
+            )
+            raw = sorted(state.candidates.raw_rejected, key=_raw_playtest_score)
+            if admitted:
+                candidate = admitted[0]
+            elif raw:
+                candidate = raw[0]
+            else:
+                candidate = _safe_fallback_candidate(
+                    state,
+                    prepared=prepared,
+                    authority=authority,
+                    onset_analysis=onset_analysis,
+                    run_dir=run_dir,
+                    base_seed=base_seed,
+                    authority_epoch=authority_epoch,
+                )
+            assignment[difficulty] = candidate
+        completed.append((states, assignment, _family_review(assignment)))
+    return completed
+
+
+def _generation_bounds(
+    prepared: PreparedAudio,
+    onset_analysis: OnsetAnalysis,
+) -> tuple[SongBoundaryContract | None, int | None]:
     boundary = (
         build_song_boundary_contract(
             onset_analysis.activity,
@@ -450,6 +671,23 @@ def _generate_next_pass(
             else None
         )
     )
+    return boundary, music_end_ms
+
+
+def _generate_next_pass(
+    state: _VariantState,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    generator: ChartGenerator,
+    base_seed: int,
+    authority_epoch: int,
+    allow_timing_escalation: bool = True,
+) -> _Candidate:
+    last_error: Exception | None = None
+    boundary, music_end_ms = _generation_bounds(prepared, onset_analysis)
     while state.budget_left:
         attempt = state.budget.next_attempt
         _require_timing_authority(prepared, authority)
@@ -563,17 +801,32 @@ def _generate_next_pass(
                 # 구조·identity 를 통과한 거절 후보는 전부 raw fallback
                 # 으로도 보존한다. 국소 커버리지 실패는 부분 재생성
                 # 소스로도 쓴다 (부분 재생성이 실패해도 raw 는 남는다).
-                _capture_raw_candidate(
-                    state,
-                    request=request,
-                    generated=generated,
-                    acceptance=acceptance,
-                    workdir=workdir,
-                    attempt=attempt,
-                    seed=attempt_seed,
-                    prepared=prepared,
-                    authority=authority,
-                )
+                try:
+                    raw_captured = _capture_raw_candidate(
+                        state,
+                        request=request,
+                        generated=generated,
+                        acceptance=acceptance,
+                        workdir=workdir,
+                        attempt=attempt,
+                        seed=attempt_seed,
+                        prepared=prepared,
+                        authority=authority,
+                    )
+                except (
+                    GeneratedChartValidationError,
+                    TimingAuthorityValidationError,
+                    WorkerError,
+                ) as error:
+                    state.attempt_errors.append(_error_report_json(error))
+                    _block_full_length_retry(
+                        state,
+                        reason="SERIALIZATION_CONTRACT_FAILED",
+                        seed=attempt_seed,
+                        attempt=attempt,
+                    )
+                    last_error = error
+                    break
                 if _is_localized_coverage_failure(acceptance):
                     osu_text = _serialized_candidate_text(
                         generated,
@@ -596,6 +849,14 @@ def _generate_next_pass(
                             ),
                         )
                     )
+                if raw_captured and not timing_failures:
+                    _block_full_length_retry(
+                        state,
+                        reason="HARD_SAFE_RAW_AVAILABLE",
+                        seed=attempt_seed,
+                        attempt=attempt,
+                    )
+                    break
                 continue
 
             validate_timing_identity(generated.bpm_events, authority.bpm_events)
@@ -605,12 +866,45 @@ def _generate_next_pass(
                 duration_ms=prepared.normalized.duration_ms,
                 max_note_start_ms=(boundary.max_note_start_ms if boundary else None),
             )
-            osu_text = _serialized_candidate_text(
-                generated,
-                authority=authority,
-                prepared=prepared,
-                key_mode=state.key_mode,
-            )
+            try:
+                osu_text = _serialized_candidate_text(
+                    generated,
+                    authority=authority,
+                    prepared=prepared,
+                    key_mode=state.key_mode,
+                )
+            except (
+                GeneratedChartValidationError,
+                TimingAuthorityValidationError,
+                WorkerError,
+            ) as error:
+                state.budget.record_quality_attempt()
+                state.attempt_errors.append(_error_report_json(error))
+                state.attempt_evidence.append(
+                    {
+                        "seed": attempt_seed,
+                        "workdir": workdir.relative_to(run_dir).as_posix(),
+                        "reason": "SERIALIZATION_CONTRACT_FAILED",
+                        "error": _error_report_json(error),
+                    }
+                )
+                _record_candidate_event(
+                    state,
+                    admitted=False,
+                    authority_epoch=authority_epoch,
+                    attempt=attempt,
+                    seed=attempt_seed,
+                    purpose="PRIMARY_ATTEMPT",
+                    reason="SERIALIZATION_CONTRACT_FAILED",
+                )
+                _block_full_length_retry(
+                    state,
+                    reason="SERIALIZATION_CONTRACT_FAILED",
+                    seed=attempt_seed,
+                    attempt=attempt,
+                )
+                last_error = error
+                break
             # 성공한 호출도 예산을 쓴다. 사다리 재생성이 같은 조합을
             # 무한히 다시 뽑지 않도록 총 모델 호출을 묶어 둔다.
             state.budget.record_quality_attempt()
@@ -650,6 +944,9 @@ def _generate_next_pass(
                     purpose="PRIMARY_ATTEMPT",
                     reason="VALIDATION_ERROR",
                 )
+            if _is_tail_repair_exhausted(error):
+                _block_full_length_retry_after_tail_exhaustion(state, error)
+                raise _exhausted_error(state) from error
             if not _should_retry(error):
                 raise
             if _is_crash(error):
@@ -887,17 +1184,19 @@ def run_generation(
 ) -> GenerationOutcome:
     """Generate key-mode pools and retry only failed or inverted labels.
 
-    실패 격리 원칙: 한 조합의 실패는 그 조합에만 갇힌다. 룰 기반 채보는
-    만들지 않는다. 게이트를 통과한 후보가 없으면 raw 모델 출력
-    (RAW_UNVERIFIED)을 쓰고, 그것도 없으면 그 조합만 missing 으로
-    보고한다. 단조성 제약은 후보가 존재하는 난이도 사이에서만 적용한다.
+    Failure isolation principle: one variant cannot consume another variant's
+    model budget. After bounded model recovery, every absent slot is completed
+    without inference by hard-safe raw output or a canonical safe fallback.
     """
     # timing 재선택 escalation 은 더 나은 authority 후보가 실제로 남아
     # 있을 때만 의미가 있다. 이미 Super Timing 이면 같은 seed 로 같은
     # 결과를 다시 뽑을 뿐이므로, 실패를 조합 단위로 격리한다.
     if authority_epoch < 1:
         raise ValueError("authority_epoch must be positive")
-    inference_budget = AdditionalInferenceBudget(limit=1)
+    inference_budget = AdditionalInferenceBudget(
+        limit=_VARIANT_COUNT + 2,
+        work_limit_ms=prepared.normalized.duration_ms,
+    )
     song_context = SongAnalysisContext.build(
         authority,
         onset_analysis,
@@ -913,6 +1212,7 @@ def run_generation(
     allow_timing_escalation = authority.mode == "STANDARD"
     attempt_journal = AttemptJournal(run_dir / "attempt-journal.jsonl")
     state_families: list[dict[str, _VariantState]] = []
+    model_inference_disabled_by: dict[str, object] | None = None
     for key_index, key_mode in enumerate(KEY_MODES):
         states = {
             difficulty: _VariantState(
@@ -925,6 +1225,20 @@ def run_generation(
         }
         for difficulty in DIFFICULTIES:
             state = states[difficulty]
+            if model_inference_disabled_by is not None:
+                state.publication_block_reason = "INFERENCE_COMPLETION_UNKNOWN"
+                state.full_length_retry_blocked_by = {
+                    "reason": "INFERENCE_COMPLETION_UNKNOWN",
+                    "policyVersion": "UNKNOWN_COMPLETION_NO_REEXECUTION_V1",
+                    "triggerVariant": model_inference_disabled_by["triggerVariant"],
+                }
+                state.attempt_evidence.append(
+                    {
+                        "reason": "MODEL_INFERENCE_SUPPRESSED_AFTER_UNKNOWN_COMPLETION",
+                        **model_inference_disabled_by,
+                    }
+                )
+                continue
             try:
                 state.candidates.admit(
                     _generate_next_pass(
@@ -940,6 +1254,28 @@ def run_generation(
                     )
                 )
             except WorkerError as error:
+                if error.code is ErrorCode.INFERENCE_COMPLETION_UNKNOWN:
+                    model_inference_disabled_by = {
+                        "triggerVariant": {
+                            "keyMode": state.key_mode,
+                            "difficulty": state.difficulty,
+                        },
+                        "error": _error_report(error),
+                    }
+                    state.publication_block_reason = "INFERENCE_COMPLETION_UNKNOWN"
+                    state.full_length_retry_blocked_by = {
+                        "reason": "INFERENCE_COMPLETION_UNKNOWN",
+                        "policyVersion": "UNKNOWN_COMPLETION_NO_REEXECUTION_V1",
+                        "triggerVariant": model_inference_disabled_by["triggerVariant"],
+                    }
+                    state.attempt_errors.append(_error_report_json(error))
+                    state.attempt_evidence.append(
+                        {
+                            "reason": "MODEL_INFERENCE_DISABLED_AFTER_UNKNOWN_COMPLETION",
+                            **model_inference_disabled_by,
+                        }
+                    )
+                    continue
                 if error.code is not ErrorCode.CHART_CANDIDATES_EXHAUSTED:
                     raise
                 state.exhausted_error = error
@@ -947,7 +1283,10 @@ def run_generation(
         # 역전 재생성: 게이트 통과 후보가 있는 난이도들 사이에서만.
         # 후보가 하나도 없는 난이도는 기준점으로 쓰지 않는다. 망가진
         # 조합에 맞추려고 멀쩡한 조합을 끌어내리는 일이 없어야 한다.
-        while not _has_complete_model_family(states):
+        while (
+            model_inference_disabled_by is None
+            and not _has_complete_model_family(states)
+        ):
             present = tuple(
                 states[difficulty].candidates.admitted[-1]
                 for difficulty in DIFFICULTIES
@@ -990,7 +1329,7 @@ def run_generation(
                 break
         state_families.append(states)
 
-    partial_plans = tuple(
+    partial_plans = () if model_inference_disabled_by is not None else tuple(
         plan
         for states in state_families
         for state in states.values()
@@ -1007,7 +1346,11 @@ def run_generation(
     partial_by_request_id = {plan.request.request_id: plan for plan in partial_plans}
     partial_router_plan = plan_recoveries(
         tuple(plan.request for plan in partial_plans),
-        available_slots=inference_budget.remaining,
+        available_generation_ms=(
+            inference_budget.remaining_work_ms
+            if inference_budget.remaining_work_ms is not None
+            else 0
+        ),
     )
     if partial_plans:
         router_report = partial_router_plan.to_report()
@@ -1020,23 +1363,44 @@ def run_generation(
                 }
             )
     for request in partial_router_plan.selected:
-        if not inference_budget.consume():
+        if not inference_budget.consume(request.estimated_generation_ms):
             raise AssertionError("recovery router exceeded additional inference budget")
         partial_plan = partial_by_request_id[request.request_id]
-        repaired = _execute_partial_repair(
-            partial_plan,
-            prepared=prepared,
-            authority=authority,
-            onset_analysis=onset_analysis,
-            run_dir=run_dir,
-            generator=generator,
-            base_seed=seed,
-            authority_epoch=authority_epoch,
-            evaluate_candidate=evaluate_chart_candidate,
-            serialize_candidate=_serialized_candidate_text,
-            intro_anchor_covered=_intro_anchor_covered,
-            should_retry=_should_retry,
-        )
+        try:
+            repaired = _execute_partial_repair(
+                partial_plan,
+                prepared=prepared,
+                authority=authority,
+                onset_analysis=onset_analysis,
+                run_dir=run_dir,
+                generator=generator,
+                base_seed=seed,
+                authority_epoch=authority_epoch,
+                evaluate_candidate=evaluate_chart_candidate,
+                serialize_candidate=_serialized_candidate_text,
+                intro_anchor_covered=_intro_anchor_covered,
+                should_retry=_should_retry,
+            )
+        except WorkerError as error:
+            if not _is_tail_repair_exhausted(error):
+                raise
+            partial_attempt = max(
+                partial_plan.state.budget.next_attempt,
+                partial_plan.source.attempt + 1,
+            )
+            partial_seed = (
+                seed
+                + partial_plan.state.flat_index
+                + MAX_VARIANT_ATTEMPTS * _VARIANT_COUNT
+            )
+            _block_full_length_retry_after_tail_exhaustion(
+                partial_plan.state,
+                error,
+                partial_attempt=partial_attempt,
+                partial_seed=partial_seed,
+            )
+            partial_plan.state.exhausted_error = _exhausted_error(partial_plan.state)
+            continue
         if repaired is not None:
             partial_plan.state.candidates.admit(repaired)
 
@@ -1132,14 +1496,14 @@ def run_generation(
         reverse=True,
     )
     family_requests: list[RecoveryRequest] = []
-    if unresolved_intro:
+    if unresolved_intro and model_inference_disabled_by is None:
         family_requests.append(
             intro_phrase_recovery_request(
                 key_mode=unresolved_intro[0].hard.key_mode,
                 song_duration_ms=prepared.normalized.duration_ms,
             )
         )
-    if timing_outliers:
+    if timing_outliers and model_inference_disabled_by is None:
         timing_target = timing_outliers[0]
         if (
             timing_target.target_key_mode is not None
@@ -1154,7 +1518,11 @@ def run_generation(
             )
     family_router_plan = plan_recoveries(
         tuple(family_requests),
-        available_slots=inference_budget.remaining,
+        available_generation_ms=(
+            inference_budget.remaining_work_ms
+            if inference_budget.remaining_work_ms is not None
+            else 0
+        ),
     )
     if family_requests:
         router_report = family_router_plan.to_report()
@@ -1204,6 +1572,15 @@ def run_generation(
                 serialize_candidate=_serialized_candidate_text,
                 intro_anchor_covered=_intro_anchor_covered,
             )
+    selections = _complete_playtest_selections(
+        selections,
+        prepared=prepared,
+        authority=authority,
+        onset_analysis=onset_analysis,
+        run_dir=run_dir,
+        base_seed=seed,
+        authority_epoch=authority_epoch,
+    )
     selections, intro_start_contract, intro_contract_review = (
         _apply_intro_start_contract(
             selections,
@@ -1296,4 +1673,9 @@ def run_generation(
         timing_family_reviews=timing_family_reviews,
         outro_family_review=outro_family_review,
         additional_inference_calls=inference_budget.used,
+        additional_inference_work_ms=inference_budget.used_work_ms,
+        additional_inference_work_limit_ms=(
+            inference_budget.work_limit_ms or 0
+        ),
+        diagnostic_raw_candidates=publication.diagnostic_raw_candidates,
     )

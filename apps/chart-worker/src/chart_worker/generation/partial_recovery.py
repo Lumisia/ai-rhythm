@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from chart_worker.analysis.onset import OnsetAnalysis
-from chart_worker.errors import WorkerError
+from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.candidate_state import Candidate, VariantState
 from chart_worker.generation.generation_control import (
     MAX_VARIANT_ATTEMPTS,
@@ -107,6 +107,13 @@ def plan_partial_repair(
     )
 
 
+def _is_partial_rejoin_invalid(error: Exception) -> bool:
+    return (
+        isinstance(error, WorkerError)
+        and error.code is ErrorCode.MANIA_PARTIAL_REJOIN_INVALID
+    )
+
+
 def execute_partial_repair(
     plan: PartialRepairPlan,
     *,
@@ -157,7 +164,14 @@ def execute_partial_repair(
         / f"{state.key_mode}k-{state.difficulty.lower()}"
         / "partial-remap"
     )
-    partial_attempt = MAX_VARIANT_ATTEMPTS + 1
+    # VariantState always carries a budget in production.  Keeping the source
+    # attempt as the lower-bound also makes this executor usable with the
+    # deliberately minimal state doubles used by protocol/error tests.
+    budget = getattr(state, "budget", None)
+    partial_attempt = max(
+        getattr(budget, "next_attempt", source.attempt + 1),
+        source.attempt + 1,
+    )
     inference_completed = False
     try:
         generated = run_inference_with_journal(
@@ -276,6 +290,12 @@ def execute_partial_repair(
                 purpose="PARTIAL_REMAP",
                 reason="VALIDATION_ERROR",
             )
+        if _is_partial_rejoin_invalid(error):
+            # 이 국소 복구는 이미 청구됐고 다시 청구할 예산이 없다. 실패를
+            # 곡 전체로 올리지 말고 이 변형만 missing으로 남겨 다른 변형의
+            # 생성과 게시는 계속한다.
+            state.attempt_errors.append(error_report_json(error))
+            return None
         if not should_retry(error):
             raise
         state.attempt_errors.append(error_report_json(error))

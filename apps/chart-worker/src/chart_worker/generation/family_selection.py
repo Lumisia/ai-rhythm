@@ -268,7 +268,7 @@ def compare_song_selection_shadow(
             state = states[difficulty]
             snapshots = []
             ids: dict[int, str] = {}
-            for candidate in state.candidates.admitted:
+            for candidate in state.candidates.playtest_candidates:
                 candidate_id = candidate_stable_id(
                     candidate,
                     key_mode=key_mode,
@@ -292,7 +292,8 @@ def compare_song_selection_shadow(
                         provenance=candidate.provenance,
                         hard_eligible=(
                             acceptance.action is not GateAction.RETRY_MAP
-                            and candidate.provenance != "RAW_UNVERIFIED"
+                            and candidate.provenance
+                            not in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
                         ),
                         axis_actions=tuple(
                             (decision.axis.value, decision.action.value)

@@ -8,9 +8,12 @@ import pytest
 from chart_worker import pipeline
 from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
+from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.attempt_journal import AttemptJournal
+from chart_worker.generation.diagnostic_fallback import DiagnosticRawCandidate
 from chart_worker.generation.fake import FakeGenerator
+from chart_worker.generation.inference_session import SessionState, SongIdentity
 from chart_worker.generation.mapperatorinator_patch import CONSTRAINT_PATCH_ID
 from chart_worker.generation.resnap_diagnostics import RESNAP_DIAGNOSTICS_VERSION
 from chart_worker.hashing import sha256_file
@@ -24,12 +27,247 @@ from chart_worker.stages.timing_feedback import (
 )
 from chart_worker.stages.types import MissingVariant
 from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
-from chart_worker.validation.quality_gate import GateAction
+from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateAction, GateAxis
 from chart_worker.validation.timing_review import (
     TimingAuthorityAction,
     TimingAuthorityReview,
 )
 from tests.support import fake_dependencies
+
+
+class _RecordingInferenceSession:
+    def __init__(self) -> None:
+        self.state = SessionState.IDLE
+        self.events: list[object] = []
+
+    def begin_song(self, identity: SongIdentity) -> None:
+        assert self.state is SessionState.IDLE
+        self.events.append(("begin", identity))
+        self.state = SessionState.SONG_ACTIVE
+
+    def invoke(self, argv, workdir):
+        raise AssertionError("pipeline lifecycle test does not invoke inference directly")
+
+    def end_song(self) -> None:
+        assert self.state is SessionState.SONG_ACTIVE
+        self.events.append("end")
+        self.state = SessionState.IDLE
+
+    def close(self) -> None:
+        self.events.append("close")
+        self.state = SessionState.CLOSED
+
+
+def _song_session_config() -> WorkerConfig:
+    return WorkerConfig(
+        mapperatorinator_backend="song_session",
+        mapperatorinator_hold_state_mode="incremental",
+        mapperatorinator_home=Path(r"C:\Mapperatorinator"),
+        mapperatorinator_python=Path(r"C:\Mapperatorinator\.venv\Scripts\python.exe"),
+        mapperatorinator_model_root=Path(r"C:\models\mapperatorinator-v32"),
+        mapperatorinator_model_revision="a" * 40,
+    )
+
+
+def test_pipeline_owns_one_song_session_across_timing_and_maps(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    session = _RecordingInferenceSession()
+    opened: list[Path] = []
+    bound: list[object] = []
+    dependencies = fake_dependencies()
+
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="mapperatorinator",
+        ),
+        dependencies=replace(
+            dependencies,
+            config=_song_session_config(),
+            open_inference_session=lambda _config, run_dir: (
+                opened.append(run_dir) or session
+            ),
+            bind_inference_session=lambda generator, observed: (
+                bound.append((generator, observed)) or generator
+            ),
+        ),
+    )
+
+    assert result.output_dir == tmp_path / "run"
+    assert opened == [tmp_path / "run"]
+    assert len(bound) == 1 and bound[0][1] is session
+    assert session.events[0][0] == "begin"
+    identity = session.events[0][1]
+    assert identity.audio_sha256 == sha256_file(tmp_path / "run" / "audio" / "game.flac")
+    assert session.events[1:] == ["end", "close"]
+
+
+def test_pipeline_does_not_close_attached_container_session(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    session = _RecordingInferenceSession()
+    dependencies = fake_dependencies()
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="mapperatorinator",
+        ),
+        dependencies=replace(
+            dependencies,
+            config=_song_session_config(),
+            attached_inference_session=session,
+            open_inference_session=lambda _config, _run_dir: pytest.fail(
+                "attached sessions must not open a child"
+            ),
+            bind_inference_session=lambda generator, _session: generator,
+        ),
+    )
+
+    assert session.events[-1] == "end"
+    assert "close" not in session.events
+    assert session.state is SessionState.IDLE
+
+
+def test_pipeline_closes_owned_session_on_base_exception(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    session = _RecordingInferenceSession()
+    dependencies = fake_dependencies()
+
+    def interrupted_timing(*_args):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="mapperatorinator",
+            ),
+            dependencies=replace(
+                dependencies,
+                config=_song_session_config(),
+                timing=interrupted_timing,
+                open_inference_session=lambda _config, _run_dir: session,
+                bind_inference_session=lambda generator, _session: generator,
+            ),
+        )
+
+    assert session.events[-2:] == ["end", "close"]
+    assert session.state is SessionState.CLOSED
+
+
+def test_unknown_resident_completion_is_reported_as_infra_without_another_generation(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    calls = 0
+    unknown = WorkerError(
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+        "accepted invocation lost its terminal record",
+        context={
+            "accepted": True,
+            "invocationId": "a" * 64,
+            "requestHash": "b" * 64,
+        },
+    )
+
+    def generation(*_args):
+        nonlocal calls
+        calls += 1
+        raise unknown
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="mapperatorinator",
+            ),
+            dependencies=replace(dependencies, generation=generation),
+        )
+
+    assert captured.value is unknown
+    assert calls == 1
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["status"] == "FAILED"
+    assert report["failureStage"] == "GENERATION"
+    assert report["outcomeStatusV2"]["failureCategory"] == "INFRA"
+    assert report["error"] == {
+        "code": "INFERENCE_COMPLETION_UNKNOWN",
+        "context": unknown.context,
+    }
+
+
+def test_map_unknown_after_timing_returns_twelve_safe_playtest_charts(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    delegate = FakeGenerator()
+
+    class UnknownMapGenerator:
+        def __init__(self) -> None:
+            self.map_calls = 0
+
+        def generate_timing(self, request, workdir):
+            return delegate.generate_timing(request, workdir)
+
+        def generate_map(self, request, workdir):
+            del request, workdir
+            self.map_calls += 1
+            raise WorkerError(
+                ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+                "accepted MAP invocation lost its terminal record",
+                context={
+                    "accepted": True,
+                    "invocationId": "a" * 64,
+                    "requestHash": "b" * 64,
+                },
+            )
+
+    generator = UnknownMapGenerator()
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(
+            dependencies,
+            select_generator=lambda _name, _config: generator,
+        ),
+    )
+
+    manifest = PlaytestRunManifestV2.model_validate_json(
+        result.manifest_path.read_text(encoding="utf-8")
+    )
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert generator.map_calls == 1
+    assert len(manifest.charts) == 12
+    assert manifest.missing_charts == []
+    assert {(chart.key_mode, chart.difficulty) for chart in manifest.charts} == {
+        (key_mode, difficulty)
+        for key_mode in (4, 6, 7)
+        for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+    }
+    assert all(chart.provenance == "SAFE_FALLBACK" for chart in manifest.charts)
+    assert all(chart.production_eligible is False for chart in manifest.charts)
+    assert all(chart.distribution_tier == "PLAYTEST_ONLY" for chart in manifest.charts)
+    assert report["status"] == "REVIEW"
 
 
 def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
@@ -64,6 +302,11 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert manifest.audio.no_drums is None
     assert manifest.audio.keys is None
     assert manifest.keysound_manifest_path is None
+    assert all(chart.production_eligible for chart in manifest.charts)
+    assert all(
+        chart.distribution_tier == "PRODUCTION_CANDIDATE"
+        for chart in manifest.charts
+    )
     assert not (output_dir / "analysis").exists()
 
     report = json.loads((output_dir / "generation-report.json").read_text())
@@ -81,6 +324,8 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     }
     assert manifest.publication.decision == "PLAYTEST_ONLY"
     assert report["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
+    assert report["additionalInferenceWorkMs"] == 0
+    assert report["additionalInferenceWorkLimitMs"] == 10_000
     assert report["timingAuthority"] == "audio/timing-reference.osu"
     assert report["timingAuthoritySha256"] == sha256_file(
         output_dir / "audio" / "timing-reference.osu"
@@ -137,6 +382,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["timingAuthorityRecoveryPreflight"]["version"] == ("recovery-preflight-v1")
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
+    assert report["mapperatorinatorHoldStateMode"] is None
     assert report["attemptsPerChartMax"] == 6
     assert report["qualityAttemptsPerChartMax"] == 3
     assert report["crashAttemptsPerChartMax"] == 3
@@ -147,7 +393,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     )
     assert report["runtimeFingerprint"]["id"].startswith("sha256:")
     assert report["runtimeFingerprint"]["evidenceGrade"] == "VERIFIED_CODE"
-    assert report["qualityGateVersion"] == "quality-gate-v3-outro-review"
+    assert report["qualityGateVersion"] == QUALITY_GATE_VERSION
     assert report["publishable"] is False
     assert report["publicationDecision"] == {
         "policyVersion": "PUBLICATION_POLICY_V2",
@@ -369,20 +615,30 @@ def test_authority_review_sets_review_required_when_all_maps_pass(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("code", "status"),
+    ("code", "status", "generator", "hold_state_mode"),
     [
-        (ErrorCode.CHART_TIMING_REVIEW_REQUIRED, "REVIEW"),
-        (ErrorCode.CHART_CANDIDATES_EXHAUSTED, "EXHAUSTED"),
-        (ErrorCode.CHART_VALIDATION_FAILED, "FAILED"),
+        (ErrorCode.CHART_TIMING_REVIEW_REQUIRED, "REVIEW", "fake", None),
+        (ErrorCode.CHART_TIMING_REVIEW_REQUIRED, "REVIEW", "mapperatorinator", "incremental"),
+        (ErrorCode.CHART_CANDIDATES_EXHAUSTED, "EXHAUSTED", "fake", None),
+        (ErrorCode.CHART_CANDIDATES_EXHAUSTED, "EXHAUSTED", "mapperatorinator", "incremental"),
+        (ErrorCode.CHART_VALIDATION_FAILED, "FAILED", "fake", None),
+        (ErrorCode.CHART_VALIDATION_FAILED, "FAILED", "mapperatorinator", "incremental"),
     ],
 )
 def test_withheld_generation_writes_failure_report_without_publishable_artifacts(
-    code: ErrorCode, status: str, tmp_path: Path
+    code: ErrorCode, status: str, generator: str, hold_state_mode: str | None, tmp_path: Path
 ):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     output_dir = tmp_path / "run"
     dependencies = fake_dependencies()
+    if generator == "mapperatorinator":
+        dependencies = replace(
+            dependencies,
+            config=dependencies.config.model_copy(
+                update={"mapperatorinator_hold_state_mode": "incremental"}
+            ),
+        )
     export_calls = []
     failure = WorkerError(
         code,
@@ -404,7 +660,7 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
                 source=source,
                 output_dir=output_dir,
                 title="fixture",
-                generator="fake",
+                generator=generator,
                 seed=7,
             ),
             dependencies=replace(
@@ -417,7 +673,7 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
     assert captured.value is failure
     report = json.loads((output_dir / "generation-report.json").read_text())
     assert report["version"] == 1
-    assert report["qualityGateVersion"] == "quality-gate-v3-outro-review"
+    assert report["qualityGateVersion"] == QUALITY_GATE_VERSION
     assert report["runId"] == "00000000-0000-0000-0000-000000000007"
     assert report["publishable"] is False
     assert report["publicationDecision"] == {
@@ -432,6 +688,7 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
         ],
     }
     assert report["status"] == status
+    assert report["mapperatorinatorHoldStateMode"] == hold_state_mode
     assert report["error"] == {
         "code": code.value,
         "context": failure.context,
@@ -588,13 +845,24 @@ def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path)
     assert not (output_dir / "playtest-run-v2.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("generator", "hold_state_mode"),
+    [("fake", None), ("mapperatorinator", "incremental_verify")],
+)
 def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
-    tmp_path: Path,
+    generator: str, hold_state_mode: str | None, tmp_path: Path,
 ):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     output_dir = tmp_path / "run"
     dependencies = fake_dependencies()
+    if generator == "mapperatorinator":
+        dependencies = replace(
+            dependencies,
+            config=dependencies.config.model_copy(
+                update={"mapperatorinator_hold_state_mode": "incremental_verify"}
+            ),
+        )
     generation_calls = []
     export_calls = []
     failure = WorkerError(
@@ -627,7 +895,7 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
                 source=source,
                 output_dir=output_dir,
                 title="fixture",
-                generator="fake",
+                generator=generator,
                 seed=7,
             ),
             dependencies=replace(
@@ -643,6 +911,7 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
     assert report["publishable"] is False
     assert report["status"] == "REVIEW"
     assert report["failureStage"] == "TIMING"
+    assert report["mapperatorinatorHoldStateMode"] == hold_state_mode
     assert report["error"] == {
         "code": "CHART_TIMING_REVIEW_REQUIRED",
         "context": {
@@ -722,7 +991,10 @@ def test_timing_candidates_exhausted_writes_attempt_evidence_before_reraising(
     assert not (output_dir / "playtest-run-v2.json").exists()
 
 
-@pytest.mark.parametrize("provenance", ("PRIMARY", "RAW_UNVERIFIED"))
+@pytest.mark.parametrize(
+    "provenance",
+    ("PRIMARY", "RAW_UNVERIFIED", "SAFE_FALLBACK"),
+)
 def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
     tmp_path: Path,
     provenance: str,
@@ -811,6 +1083,90 @@ def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v2.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("provenance", "recovery_reason"),
+    (
+        ("RAW_UNVERIFIED", "QUALITY_GATE_REJECTED"),
+        ("SAFE_FALLBACK", "NO_STRUCTURALLY_SAFE_MODEL_CANDIDATE"),
+    ),
+)
+def test_pipeline_allows_hard_safe_fallback_only_as_playtest_output(
+    tmp_path: Path,
+    provenance: str,
+    recovery_reason: str,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        first = outcome.variants[0]
+        decisions = tuple(
+            replace(
+                decision,
+                action=GateAction.RETRY_MAP,
+                reasons=("FIXTURE_SOFT_QUALITY_REJECTION",),
+            )
+            if decision.axis is GateAxis.COVERAGE
+            else decision
+            for decision in first.acceptance.decisions
+        )
+        acceptance = replace(
+            first.acceptance,
+            action=GateAction.RETRY_MAP,
+            decisions=decisions,
+        )
+        fallback = replace(
+            first,
+            acceptance=acceptance,
+            provenance=provenance,
+            recovery_reason=recovery_reason,
+        )
+        return replace(outcome, variants=(fallback, *outcome.variants[1:]))
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=output_dir,
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    assert len(report["charts"]) == 12
+    assert report["charts"][0]["provenance"] == provenance
+    assert report["charts"][0]["acceptanceStatus"] == "RETRY_MAP"
+    assert report["charts"][0]["productionEligible"] is False
+    assert report["charts"][0]["distributionTier"] == "PLAYTEST_ONLY"
+    assert report["status"] == "REVIEW"
+    assert report["publishable"] is False
+    assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
+    manifest = PlaytestRunManifestV2.model_validate_json(
+        (output_dir / "playtest-run-v2.json").read_text()
+    )
+    chart = next(
+        item
+        for item in manifest.charts
+        if (item.key_mode, item.difficulty) == (4, "EASY")
+    )
+    assert chart.provenance == provenance
+    assert chart.production_eligible is False
+    assert chart.distribution_tier == "PLAYTEST_ONLY"
 
 
 def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
@@ -1071,6 +1427,8 @@ def test_generation_report_records_raw_unverified_provenance(tmp_path: Path):
     first = report["charts"][0]
     assert first["provenance"] == "RAW_UNVERIFIED"
     assert first["recoveryReason"] == "QUALITY_GATE_REJECTED"
+    assert first["productionEligible"] is False
+    assert first["distributionTier"] == "PLAYTEST_ONLY"
     assert "recoveryPlan" not in first
     # raw 출력이 섞이면 곡을 PASS 로 올리지 않는다.
     assert report["status"] == "REVIEW"
@@ -1400,10 +1758,105 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
     assert len(report["charts"]) == 12
     assert all(chart["timingDiagnostics"]["activeOnsetCount"] == 0 for chart in report["charts"])
     assert all(
-        "LOW_ACTIVE_ONSET_SUPPORT" in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
+        "LOW_ACTIVE_ONSET_SUPPORT"
+        in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
         for chart in report["charts"]
     )
     assert len(list((tmp_path / "run" / "charts").glob("*.json"))) == 12
+
+
+def test_missing_variant_exports_diagnostic_raw_without_entering_normal_charts(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        dropped, *kept = outcome.variants
+        source_workdir = run_dir / "raw" / "work" / "diagnostic-source"
+        source_workdir.mkdir(parents=True)
+        diagnostic = DiagnosticRawCandidate.create(
+            key_mode=dropped.key_mode,
+            difficulty=dropped.difficulty,
+            seed=dropped.selected_seed or 0,
+            attempt=dropped.attempt,
+            osu_text=dropped.raw_osu_path.read_text(encoding="utf-8"),
+            source_workdir=source_workdir,
+            gate_report=dropped.acceptance.to_report(),
+            attempt_errors=("fixture quality rejection",),
+            attempt_evidence=({"reason": "QUALITY_GATE_RETRY"},),
+        )
+        return replace(
+            outcome,
+            variants=tuple(kept),
+            missing=(
+                MissingVariant(
+                    key_mode=dropped.key_mode,
+                    difficulty=dropped.difficulty,
+                    reason="QUALITY_GATE_REJECTED",
+                ),
+            ),
+            diagnostic_raw_candidates=(diagnostic,),
+        )
+
+    config = WorkerConfig(
+        mapperatorinator_hold_state_mode="incremental",
+        mapperatorinator_model_root=Path(r"C:\models\mapperatorinator-v32"),
+        mapperatorinator_model_revision="a" * 40,
+    )
+    run_dir = tmp_path / "run"
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=run_dir,
+            title="fixture",
+            generator="mapperatorinator",
+            seed=7,
+        ),
+        dependencies=replace(
+            dependencies,
+            config=config,
+            generation=generation,
+        ),
+    )
+
+    diagnostic_path = (
+        run_dir
+        / "diagnostic-raw-fallback"
+        / "4k-easy"
+        / "map.osu"
+    )
+    assert diagnostic_path.is_file()
+    assert diagnostic_path not in result.chart_paths
+    assert diagnostic_path not in result.raw_osu_paths
+    report = json.loads((run_dir / "generation-report.json").read_text(encoding="utf-8"))
+    assert len(report["charts"]) == 11
+    assert report["missingCharts"] == [
+        {
+            "keyMode": 4,
+            "difficulty": "EASY",
+            "reason": "QUALITY_GATE_REJECTED",
+            "attemptErrors": [],
+            "attemptEvidence": [],
+        }
+    ]
+    assert report["diagnosticRawFallbacks"][0]["path"].endswith("/map.osu")
+    assert report["diagnosticRawFallbacks"][0]["productionEligible"] is False
+    manifest = json.loads(
+        (diagnostic_path.parent / "manifest-v1.json").read_text(encoding="utf-8")
+    )
+    assert manifest["decision"] == "PLAYTEST_ONLY"
+    assert manifest["identity"]["patchSetId"] == CONSTRAINT_PATCH_ID
 
 
 def test_outro_family_shadow_finding_marks_review_without_spending_generation_budget(
@@ -1452,6 +1905,13 @@ def test_outro_family_shadow_finding_marks_review_without_spending_generation_bu
 def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: Path):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    dependencies = replace(
+        dependencies,
+        config=dependencies.config.model_copy(
+            update={"mapperatorinator_hold_state_mode": "incremental_verify"}
+        ),
+    )
 
     run_pipeline(
         PipelineOptions(
@@ -1460,11 +1920,12 @@ def test_generation_report_records_mapperatorinator_constraint_patch(tmp_path: P
             title="fixture",
             generator="mapperatorinator",
         ),
-        dependencies=fake_dependencies(),
+        dependencies=dependencies,
     )
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
     assert report["mapperatorinatorConstraintPatch"] == CONSTRAINT_PATCH_ID
+    assert report["mapperatorinatorHoldStateMode"] == "incremental_verify"
 
 
 def test_pipeline_rejects_canonical_audio_changed_after_prepare(tmp_path: Path):
@@ -1712,10 +2173,23 @@ def test_map_timing_feedback_replaces_authority_and_regenerates_all_variants(
     assert report["mapTimingEscalations"][0]["failureFamily"] == "DUPLICATE_NOTE"
 
 
-def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("generator", "hold_state_mode"),
+    [("fake", None), ("mapperatorinator", "incremental")],
+)
+def test_second_map_timing_feedback_is_bounded_and_reported(
+    generator: str, hold_state_mode: str | None, tmp_path: Path
+):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
     dependencies = fake_dependencies()
+    if generator == "mapperatorinator":
+        dependencies = replace(
+            dependencies,
+            config=dependencies.config.model_copy(
+                update={"mapperatorinator_hold_state_mode": "incremental"}
+            ),
+        )
     generation_modes: list[str] = []
 
     def super_timing(prepared, analysis, run_dir, generator, seed, authority_epoch=2):
@@ -1739,7 +2213,7 @@ def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
                 source=source,
                 output_dir=tmp_path / "run",
                 title="fixture",
-                generator="fake",
+                generator=generator,
                 seed=7,
             ),
             dependencies=replace(
@@ -1759,6 +2233,52 @@ def test_second_map_timing_feedback_is_bounded_and_reported(tmp_path: Path):
     ]
     assert len(report["mapTimingEscalations"]) == 2
     assert report["failureStage"] == "GENERATION"
+    assert report["mapperatorinatorHoldStateMode"] == hold_state_mode
+
+
+def test_super_timing_failure_writes_mapperatorinator_hold_state_mode(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    dependencies = replace(
+        dependencies,
+        config=dependencies.config.model_copy(
+            update={"mapperatorinator_hold_state_mode": "incremental_verify"}
+        ),
+    )
+    failure = WorkerError(
+        ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+        "super timing fixture",
+    )
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        del prepared, analysis, run_dir, generator, seed, authority_epoch
+        raise _retry_timing_signal(authority.sha256)
+
+    def super_timing(prepared, analysis, run_dir, generator, seed, authority_epoch=2):
+        del prepared, analysis, run_dir, generator, seed, authority_epoch
+        raise failure
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="mapperatorinator",
+                seed=7,
+            ),
+            dependencies=replace(
+                dependencies,
+                generation=generation,
+                super_timing=super_timing,
+            ),
+        )
+
+    assert captured.value is failure
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["failureStage"] == "TIMING"
+    assert report["mapperatorinatorHoldStateMode"] == "incremental_verify"
 
 
 def test_independent_fallback_does_not_reenter_failed_super_timing_path(

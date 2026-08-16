@@ -14,6 +14,7 @@ from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverag
 from chart_worker.validation.timing_review import TimingAuthorityReview
 
 if TYPE_CHECKING:
+    from chart_worker.generation.diagnostic_fallback import DiagnosticRawCandidate
     from chart_worker.validation.difficulty_order import DifficultyOrderReview
     from chart_worker.validation.difficulty_selector import DifficultySelectionComparison
     from chart_worker.validation.intro_phrase_family import IntroPhraseFamilyReview
@@ -36,10 +37,15 @@ GenerationProvenance = Literal[
     "INTRO_RECOVERY",
     "INTRO_ALIGNED",
     "RAW_UNVERIFIED",
+    "SAFE_FALLBACK",
 ]
-"""RAW_UNVERIFIED: 구조·timing identity 는 통과했지만 품질 축이 거절한
-모델 원본 출력. 룰 기반 채보 생성은 금지 정책이라 마지막 fallback 도
-모델 출력이다. 이 provenance 가 있으면 곡 상태는 REVIEW 로 승격된다."""
+"""Playtest provenance contract.
+
+RAW_UNVERIFIED is a model result that passed STRUCTURE, TIMING_IDENTITY, and
+SONG_BOUNDS but failed a softer musical-quality axis. SAFE_FALLBACK is a
+deterministic chart on the canonical timing authority used only when no hard-
+safe model result exists. Either provenance forces PLAYTEST_ONLY/REVIEW.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +96,7 @@ class GeneratedVariant:
     difficulty_order: "DifficultyOrderReview | None" = None
     provenance: GenerationProvenance = "PRIMARY"
     recovery_reason: str | None = None
-    """왜 PRIMARY 가 아닌지. RAW_UNVERIFIED 면 어떤 축이 우회됐는지 남긴다."""
+    """Why this is not PRIMARY, including any playtest-only fallback policy."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +137,9 @@ class GenerationOutcome:
     timing_family_reviews: tuple["TimingFamilyReview", ...] = ()
     outro_family_review: "OutroFamilyReview | None" = None
     additional_inference_calls: int = 0
+    additional_inference_work_ms: int = 0
+    additional_inference_work_limit_ms: int = 0
+    diagnostic_raw_candidates: tuple["DiagnosticRawCandidate", ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

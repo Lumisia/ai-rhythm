@@ -128,6 +128,92 @@ def _analysis() -> OnsetAnalysis:
     )
 
 
+@pytest.mark.parametrize(
+    ("duration_ms", "bpm_events"),
+    [
+        pytest.param(96_523, (OsuBpmEvent(0, 60.0),), id="short-slow"),
+        pytest.param(
+            178_902,
+            (OsuBpmEvent(0, 120.0), OsuBpmEvent(89_451, 180.0)),
+            id="median-speedup",
+        ),
+        pytest.param(
+            361_929,
+            (
+                OsuBpmEvent(0, 240.0),
+                OsuBpmEvent(120_000, 90.0),
+                OsuBpmEvent(240_000, 160.0),
+            ),
+            id="long-multi-tempo",
+        ),
+    ],
+)
+def test_safe_fallback_hard_contract_across_corpus_duration_and_bpm_extremes(
+    monkeypatch,
+    tmp_path: Path,
+    duration_ms: int,
+    bpm_events: tuple[OsuBpmEvent, ...],
+):
+    case_dir = tmp_path / str(duration_ms)
+    prepared = _prepared(case_dir, duration_ms=duration_ms)
+    authority = _authority(prepared, case_dir, bpm_events)
+    frame_count = duration_ms // 100 + 1
+    analysis = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=np.zeros(frame_count),
+        band_strength=np.zeros((3, frame_count)),
+        onset_ms=tuple(range(0, duration_ms, 250)),
+    )
+    monkeypatch.setattr(
+        s2_generate,
+        "evaluate_chart_candidate",
+        evaluate_chart_candidate,
+    )
+
+    candidates = []
+    for key_index, key_mode in enumerate((4, 6, 7)):
+        for difficulty_index, difficulty in enumerate(
+            ("EASY", "NORMAL", "HARD", "EXPERT")
+        ):
+            state = s2_generate._VariantState(
+                key_mode,
+                difficulty,
+                key_index * 4 + difficulty_index,
+            )
+            candidates.append(
+                s2_generate._safe_fallback_candidate(
+                    state,
+                    prepared=prepared,
+                    authority=authority,
+                    onset_analysis=analysis,
+                    run_dir=case_dir,
+                    base_seed=7,
+                    authority_epoch=1,
+                )
+            )
+
+    assert {(item.request.key_mode, item.request.difficulty) for item in candidates} == {
+        (key_mode, difficulty)
+        for key_mode in (4, 6, 7)
+        for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+    }
+    assert all(item.provenance == "SAFE_FALLBACK" for item in candidates)
+    assert all(item.generated.bpm_events == bpm_events for item in candidates)
+    assert all(
+        item.acceptance.decision(axis).action is GateAction.PASS
+        for item in candidates
+        for axis in (GateAxis.STRUCTURE, GateAxis.TIMING_IDENTITY, GateAxis.SONG_BOUNDS)
+    )
+    assert all(
+        0 <= note.time_ms < duration_ms
+        and note.time_ms + (note.duration_ms if note.kind == "HOLD" else 0)
+        <= duration_ms
+        for item in candidates
+        for note in item.generated.notes
+    )
+
+
 def test_song_selection_context_changes_with_boundary_policy(tmp_path: Path):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
@@ -282,6 +368,81 @@ class RecordingGenerator:
             seed=request.seed,
             bpm_events=(OsuBpmEvent(0, 120.0),),
         )
+
+
+def test_tail_exhaustion_suppresses_only_the_same_variant_full_seed(tmp_path: Path):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    tail_context = {
+        "reason": "END_BOUNDARY_CROSSES_HOLD",
+        "signature": "END_BOUNDARY_CROSSES_HOLD:500:11",
+        "requestedEndMs": 500,
+        "effectiveCutMs": 510,
+        "earliestGeneratedSourceWindowId": 11,
+        "repairStartWindowId": 9,
+        "repairWindowIds": [9, 10, 11],
+        "repairAttempts": 2,
+    }
+
+    class TailExhaustedEasyGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if (request.key_mode, request.difficulty) == (4, "EASY"):
+                raise WorkerError(
+                    ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED,
+                    "fixture tail exhausted",
+                    context=tail_context,
+                )
+            return generated
+
+    generator = TailExhaustedEasyGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert len(generator.map_calls) == 12
+    assert [
+        request.seed
+        for request in generator.map_calls
+        if (request.key_mode, request.difficulty) == (4, "EASY")
+    ] == [0]
+    assert len(outcome.variants) == 12
+    assert outcome.additional_inference_calls == 0
+    assert outcome.missing == ()
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    assert [json.loads(entry)["code"] for entry in fallback.attempt_errors] == [
+        "MANIA_TAIL_REPAIR_EXHAUSTED"
+    ]
+    assert {
+        "reason": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": tail_context,
+        "outerFullLengthRetrySuppressed": True,
+        "totalAttempts": 1,
+        "qualityAttempts": 0,
+        "crashAttempts": 0,
+    } in fallback.attempt_evidence
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "attempt-journal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    failed_variant = [
+        entry for entry in journal if (entry["keyMode"], entry["difficulty"]) == (4, "EASY")
+    ]
+    assert [entry["eventType"] for entry in failed_variant] == [
+        "INFERENCE_STARTED",
+        "INFERENCE_FAILED",
+    ]
+    assert failed_variant[-1]["payload"]["error"]["context"] == tail_context
 
 
 def test_run_generation_creates_exactly_twelve_parseable_variants(tmp_path: Path):
@@ -1023,7 +1184,7 @@ def test_exact_intro_reselection_rejects_new_chart_review_axis(tmp_path: Path):
     )
 
 
-def test_unresolved_isolated_expert_first_row_is_removed_from_publication(
+def test_unresolved_isolated_expert_first_row_is_kept_as_playtest_only(
     tmp_path: Path,
 ):
     prepared = _prepared(tmp_path, duration_ms=20_000)
@@ -1059,19 +1220,98 @@ def test_unresolved_isolated_expert_first_row_is_removed_from_publication(
 
     assert len(generator.map_calls) == 13
     assert outcome.additional_inference_calls == 1
-    assert not any(
-        (variant.key_mode, variant.difficulty) == (4, "EXPERT")
+    assert len(outcome.variants) == 12
+    assert outcome.missing == ()
+    expert = next(
+        variant
         for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EXPERT")
     )
-    missing = next(
-        entry
-        for entry in outcome.missing
-        if (entry.key_mode, entry.difficulty) == (4, "EXPERT")
-    )
-    assert missing.reason == "INTRO_PHRASE_DEFECT_UNRESOLVED"
+    assert expert.provenance == "RAW_UNVERIFIED"
+    assert expert.recovery_reason == "INTRO_PHRASE_DEFECT_UNRESOLVED"
     assert any(
-        evidence["reason"] == "INTRO_PHRASE_DEFECT_PUBLICATION_BLOCKED"
-        for evidence in missing.attempt_evidence
+        evidence["reason"] == "INTRO_PHRASE_DEFECT_PLAYTEST_ONLY"
+        for evidence in expert.attempt_evidence
+    )
+
+
+def test_unresolved_intro_keeps_existing_raw_candidate_without_duplicate_identity(
+    monkeypatch,
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    soft_retry = replace(
+        accepted,
+        action=GateAction.RETRY_MAP,
+        decisions=tuple(
+            replace(
+                decision,
+                action=GateAction.RETRY_MAP,
+                reasons=("FIXTURE_PATTERN_REVIEW",),
+            )
+            if decision.axis is GateAxis.PATTERN
+            else decision
+            for decision in accepted.decisions
+        ),
+    )
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        source = (
+            soft_retry
+            if generated.key_mode == 4 and requested_difficulty == "EXPERT"
+            else accepted
+        )
+        return _acceptance_for_difficulty(source, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class RawPhraseDefectGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            self.map_calls.append(request)
+            self.map_workdirs.append(workdir)
+            rows = (
+                (0, 12_000)
+                if (request.key_mode, request.difficulty) == (4, "EXPERT")
+                else (0, 250)
+            )
+            return GeneratedChart(
+                notes=[
+                    NoteEvent(row, index % request.key_mode)
+                    for index, row in enumerate(rows)
+                ],
+                key_mode=request.key_mode,
+                osu_text="",
+                generator_name="raw-phrase-defect-fixture",
+                seed=request.seed,
+                bpm_events=authority.bpm_events,
+            )
+
+    generator = RawPhraseDefectGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    expert = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EXPERT")
+    )
+    assert len(generator.map_calls) == 12
+    assert len(outcome.variants) == 12
+    assert outcome.missing == ()
+    assert expert.provenance == "RAW_UNVERIFIED"
+    assert expert.recovery_reason == "QUALITY_GATE_REJECTED"
+    assert any(
+        evidence.get("reason") == "INTRO_PHRASE_DEFECT_PLAYTEST_ONLY"
+        for evidence in expert.attempt_evidence
     )
 
 
@@ -1554,14 +1794,10 @@ def test_exhausted_hard_still_tries_available_expert_candidate(
     ]
 
 
-def test_persistent_inversion_drops_only_the_inverted_label(
+def test_persistent_inversion_keeps_all_labels_but_marks_order_for_review(
     monkeypatch, tmp_path: Path
 ):
-    """역전이 끝내 안 풀리면 그 조합 하나만 빼고 나머지는 발행한다.
-
-    예전에는 곡 전체를 실패시키거나 정상 후보까지 낮은 대체 채보로
-    끌어내렸다. 실패는 조합 단위로 갇혀야 한다.
-    """
+    """역전이 끝내 안 풀려도 플레이테스트 채보는 삭제하지 않는다."""
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
     accepted = _pass_acceptance(authority)
@@ -1599,15 +1835,19 @@ def test_persistent_inversion_drops_only_the_inverted_label(
         ("HARD", 26),
         ("EXPERT", 27),
     ]
-    # 남은 셋은 단조 증가한다. 버려진 것은 EXPERT 하나뿐이다.
-    assert {entry.difficulty for entry in outcome.missing} == {"EXPERT"}
-    assert all(entry.reason == "DROPPED_FOR_MONOTONICITY" for entry in outcome.missing)
+    assert outcome.missing == ()
     published_4k = {
         variant.difficulty for variant in outcome.variants if variant.key_mode == 4
     }
-    assert published_4k == {"EASY", "NORMAL", "HARD"}
+    assert published_4k == {"EASY", "NORMAL", "HARD", "EXPERT"}
     assert (tmp_path / "raw" / "4k-hard.osu").is_file()
-    assert not (tmp_path / "raw" / "4k-expert.osu").exists()
+    assert (tmp_path / "raw" / "4k-expert.osu").is_file()
+    assert all(
+        variant.difficulty_order is not None
+        and variant.difficulty_order.status == "RETRY"
+        for variant in outcome.variants
+        if variant.key_mode == 4
+    )
     assert all(
         variant.provenance in {"PRIMARY", "RETRY"} for variant in outcome.variants
     )
@@ -1798,7 +2038,12 @@ def test_failed_key_mode_does_not_discard_the_other_key_modes(
 
     def reject_6k(generated, *args, requested_difficulty, **kwargs):
         del args, kwargs
-        action = GateAction.RETRY_MAP if generated.key_mode == 6 else GateAction.PASS
+        action = (
+            GateAction.RETRY_MAP
+            if generated.key_mode == 6
+            and generated.generator_name != "adaptive-recovery-v1"
+            else GateAction.PASS
+        )
         return _acceptance_for_difficulty(
             _acceptance_with_action(authority, action),
             requested_difficulty,
@@ -1815,14 +2060,15 @@ def test_failed_key_mode_does_not_discard_the_other_key_modes(
         seed=0,
     )
 
-    assert {variant.key_mode for variant in outcome.variants} == {4, 7}
-    assert len(outcome.variants) == 8
-    assert {entry.key_mode for entry in outcome.missing} == {6}
-    # 구조 축이 거절했으므로 raw fallback 도 쓸 수 없다.
+    assert {variant.key_mode for variant in outcome.variants} == {4, 6, 7}
+    assert len(outcome.variants) == 12
+    assert outcome.missing == ()
     assert all(
-        entry.reason == "NO_PUBLISHABLE_CANDIDATE" for entry in outcome.missing
+        variant.provenance == "SAFE_FALLBACK"
+        for variant in outcome.variants
+        if variant.key_mode == 6
     )
-    assert not list((tmp_path / "raw").glob("6k-*.osu"))
+    assert len(list((tmp_path / "raw").glob("6k-*.osu"))) == 4
     assert len(list((tmp_path / "raw").glob("4k-*.osu"))) == 4
     assert len(list((tmp_path / "raw").glob("7k-*.osu"))) == 4
 
@@ -1851,21 +2097,20 @@ def test_stable_raw_reparse_rejects_text_with_different_timing_identity(
             )
 
     generator = MismatchedTextGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    # 직렬화 결과가 authority 와 다른 시간축이면 발행할 수 없다.
-    # 룰 기반 대체는 금지이므로 채보 0장이 되고 곡이 실패한다.
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert len(generator.map_calls) == 36
-    assert not list((tmp_path / "raw").glob("*k-*.osu"))
+    # 손상된 모델 텍스트는 배포하지 않고 canonical fallback으로 대체한다.
+    assert len(outcome.variants) == 12
+    assert all(variant.provenance == "SAFE_FALLBACK" for variant in outcome.variants)
+    assert len(generator.map_calls) == 12
+    assert len(list((tmp_path / "raw").glob("*k-*.osu"))) == 12
 
 
 @pytest.mark.parametrize(
@@ -1925,29 +2170,24 @@ def test_serialized_note_or_key_mismatch_retries_without_stable_promotion(
             )
 
     generator = MismatchedCandidateGenerator()
-    try:
-        outcome = run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
-    except WorkerError as error:
-        # 열두 조합 모두 못 살렸다.
-        assert error.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-        published: set[tuple[int, str]] = set()
-    else:
-        # 직렬화 키 수가 6K 와만 맞는 경우처럼 일부만 살아남을 수 있다.
-        published = {
-            (variant.key_mode, variant.difficulty) for variant in outcome.variants
-        }
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    # 직렬화한 노트가 생성 객체와 다르면 그 후보는 raw 로도 못 쓴다.
-    assert (4, "EASY") not in published
-    assert len(generator.map_calls) >= 14
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    # 직렬화가 객체와 다르면 모델 결과는 raw로도 쓰지 않고 안전 대체한다.
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    assert len(generator.map_calls) == 12
+    assert (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
 def test_reference_metadata_mutated_during_map_is_rejected_before_promotion(
@@ -2035,19 +2275,25 @@ def test_generated_structure_defects_exhaust_with_gate_evidence_before_stable_ra
             )
 
     generator = InvalidLaneGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert len(generator.map_calls) == 36
-    attempts = captured.value.context["attempts"]
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    attempts = [
+        item for item in fallback.attempt_evidence if "gateReport" in item
+    ]
     assert [attempt["seed"] for attempt in attempts] == [0, 12, 24]
     assert [attempt["workdir"] for attempt in attempts] == [
         "raw/work/epoch-1/4k-easy/attempt-1",
@@ -2059,8 +2305,8 @@ def test_generated_structure_defects_exhaust_with_gate_evidence_before_stable_ra
         == ["STRUCTURE_INVALID"]
         for attempt in attempts
     )
-    # 구조 축 실패는 raw fallback 대상이 아니다. 플레이가 불가능하다.
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    # 구조 축 실패 모델 출력은 버리고 검증된 안전 fallback만 발행한다.
+    assert (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
 def test_real_hold_overlap_retries_only_the_failed_variant(tmp_path: Path):
@@ -2253,20 +2499,28 @@ def test_timing_feedback_duplicates_in_different_segments_remain_map_retries(
             return generated
 
     generator = DuplicatesMoveAcrossSegments()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
     # 핵심: 중복이 서로 다른 timing 구간에서 나면 timing 층으로 올리지
     # 않는다. RetryTimingSignal 이 아니라 조합 단위 소진으로 끝난다.
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert [call.seed for call in generator.map_calls[:3]] == [0, 12, 24]
+    assert [
+        call.seed
+        for call in generator.map_calls
+        if (call.key_mode, call.difficulty) == (4, "EASY")
+    ] == [0, 12, 24]
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
 
 
 def test_timing_feedback_two_active_middle_gaps_escalate(monkeypatch, tmp_path: Path):
@@ -2446,38 +2700,120 @@ def test_review_candidate_is_published_without_consuming_another_seed(
     assert (tmp_path / "raw" / "4k-easy.osu").is_file()
 
 
+@pytest.mark.parametrize("failure_index", (0, 5, 11))
+def test_unknown_completion_never_consumes_a_second_full_length_seed(
+    tmp_path: Path,
+    failure_index: int,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    unknown = WorkerError(
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+        "accepted invocation lost its terminal record",
+        context={"accepted": True},
+    )
+
+    class UnknownGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if len(self.map_calls) - 1 == failure_index:
+                raise unknown
+            return generated
+
+    generator = UnknownGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    slots = tuple(
+        (key_mode, difficulty)
+        for key_mode in (4, 6, 7)
+        for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+    )
+    trigger_slot = slots[failure_index]
+    assert [request.seed for request in generator.map_calls] == list(
+        range(failure_index + 1)
+    )
+    assert len(outcome.variants) == 12
+    assert outcome.missing == ()
+    by_slot = {
+        (variant.key_mode, variant.difficulty): variant for variant in outcome.variants
+    }
+    assert all(by_slot[slot].provenance == "PRIMARY" for slot in slots[:failure_index])
+    assert all(
+        by_slot[slot].provenance == "SAFE_FALLBACK"
+        for slot in slots[failure_index:]
+    )
+    trigger = by_slot[trigger_slot]
+    assert any(
+        evidence["reason"] == "MODEL_INFERENCE_DISABLED_AFTER_UNKNOWN_COMPLETION"
+        and evidence["triggerVariant"]
+        == {"keyMode": trigger_slot[0], "difficulty": trigger_slot[1]}
+        and evidence["error"]["code"] == "INFERENCE_COMPLETION_UNKNOWN"
+        for evidence in trigger.attempt_evidence
+    )
+    if failure_index + 1 < len(slots):
+        following = by_slot[slots[failure_index + 1]]
+        assert any(
+            evidence["reason"]
+            == "MODEL_INFERENCE_SUPPRESSED_AFTER_UNKNOWN_COMPLETION"
+            and evidence["triggerVariant"]
+            == {"keyMode": trigger_slot[0], "difficulty": trigger_slot[1]}
+            for evidence in following.attempt_evidence
+        )
+
+
 def test_three_retry_map_decisions_exhaust_with_structured_attempt_evidence(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
     retry = _acceptance_with_action(authority, GateAction.RETRY_MAP)
+
+    def evaluate(generated, *args, **kwargs):
+        del args, kwargs
+        return accepted if generated.generator_name == "adaptive-recovery-v1" else retry
+
     monkeypatch.setattr(
         s2_generate,
         "evaluate_chart_candidate",
-        lambda *args, **kwargs: retry,
+        evaluate,
     )
     generator = RecordingGenerator()
 
-    with pytest.raises(WorkerError) as captured:
-        _run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    # 한 조합이 소진돼도 즉시 곡을 버리지 않는다. 12 조합 전부 3 seed 를
-    # 쓰고, 그래도 발행할 채보가 하나도 없을 때만 실패한다.
+    # 기존 모델 예산은 그대로 유한하며, 소진 뒤에는 추가 inference 없이
+    # canonical fallback을 발행한다.
     assert [request.seed for request in generator.map_calls] == [
         flat_index + attempt * 12
         for flat_index in range(12)
         for attempt in range(3)
     ]
-    assert captured.value.context["attempts"] == [
+    assert len(outcome.variants) == 12
+    assert all(variant.provenance == "SAFE_FALLBACK" for variant in outcome.variants)
+    first = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    gate_attempts = [
+        item for item in first.attempt_evidence if "gateReport" in item
+    ]
+    assert gate_attempts == [
         {
             "seed": attempt_seed,
             "workdir": f"raw/work/epoch-1/4k-easy/attempt-{attempt}",
@@ -2485,17 +2821,72 @@ def test_three_retry_map_decisions_exhaust_with_structured_attempt_evidence(
         }
         for attempt, attempt_seed in enumerate((0, 12, 24), start=1)
     ]
-    assert len(captured.value.context["errors"]) == 3
-    assert captured.value.context["qualityAttempts"] == 3
-    assert captured.value.context["crashAttempts"] == 0
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    assert len(first.attempt_errors) == 3
+    assert (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
-def test_crashing_variant_is_isolated_without_regenerating_successes(tmp_path: Path):
-    """크래시로 후보가 하나도 안 나오면 그 조합만 빠진다.
+def test_hard_safe_quality_rejection_stops_after_first_full_length_seed(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    soft_retry = replace(
+        accepted,
+        action=GateAction.RETRY_MAP,
+        decisions=tuple(
+            replace(
+                decision,
+                action=GateAction.RETRY_MAP,
+                reasons=("FIXTURE_PATTERN_REVIEW",),
+            )
+            if decision.axis is GateAxis.PATTERN
+            else decision
+            for decision in accepted.decisions
+        ),
+    )
 
-    룰 기반 대체 채보를 만들지 않는다. 나머지 11장은 재생성 없이 그대로다.
-    """
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        source = (
+            soft_retry
+            if generated.generator_name != "adaptive-recovery-v1"
+            and generated.key_mode == 4
+            and requested_difficulty == "EASY"
+            else accepted
+        )
+        return _acceptance_for_difficulty(source, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert len(generator.map_calls) == 12
+    assert [
+        request.seed
+        for request in generator.map_calls
+        if (request.key_mode, request.difficulty) == (4, "EASY")
+    ] == [0]
+    raw = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert raw.provenance == "RAW_UNVERIFIED"
+    assert raw.recovery_reason == "QUALITY_GATE_REJECTED"
+
+
+def test_crashing_variant_gets_safe_fallback_without_regenerating_successes(
+    tmp_path: Path,
+):
+    """모델 출력이 전혀 없어도 canonical timing 기반 안전 채보를 제공한다."""
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
 
@@ -2519,13 +2910,77 @@ def test_crashing_variant_is_isolated_without_regenerating_successes(tmp_path: P
         seed=0,
     )
 
-    assert len(outcome.variants) == 11
-    assert [(entry.key_mode, entry.difficulty) for entry in outcome.missing] == [
-        (4, "EASY")
-    ]
-    assert outcome.missing[0].reason == "NO_PUBLISHABLE_CANDIDATE"
-    assert all(variant.provenance == "PRIMARY" for variant in outcome.variants)
+    assert len(outcome.variants) == 12
+    assert outcome.missing == ()
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    assert fallback.recovery_reason == "NO_STRUCTURALLY_SAFE_MODEL_CANDIDATE"
+    assert fallback.generated.generator_name == "adaptive-recovery-v1"
+    assert fallback.acceptance.decision(GateAxis.STRUCTURE).action is GateAction.PASS
+    assert (
+        fallback.acceptance.decision(GateAxis.TIMING_IDENTITY).action
+        is GateAction.PASS
+    )
+    assert fallback.acceptance.decision(GateAxis.SONG_BOUNDS).action is GateAction.PASS
     # 크래시 예산 3회만 쓰고 나머지 11 조합은 한 번씩만 부른다.
+    assert len(generator.map_calls) == 14
+
+
+def test_song_bounds_rejected_model_output_is_not_promoted_as_raw(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    song_bounds_retry = replace(
+        accepted,
+        action=GateAction.RETRY_MAP,
+        decisions=tuple(
+            replace(
+                decision,
+                action=GateAction.RETRY_MAP,
+                reasons=("NOTE_START_AFTER_MUSIC_END",),
+            )
+            if decision.axis is GateAxis.SONG_BOUNDS
+            else decision
+            for decision in accepted.decisions
+        ),
+    )
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        source = (
+            accepted
+            if generated.generator_name == "adaptive-recovery-v1"
+            else song_bounds_retry
+            if generated.key_mode == 4 and requested_difficulty == "EASY"
+            else accepted
+        )
+        return _acceptance_for_difficulty(source, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    assert fallback.acceptance.decision(GateAxis.SONG_BOUNDS).action is GateAction.PASS
+    assert outcome.diagnostic_raw_candidates == ()
     assert len(generator.map_calls) == 14
 
 
@@ -2573,7 +3028,7 @@ def test_localized_coverage_failure_remaps_only_the_exhausted_variant(
     partial_requests = [
         request for request in generator.map_calls if request.add_to_beatmap
     ]
-    assert len(generator.map_calls) == 15
+    assert len(generator.map_calls) == 13
     assert len(partial_requests) == 1
     assert partial_requests[0].partial_start_ms == 8_000
     assert partial_requests[0].partial_end_ms == 22_000
@@ -2582,6 +3037,8 @@ def test_localized_coverage_failure_remaps_only_the_exhausted_variant(
     assert repaired.provenance == "PARTIAL_REMAP"
     assert repaired.recovery_reason == "ACTIVE_COVERAGE_GAP"
     assert outcome.additional_inference_calls == 1
+    assert outcome.additional_inference_work_ms == 14_000
+    assert outcome.additional_inference_work_limit_ms == 60_000
     journal = [
         json.loads(line)
         for line in (tmp_path / "attempt-journal.jsonl")
@@ -2602,6 +3059,187 @@ def test_localized_coverage_failure_remaps_only_the_exhausted_variant(
         for variant in variants
         if variant is not repaired
     )
+
+
+def test_song_work_budget_admits_two_small_partial_repairs(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path, duration_ms=60_000)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.generator_name == "partial-repair":
+            return _acceptance_for_difficulty(accepted, requested_difficulty)
+        if requested_difficulty == "EASY" and generated.key_mode in {4, 6}:
+            return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class PartialRepairGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if request.add_to_beatmap:
+                return replace(generated, generator_name="partial-repair")
+            return generated
+
+    generator = PartialRepairGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    partial_requests = [
+        request for request in generator.map_calls if request.add_to_beatmap
+    ]
+    assert len(generator.map_calls) == 14
+    assert [(request.key_mode, request.difficulty) for request in partial_requests] == [
+        (4, "EASY"),
+        (6, "EASY"),
+    ]
+    assert outcome.additional_inference_calls == 2
+    assert outcome.additional_inference_work_ms == 28_000
+    assert outcome.additional_inference_work_limit_ms == 60_000
+    assert all(
+        next(
+            variant
+            for variant in outcome.variants
+            if (variant.key_mode, variant.difficulty) == slot
+        ).provenance
+        == "PARTIAL_REMAP"
+        for slot in ((4, "EASY"), (6, "EASY"))
+    )
+
+
+def test_partial_tail_exhaustion_blocks_only_that_variant(
+    monkeypatch, tmp_path: Path
+):
+    prepared = _prepared(tmp_path, duration_ms=60_000)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+    tail_context = {
+        "reason": "END_BOUNDARY_CROSSES_HOLD",
+        "signature": "END_BOUNDARY_CROSSES_HOLD:500:11",
+        "requestedEndMs": 500,
+        "effectiveCutMs": 510,
+        "earliestGeneratedSourceWindowId": 11,
+        "repairStartWindowId": 9,
+        "repairWindowIds": [9, 10, 11],
+        "repairAttempts": 2,
+    }
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if (
+            generated.generator_name != "adaptive-recovery-v1"
+            and requested_difficulty == "EASY"
+            and generated.key_mode == 4
+        ):
+            return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    exhausted_context = {}
+    real_assemble_publication = s2_generate.assemble_publication
+
+    def capture_exhausted_context(selections, **kwargs):
+        failed_state = next(
+            states["EASY"]
+            for states, _assignment, _review in selections
+            if states["EASY"].key_mode == 4
+        )
+        assert failed_state.exhausted_error is not None
+        exhausted_context.update(failed_state.exhausted_error.context)
+        return real_assemble_publication(selections, **kwargs)
+
+    monkeypatch.setattr(
+        s2_generate,
+        "assemble_publication",
+        capture_exhausted_context,
+    )
+
+    class PartialTailExhaustedGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if request.add_to_beatmap:
+                raise WorkerError(
+                    ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED,
+                    "fixture partial tail exhausted",
+                    context=tail_context,
+                )
+            return generated
+
+    generator = PartialTailExhaustedGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert len(generator.map_calls) == 13
+    assert [
+        request.seed
+        for request in generator.map_calls
+        if (request.key_mode, request.difficulty) == (4, "EASY")
+    ] == [0, 36]
+    assert generator.map_calls[-1].add_to_beatmap is True
+    assert len(outcome.variants) == 12
+    assert outcome.additional_inference_calls == 1
+    assert outcome.missing == ()
+    assert outcome.diagnostic_raw_candidates == ()
+    raw = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert raw.provenance == "RAW_UNVERIFIED"
+    assert json.loads(raw.attempt_errors[-1]) == {
+        "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": tail_context,
+        "message": "MANIA_TAIL_REPAIR_EXHAUSTED: fixture partial tail exhausted",
+        "type": "WorkerError",
+    }
+    assert {
+        "reason": "MANIA_TAIL_REPAIR_EXHAUSTED",
+        "context": tail_context,
+        "outerFullLengthRetrySuppressed": True,
+        "partialAttempt": 2,
+        "partialSeed": 36,
+        "totalAttempts": 2,
+        "qualityAttempts": 1,
+        "crashAttempts": 0,
+    } in raw.attempt_evidence
+    assert exhausted_context["totalAttempts"] == 2
+    assert exhausted_context["seeds"] == [0, 36]
+    assert exhausted_context["partialAttempts"] == [2]
+    assert exhausted_context["partialSeeds"] == [36]
+    assert exhausted_context["qualityAttempts"] == 1
+    assert exhausted_context["crashAttempts"] == 0
+    journal = [
+        json.loads(line)
+        for line in (tmp_path / "attempt-journal.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    partial_events = [
+        entry for entry in journal if entry["payload"].get("purpose") == "PARTIAL_REMAP"
+    ]
+    assert [entry["eventType"] for entry in partial_events] == [
+        "INFERENCE_STARTED",
+        "INFERENCE_FAILED",
+    ]
+    assert partial_events[-1]["payload"]["error"]["context"] == tail_context
 
 
 def test_confirmed_intro_mismatch_is_not_hidden_by_note_mutation(
@@ -2749,7 +3387,7 @@ def test_unanimous_audio_backed_family_overrides_conflicting_early_anchor(
     assert {variant.generated.notes[0].time_ms for variant in outcome.variants} == {500}
 
 
-def test_rejected_partial_remap_never_promotes_raw_quality_rejection(
+def test_rejected_partial_remap_promotes_structurally_safe_raw_for_playtest(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path, duration_ms=60_000)
@@ -2777,18 +3415,22 @@ def test_rejected_partial_remap_never_promotes_raw_quality_rejection(
         seed=0,
     )
 
-    assert len(generator.map_calls) == 15
+    assert len(generator.map_calls) == 13
     assert sum(request.add_to_beatmap for request in generator.map_calls) == 1
-    assert not any(
-        (variant.key_mode, variant.difficulty) == (4, "EASY")
+    raw = next(
+        variant
         for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
     )
-    missing = next(
-        entry
-        for entry in outcome.missing
-        if (entry.key_mode, entry.difficulty) == (4, "EASY")
-    )
-    assert missing.reason == "QUALITY_GATE_REJECTED"
+    assert len(outcome.variants) == 12
+    assert outcome.missing == ()
+    assert raw.provenance == "RAW_UNVERIFIED"
+    assert raw.recovery_reason == "QUALITY_GATE_REJECTED"
+    assert raw.acceptance.action is GateAction.RETRY_MAP
+    assert raw.acceptance.decision(GateAxis.STRUCTURE).action is GateAction.PASS
+    assert raw.acceptance.decision(GateAxis.TIMING_IDENTITY).action is GateAction.PASS
+    assert raw.acceptance.decision(GateAxis.SONG_BOUNDS).action is GateAction.PASS
+    assert outcome.diagnostic_raw_candidates == ()
 
 
 def test_normal_generation_marks_every_variant_primary(tmp_path: Path):
@@ -2796,7 +3438,7 @@ def test_normal_generation_marks_every_variant_primary(tmp_path: Path):
     authority = _authority(prepared, tmp_path)
     generator = RecordingGenerator()
 
-    variants = _run_generation(
+    outcome = run_generation(
         prepared,
         authority,
         _analysis(),
@@ -2804,10 +3446,12 @@ def test_normal_generation_marks_every_variant_primary(tmp_path: Path):
         generator=generator,
         seed=0,
     )
+    variants = outcome.variants
 
     assert len(generator.map_calls) == 12
     assert all(variant.provenance == "PRIMARY" for variant in variants)
     assert all(variant.recovery_reason is None for variant in variants)
+    assert outcome.diagnostic_raw_candidates == ()
 
 
 def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
@@ -2815,12 +3459,15 @@ def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
 ):
     prepared = _prepared(tmp_path)
     authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
     retry = _acceptance_with_action(authority, GateAction.RETRY_MAP)
     evaluation_calls = 0
 
-    def evaluate(*args, **kwargs):
+    def evaluate(generated, *args, **kwargs):
         nonlocal evaluation_calls
         del args, kwargs
+        if generated.generator_name == "adaptive-recovery-v1":
+            return accepted
         evaluation_calls += 1
         return retry
 
@@ -2841,26 +3488,26 @@ def test_mixed_exhaustion_retains_gate_evidence_with_all_legacy_errors(
             )
 
     generator = GateThenLegacyFailureGenerator()
-    with pytest.raises(WorkerError) as captured:
-        _run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    context = captured.value.context
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
     # 게이트 거절 1건이 품질 예산에서, 크래시 3건이 크래시 예산에서 나간다.
     # 예산이 하나였을 때는 크래시가 품질 재시도 기회까지 먹었다.
-    assert context["seeds"] == [0, 12, 24, 36]
-    assert len(context["errors"]) == 4
-    assert context["qualityAttempts"] == 1
-    assert context["crashAttempts"] == 3
+    assert len(fallback.attempt_errors) == 4
     assert evaluation_calls == 1
-    assert context["attempts"] == [
+    assert [item for item in fallback.attempt_evidence if "gateReport" in item] == [
         {
             "seed": 0,
             "workdir": "raw/work/epoch-1/4k-easy/attempt-1",
@@ -2928,19 +3575,19 @@ def test_reports_all_errors_when_one_variant_exhausts_its_attempts(tmp_path: Pat
             )
 
     generator = AlwaysInvalid()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
     assert len(generator.map_calls) == 36
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
-    assert len(captured.value.context["errors"]) == 3
+    assert len(outcome.variants) == 12
+    assert all(variant.provenance == "SAFE_FALLBACK" for variant in outcome.variants)
+    assert all(len(variant.attempt_errors) == 3 for variant in outcome.variants)
 
 
 def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
@@ -2967,19 +3614,25 @@ def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
             )
 
     generator = DifferentTimingGenerator()
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=generator,
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
 
-    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
     assert len(generator.map_calls) == 36
-    attempts = captured.value.context["attempts"]
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    attempts = [
+        item for item in fallback.attempt_evidence if "gateReport" in item
+    ]
     assert [attempt["seed"] for attempt in attempts] == [0, 12, 24]
     assert [attempt["workdir"] for attempt in attempts] == [
         "raw/work/epoch-1/4k-easy/attempt-1",
@@ -2991,8 +3644,8 @@ def test_generated_timing_identity_defects_exhaust_with_gate_evidence(
         == ["TIMING_REFERENCE_MISMATCH"]
         for attempt in attempts
     )
-    # 곡 공통 시간축이 다르면 raw fallback 도 쓸 수 없다.
-    assert not (tmp_path / "raw" / "4k-easy.osu").exists()
+    # 곡 공통 시간축이 다른 모델 결과는 버리고 canonical fallback을 쓴다.
+    assert (tmp_path / "raw" / "4k-easy.osu").exists()
 
 
 def test_crash_attempt_error_preserves_worker_context_and_stderr(tmp_path: Path):
@@ -3015,24 +3668,28 @@ def test_crash_attempt_error_preserves_worker_context_and_stderr(tmp_path: Path)
                 context={"stderr": "torch.cuda.OutOfMemoryError: CUDA out of memory"},
             )
 
-    with pytest.raises(WorkerError) as captured:
-        run_generation(
-            prepared,
-            authority,
-            _analysis(),
-            tmp_path,
-            generator=CrashingGenerator(),
-            seed=0,
-        )
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=CrashingGenerator(),
+        seed=0,
+    )
 
-    errors = [json.loads(entry) for entry in captured.value.context["errors"]]
+    fallback = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert fallback.provenance == "SAFE_FALLBACK"
+    errors = [json.loads(entry) for entry in fallback.attempt_errors]
     assert len(errors) == 3
     assert all(entry["code"] == "CHART_GENERATION_FAILED" for entry in errors)
     assert all(
         "CUDA out of memory" in entry["context"]["stderr"] for entry in errors
     )
-    assert captured.value.context["crashAttempts"] == 3
-    assert captured.value.context["qualityAttempts"] == 0
+    assert len(errors) == 3
     journal_path = tmp_path / "attempt-journal.jsonl"
     journal = [
         json.loads(line)

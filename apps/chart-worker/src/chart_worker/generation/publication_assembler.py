@@ -9,6 +9,10 @@ from chart_worker.generation.candidate_state import (
     VariantState,
     candidate_evidence,
 )
+from chart_worker.generation.diagnostic_fallback import (
+    DiagnosticRawCandidate,
+    select_diagnostic_candidate,
+)
 from chart_worker.generation.generation_control import RecoveryKind
 from chart_worker.schema.types import DIFFICULTIES
 from chart_worker.stages.types import (
@@ -33,6 +37,24 @@ Selection = tuple[
 class PublicationAssembly:
     variants: tuple[GeneratedVariant, ...]
     missing: tuple[MissingVariant, ...]
+    diagnostic_raw_candidates: tuple[DiagnosticRawCandidate, ...] = ()
+
+
+def _diagnostic_projection(
+    state: VariantState,
+    candidate: Candidate,
+) -> DiagnosticRawCandidate:
+    return DiagnosticRawCandidate.create(
+        key_mode=state.key_mode,
+        difficulty=state.difficulty,
+        seed=candidate.seed,
+        attempt=candidate.attempt,
+        osu_text=candidate.osu_text,
+        source_workdir=candidate.workdir,
+        gate_report=candidate.acceptance.to_report(),
+        attempt_errors=tuple(state.attempt_errors),
+        attempt_evidence=tuple(state.attempt_evidence),
+    )
 
 
 def _record_unselected_candidates(
@@ -45,6 +67,7 @@ def _record_unselected_candidates(
     for candidate in (
         *state.candidates.admitted,
         *state.candidates.raw_rejected,
+        *state.candidates.safe_fallbacks,
     ):
         if candidate is selected:
             continue
@@ -127,6 +150,7 @@ def assemble_publication(
 
     variants: list[GeneratedVariant] = []
     missing: list[MissingVariant] = []
+    diagnostic_raw_candidates: list[DiagnosticRawCandidate] = []
     promoted_paths: list[Path] = []
     try:
         for states, assignment, order_review in selections:
@@ -168,6 +192,7 @@ def assemble_publication(
                         candidate_count=(
                             len(state.candidates.admitted)
                             + len(state.candidates.raw_rejected)
+                            + len(state.candidates.safe_fallbacks)
                         ),
                         generation_attempt_count=(
                             state.budget.next_attempt
@@ -196,6 +221,17 @@ def assemble_publication(
                         None,
                         order_review,
                         run_dir=run_dir,
+                    )
+                if had_rejected_raw:
+                    diagnostic_raw_candidates.append(
+                        select_diagnostic_candidate(
+                            tuple(
+                                _diagnostic_projection(state, candidate)
+                                for candidate in state.candidates.raw_rejected
+                            ),
+                            key_mode=state.key_mode,
+                            difficulty=difficulty,
+                        )
                     )
                 missing.append(
                     MissingVariant(
@@ -237,4 +273,8 @@ def assemble_publication(
             context={"missing": [entry.to_report() for entry in missing]},
         )
 
-    return PublicationAssembly(variants=tuple(variants), missing=tuple(missing))
+    return PublicationAssembly(
+        variants=tuple(variants),
+        missing=tuple(missing),
+        diagnostic_raw_candidates=tuple(diagnostic_raw_candidates),
+    )

@@ -57,19 +57,28 @@ class RecoveryRequest:
 class RecoveryPlan:
     selected: tuple[RecoveryRequest, ...]
     deferred: tuple[RecoveryRequest, ...]
-    available_slots: int
+    available_generation_ms: int
+    selected_generation_ms: int
+
+    @property
+    def remaining_generation_ms(self) -> int:
+        return self.available_generation_ms - self.selected_generation_ms
 
     def to_report(self) -> dict[str, object]:
         return {
-            "policyVersion": "RECOVERY_PRIORITY_V1",
-            "availableSlots": self.available_slots,
+            "policyVersion": "RECOVERY_WORK_BUDGET_V2",
+            "availableGenerationMs": self.available_generation_ms,
+            "selectedGenerationMs": self.selected_generation_ms,
+            "remainingGenerationMs": self.remaining_generation_ms,
             "selectedRequestIds": [request.request_id for request in self.selected],
             "deferredRequestIds": [request.request_id for request in self.deferred],
             "requests": [
                 {
                     **request.to_report(),
                     "decision": (
-                        "SELECTED" if request in self.selected else "DEFERRED_BUDGET"
+                        "SELECTED"
+                        if request in self.selected
+                        else "DEFERRED_WORK_BUDGET"
                     ),
                 }
                 for request in (*self.selected, *self.deferred)
@@ -98,23 +107,36 @@ def _rank_key(request: RecoveryRequest) -> tuple[int, int, int, int, str, str]:
 def plan_recoveries(
     requests: tuple[RecoveryRequest, ...],
     *,
-    available_slots: int,
+    available_generation_ms: int,
 ) -> RecoveryPlan:
     """Choose recovery work independently of discovery or iteration order."""
 
-    if available_slots < 0:
-        raise ValueError("available_slots must be non-negative")
+    if available_generation_ms < 0:
+        raise ValueError("available_generation_ms must be non-negative")
     request_ids = [request.request_id for request in requests]
     if len(request_ids) != len(set(request_ids)):
         raise ValueError("duplicate recovery request id")
 
     ranked = tuple(sorted(requests, key=_rank_key))
-    selected = ranked[:available_slots]
-    deferred = ranked[available_slots:]
+    selected: list[RecoveryRequest] = []
+    deferred: list[RecoveryRequest] = []
+    remaining = available_generation_ms
+    higher_priority_blocked = False
+    for request in ranked:
+        if not higher_priority_blocked and request.estimated_generation_ms <= remaining:
+            selected.append(request)
+            remaining -= request.estimated_generation_ms
+        else:
+            deferred.append(request)
+            # Requests are sorted by priority and then increasing cost.  Once
+            # a completeness request cannot fit, spending the leftover on a
+            # lower-priority quality retry would invert the user-visible goal.
+            higher_priority_blocked = True
     return RecoveryPlan(
-        selected=selected,
-        deferred=deferred,
-        available_slots=available_slots,
+        selected=tuple(selected),
+        deferred=tuple(deferred),
+        available_generation_ms=available_generation_ms,
+        selected_generation_ms=available_generation_ms - remaining,
     )
 
 

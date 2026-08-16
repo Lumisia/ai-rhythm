@@ -32,13 +32,23 @@ def _authority(
 
 
 def _analysis(
-    onsets: tuple[int, ...], *, activity: AudioActivity | None = None
+    onsets: tuple[int, ...],
+    *,
+    activity: AudioActivity | None = None,
+    strengths: dict[int, float] | None = None,
 ) -> OnsetAnalysis:
+    frame_count = max(601, max(onsets, default=0) // 100 + 2)
+    strength = np.zeros(frame_count)
+    resolved_strengths = (
+        strengths if strengths is not None else {time_ms: 1.0 for time_ms in onsets}
+    )
+    for time_ms, value in resolved_strengths.items():
+        strength[min(frame_count - 1, round(time_ms / 100))] = value
     return OnsetAnalysis(
         sample_rate_hz=1_000,
         hop_length=100,
-        strength=np.zeros(601),
-        band_strength=np.zeros((3, 601)),
+        strength=strength,
+        band_strength=np.zeros((3, frame_count)),
         onset_ms=onsets,
         activity=activity,
     )
@@ -169,7 +179,9 @@ def test_quality_gate_uses_musical_coverage_horizon_for_trailing_gap():
     )
 
     assert _decision(result, "COVERAGE").action is _gate().GateAction.RETRY_MAP
-    assert _decision(result, "COVERAGE").reasons == ("ACTIVE_TRAILING_GAP",)
+    assert _decision(result, "COVERAGE").reasons == (
+        "ATTACK_REQUIRED_TRAILING_GAP",
+    )
     assert result.timing.coverage_gaps[0].end_ms == 84_000
 
 
@@ -432,6 +444,82 @@ def test_quiet_coverage_gap_is_advisory_with_a_position_specific_reason():
     assert decision.action is _gate().GateAction.PASS
     assert decision.reasons == ("QUIET_POST_FIRST_GAP",)
     assert result.action is _gate().GateAction.PASS
+
+
+def test_sustain_representable_gap_requires_review_not_full_map_retry():
+    onsets = (1_000, *range(5_000, 21_000, 1_000), 30_000)
+    analysis = _analysis(
+        onsets,
+        strengths={1_000: 1.0, 30_000: 1.0, **{time: 0.1 for time in onsets[1:-1]}},
+        activity=AudioActivity(
+            frame_ms=1_000.0,
+            rms_db=np.full(42, -10.0),
+            floor_db=-20.0,
+            active_onset_ms=onsets,
+        ),
+    )
+    chart = GeneratedChart(
+        notes=[
+            NoteEvent(4_000, 0, kind="HOLD", duration_ms=26_000),
+            NoteEvent(30_000, 0),
+        ],
+        key_mode=4,
+        osu_text="",
+        generator_name="test",
+        seed=0,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+    )
+
+    result = _gate().evaluate_chart_candidate(
+        chart,
+        _authority(),
+        analysis,
+        requested_key_mode=4,
+        requested_difficulty="EASY",
+        duration_ms=40_000,
+    )
+
+    decision = _decision(result, "COVERAGE")
+    assert decision.action is _gate().GateAction.REVIEW
+    assert "SUSTAIN_REPRESENTABLE_POST_FIRST_GAP" in decision.reasons
+
+
+def test_repeated_strong_attacks_under_hold_still_retry_map():
+    onsets = tuple(range(5_000, 21_000, 1_000))
+    analysis = _analysis(
+        onsets,
+        strengths={time: 0.9 for time in onsets},
+        activity=AudioActivity(
+            frame_ms=1_000.0,
+            rms_db=np.full(42, -10.0),
+            floor_db=-20.0,
+            active_onset_ms=onsets,
+        ),
+    )
+    chart = GeneratedChart(
+        notes=[
+            NoteEvent(4_000, 0, kind="HOLD", duration_ms=26_000),
+            NoteEvent(30_000, 0),
+        ],
+        key_mode=4,
+        osu_text="",
+        generator_name="test",
+        seed=0,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+    )
+
+    result = _gate().evaluate_chart_candidate(
+        chart,
+        _authority(),
+        analysis,
+        requested_key_mode=4,
+        requested_difficulty="EXPERT",
+        duration_ms=40_000,
+    )
+
+    decision = _decision(result, "COVERAGE")
+    assert decision.action is _gate().GateAction.RETRY_MAP
+    assert "ATTACK_REQUIRED_POST_FIRST_GAP" in decision.reasons
 
 
 def test_near_active_quiet_trailing_gap_requires_review_without_retrying_the_map():
