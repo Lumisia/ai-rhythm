@@ -138,3 +138,10 @@ secrets*.json
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local test evidence (generated; never commit)
+/.test-evidence/
+/apps/chart-worker/.data/test-evidence/
+/apps/chart-worker/.integration-*/
+/apps/chart-worker/.pytest-*/
+/apps/chart-worker/.tmp-*/

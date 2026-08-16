@@ -1,9 +1,15 @@
 # chart-worker 직접 생성과 로컬 검증
 
+> 기준일 2026-08-17 · 브랜치 `feat/chart-worker-foundation`
+> 아래 「2026-08-04 keycount 패치 smoke」 등 날짜가 붙은 절은 그 시점의 기록이며
+> 갱신하지 않는다. 나머지는 현재 코드와 일치해야 한다.
+
 `chart-worker`는 한 곡에서 4K·6K·7K와 EASY·NORMAL·HARD·EXPERT 조합
 12개를 생성한다. Mapperatorinator가 만든 timing, 레인, TAP/HOLD 종류와 길이를
-후처리로 바꾸지 않는다. `generate`와 `bench` 명령을 실행하는 동안에만 모델이
-동작하며 상시 GPU 서비스가 아니다.
+후처리로 바꾸지 않는다. 기본 `oneshot`은 `generate`/`bench` 호출 동안만 모델이
+동작한다. opt-in `song_session`은 한 곡의 timing·MAP 호출 사이에서 모델과 encoder
+cache를 재사용하고, Modal 경로는 container 수명 동안 model registry를 유지하되 곡별
+cache/checkpoint 상태는 `BEGIN_SONG`/`END_SONG`으로 격리한다.
 
 canonical audio 프로파일은 `audio-profile-v2`다. 원본과 앞 무음 제거 후 결과를
 정확히 600초까지 허용하며, 600초를 초과하면 곡을 자르지 않고
@@ -38,7 +44,9 @@ coverage 누락만 있는 후보는 HOLD 경계를 보존한 좁은 구간을 �
 | EASY | 1.0 | `expression/simple` |
 | NORMAL | 1.5 | `style/mixed rice` |
 | HARD | 2.0 | `style/mixed rice`, `streams/bursts` |
-| EXPERT | 3.0 | `style/mixed rice`, `skillset/streams`, `skillset/tech` |
+| EXPERT | 3.0 | `style/mixed rice`, `skillset/streams` |
+
+`skillset/tech`는 EXPERT 과밀도 A/B 이후 2026-08-09에 제거했다.
 
 timing 요청은 `output_type=[TIMING]`이고, MAP 요청은 `output_type=[MAP]`,
 `beatmap_path=audio/timing-reference.osu`, `in_context=[TIMING]`을 사용한다. MAP의 공통
@@ -64,17 +72,33 @@ grid subdivision 정렬은 이 tempo 검토와 별개의 검증 신호다.
 
 ## 실제 Mapperatorinator 실행 준비
 
-먼저 프로젝트가 고정한 Mapperatorinator commit에 keycount 출력 제약 패치를 한 번
-적용한다. 이미 적용된 상태에서는 그대로 성공한다.
+먼저 프로젝트가 고정한 Mapperatorinator commit에 **패치 스택 39개**를 적용한다.
+이미 적용된 상태에서는 그대로 성공한다. 패치가 추가될 때마다 다시 실행해야 한다.
 
 ```powershell
 Set-Location apps\chart-worker
 .\.venv\Scripts\python.exe scripts\apply_mapperatorinator_patch.py C:\Users\PC\mapperatorinator
 ```
 
-worker는 실행 전에 commit과 패치 상태를 확인한다. 다른 commit, 일부만 적용된 패치,
-미적용 상태에서는 추론을 시작하지 않는다. 이 제약은 4K·6K·7K에서 요청 범위 밖
-`MANIA_COLUMN` 토큰만 차단하며 timing, TAP/HOLD, descriptor는 변경하지 않는다.
+스택은 `REQUIRED_PATCHES`에 순서대로 정의돼 있고, 계열은 keycount, output-safety,
+event-times + resnap, origin/sidecar, hold-state, grammar v2~v25, v26 tail repair,
+v27 resident runtime, v28 temporal horizon, v29 decoder termination, v30 generation telemetry,
+v31 resnap integer milliseconds, v32 canonical sidecar, v33 terminal budget, v34 group fragment
+defense다. v25는 HOLD 상태 계산 모드
+(`full_scan` / `incremental_verify` / `incremental`)를 추가하고, v26은 checkpoint 기반
+suffix repair, v27은 offline model registry·곡 단위 상주·encoder cache를 추가한다.
+v28은 시간·토큰 도달 가능성을 제한하고, v29는 compiled hard-cap 무-EOS를 typed
+failure로 바꾸며 sampling bucket 재시작의 RNG를 복원하고 마지막 token에서 EOS만
+허용한다. v30은 opt-in `.generation.json`에 output/audio/reference hash와
+encoder/cache/decode/HOLD/tail/runtime 통계를 기록한다. 기본값은 꺼져 있다.
+v31은 lane-order 시각을 정수 ms로 고정하고, v32는 최종 직렬화 결과에 sidecar를
+다시 결속한다. v33은 마지막 token의 EOS 예산을 예약하며, v34는 소유할 완성 group이
+없는 trailing fragment를 생짜 `IndexError` 대신 명시적 실패로 거부한다.
+
+worker는 실행 전에 commit과 **스택 전체**의 적용 상태를 확인한다. 검증은
+`HEAD + 전체 패치`를 임시 디렉터리에 재구성해 워크트리와 바이트 비교하는 방식이라,
+다른 commit·일부만 적용·미적용 어느 쪽이든 `MapperatorinatorPatchError`로 즉시
+멈춘다. upstream 체크아웃에 추적되지 않는 잔여 파일이 있어도 실패할 수 있다.
 
 PowerShell의 현재 프로세스에만 Mapperatorinator와 공유 FFmpeg 경로를 설정한다.
 환경에 맞게 실제 경로를 바꾼다.
@@ -122,36 +146,51 @@ uv run --project apps/chart-worker chart-worker bench `
 
 주요 산출물은 다음과 같다.
 
-- `raw/<key>k-<difficulty>.osu`: `PASS` 또는 발행 가능한 `REVIEW`인 Mapperatorinator 원본
+- `raw/<key>k-<difficulty>.osu`: admitted 모델 후보 또는 hard-safe
+  `RAW_UNVERIFIED`/`SAFE_FALLBACK` 플레이테스트 후보
 - `raw/work/<variant>/attempt-1..3/`: 시도별 진단 작업 위치. 생성기가 만든 경우 원문과 Hydra 로그를 보존
 - `charts/*.json`: 전체 실행이 공개 가능할 때 원본 노트와 timing을 보존한 chart-v1
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
 - `audio/timing-reference.osu`: 12개 MAP이 공유하는 SHA-256 고정 timing 기준
 - `generation-report.json`: 성공 또는 보류 결과, 품질 프로필과 후보 선택 근거
+- `diagnostic-raw-fallback/<variant>/`: 정상 발행 후보가 없는 변형의 hard-safe Mapperatorinator 원본. `PLAYTEST_ONLY`, `productionEligible=false`이며 정상 export 입력이 아님
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
-- `playtest-run-v1.json`: 프론트엔드가 읽는 실행 폴더 manifest
+- `playtest-run-v2.json`: 프론트엔드가 읽는 실행 폴더 manifest
 
-성공한 `generation-report.json`은 `qualityGateVersion=quality-gate-v1`,
-`publishable=true`, `status=PASS`, timing authority의 tempo metrics·review와 채보별
+성공한 `generation-report.json`은 `qualityGateVersion=quality-gate-v4-beat-aware-coverage`,
+`status=PASS`, timing authority의 tempo metrics·review와 채보별
 acceptance status·reason·축별 결정·note-grid 근거를 기록한다. 각 채보에는 선택 seed,
 실제 생성 횟수, 후보 수, 측정 난이도와 15초 구간별 HOLD·레인·반복 프로필을 남기고,
 키 모드별 `difficultyOrder`에는 네 라벨의 상대 난이도와 역전·동률 쌍을 남긴다.
-채보별 `REVIEW`가 있어도 성공 보고서는 `publishable=true`, `status=PASS`를 유지하고
-`timingReviewRequired=true`와 acceptance reason을 기록한다. 재시도 소진이나 구조 실패로
-보류된 실행은 `publishable=false`, `status=EXHAUSTED` 또는 `FAILED`, error code/context,
+채보별 `REVIEW`가 있어도 실행 자체는 완료될 수 있지만, raw/safe fallback이 하나라도
+있으면 `distributionTier=PLAYTEST_ONLY`, `productionEligible=false`를 채보별로 남기고
+전체 publication decision도 production 허용으로 승격하지 않는다.
+
+발행 여부는 boolean이 아니다. `PUBLICATION_POLICY_V2`가 `ALLOW_PRODUCTION` /
+`PLAYTEST_ONLY` / `REJECTED` 중 하나를 사유 코드와 함께 내고, 직교하는 `OutcomeStatus`가
+`execution` · `completeness` · `quality` · `publishable_strict`를 따로 기록한다.
+품질이 `REVIEW`면 12개가 다 있어도 `PLAYTEST_ONLY`다.
+
+오디오 또는 canonical timing authority 자체가 실패한 실행은 `REJECTED`,
+`status=EXHAUSTED` 또는 `FAILED`, error code/context,
 `canonicalAudioSha256`와 timing authority identity를 기록한다. authority 승격 전 구조 실패는
 `failureStage=TIMING`과 null authority identity를 기록한다. 생성기가 후보 원문이나
 로그를 만든 경우에는 진단 작업 위치인 `raw/work/<variant>/attempt-*`에 보존한다.
-작업 산출물의 존재 여부와 관계없이 거절된 후보는 안정된 `raw/<variant>.osu`에 도달하지
-않는다. 보류된 실행은 export하지 않으며 `charts/`와 `playtest-run-v1.json`도 만들지 않는다.
+작업 산출물의 존재 여부와 관계없이 hard invariant를 통과하지 못한 모델 후보 자체는
+안정된 `raw/<variant>.osu`에 도달하지 않는다. timing authority가 유효하면 그 슬롯은
+hard-safe raw 또는 결정론적 safe fallback으로 채우고 명시적으로 PLAYTEST_ONLY로
+export한다. authority 전제가 깨진 실행은 export하지 않는다.
 
 onset과 활성 구간은 canonical `audio/game.flac`의 `OnsetAnalysis`에서 곡당 한 번 계산하고
 12개 채보가 공유한다. nearest-onset ±20ms·±50ms 비율, 15초 구간, coverage metric도
 후보 acceptance에 한 번 기록하며 보고서는 이를 다시 계산하지 않고 직렬화한다. 이 비율은
 자동 proxy 진단이다. 예를 들어 70%는 사람이 라벨링한 Mapperatorinator 정확도가 아니다.
-활성 오디오 근거가 충분한 8초 이상 공백은 `ACTIVE_*_GAP`으로 `RETRY_MAP`이 된다.
-조용하거나 활성도가 낮은 공백은 `QUIET_*_GAP`, onset·구간·grid 근거가 약한 경우는
-그에 해당하는 reason과 함께 `REVIEW`가 되며 새 seed를 소비하지 않는다. 이 자동 게이트는
+coverage는 고정 8초만으로 거부하지 않는다. 로컬 timing의 누적 beat 수, 최소 4초 phrase,
+곡 내부 상대 spectral-flux 강도, 난이도별 반복 attack 수와 HOLD 시간 점유율을 함께 기록한다.
+반복 attack 근거가 충분하면 `ATTACK_REQUIRED_*_GAP`으로 `RETRY_MAP`, 지속음이 HOLD로
+대표되거나 증거가 부족하면 각각 `SUSTAIN_REPRESENTABLE_*` 또는
+`INSUFFICIENT_COVERAGE_EVIDENCE_*`와 함께 `REVIEW`가 된다. 증거 부족은 품질을 hard reject하지
+않지만 timing/recovery 손상을 PASS로 지우지도 않는다. 이 자동 게이트는
 경고를 보존한 채 발행할 수 있지만 사람의 음악적 정답이나 주관적 품질을 보증하지 않고
 노트를 수정하지 않는다. HOLD는
 난이도별 10/15/20/25% 같은 고정 목표를 적용하지 않는다. 대신 같은 곡·채보의 활성 15초
@@ -162,15 +201,29 @@ onset과 활성 구간은 canonical `audio/game.flac`의 `OnsetAnalysis`에서 �
 원본 osu!mania 키 수, X 좌표와 변환 레인 범위, `0 <= 시작 < 음원 길이`와
 `HOLD 끝 <= 음원 길이`, 빈 채보, 퇴화 HOLD, 같은 레인·시각 중복, 겹친 HOLD,
 정렬되고 중복 없는 양의 유한 BPM timing point를 검사한다. 실패 조합은
-명확한 MAP 결함일 때만 최대 두 번 재시도하고 세 출력이 모두 잘못되면 실행을
-`EXHAUSTED`로 보류한다. 정상 출력은 12개 조합을 각 한 번, 총 12회 추론한다. 프로필
-검사는 모델 추론 없이 동작하고, 추가 추론은 구조·타이밍 결함이 있는 조합 또는 엄격한
-난이도 역전에 포함된 라벨에만 발생하며 라벨별 총 세 번으로 제한된다.
+명확한 MAP 결함일 때만 복구를 검토한다. 이미 hard-safe인 품질 거절 후보는 같은 슬롯의
+전체 길이 seed를 다시 생성하지 않고 PLAYTEST_ONLY raw로 보존한다. 추가 추론은 곡 길이
+1회분의 work-ms 안에서 partial 범위를 우선하고, full retry는 곡 전체 길이만큼 소비한다.
+모델 출력이 모두 hard-invalid이면 모델을 더 부르지 않고 canonical timing/onset 기반
+SAFE_FALLBACK으로 슬롯을 채운다.
 
 canonical `game.flac`의 SHA-256은 onset 분석 전과 외부 Mapperatorinator 생성 직후
 다시 계산한다. 중간에 오디오가 바뀌면 export·manifest 작성 전에 실패한다. 채보 전체
 timing 진단이 `INSUFFICIENT`여도 공개 가능한 `PASS`가 아니라 `REVIEW`로 기록하고
 경고와 함께 export한다.
+
+HOLD 상태 검사는 기본 `incremental`이다. `full_scan`과 `incremental_verify`는 명시적
+진단 옵션으로만 남아 있으며 일반 생성 기본값으로 사용하지 않는다. v28 temporal horizon은
+마지막 생성 창의 유효 종료 시각과 남은 토큰으로 닫을 수 없는 새 HOLD를 미리 차단하지만,
+checkpoint tail repair와 최종 canonical validator는 계속 실행한다. v29는 hard cap에서
+EOS 없는 출력을 성공으로 반환하지 않고 `TOKEN_BUDGET_EXHAUSTED`로 분류한다.
+
+2026-08-16 bounded 실측에서는 47.4897초/20-window/4K EASY 하나를 동일 seed로
+one-shot, resident first, resident cache hit 순서로 실행했다. wall은 각각
+15.3952/6.5417/4.7340초였고 resident startup은 별도 8.3330초였다. 세 `.osu` bytes는
+동일했고 cache hit의 encoder precompute는 0.0188초였다. 이 결과는 상주/cache 활성화의
+짧은 단일 표본일 뿐, 전체 곡 33분이나 장르 일반화를 증명하지 않는다. 원본 증거는
+`.data/test-evidence/adaptive-v30-20window-20260816/`에 있다.
 
 ## GPU 없는 구조 검사
 
@@ -228,7 +281,7 @@ NORMAL 요청이어도 6K·7K 측정 결과는 HARD이므로 키 수별 requeste
 회귀는 약 17분 22초가 걸렸다. 4K EASY·HARD와 7K EXPERT는 두 번째 시도,
 6K EXPERT는 세 번째 시도에 통과했고 나머지는 첫 시도에 통과했다. 전체 ±50ms
 precision은 62.35~94.55%였다. 이 수치는 상대 RMS 분류를 추가하기 전 raw onset
-공백 판정으로 얻은 과거 기준이다. 당시와 달리 현재 `quality-gate-v1`은 조용하거나
+공백 판정으로 얻은 과거 기준이다. 당시와 달리 이후 quality gate는 조용하거나
 활성도가 낮은 공백도 `REVIEW` 근거로 보존한다. 상세 표와 최신 재진단 결과는
 `../../docs/현재 구현 상태와 운영 가이드.md`에 기록한다.
 
@@ -260,9 +313,17 @@ Beat This, Demucs와 키음 stem은 현재 패키지의 생성 의존성이 아�
 /songs/<songId>/runs/<runId>/audio/game.flac
 ```
 
-공유 Volume의 `/data/game.flac` 같은 한 경로에 여러 요청이 쓰면 안 된다. 이 계약은
-문서와 로컬 산출물 구조에 반영됐지만 Modal 실행·object storage 업로드 어댑터는
-아직 구현하지 않았다.
+공유 Volume의 `/data/game.flac` 같은 한 경로에 여러 요청이 쓰면 안 된다. 현재
+`modal_app.py`는 `/jobs/runs/<sha256(requestId)>` 고유 run 디렉터리, L4/4 CPU/16GiB,
+min 0/max 1, concurrency 1,
+scaledown 60초, incremental-only 상주 세션, 성공 뒤 jobs Volume commit, `.remote()` 전
+로컬 $24 예약 장부까지 소스 계약으로 구현한다. object storage 업로드는 아직 없다.
+
+이 파일이 존재한다고 배포 준비가 끝난 것은 아니다. Modal SDK lock·immutable OCI build·
+model Volume manifest·fresh-container checkpoint 내구성·실제 CUDA load/시간/비용은 검증하지
+않았다. 같은 request ID의 검증된 성공 marker replay와 nonempty/no-marker 복구도 아직 없다.
+`retries=0`도 container crash 재스케줄을 완전히 막지 않으므로, 중단 입력은
+`UNKNOWN_COMPLETION`으로 처리하고 실제 `modal run`/`deploy`는 별도 승인 전 금지한다.
 
 향후 Modal 이미지에서도 모델 추론 전에 같은 적용기를 이미지 구성 단계에서 실행한다.
 이미지의 실제 설치 경로에 맞추되 의미는 다음과 같다.
