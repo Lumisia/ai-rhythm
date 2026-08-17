@@ -107,6 +107,35 @@ def test_repeated_strong_attacks_without_hold_require_attack_coverage():
     assert result.hold_occupancy_ratio == 0.0
 
 
+def test_strong_audio_attacks_are_not_vetoed_by_a_corrupted_tempo_integral():
+    """Independent audio evidence must survive a pathological timing candidate.
+
+    A very low local BPM can make a long, clearly active phrase integrate to
+    fewer than 16 beats.  That is evidence against the timing authority, not
+    evidence that the audible attacks disappeared.
+    """
+
+    analysis = _analysis(
+        duration_ms=40_000,
+        onset_strengths={time_ms: 0.9 for time_ms in range(5_000, 31_000, 1_000)},
+    )
+
+    result = classify_coverage_interval(
+        [],
+        analysis,
+        _tempo((0, 4.3)),
+        start_ms=4_000,
+        end_ms=32_000,
+        difficulty="HARD",
+    )
+
+    assert result.beat_count is not None
+    assert result.beat_count < 16.0
+    assert result.active_frame_ratio >= 0.35
+    assert result.strong_attack_count >= 4
+    assert result.kind is CoverageKind.ATTACK_REQUIRED
+
+
 def test_missing_tempo_or_activity_is_insufficient_not_hard_failure():
     with_activity = _analysis(
         duration_ms=30_000,

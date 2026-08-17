@@ -20,6 +20,51 @@
       "title": "AudioFileRef",
       "type": "object"
     },
+    "CoverageSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "firstNoteTimeMs": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Firstnotetimems"
+        },
+        "maxGapMs": {
+          "minimum": 0,
+          "title": "Maxgapms",
+          "type": "integer"
+        },
+        "attackRequiredGapCount": {
+          "minimum": 0,
+          "title": "Attackrequiredgapcount",
+          "type": "integer"
+        },
+        "attackRequiredGapTotalMs": {
+          "minimum": 0,
+          "title": "Attackrequiredgaptotalms",
+          "type": "integer"
+        },
+        "repairedGapCount": {
+          "minimum": 0,
+          "title": "Repairedgapcount",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "firstNoteTimeMs",
+        "maxGapMs",
+        "attackRequiredGapCount",
+        "attackRequiredGapTotalMs",
+        "repairedGapCount"
+      ],
+      "title": "CoverageSummary",
+      "type": "object"
+    },
     "MissingChartRef": {
       "additionalProperties": false,
       "description": "이번 실행에서 발행하지 못한 조합. 프론트가 목록에서 빠지는 근거다.",
@@ -250,6 +295,7 @@
             "PARTIAL_REMAP",
             "INTRO_RECOVERY",
             "INTRO_ALIGNED",
+            "COVERAGE_REPAIR",
             "RAW_UNVERIFIED",
             "SAFE_FALLBACK"
           ],
@@ -269,6 +315,34 @@
           ],
           "title": "Distributiontier",
           "type": "string"
+        },
+        "playabilityTier": {
+          "anyOf": [
+            {
+              "enum": [
+                "MODEL_PLAYABLE",
+                "RECOVERY_PLAYABLE",
+                "DIAGNOSTIC_ONLY"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Playabilitytier"
+        },
+        "coverageSummary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CoverageSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [

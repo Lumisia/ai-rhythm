@@ -1434,6 +1434,116 @@ def test_generation_report_records_raw_unverified_provenance(tmp_path: Path):
     assert report["status"] == "REVIEW"
     assert report["publishable"] is False
     assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
+    manifest = PlaytestRunManifestV2.model_validate_json(
+        (tmp_path / "run" / "playtest-run-v2.json").read_text(encoding="utf-8")
+    )
+    assert manifest.charts[0].playability_tier == "DIAGNOSTIC_ONLY"
+    assert manifest.charts[0].coverage_summary is not None
+
+
+def test_manifest_marks_coverage_repair_as_recovery_playable(tmp_path: Path):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        first, *remaining = outcome.variants
+        repaired = replace(
+            first,
+            provenance="COVERAGE_REPAIR",
+            recovery_reason="ACTIVE_COVERAGE_GAP_REPAIRED",
+            coverage_repair_gap_count=2,
+        )
+        return replace(outcome, variants=(repaired, *remaining))
+
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    manifest = PlaytestRunManifestV2.model_validate_json(
+        result.manifest_path.read_text(encoding="utf-8")
+    )
+    first = manifest.charts[0]
+    assert first.provenance == "COVERAGE_REPAIR"
+    assert first.production_eligible is False
+    assert first.distribution_tier == "PLAYTEST_ONLY"
+    assert first.playability_tier == "RECOVERY_PLAYABLE"
+    assert first.coverage_summary is not None
+    assert first.coverage_summary.repaired_gap_count == 2
+
+
+def test_manifest_does_not_call_a_still_rejected_coverage_repair_playable(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        first, *remaining = outcome.variants
+        rejected = replace(
+            first.acceptance,
+            action=GateAction.RETRY_MAP,
+            decisions=tuple(
+                replace(
+                    decision,
+                    action=GateAction.RETRY_MAP,
+                    reasons=("FIXTURE_TIMING_ALIGNMENT_RETRY",),
+                )
+                if decision.axis is GateAxis.TIMING_ALIGNMENT
+                else decision
+                for decision in first.acceptance.decisions
+            ),
+        )
+        repaired = replace(
+            first,
+            acceptance=rejected,
+            provenance="COVERAGE_REPAIR",
+            recovery_reason="ACTIVE_COVERAGE_GAP_REPAIRED",
+            coverage_repair_gap_count=2,
+        )
+        return replace(outcome, variants=(repaired, *remaining))
+
+    result = run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    manifest = PlaytestRunManifestV2.model_validate_json(
+        result.manifest_path.read_text(encoding="utf-8")
+    )
+    assert manifest.charts[0].playability_tier == "DIAGNOSTIC_ONLY"
 
 
 def test_generation_report_records_missing_charts_as_partial(tmp_path: Path):

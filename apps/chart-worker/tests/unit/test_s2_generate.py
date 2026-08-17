@@ -128,6 +128,28 @@ def _analysis() -> OnsetAnalysis:
     )
 
 
+def _active_analysis(duration_ms: int, *, onset_step_ms: int = 500) -> OnsetAnalysis:
+    frame_ms = 100
+    frame_count = duration_ms // frame_ms + 1
+    rows = tuple(range(250, duration_ms, onset_step_ms))
+    strength = np.zeros(frame_count)
+    for time_ms in rows:
+        strength[round(time_ms / frame_ms)] = 1.0
+    return OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.vstack((strength, strength, strength)),
+        onset_ms=rows,
+        activity=AudioActivity(
+            frame_ms=frame_ms,
+            rms_db=np.full(frame_count, -12.0),
+            floor_db=-40.0,
+            active_onset_ms=rows,
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("duration_ms", "bpm_events"),
     [
@@ -305,6 +327,51 @@ def _coverage_retry_acceptance(authority: SongTimingAuthority):
         decisions=decisions,
         timing=replace(accepted.timing, coverage_gaps=(gap,)),
     )
+
+
+def test_raw_playtest_score_prefers_the_shorter_active_gap_when_counts_match(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    base = _coverage_retry_acceptance(authority)
+
+    def candidate(*, seed: int, end_ms: int):
+        gap = replace(base.timing.coverage_gaps[0], start_ms=0, end_ms=end_ms)
+        acceptance = replace(
+            base,
+            timing=replace(base.timing, coverage_gaps=(gap,)),
+        )
+        request = GenerationRequest(
+            audio_path=prepared.normalized.path,
+            timing_reference_path=authority.reference_path,
+            key_mode=4,
+            difficulty="EASY",
+            seed=seed,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+        return s2_generate._Candidate(
+            request=request,
+            generated=GeneratedChart(
+                notes=[NoteEvent(0, 0)],
+                key_mode=4,
+                osu_text="",
+                generator_name="raw-score-fixture",
+                seed=seed,
+                bpm_events=authority.bpm_events,
+            ),
+            acceptance=acceptance,
+            osu_text="",
+            workdir=tmp_path / f"raw-{seed}",
+            attempt=1,
+            seed=seed,
+            provenance="RAW_UNVERIFIED",
+        )
+
+    longer = candidate(seed=0, end_ms=166_000)
+    shorter = candidate(seed=1, end_ms=8_000)
+
+    assert min((longer, shorter), key=s2_generate._raw_playtest_score) is shorter
 
 
 def _acceptance_for_difficulty(acceptance, difficulty: str):
@@ -3198,13 +3265,13 @@ def test_partial_tail_exhaustion_blocks_only_that_variant(
     assert outcome.additional_inference_calls == 1
     assert outcome.missing == ()
     assert outcome.diagnostic_raw_candidates == ()
-    raw = next(
+    selected = next(
         variant
         for variant in outcome.variants
         if (variant.key_mode, variant.difficulty) == (4, "EASY")
     )
-    assert raw.provenance == "RAW_UNVERIFIED"
-    assert json.loads(raw.attempt_errors[-1]) == {
+    assert selected.provenance == "SAFE_FALLBACK"
+    assert json.loads(selected.attempt_errors[-1]) == {
         "code": "MANIA_TAIL_REPAIR_EXHAUSTED",
         "context": tail_context,
         "message": "MANIA_TAIL_REPAIR_EXHAUSTED: fixture partial tail exhausted",
@@ -3219,7 +3286,7 @@ def test_partial_tail_exhaustion_blocks_only_that_variant(
         "totalAttempts": 2,
         "qualityAttempts": 1,
         "crashAttempts": 0,
-    } in raw.attempt_evidence
+    } in selected.attempt_evidence
     assert exhausted_context["totalAttempts"] == 2
     assert exhausted_context["seeds"] == [0, 36]
     assert exhausted_context["partialAttempts"] == [2]
@@ -3387,7 +3454,168 @@ def test_unanimous_audio_backed_family_overrides_conflicting_early_anchor(
     assert {variant.generated.notes[0].time_ms for variant in outcome.variants} == {500}
 
 
-def test_rejected_partial_remap_promotes_structurally_safe_raw_for_playtest(
+def test_coverage_repair_outranks_gapped_raw_without_another_full_model_call(
+    monkeypatch, tmp_path: Path
+):
+    duration_ms = 40_000
+    prepared = _prepared(tmp_path, duration_ms=duration_ms)
+    authority = _authority(prepared, tmp_path)
+    analysis = _active_analysis(duration_ms)
+    accepted = _pass_acceptance(authority)
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.key_mode == 4 and requested_difficulty == "EASY":
+            return evaluate_chart_candidate(
+                generated,
+                authority,
+                analysis,
+                requested_key_mode=4,
+                requested_difficulty="EASY",
+                duration_ms=duration_ms,
+            )
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    generator = RecordingGenerator()
+
+    outcome = run_generation(
+        prepared,
+        authority,
+        analysis,
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    selected = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert selected.provenance == "COVERAGE_REPAIR"
+    assert selected.coverage_repair_gap_count > 0
+    assert (
+        selected.acceptance.decision(GateAxis.COVERAGE).action
+        is not GateAction.RETRY_MAP
+    )
+    assert len(generator.map_calls) == 12
+    assert all(not request.add_to_beatmap for request in generator.map_calls)
+
+
+def test_zero_inference_coverage_repair_precedes_a_viable_partial_model_call(
+    monkeypatch, tmp_path: Path
+):
+    """A validated local repair must avoid the slower partial decoder path."""
+
+    duration_ms = 60_000
+    prepared = _prepared(tmp_path, duration_ms=duration_ms)
+    authority = _authority(prepared, tmp_path)
+    analysis = _active_analysis(duration_ms)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.generator_name.startswith("coverage-repair-v1:"):
+            return _acceptance_for_difficulty(accepted, requested_difficulty)
+        if requested_difficulty == "EASY" and generated.key_mode == 4:
+            return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class PartialMustNotRun(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            if request.add_to_beatmap:
+                raise AssertionError("validated CPU coverage repair must run first")
+            return super().generate_map(request, workdir)
+
+    generator = PartialMustNotRun()
+    outcome = run_generation(
+        prepared,
+        authority,
+        analysis,
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    selected = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert len(generator.map_calls) == 12
+    assert outcome.additional_inference_calls == 0
+    assert selected.provenance == "COVERAGE_REPAIR"
+    assert selected.coverage_repair_gap_count == 1
+
+
+def test_still_rejected_coverage_repair_does_not_suppress_partial_model_call(
+    monkeypatch, tmp_path: Path
+):
+    duration_ms = 60_000
+    prepared = _prepared(tmp_path, duration_ms=duration_ms)
+    authority = _authority(prepared, tmp_path)
+    analysis = _active_analysis(duration_ms)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+    alignment_retry = replace(
+        accepted,
+        action=GateAction.RETRY_MAP,
+        decisions=tuple(
+            replace(
+                decision,
+                action=GateAction.RETRY_MAP,
+                reasons=("FIXTURE_TIMING_ALIGNMENT_RETRY",),
+            )
+            if decision.axis is GateAxis.TIMING_ALIGNMENT
+            else decision
+            for decision in accepted.decisions
+        ),
+    )
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.generator_name == "partial-repair":
+            return _acceptance_for_difficulty(accepted, requested_difficulty)
+        if generated.generator_name.startswith("coverage-repair-v1:"):
+            return _acceptance_for_difficulty(alignment_retry, requested_difficulty)
+        if requested_difficulty == "EASY" and generated.key_mode == 4:
+            return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+
+    class PartialRepairGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if request.add_to_beatmap:
+                return replace(generated, generator_name="partial-repair")
+            return generated
+
+    generator = PartialRepairGenerator()
+    outcome = run_generation(
+        prepared,
+        authority,
+        analysis,
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    selected = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert len(generator.map_calls) == 13
+    assert outcome.additional_inference_calls == 1
+    assert selected.provenance == "PARTIAL_REMAP"
+
+
+def test_rejected_partial_remap_prefers_coverage_safe_fallback_over_gapped_raw(
     monkeypatch, tmp_path: Path
 ):
     prepared = _prepared(tmp_path, duration_ms=60_000)
@@ -3417,20 +3645,77 @@ def test_rejected_partial_remap_promotes_structurally_safe_raw_for_playtest(
 
     assert len(generator.map_calls) == 13
     assert sum(request.add_to_beatmap for request in generator.map_calls) == 1
-    raw = next(
+    selected = next(
         variant
         for variant in outcome.variants
         if (variant.key_mode, variant.difficulty) == (4, "EASY")
     )
     assert len(outcome.variants) == 12
     assert outcome.missing == ()
-    assert raw.provenance == "RAW_UNVERIFIED"
-    assert raw.recovery_reason == "QUALITY_GATE_REJECTED"
-    assert raw.acceptance.action is GateAction.RETRY_MAP
-    assert raw.acceptance.decision(GateAxis.STRUCTURE).action is GateAction.PASS
-    assert raw.acceptance.decision(GateAxis.TIMING_IDENTITY).action is GateAction.PASS
-    assert raw.acceptance.decision(GateAxis.SONG_BOUNDS).action is GateAction.PASS
+    assert selected.provenance == "SAFE_FALLBACK"
+    assert selected.recovery_reason == "COVERAGE_REPAIR_UNAVAILABLE"
+    assert selected.acceptance.action is not GateAction.RETRY_MAP
+    assert selected.acceptance.decision(GateAxis.STRUCTURE).action is GateAction.PASS
+    assert selected.acceptance.decision(GateAxis.TIMING_IDENTITY).action is GateAction.PASS
+    assert selected.acceptance.decision(GateAxis.SONG_BOUNDS).action is GateAction.PASS
     assert outcome.diagnostic_raw_candidates == ()
+
+
+def test_soft_coverage_review_model_repair_outranks_pass_safe_fallback(
+    monkeypatch, tmp_path: Path
+):
+    """A soft coverage label must not discard the model's rhythm and difficulty."""
+
+    prepared = _prepared(tmp_path, duration_ms=60_000)
+    authority = _authority(prepared, tmp_path)
+    accepted = _pass_acceptance(authority)
+    coverage_retry = _coverage_retry_acceptance(authority)
+    soft_coverage_review = replace(
+        accepted,
+        action=GateAction.REVIEW,
+        decisions=tuple(
+            replace(
+                decision,
+                action=GateAction.REVIEW,
+                reasons=("SUSTAIN_REPRESENTABLE_MIDDLE_GAP",),
+            )
+            if decision.axis is GateAxis.COVERAGE
+            else decision
+            for decision in accepted.decisions
+        ),
+    )
+
+    def evaluate(generated, *args, requested_difficulty, **kwargs):
+        del args, kwargs
+        if generated.generator_name == "adaptive-recovery-v1":
+            return _acceptance_for_difficulty(accepted, requested_difficulty)
+        if generated.generator_name.startswith("coverage-repair-v1:"):
+            return _acceptance_for_difficulty(
+                soft_coverage_review, requested_difficulty
+            )
+        if requested_difficulty == "EASY" and generated.key_mode == 4:
+            return _acceptance_for_difficulty(
+                coverage_retry, requested_difficulty
+            )
+        return _acceptance_for_difficulty(accepted, requested_difficulty)
+
+    monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    outcome = run_generation(
+        prepared,
+        authority,
+        _active_analysis(60_000),
+        tmp_path,
+        generator=RecordingGenerator(),
+        seed=0,
+    )
+
+    selected = next(
+        variant
+        for variant in outcome.variants
+        if (variant.key_mode, variant.difficulty) == (4, "EASY")
+    )
+    assert selected.provenance == "COVERAGE_REPAIR"
+    assert selected.acceptance.decision(GateAxis.COVERAGE).action is GateAction.REVIEW
 
 
 def test_normal_generation_marks_every_variant_primary(tmp_path: Path):

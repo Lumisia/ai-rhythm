@@ -207,6 +207,9 @@ def assemble_publication(
                         difficulty_order=order_review,
                         provenance=candidate.provenance,
                         recovery_reason=candidate.recovery_reason,
+                        coverage_repair_gap_count=(
+                            candidate.coverage_repair_gap_count
+                        ),
                     )
                 )
             for difficulty in DIFFICULTIES:

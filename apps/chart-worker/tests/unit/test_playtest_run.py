@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from chart_worker.schema.export import export_schemas, schemas
 from chart_worker.schema.playtest_run import (
     AudioFileRef,
+    CoverageSummary,
     MissingChartRef,
     OutcomeStatusSnapshot,
     PlaytestRunManifest,
@@ -188,6 +189,56 @@ def test_v2_chart_ref_requires_playtest_tier_for_safe_fallback():
             provenance="SAFE_FALLBACK",
             production_eligible=True,
             distribution_tier="PRODUCTION_CANDIDATE",
+        )
+
+
+def test_v2_chart_ref_carries_honest_coverage_repair_playability():
+    summary = CoverageSummary(
+        first_note_time_ms=250,
+        max_gap_ms=2_000,
+        attack_required_gap_count=0,
+        attack_required_gap_total_ms=0,
+        repaired_gap_count=2,
+    )
+    repaired = RunChartRefV2(
+        key_mode=4,
+        difficulty="EASY",
+        path="charts/4k-easy.chart.json",
+        sha256=SHA,
+        provenance="COVERAGE_REPAIR",
+        production_eligible=False,
+        distribution_tier="PLAYTEST_ONLY",
+        playability_tier="RECOVERY_PLAYABLE",
+        coverage_summary=summary,
+    )
+
+    assert repaired.coverage_summary == summary
+    assert repaired.playability_tier == "RECOVERY_PLAYABLE"
+    with pytest.raises(ValidationError, match="RAW_UNVERIFIED"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="EASY",
+            path="charts/4k-easy.chart.json",
+            sha256=SHA,
+            provenance="RAW_UNVERIFIED",
+            production_eligible=False,
+            distribution_tier="PLAYTEST_ONLY",
+            playability_tier="MODEL_PLAYABLE",
+            coverage_summary=summary,
+        )
+
+
+def test_v2_chart_ref_requires_summary_when_new_playability_tier_is_present():
+    with pytest.raises(ValidationError, match="coverage summary"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="EASY",
+            path="charts/4k-easy.chart.json",
+            sha256=SHA,
+            provenance="SAFE_FALLBACK",
+            production_eligible=False,
+            distribution_tier="PLAYTEST_ONLY",
+            playability_tier="RECOVERY_PLAYABLE",
         )
 
 

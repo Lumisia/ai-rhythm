@@ -51,6 +51,14 @@ class RunChartRef(AudioFileRef):
     difficulty: Difficulty
 
 
+class CoverageSummary(CamelModel):
+    first_note_time_ms: int | None
+    max_gap_ms: int = Field(ge=0)
+    attack_required_gap_count: int = Field(ge=0)
+    attack_required_gap_total_ms: int = Field(ge=0)
+    repaired_gap_count: int = Field(ge=0)
+
+
 class RunChartRefV2(RunChartRef):
     """A chart reference whose trust tier cannot be hidden from consumers."""
 
@@ -60,6 +68,7 @@ class RunChartRefV2(RunChartRef):
         "PARTIAL_REMAP",
         "INTRO_RECOVERY",
         "INTRO_ALIGNED",
+        "COVERAGE_REPAIR",
         "RAW_UNVERIFIED",
         "SAFE_FALLBACK",
     ] = "PRIMARY"
@@ -67,10 +76,20 @@ class RunChartRefV2(RunChartRef):
     distribution_tier: Literal["PRODUCTION_CANDIDATE", "PLAYTEST_ONLY"] = (
         "PRODUCTION_CANDIDATE"
     )
+    playability_tier: Literal[
+        "MODEL_PLAYABLE",
+        "RECOVERY_PLAYABLE",
+        "DIAGNOSTIC_ONLY",
+    ] | None = None
+    coverage_summary: CoverageSummary | None = None
 
     @model_validator(mode="after")
     def _check_distribution_tier(self) -> Self:
-        is_fallback = self.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+        is_fallback = self.provenance in {
+            "COVERAGE_REPAIR",
+            "RAW_UNVERIFIED",
+            "SAFE_FALLBACK",
+        }
         if is_fallback and (
             self.production_eligible or self.distribution_tier != "PLAYTEST_ONLY"
         ):
@@ -84,6 +103,24 @@ class RunChartRefV2(RunChartRef):
             raise ValueError(
                 "model-backed provenance must remain a production candidate"
             )
+        if (self.playability_tier is None) != (self.coverage_summary is None):
+            raise ValueError(
+                "playability tier and coverage summary must be present together"
+            )
+        if self.playability_tier is None:
+            return self
+        if not is_fallback and self.playability_tier != "MODEL_PLAYABLE":
+            raise ValueError(
+                "model-backed provenance must be MODEL_PLAYABLE"
+            )
+        if self.provenance == "RAW_UNVERIFIED" and (
+            self.playability_tier != "DIAGNOSTIC_ONLY"
+        ):
+            raise ValueError("RAW_UNVERIFIED must be DIAGNOSTIC_ONLY")
+        if self.provenance in {"COVERAGE_REPAIR", "SAFE_FALLBACK"} and (
+            self.playability_tier == "MODEL_PLAYABLE"
+        ):
+            raise ValueError("recovery provenance cannot be MODEL_PLAYABLE")
         return self
 
 

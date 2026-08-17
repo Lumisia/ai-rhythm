@@ -78,7 +78,9 @@ def onsets(*, sustained: bool = True) -> OnsetAnalysis:
         frame_ms=frame_ms,
         rms_db=np.full(frame_count, -12.0 if sustained else -80.0),
         floor_db=-40.0,
-        active_onset_ms=onset_ms if sustained else (),
+        # Quiet mixes may still contain locally prominent attacks.  Keep those
+        # attacks available while the low RMS prevents sustain-only HOLDs.
+        active_onset_ms=onset_ms,
     )
     return OnsetAnalysis(
         sample_rate_hz=1_000,
@@ -111,6 +113,69 @@ def corpus_onsets(duration_ms: int, *, onset_step_ms: int) -> OnsetAnalysis:
         onset_ms=onset_ms,
         activity=activity,
     )
+
+
+def test_recovery_stops_rows_when_audio_evidence_ends_before_file_duration():
+    active_end_ms = 12_000
+    frame_ms = 100
+    frame_count = DURATION_MS // frame_ms
+    onset_ms = tuple(range(0, active_end_ms, 250))
+    strength = np.zeros(frame_count, dtype=np.float64)
+    for time_ms in onset_ms:
+        strength[round(time_ms / frame_ms)] = 1.0
+    rms_db = np.full(frame_count, -80.0)
+    rms_db[: active_end_ms // frame_ms] = -12.0
+    analysis = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.vstack((strength, strength, strength)),
+        onset_ms=onset_ms,
+        activity=AudioActivity(
+            frame_ms=frame_ms,
+            rms_db=rms_db,
+            floor_db=-40.0,
+            active_onset_ms=onset_ms,
+        ),
+    )
+
+    chart = build_recovery_chart(
+        request(difficulty="EXPERT"),
+        authority((0, 120.0)),
+        analysis,
+    )
+
+    assert chart.notes
+    assert max(note.time_ms for note in chart.notes) < active_end_ms
+
+
+def test_recovery_keeps_rows_for_sustained_audio_without_detected_onsets():
+    frame_ms = 100
+    frame_count = DURATION_MS // frame_ms
+    strength = np.zeros(frame_count, dtype=np.float64)
+    analysis = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.vstack((strength, strength, strength)),
+        onset_ms=(),
+        activity=AudioActivity(
+            frame_ms=frame_ms,
+            rms_db=np.full(frame_count, -12.0),
+            floor_db=-40.0,
+            active_onset_ms=(),
+        ),
+    )
+
+    chart = build_recovery_chart(
+        request(difficulty="EASY"),
+        authority((0, 120.0)),
+        analysis,
+    )
+
+    assert chart.notes
+    assert min(note.time_ms for note in chart.notes) == 0
+    assert max(note.time_ms for note in chart.notes) >= DURATION_MS - 500
 
 
 def test_recovery_uses_every_tempo_segment_and_audio_bounds():

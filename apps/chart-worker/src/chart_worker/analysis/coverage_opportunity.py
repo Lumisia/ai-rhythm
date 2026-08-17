@@ -1,4 +1,4 @@
-"""Beat-normalized evidence for distinguishing attacks from sustained coverage."""
+"""Cross-evidence classification of attacks and sustained note coverage."""
 
 from __future__ import annotations
 
@@ -14,10 +14,7 @@ from chart_worker.analysis.song_context import LocalTempoMap
 from chart_worker.schema.note import Chart
 from chart_worker.schema.types import DIFFICULTIES
 
-COVERAGE_OPPORTUNITY_VERSION = "coverage-opportunity-v1"
-MIN_PHRASE_BEATS = 16.0
-PHRASE_BEAT_QUANTIZATION_TOLERANCE = 0.01
-"""Integer-millisecond timestamps can undershoot an exact beat boundary slightly."""
+COVERAGE_OPPORTUNITY_VERSION = "coverage-opportunity-v2"
 MIN_PHRASE_DURATION_MS = 4_000
 MIN_SUSTAIN_HOLD_OCCUPANCY = 0.80
 MIN_ACTIVE_FRAME_RATIO = 0.35
@@ -39,7 +36,7 @@ class CoverageKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CoverageOpportunity:
-    version: Literal["coverage-opportunity-v1"]
+    version: Literal["coverage-opportunity-v2"]
     start_ms: int
     end_ms: int
     beat_count: float | None
@@ -236,10 +233,7 @@ def classify_coverage_interval(
     interval_strengths = tuple(onset_analysis.strength_at(time_ms) for time_ms in interval_times)
     strong_attack_count = sum(value >= threshold for value in interval_strengths)
 
-    if (
-        end_ms - start_ms < MIN_PHRASE_DURATION_MS
-        or beat_count + PHRASE_BEAT_QUANTIZATION_TOLERANCE < MIN_PHRASE_BEATS
-    ):
+    if end_ms - start_ms < MIN_PHRASE_DURATION_MS:
         return _insufficient(
             start_ms=start_ms,
             end_ms=end_ms,
@@ -251,7 +245,15 @@ def classify_coverage_interval(
             strong_attack_threshold=round(threshold, 6),
         )
 
-    if strong_attack_count >= MIN_STRONG_ATTACKS[difficulty]:
+    # Tempo integration is retained as diagnostic evidence, but it must not
+    # veto two independent observations from the audio itself: repeated
+    # spectral attacks and sustained RMS activity.  A half/double-tempo switch
+    # or a pathological local BPM otherwise turns audible phrases into false
+    # "insufficient evidence" gaps.
+    if (
+        strong_attack_count >= MIN_STRONG_ATTACKS[difficulty]
+        and active_frame_ratio >= MIN_ACTIVE_FRAME_RATIO
+    ):
         kind = CoverageKind.ATTACK_REQUIRED
     elif (
         hold_occupancy_ratio >= MIN_SUSTAIN_HOLD_OCCUPANCY

@@ -23,6 +23,7 @@ from chart_worker.generation.candidate_state import (
 from chart_worker.generation.candidate_state import (
     candidate_evidence as _candidate_evidence,
 )
+from chart_worker.generation.coverage_repair import build_coverage_repair_chart
 from chart_worker.generation.family_selection import (
     candidate_stable_id as _family_candidate_stable_id,
 )
@@ -489,7 +490,9 @@ def _is_hard_safe_playtest_candidate(acceptance: ChartAcceptance) -> bool:
     )
 
 
-def _raw_playtest_score(candidate: _Candidate) -> tuple[int, int, float, int, int]:
+def _raw_playtest_score(
+    candidate: _Candidate,
+) -> tuple[int, int, int, float, int, int]:
     acceptance = candidate.acceptance
     noncoverage_retries = sum(
         decision.action is GateAction.RETRY_MAP
@@ -497,18 +500,177 @@ def _raw_playtest_score(candidate: _Candidate) -> tuple[int, int, float, int, in
         if decision.axis
         not in {GateAxis.STRUCTURE, GateAxis.TIMING_IDENTITY, GateAxis.COVERAGE}
     )
-    attack_gaps = sum(
-        gap.opportunity is not None and gap.opportunity.kind.value == "ATTACK_REQUIRED"
+    attack_gaps = tuple(
+        gap
         for gap in acceptance.timing.coverage_gaps
+        if gap.opportunity is None
+        or gap.opportunity.kind.value == "ATTACK_REQUIRED"
     )
     precision = acceptance.timing.overall.matched_precision_50
     return (
         noncoverage_retries,
-        attack_gaps,
+        len(attack_gaps),
+        sum(gap.end_ms - gap.start_ms for gap in attack_gaps),
         -precision if precision is not None else 0.0,
         candidate.attempt,
         candidate.seed,
     )
+
+
+def _attack_gap_summary(acceptance: ChartAcceptance) -> tuple[int, int]:
+    gaps = tuple(
+        gap
+        for gap in acceptance.timing.coverage_gaps
+        if gap.opportunity is None
+        or gap.opportunity.kind.value == "ATTACK_REQUIRED"
+    )
+    return len(gaps), sum(gap.end_ms - gap.start_ms for gap in gaps)
+
+
+def _gate_action_rank(action: GateAction) -> int:
+    return {
+        GateAction.PASS: 0,
+        GateAction.REVIEW: 1,
+        GateAction.RETRY_MAP: 2,
+    }[action]
+
+
+def _playtest_candidate_score(
+    candidate: _Candidate,
+) -> tuple[int, int, int, int, int, int, int]:
+    attack_count, attack_total_ms = _attack_gap_summary(candidate.acceptance)
+    provenance_rank = {
+        "COVERAGE_REPAIR": 0,
+        "SAFE_FALLBACK": 1,
+        "RAW_UNVERIFIED": 2,
+    }.get(candidate.provenance, 0)
+    return (
+        attack_count,
+        attack_total_ms,
+        _gate_action_rank(
+            candidate.acceptance.decision(GateAxis.TIMING_ALIGNMENT).action
+        ),
+        provenance_rank,
+        _gate_action_rank(
+            candidate.acceptance.decision(GateAxis.COVERAGE).action
+        ),
+        candidate.attempt,
+        candidate.seed,
+    )
+
+
+def _coverage_repair_candidate(
+    state: _VariantState,
+    source: _Candidate,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+) -> _Candidate:
+    repaired, plan = build_coverage_repair_chart(
+        source.request,
+        source.generated,
+        source.acceptance,
+        authority,
+        onset_analysis,
+    )
+    acceptance = evaluate_chart_candidate(
+        repaired,
+        authority,
+        onset_analysis,
+        requested_key_mode=state.key_mode,
+        requested_difficulty=state.difficulty,
+        duration_ms=prepared.normalized.duration_ms,
+        boundary_policy_mode=prepared.boundary_policy_mode,
+    )
+    if not _is_hard_safe_playtest_candidate(acceptance):
+        raise ValueError("coverage repair failed hard safety gates")
+    source_summary = _attack_gap_summary(source.acceptance)
+    repaired_summary = _attack_gap_summary(acceptance)
+    if repaired_summary >= source_summary:
+        raise ValueError("coverage repair did not strictly improve active gaps")
+    osu_text = _serialized_candidate_text(
+        repaired,
+        authority=authority,
+        prepared=prepared,
+        key_mode=state.key_mode,
+    )
+    candidate = _Candidate(
+        request=source.request,
+        generated=repaired,
+        acceptance=acceptance,
+        osu_text=osu_text,
+        workdir=source.workdir / "coverage-repair",
+        attempt=source.attempt,
+        seed=source.seed,
+        provenance="COVERAGE_REPAIR",
+        recovery_reason="ACTIVE_COVERAGE_GAP_REPAIRED",
+        intro_anchor_covered=_intro_anchor_covered(repaired, authority),
+        coverage_repair_gap_count=plan.repaired_gap_count,
+    )
+    state.candidates.add_safe_fallback(candidate)
+    state.attempt_evidence.append(
+        {
+            "reason": "COVERAGE_REPAIR_CREATED",
+            "sourceSeed": source.seed,
+            "sourceAttackGapCount": source_summary[0],
+            "sourceAttackGapTotalMs": source_summary[1],
+            "resultAttackGapCount": repaired_summary[0],
+            "resultAttackGapTotalMs": repaired_summary[1],
+            "repairPlan": plan.to_report(),
+        }
+    )
+    return candidate
+
+
+def _get_or_create_coverage_repair_candidate(
+    state: _VariantState,
+    source: _Candidate,
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+) -> _Candidate | None:
+    existing = next(
+        (
+            candidate
+            for candidate in state.candidates.safe_fallbacks
+            if candidate.provenance == "COVERAGE_REPAIR"
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+    if any(
+        evidence.get("reason") == "COVERAGE_REPAIR_REJECTED"
+        and evidence.get("sourceSeed") == source.seed
+        for evidence in state.attempt_evidence
+    ):
+        return None
+    try:
+        return _coverage_repair_candidate(
+            state,
+            source,
+            prepared=prepared,
+            authority=authority,
+            onset_analysis=onset_analysis,
+        )
+    except (
+        GeneratedChartValidationError,
+        TimingAuthorityValidationError,
+        TypeError,
+        ValueError,
+        WorkerError,
+    ) as error:
+        state.attempt_evidence.append(
+            {
+                "reason": "COVERAGE_REPAIR_REJECTED",
+                "sourceSeed": source.seed,
+                "errorType": type(error).__name__,
+                "message": str(error),
+            }
+        )
+        return None
 
 
 def _safe_fallback_candidate(
@@ -520,6 +682,7 @@ def _safe_fallback_candidate(
     run_dir: Path,
     base_seed: int,
     authority_epoch: int,
+    recovery_reason: str = "NO_STRUCTURALLY_SAFE_MODEL_CANDIDATE",
 ) -> _Candidate:
     seed = base_seed + state.flat_index
     boundary, music_end_ms = _generation_bounds(prepared, onset_analysis)
@@ -584,7 +747,7 @@ def _safe_fallback_candidate(
         attempt=max(1, state.budget.next_attempt - 1),
         seed=seed,
         provenance="SAFE_FALLBACK",
-        recovery_reason="NO_STRUCTURALLY_SAFE_MODEL_CANDIDATE",
+        recovery_reason=recovery_reason,
         intro_anchor_covered=_intro_anchor_covered(generated, authority),
     )
     state.candidates.add_safe_fallback(candidate)
@@ -630,7 +793,42 @@ def _complete_playtest_selections(
             if admitted:
                 candidate = admitted[0]
             elif raw:
-                candidate = raw[0]
+                best_raw = raw[0]
+                if best_raw.acceptance.decision(GateAxis.COVERAGE).action is GateAction.RETRY_MAP:
+                    alternatives: list[_Candidate] = [best_raw]
+                    coverage_repair = _get_or_create_coverage_repair_candidate(
+                        state,
+                        best_raw,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                    )
+                    if coverage_repair is not None:
+                        alternatives.append(coverage_repair)
+                    try:
+                        alternatives.append(
+                            _safe_fallback_candidate(
+                                state,
+                                prepared=prepared,
+                                authority=authority,
+                                onset_analysis=onset_analysis,
+                                run_dir=run_dir,
+                                base_seed=base_seed,
+                                authority_epoch=authority_epoch,
+                                recovery_reason="COVERAGE_REPAIR_UNAVAILABLE",
+                            )
+                        )
+                    except (TypeError, ValueError, WorkerError) as error:
+                        state.attempt_evidence.append(
+                            {
+                                "reason": "COVERAGE_SAFE_FALLBACK_REJECTED",
+                                "errorType": type(error).__name__,
+                                "message": str(error),
+                            }
+                        )
+                    candidate = min(alternatives, key=_playtest_candidate_score)
+                else:
+                    candidate = best_raw
             else:
                 candidate = _safe_fallback_candidate(
                     state,
@@ -1329,19 +1527,49 @@ def run_generation(
                 break
         state_families.append(states)
 
-    partial_plans = () if model_inference_disabled_by is not None else tuple(
-        plan
-        for states in state_families
-        for state in states.values()
-        if not state.candidates.admitted
-        if (
-            plan := _plan_partial_repair(
-                state,
-                authority=authority,
-                duration_ms=prepared.normalized.duration_ms,
+    # A deterministic, revalidated TAP-only repair is cheaper and safer than
+    # another decoder invocation.  Build it first; partial model generation is
+    # reserved for gaps that this zero-inference path cannot repair.
+    if model_inference_disabled_by is None:
+        for states in state_families:
+            for state in states.values():
+                if state.candidates.admitted:
+                    continue
+                raw = sorted(state.candidates.raw_rejected, key=_raw_playtest_score)
+                if not raw:
+                    continue
+                best_raw = raw[0]
+                if best_raw.acceptance.decision(GateAxis.COVERAGE).action is GateAction.RETRY_MAP:
+                    _get_or_create_coverage_repair_candidate(
+                        state,
+                        best_raw,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                    )
+
+    partial_plans = (
+        ()
+        if model_inference_disabled_by is not None
+        else tuple(
+            plan
+            for states in state_families
+            for state in states.values()
+            if not state.candidates.admitted
+            if not any(
+                candidate.provenance == "COVERAGE_REPAIR"
+                and candidate.acceptance.action is not GateAction.RETRY_MAP
+                for candidate in state.candidates.safe_fallbacks
             )
+            if (
+                plan := _plan_partial_repair(
+                    state,
+                    authority=authority,
+                    duration_ms=prepared.normalized.duration_ms,
+                )
+            )
+            is not None
         )
-        is not None
     )
     partial_by_request_id = {plan.request.request_id: plan for plan in partial_plans}
     partial_router_plan = plan_recoveries(

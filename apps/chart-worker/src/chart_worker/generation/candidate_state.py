@@ -46,6 +46,7 @@ class Candidate:
     provenance: GenerationProvenance
     recovery_reason: str | None = None
     intro_anchor_covered: bool | None = None
+    coverage_repair_gap_count: int = 0
 
 
 @dataclass(slots=True)

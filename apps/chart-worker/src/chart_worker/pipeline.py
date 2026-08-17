@@ -56,6 +56,7 @@ from chart_worker.generation.params import DESCRIPTORS
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.playtest_run import (
     AudioFileRef,
+    CoverageSummary,
     MissingChartRef,
     OutcomeStatusSnapshot,
     PlaytestRunManifestV2,
@@ -105,6 +106,9 @@ from chart_worker.validation.timing_family_review import TimingFamilyReview
 from chart_worker.validation.timing_review import TimingAuthorityAction
 
 GeneratorName = Literal["fake", "mapperatorinator"]
+_PLAYTEST_ONLY_PROVENANCES = frozenset(
+    {"COVERAGE_REPAIR", "RAW_UNVERIFIED", "SAFE_FALLBACK"}
+)
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
 AnalysisStage = Callable[[Path], OnsetAnalysis]
 TimingStage = Callable[
@@ -466,6 +470,34 @@ def _max_gap_ms(variant: GeneratedVariant) -> int:
     return max((right - left for left, right in pairwise(times)), default=0)
 
 
+def _coverage_summary(variant: GeneratedVariant) -> CoverageSummary:
+    attack_gaps = tuple(
+        gap
+        for gap in variant.acceptance.timing.coverage_gaps
+        if gap.opportunity is None
+        or gap.opportunity.kind.value == "ATTACK_REQUIRED"
+    )
+    return CoverageSummary(
+        first_note_time_ms=variant.acceptance.timing.first_note_time_ms,
+        max_gap_ms=variant.acceptance.timing.max_gap_ms,
+        attack_required_gap_count=len(attack_gaps),
+        attack_required_gap_total_ms=sum(
+            gap.end_ms - gap.start_ms for gap in attack_gaps
+        ),
+        repaired_gap_count=variant.coverage_repair_gap_count,
+    )
+
+
+def _playability_tier(variant: GeneratedVariant) -> str:
+    if variant.provenance not in _PLAYTEST_ONLY_PROVENANCES:
+        return "MODEL_PLAYABLE"
+    if variant.provenance == "RAW_UNVERIFIED":
+        return "DIAGNOSTIC_ONLY"
+    if variant.acceptance.action is GateAction.RETRY_MAP:
+        return "DIAGNOSTIC_ONLY"
+    return "RECOVERY_PLAYABLE"
+
+
 def _require_difficulty_order_reports(
     generated: tuple[GeneratedVariant, ...],
     missing: tuple[MissingVariant, ...] = (),
@@ -562,10 +594,8 @@ def _generation_report(
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
         acceptance = variant.acceptance.to_report()
-        playtest_only = variant.provenance in {
-            "RAW_UNVERIFIED",
-            "SAFE_FALLBACK",
-        }
+        playtest_only = variant.provenance in _PLAYTEST_ONLY_PROVENANCES
+        coverage_summary = _coverage_summary(variant)
         quality_profile = acceptance["qualityProfile"]
         resnap_diagnostics = variant.generated.resnap_diagnostics.to_report()
         hold_lane_state_trace = analyze_hold_lane_state(
@@ -600,6 +630,8 @@ def _generation_report(
                 "distributionTier": (
                     "PLAYTEST_ONLY" if playtest_only else "PRODUCTION_CANDIDATE"
                 ),
+                "playabilityTier": _playability_tier(variant),
+                "coverageSummary": coverage_summary.model_dump(by_alias=True),
                 "attemptErrors": list(variant.attempt_errors),
                 "attemptEvidence": list(variant.attempt_evidence),
                 "acceptanceStatus": acceptance["action"],
@@ -643,7 +675,7 @@ def _generation_report(
         or (outro_family_review is not None and outro_family_review.status == "REVIEW")
     )
     has_playtest_fallback = any(
-        variant.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+        variant.provenance in _PLAYTEST_ONLY_PROVENANCES
         for variant in generated
     )
     has_order_retry = any(
@@ -1002,7 +1034,7 @@ def _require_publishable_acceptance(generated: tuple[GeneratedVariant, ...]) -> 
             )
         )
         if (
-            variant.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+            variant.provenance in _PLAYTEST_ONLY_PROVENANCES
             and hard_safe
         ):
             continue
@@ -1407,13 +1439,15 @@ def _run_pipeline(
                 provenance=variant.provenance,
                 production_eligible=(
                     variant.provenance
-                    not in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+                    not in _PLAYTEST_ONLY_PROVENANCES
                 ),
                 distribution_tier=(
                     "PLAYTEST_ONLY"
-                    if variant.provenance in {"RAW_UNVERIFIED", "SAFE_FALLBACK"}
+                    if variant.provenance in _PLAYTEST_ONLY_PROVENANCES
                     else "PRODUCTION_CANDIDATE"
                 ),
+                playability_tier=_playability_tier(variant),
+                coverage_summary=_coverage_summary(variant),
             )
             for variant, result in zip(generated, exported, strict=True)
         ],

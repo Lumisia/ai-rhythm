@@ -72,10 +72,11 @@ def _tempo_rows(
     request: GenerationRequest,
     authority: SongTimingAuthority,
     budget: RecoveryBudget,
-    active_onsets: tuple[int, ...],
+    onsets: OnsetAnalysis,
 ) -> tuple[int, ...]:
     rows: list[int] = []
     events = authority.bpm_events
+    active_onsets = _active_onsets(onsets)
     if not events:
         raise ValueError("recovery requires timing authority BPM events")
     note_start_end_ms = min(
@@ -111,8 +112,25 @@ def _tempo_rows(
                     segment_end, note_start_end_ms
                 ):
                     continue
-                if subdivision and not _has_nearby_onset(time_ms, active_onsets):
-                    continue
+                has_nearby_onset = _has_nearby_onset(time_ms, active_onsets)
+                if onsets.activity is None:
+                    if subdivision and not has_nearby_onset:
+                        continue
+                elif not has_nearby_onset:
+                    if subdivision:
+                        continue
+                    next_grid_ms = min(
+                        segment_end,
+                        note_start_end_ms,
+                        round(time_ms + beat_ms / budget.subdivisions),
+                    )
+                    if not _is_sustained(
+                        onsets,
+                        active_onsets,
+                        time_ms,
+                        next_grid_ms,
+                    ):
+                        continue
                 if rows and time_ms - rows[-1] < budget.min_row_gap_ms:
                     continue
                 if not rows or time_ms != rows[-1]:
@@ -134,7 +152,7 @@ def plan_recovery_rows(
         if subdivisions <= 0:
             raise ValueError("recovery subdivisions must be positive")
         budget = replace(budget, subdivisions=subdivisions)
-    rows = _tempo_rows(request, authority, budget, _active_onsets(onsets))
+    rows = _tempo_rows(request, authority, budget, onsets)
     return RecoveryRowPlan(rows=rows, subdivisions=budget.subdivisions)
 
 

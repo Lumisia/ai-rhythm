@@ -36,15 +36,17 @@ GenerationProvenance = Literal[
     "PARTIAL_REMAP",
     "INTRO_RECOVERY",
     "INTRO_ALIGNED",
+    "COVERAGE_REPAIR",
     "RAW_UNVERIFIED",
     "SAFE_FALLBACK",
 ]
 """Playtest provenance contract.
 
 RAW_UNVERIFIED is a model result that passed STRUCTURE, TIMING_IDENTITY, and
-SONG_BOUNDS but failed a softer musical-quality axis. SAFE_FALLBACK is a
-deterministic chart on the canonical timing authority used only when no hard-
-safe model result exists. Either provenance forces PLAYTEST_ONLY/REVIEW.
+SONG_BOUNDS but failed a softer musical-quality axis. COVERAGE_REPAIR preserves
+that source and adds TAP rows only inside proven active gaps. SAFE_FALLBACK is
+a deterministic whole-chart recovery. Every recovery provenance forces
+PLAYTEST_ONLY/REVIEW.
 """
 
 
@@ -96,6 +98,7 @@ class GeneratedVariant:
     difficulty_order: "DifficultyOrderReview | None" = None
     provenance: GenerationProvenance = "PRIMARY"
     recovery_reason: str | None = None
+    coverage_repair_gap_count: int = 0
     """Why this is not PRIMARY, including any playtest-only fallback policy."""
 
 
