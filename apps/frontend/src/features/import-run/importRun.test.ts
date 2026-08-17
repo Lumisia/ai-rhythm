@@ -38,6 +38,7 @@ interface RunOptions {
   reportPublicationMismatch?: boolean;
   reportPublishableMismatch?: boolean;
   reportStrictBlockerMismatch?: boolean;
+  recoveryTrust?: boolean;
   review?: boolean;
   tamperReportHash?: boolean;
   uncalibratedBoundary?: boolean;
@@ -139,7 +140,27 @@ function makeRunFiles(options: RunOptions = {}): File[] {
       const body = JSON.stringify(chart);
       const path = index === 0 && options.chartPath ? options.chartPath : `charts/${keyMode}k-${difficulty}.json`;
       if (!(options.partial && index === 0)) {
-        chartRefs.push({ path, sha256: digest(body), keyMode, difficulty });
+        chartRefs.push({
+          path,
+          sha256: digest(body),
+          keyMode,
+          difficulty,
+          ...(options.recoveryTrust && index === 0
+            ? {
+                provenance: "COVERAGE_REPAIR" as const,
+                productionEligible: false,
+                distributionTier: "PLAYTEST_ONLY" as const,
+                playabilityTier: "RECOVERY_PLAYABLE" as const,
+                coverageSummary: {
+                  firstNoteTimeMs: 500,
+                  maxGapMs: 1_000,
+                  attackRequiredGapCount: 0,
+                  attackRequiredGapTotalMs: 0,
+                  repairedGapCount: 2,
+                },
+              }
+            : {}),
+        });
       }
       if (!(options.omitFirstChart && index === 0) && !(options.partial && index === 0)) {
         chartFiles.push(makeFile(`charts/${keyMode}k-${difficulty}.json`, options.badChartHash && index === 0 ? "{}" : body));
@@ -368,6 +389,27 @@ describe("importRun", () => {
     expect(Array.from(new Uint8Array(imported.audio.game).slice(0, 4))).toEqual(
       Array.from(encoder.encode("fLaC")),
     );
+  });
+
+  it("accepts chart-level recovery provenance and coverage evidence", async () => {
+    const imported = await importRun(
+      makeRunFiles({ recoveryTrust: true, review: true }),
+      "PLAYTEST",
+    );
+
+    expect(imported.charts[0].ref).toMatchObject({
+      provenance: "COVERAGE_REPAIR",
+      productionEligible: false,
+      distributionTier: "PLAYTEST_ONLY",
+      playabilityTier: "RECOVERY_PLAYABLE",
+      coverageSummary: {
+        firstNoteTimeMs: 500,
+        maxGapMs: 1_000,
+        attackRequiredGapCount: 0,
+        attackRequiredGapTotalMs: 0,
+        repairedGapCount: 2,
+      },
+    });
   });
 
   it("projects verified v2 boundary evidence without making it a human verdict", async () => {

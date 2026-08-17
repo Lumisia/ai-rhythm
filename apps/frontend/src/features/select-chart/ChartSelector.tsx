@@ -10,6 +10,28 @@ interface ChartSelectorProps {
 
 const keyModes = [4, 6, 7] as const;
 
+function chartTrust(chart: ImportedChart) {
+  const provenance = chart.ref.provenance ?? "LEGACY_UNVERIFIED";
+  const fallback = new Set([
+    "COVERAGE_REPAIR",
+    "RAW_UNVERIFIED",
+    "SAFE_FALLBACK",
+  ]).has(provenance);
+  const tier =
+    chart.ref.playabilityTier ??
+    (fallback ? "DIAGNOSTIC_ONLY" : "MODEL_PLAYABLE");
+  const label = {
+    MODEL_PLAYABLE: "MODEL PLAYABLE",
+    RECOVERY_PLAYABLE: "PLAYABLE RECOVERY",
+    DIAGNOSTIC_ONLY: "DIAGNOSTIC ONLY",
+  }[tier];
+  return { label, provenance, summary: chart.ref.coverageSummary };
+}
+
+function seconds(ms: number): string {
+  return `${(ms / 1_000).toFixed(1)}초`;
+}
+
 export function ChartSelector({
   run,
   lastReviews = {},
@@ -70,11 +92,41 @@ export function ChartSelector({
             <div className="chart-grid">
               {run.charts
                 .filter((chart) => chart.document.keyMode === keyMode)
-                .map((chart) => (
-                  <article className="chart-card" key={chart.document.chartId}>
+                .map((chart) => {
+                  const trust = chartTrust(chart);
+                  return (
+                  <article
+                    className="chart-card"
+                    data-playability={chart.ref.playabilityTier ?? "INFERRED"}
+                    key={chart.document.chartId}
+                  >
                     <div className="card-topline">
                       <strong>{chart.document.difficulty}</strong>
                       <span>LV {chart.document.metrics.projectRating.toFixed(2)}</span>
+                    </div>
+                    <div aria-label="chart trust" className="chart-trust">
+                      <strong>{trust.label}</strong>
+                      <span>{trust.provenance}</span>
+                      {trust.summary ? (
+                        <>
+                          <span>
+                            첫 노트 {trust.summary.firstNoteTimeMs === null
+                              ? "없음"
+                              : seconds(trust.summary.firstNoteTimeMs)}
+                          </span>
+                          <span>최대 공백 {seconds(trust.summary.maxGapMs)}</span>
+                          <span>복구 구간 {trust.summary.repairedGapCount}개</span>
+                          {trust.summary.attackRequiredGapCount > 0 ? (
+                            <span className="value-fault">
+                              활성 공백 {trust.summary.attackRequiredGapCount}개 · {seconds(
+                                trust.summary.attackRequiredGapTotalMs,
+                              )}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        <span className="value-fault">coverage evidence 없음</span>
+                      )}
                     </div>
                     <dl>
                       <div><dt>NOTES</dt><dd>{chart.document.metrics.noteCount}</dd></div>
@@ -106,7 +158,8 @@ export function ChartSelector({
                       {keyMode}K {chart.document.difficulty} 플레이
                     </button>
                   </article>
-                ))}
+                  );
+                })}
             </div>
           </section>
         ))}

@@ -85,9 +85,37 @@ export interface AudioFileRef {
   sha256: string;
 }
 
+export type GenerationProvenance =
+  | "PRIMARY"
+  | "RETRY"
+  | "PARTIAL_REMAP"
+  | "INTRO_RECOVERY"
+  | "INTRO_ALIGNED"
+  | "COVERAGE_REPAIR"
+  | "RAW_UNVERIFIED"
+  | "SAFE_FALLBACK";
+
+export type PlayabilityTier =
+  | "MODEL_PLAYABLE"
+  | "RECOVERY_PLAYABLE"
+  | "DIAGNOSTIC_ONLY";
+
+export interface CoverageSummary {
+  firstNoteTimeMs: number | null;
+  maxGapMs: number;
+  attackRequiredGapCount: number;
+  attackRequiredGapTotalMs: number;
+  repairedGapCount: number;
+}
+
 export interface RunChartRef extends AudioFileRef {
   keyMode: KeyMode;
   difficulty: Difficulty;
+  provenance?: GenerationProvenance;
+  productionEligible?: boolean;
+  distributionTier?: "PRODUCTION_CANDIDATE" | "PLAYTEST_ONLY";
+  playabilityTier?: PlayabilityTier;
+  coverageSummary?: CoverageSummary;
 }
 
 /** A combination the worker could not publish in this run. */

@@ -76,7 +76,101 @@ function importedRun(
   };
 }
 
+function chartWithTrust(
+  provenance: "COVERAGE_REPAIR" | "SAFE_FALLBACK",
+  trust?: {
+    playabilityTier: "RECOVERY_PLAYABLE" | "DIAGNOSTIC_ONLY";
+    firstNoteTimeMs: number | null;
+    maxGapMs: number;
+    attackRequiredGapCount: number;
+    attackRequiredGapTotalMs: number;
+    repairedGapCount: number;
+  },
+): ImportedChart {
+  return {
+    ref: {
+      path: "charts/4k-easy.chart.json",
+      sha256: "a".repeat(64),
+      keyMode: 4,
+      difficulty: "EASY",
+      provenance,
+      productionEligible: false,
+      distributionTier: "PLAYTEST_ONLY",
+      playabilityTier: trust?.playabilityTier,
+      coverageSummary: trust
+        ? {
+            firstNoteTimeMs: trust.firstNoteTimeMs,
+            maxGapMs: trust.maxGapMs,
+            attackRequiredGapCount: trust.attackRequiredGapCount,
+            attackRequiredGapTotalMs: trust.attackRequiredGapTotalMs,
+            repairedGapCount: trust.repairedGapCount,
+          }
+        : undefined,
+    },
+    document: {
+      chartId: "chart-4k-easy",
+      keyMode: 4,
+      difficulty: "EASY",
+      metrics: {
+        noteCount: 120,
+        holdCount: 0,
+        peakNps: 2,
+        chordRatio: 0,
+        projectRating: 1,
+        projectTier: "EASY",
+      },
+    },
+  } as unknown as ImportedChart;
+}
+
 describe("ChartSelector publication status", () => {
+  it("shows chart-level recovery provenance and coverage evidence", () => {
+    const run = importedRun("PLAYTEST_ONLY", ["QUALITY_REVIEW_REQUIRED"], 0);
+    run.charts = [
+      chartWithTrust("COVERAGE_REPAIR", {
+        playabilityTier: "RECOVERY_PLAYABLE",
+        firstNoteTimeMs: 250,
+        maxGapMs: 8_250,
+        attackRequiredGapCount: 0,
+        attackRequiredGapTotalMs: 0,
+        repairedGapCount: 2,
+      }),
+    ];
+
+    render(
+      <ChartSelector
+        run={run}
+        onBoundaryReview={vi.fn()}
+        onReset={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("PLAYABLE RECOVERY")).toBeVisible();
+    expect(screen.getByText("COVERAGE_REPAIR")).toBeVisible();
+    expect(screen.getByText("첫 노트 0.3초")).toBeVisible();
+    expect(screen.getByText("최대 공백 8.3초")).toBeVisible();
+    expect(screen.getByText("복구 구간 2개")).toBeVisible();
+  });
+
+  it("treats a legacy fallback without coverage fields as diagnostic only", () => {
+    const run = importedRun("PLAYTEST_ONLY", ["QUALITY_REVIEW_REQUIRED"], 0);
+    run.charts = [chartWithTrust("SAFE_FALLBACK")];
+
+    render(
+      <ChartSelector
+        run={run}
+        onBoundaryReview={vi.fn()}
+        onReset={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("DIAGNOSTIC ONLY")).toBeVisible();
+    expect(screen.getByText("SAFE_FALLBACK")).toBeVisible();
+    expect(screen.getByText("coverage evidence 없음")).toBeVisible();
+  });
+
   it("shows a visible playtest-only warning and its literal reasons", () => {
     render(
       <ChartSelector
