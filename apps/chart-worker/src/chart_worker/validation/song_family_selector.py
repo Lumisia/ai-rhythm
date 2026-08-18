@@ -219,6 +219,42 @@ def _prune_slot(
     return tuple(retained), tuple(sorted(pruned))
 
 
+def _v2_replacement_allowed(
+    current: CandidateSnapshot,
+    challenger: CandidateSnapshot,
+    *,
+    canonical_first_row_ms: int | None,
+) -> bool:
+    """Require monotonic protected quality before enforcing a family change."""
+    if challenger.candidate_id == current.candidate_id:
+        return True
+    if not challenger.hard_eligible:
+        return False
+    if not current.hard_eligible:
+        return True
+    current_metrics = current.protected_metrics
+    challenger_metrics = challenger.protected_metrics
+    if challenger_metrics.review_rank > current_metrics.review_rank:
+        return False
+    if (
+        challenger_metrics.hold_integrity_violations
+        > current_metrics.hold_integrity_violations
+        or challenger_metrics.active_gap_count > current_metrics.active_gap_count
+    ):
+        return False
+    if current_metrics.matched_precision_50 is not None and (
+        challenger_metrics.matched_precision_50 is None
+        or challenger_metrics.matched_precision_50
+        < current_metrics.matched_precision_50 - MATCHED_PRECISION_EPSILON
+    ):
+        return False
+    return not (
+        canonical_first_row_ms is not None
+        and current.first_row_ms == canonical_first_row_ms
+        and challenger.first_row_ms != canonical_first_row_ms
+    )
+
+
 def _difficulty_violations(candidates: tuple[CandidateSnapshot, ...]) -> int:
     ordered = sorted(candidates, key=lambda item: DIFFICULTIES.index(item.difficulty))
     violations = 0
@@ -422,7 +458,23 @@ def compare_song_families(
     pruned_pools = {}
     pruned_ids = []
     for slot in expected_slots:
-        retained, removed = _prune_slot(normalized_pools[slot])
+        candidates = normalized_pools[slot]
+        if mode == "V2" and (current_id := current[slot]) is not None:
+            current_candidate = by_id[current_id]
+            allowed = tuple(
+                item
+                for item in candidates
+                if _v2_replacement_allowed(
+                    current_candidate,
+                    item,
+                    canonical_first_row_ms=canonical_first_row_ms,
+                )
+            )
+            pruned_ids.extend(
+                item.candidate_id for item in candidates if item not in allowed
+            )
+            candidates = allowed
+        retained, removed = _prune_slot(candidates)
         pruned_pools[slot] = retained
         pruned_ids.extend(removed)
 

@@ -104,6 +104,7 @@ def build_runtime_fingerprint(
                 analysis.activity,
                 normalized.duration_ms,
                 enforcement_mode=prepared.boundary_policy_mode,
+                terminal_silence=analysis.terminal_silence,
             ).stable_sha256()
             if analysis.activity is not None
             else None

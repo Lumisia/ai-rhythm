@@ -10,6 +10,10 @@ from chart_worker.analysis.activity import (
     evaluate_outro_policy,
     observe_outro,
 )
+from chart_worker.analysis.terminal_silence import (
+    TerminalSilenceObservation,
+    TerminalThresholdCandidate,
+)
 
 
 def test_builds_song_relative_active_onsets():
@@ -307,6 +311,66 @@ def test_experimental_boundary_enforces_the_same_provisional_candidate():
     assert evaluation.effective_contract == evaluation.provisional_contract
     assert evaluation.effective_contract.max_note_start_ms == 20_070
     assert evaluation.effective_contract.policy_applied is True
+
+
+def test_high_confidence_terminal_consensus_is_the_only_new_enforced_boundary():
+    activity = AudioActivity(
+        frame_ms=100.0,
+        rms_db=np.concatenate([np.full(250, -10.0), np.full(50, -80.0)]),
+        floor_db=-60.0,
+        active_onset_ms=(1_000, 24_900),
+    )
+    terminal = TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=30_000,
+        frame_ms=20,
+        channel_count=2,
+        candidates=tuple(
+            TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=25_000,
+                suffix_duration_ms=5_000,
+            )
+            for rms_db, peak_db in ((-72.0, -60.0), (-66.0, -54.0), (-60.0, -48.0))
+        ),
+        candidate_spread_ms=0,
+        last_onset_ms=24_900,
+    )
+
+    evaluation = evaluate_boundary_policy(
+        activity,
+        30_000,
+        enforcement_mode="HIGH_CONFIDENCE_ENFORCED",
+        terminal_silence=terminal,
+    )
+
+    assert evaluation.effective_source == "TERMINAL_SILENCE_CONSENSUS"
+    assert evaluation.effective_contract.last_attack_ms == 25_000
+    assert evaluation.effective_contract.max_note_start_ms == 25_070
+    assert evaluation.effective_contract.release_end_ms == 25_000
+    assert evaluation.effective_contract.generation_end_ms == 30_000
+    assert evaluation.policy_state == "PROVISIONAL"
+    assert evaluation.confidence == "UNKNOWN"
+
+
+def test_high_confidence_mode_keeps_full_duration_without_consensus():
+    activity = AudioActivity(
+        frame_ms=100.0,
+        rms_db=np.concatenate([np.full(250, -10.0), np.full(50, -80.0)]),
+        floor_db=-60.0,
+        active_onset_ms=(1_000, 24_900),
+    )
+
+    evaluation = evaluate_boundary_policy(
+        activity,
+        30_000,
+        enforcement_mode="HIGH_CONFIDENCE_ENFORCED",
+        terminal_silence=None,
+    )
+
+    assert evaluation.effective_source == "FULL_DURATION_BASELINE"
+    assert evaluation.effective_contract.max_note_start_ms == 30_000
 
 
 def test_boundary_report_separates_policy_state_confidence_and_enforcement():

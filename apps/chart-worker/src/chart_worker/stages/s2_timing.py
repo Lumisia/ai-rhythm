@@ -45,6 +45,11 @@ from chart_worker.validation.timing_candidate_selector import (
     select_timing_candidate,
     timing_candidates_need_external_corroboration,
 )
+from chart_worker.validation.timing_integrity import (
+    TimingIntegrityAssessment,
+    TimingIntegrityStatus,
+    assess_timing_integrity,
+)
 from chart_worker.validation.timing_review import (
     TimingAuthorityAction,
     TimingAuthorityReview,
@@ -61,6 +66,15 @@ BeatAnalyzer = Callable[[Path], BeatGrid]
 def _should_try_super_timing(review: TimingAuthorityReview) -> bool:
     return review.action is TimingAuthorityAction.RETRY_TIMING or bool(
         _SUPER_TIMING_REVIEW_REASONS.intersection(review.reasons)
+    )
+
+
+def _has_healthy_candidate(
+    candidates: list["_EvaluatedTimingCandidate"],
+) -> bool:
+    return any(
+        candidate.integrity.status is TimingIntegrityStatus.HEALTHY
+        for candidate in candidates
     )
 
 
@@ -131,6 +145,7 @@ class _EvaluatedTimingCandidate:
     leading: LeadingTimingCoverage
     local_review: LocalTimingAuthorityReview
     recovery_preflight: RecoveryPreflight
+    integrity: TimingIntegrityAssessment
     evidence: TimingCandidateEvidence
 
 
@@ -169,12 +184,14 @@ def _evaluate_timing_candidate(
         local_metrics,
         recovery_preflight,
     )
+    integrity = assess_timing_integrity(local_review, recovery_preflight)
     evidence = build_timing_candidate_evidence(
         epoch=authority_epoch,
         mode=generated.mode,
         structurally_valid=True,
         local_review=local_review,
         tempo_metrics=metrics,
+        integrity=integrity,
     )
     evaluated = _EvaluatedTimingCandidate(
         generated=generated,
@@ -184,12 +201,14 @@ def _evaluate_timing_candidate(
         leading=leading,
         local_review=local_review,
         recovery_preflight=recovery_preflight,
+        integrity=integrity,
         evidence=evidence,
     )
     hard_rejected = (
         review.action is TimingAuthorityAction.RETRY_TIMING
         or leading.action is TimingAuthorityAction.RETRY_TIMING
         or local_review.action is TimingAuthorityAction.RETRY_TIMING
+        or integrity.status is TimingIntegrityStatus.DAMAGED
     )
     report = {
         "attempt": attempt_count,
@@ -201,6 +220,7 @@ def _evaluate_timing_candidate(
         "tempoMetrics": metrics.to_report(),
         "localTimingReview": local_review.to_report(),
         "recoveryPreflight": recovery_preflight.to_report(),
+        "timingIntegrity": integrity.to_report(),
         "candidateEvidence": evidence.to_report(),
     }
     return evaluated, report, hard_rejected
@@ -391,6 +411,7 @@ def _to_authority(
         local_review=selected.local_review,
         recovery_preflight=selected.recovery_preflight,
         candidate_selection=selection,
+        timing_integrity=selected.integrity,
     )
 
 
@@ -455,9 +476,13 @@ def run_timing_generation(
                 (prepared.beat_this_enabled and hard_rejected)
                 or evaluated.leading.action is TimingAuthorityAction.RETRY_TIMING
                 or local_review.action is TimingAuthorityAction.RETRY_TIMING
+                or evaluated.integrity.status is TimingIntegrityStatus.DAMAGED
             )
             if super_timing and terminal_hard_reject:
-                if viable_candidates:
+                if viable_candidates and (
+                    _has_healthy_candidate(viable_candidates)
+                    or not prepared.beat_this_enabled
+                ):
                     selected, selection = _select_and_promote(
                         viable_candidates,
                         prepared=prepared,
@@ -475,7 +500,18 @@ def run_timing_generation(
             retry_with_super = not super_timing and (
                 _should_try_super_timing(review)
                 or local_review.action is TimingAuthorityAction.RETRY_TIMING
+                or evaluated.integrity.status
+                is not TimingIntegrityStatus.HEALTHY
             )
+            needs_independent_corroboration = (
+                super_timing
+                and prepared.beat_this_enabled
+                and viable_candidates
+                and not _has_healthy_candidate(viable_candidates)
+            )
+            if needs_independent_corroboration:
+                reference_path.unlink(missing_ok=True)
+                break
             if not retry_with_super and viable_candidates:
                 selected, selection = _select_and_promote(
                     viable_candidates,
@@ -494,7 +530,10 @@ def run_timing_generation(
             reference_path.unlink(missing_ok=True)
             if not super_timing:
                 continue
-            if viable_candidates:
+            if viable_candidates and (
+                _has_healthy_candidate(viable_candidates)
+                or not prepared.beat_this_enabled
+            ):
                 selected, selection = _select_and_promote(
                     viable_candidates,
                     prepared=prepared,
@@ -534,18 +573,21 @@ def run_timing_generation(
         )
         attempt_reviews.append(fallback_report)
         if fallback is not None:
-            selected, selection = _select_and_promote(
-                [fallback],
-                prepared=prepared,
-                reference_path=reference_path,
-                beat_analyzer=beat_analyzer,
-            )
-            return _to_authority(
-                selected,
-                selection,
-                prepared=prepared,
-                reference_path=reference_path,
-            )
+            viable_candidates.append(fallback)
+
+    if viable_candidates:
+        selected, selection = _select_and_promote(
+            viable_candidates,
+            prepared=prepared,
+            reference_path=reference_path,
+            beat_analyzer=beat_analyzer,
+        )
+        return _to_authority(
+            selected,
+            selection,
+            prepared=prepared,
+            reference_path=reference_path,
+        )
 
     raise WorkerError(
         ErrorCode.CHART_TIMING_CANDIDATE_FAILED,

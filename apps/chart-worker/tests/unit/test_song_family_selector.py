@@ -216,6 +216,36 @@ def test_slot_pruning_preserves_candidate_with_distinct_difficulty_score():
     assert comparison.shadow_assignment["4K:EXPERT"] == ordered.candidate_id
 
 
+def test_v2_does_not_fix_difficulty_order_by_degrading_timing_precision():
+    pools, current = complete_pools()
+    current_expert = candidate(
+        4,
+        "EXPERT",
+        "3",
+        precision=0.95,
+        v2_score=3.05,
+    )
+    ordered_but_worse = candidate(
+        4,
+        "EXPERT",
+        "4",
+        precision=0.70,
+        v2_score=4.0,
+    )
+    pools[(4, "EXPERT")] = (current_expert, ordered_but_worse)
+    current[(4, "EXPERT")] = current_expert.candidate_id
+
+    selected, comparison = compare_song_families(
+        pools,
+        current,
+        canonical_first_row_ms=1_000,
+        mode="V2",
+    )
+
+    assert selected[(4, "EXPERT")] == current_expert.candidate_id
+    assert comparison.shadow_assignment["4K:EXPERT"] == current_expert.candidate_id
+
+
 def test_missing_slot_tie_break_never_compares_none_with_string():
     pools, current = complete_pools()
     pools[(4, "EXPERT")] = ()

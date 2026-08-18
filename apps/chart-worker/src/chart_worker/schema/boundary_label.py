@@ -27,7 +27,11 @@ Millisecond = Annotated[int, Field(strict=True, ge=0)]
 
 BoundaryPolicyState = Literal["EXPERIMENTAL", "PROVISIONAL", "CALIBRATED", "FROZEN"]
 BoundaryPolicyConfidence = Literal["HIGH", "MEDIUM", "LOW", "UNKNOWN"]
-BoundaryEnforcementMode = Literal["SHADOW", "EXPERIMENTAL_ENFORCED"]
+BoundaryEnforcementMode = Literal[
+    "SHADOW",
+    "EXPERIMENTAL_ENFORCED",
+    "HIGH_CONFIDENCE_ENFORCED",
+]
 BoundaryEvidenceAvailability = Literal["AVAILABLE", "UNAVAILABLE"]
 BoundaryGroupRelation = Literal["EXACT_RECORDING", "RELATED_VERSION", "UNKNOWN"]
 BoundaryVerdict = Literal[

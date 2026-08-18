@@ -309,6 +309,70 @@ def test_reports_hold_covered_strong_attack_gap_as_attack_required():
     assert gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
 
 
+def test_reports_local_gap_evidence_without_changing_the_existing_verdict():
+    strengths = {
+        **{time_ms: 0.9 for time_ms in range(1_000, 11_000, 500)},
+        21_000: 0.9,
+        22_000: 0.9,
+        23_000: 0.9,
+        24_000: 0.4,
+        25_000: 0.4,
+        26_000: 0.4,
+        27_000: 0.4,
+    }
+    strength = np.zeros(402, dtype=np.float64)
+    for time_ms, value in strengths.items():
+        strength[time_ms // 100] = value
+    onset_ms = tuple(sorted(strengths))
+    analysis = OnsetAnalysis(
+        sample_rate_hz=1_000,
+        hop_length=100,
+        strength=strength,
+        band_strength=np.zeros((3, strength.size), dtype=np.float64),
+        onset_ms=onset_ms,
+        n_fft=100,
+        activity=AudioActivity(
+            frame_ms=100.0,
+            rms_db=np.full(strength.size, -10.0),
+            floor_db=-20.0,
+            active_onset_ms=onset_ms,
+        ),
+    )
+
+    result = diagnose_chart_timing(
+        [tap(20_000), tap(28_000)],
+        analysis.onset_ms,
+        duration_ms=40_000,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+        activity=analysis.activity,
+        onset_analysis=analysis,
+        difficulty="EXPERT",
+    )
+
+    gap = next(
+        gap
+        for gap in result.coverage_gaps
+        if gap.start_ms == 20_000 and gap.end_ms == 28_000
+    )
+    assert gap.opportunity is not None
+    assert gap.opportunity.kind is CoverageKind.INSUFFICIENT_EVIDENCE
+    assert gap.to_report()["localAudioEvidence"] == {
+        "version": "coverage-jury-local-evidence-v1",
+        "startMs": 20_000,
+        "endMs": 28_000,
+        "durationMs": 8_000,
+        "activeFrameRatio": 1.0,
+        "activeOnsetCount": 7,
+        "globalStrongAttackCount": 3,
+        "localStrongAttackCount": 7,
+        "globalThreshold": 0.9,
+        "localThreshold": 0.4,
+        "neighboringActivityRatio": 1.0,
+        "policyState": "OBSERVATION_ONLY",
+        "mutatesGeneration": False,
+    }
+
+
 def test_reports_quiet_gap_without_forcing_review():
     activity = AudioActivity(
         frame_ms=1_000.0,

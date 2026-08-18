@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from dataclasses import dataclass
+from math import ceil
 
 from chart_worker.analysis.coverage_opportunity import CoverageKind
 from chart_worker.analysis.onset import OnsetAnalysis
@@ -17,6 +18,12 @@ from chart_worker.generation.recovery import (
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages.types import SongTimingAuthority
 from chart_worker.validation.quality_gate import ChartAcceptance, GateAction, GateAxis
+
+MAX_INSERTED_NOTE_RATIO = 0.15
+MIN_INSERTED_NOTE_BUDGET = 8
+MAX_INSERTED_NOTE_BUDGET = 64
+MAX_REPAIRED_DURATION_RATIO = 0.20
+MIN_REPAIRED_DURATION_BUDGET_MS = 8_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +172,31 @@ def build_coverage_repair_chart(
 
     if not inserted:
         raise ValueError("coverage repair found no supported TAP rows")
+
+    inserted_note_budget = max(
+        MIN_INSERTED_NOTE_BUDGET,
+        min(
+            MAX_INSERTED_NOTE_BUDGET,
+            ceil(len(source.notes) * MAX_INSERTED_NOTE_RATIO),
+        ),
+    )
+    repaired_duration_ms = sum(
+        end_ms - start_ms for start_ms, end_ms in repaired_intervals
+    )
+    if len(inserted) > inserted_note_budget:
+        raise ValueError(
+            "coverage repair exceeds inserted-note budget: "
+            f"{len(inserted)} > {inserted_note_budget}"
+        )
+    repaired_duration_budget_ms = max(
+        MIN_REPAIRED_DURATION_BUDGET_MS,
+        request.duration_ms * MAX_REPAIRED_DURATION_RATIO,
+    )
+    if repaired_duration_ms > repaired_duration_budget_ms:
+        raise ValueError(
+            "coverage repair exceeds repaired-duration budget: "
+            f"{repaired_duration_ms}ms > {repaired_duration_budget_ms:g}ms"
+        )
 
     notes = sorted(
         [*source.notes, *inserted],

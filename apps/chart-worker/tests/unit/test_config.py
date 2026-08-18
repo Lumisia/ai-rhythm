@@ -122,13 +122,16 @@ def test_unknown_difficulty_selector_mode_is_rejected():
         WorkerConfig(difficulty_selector_mode="AUTO")
 
 
-def test_boundary_policy_defaults_to_shadow(monkeypatch):
+def test_boundary_policy_defaults_to_high_confidence_enforcement(monkeypatch):
     monkeypatch.delenv("BOUNDARY_POLICY_MODE", raising=False)
 
-    assert load_config().boundary_policy_mode == "SHADOW"
+    assert load_config().boundary_policy_mode == "HIGH_CONFIDENCE_ENFORCED"
 
 
-@pytest.mark.parametrize("mode", ["SHADOW", "EXPERIMENTAL_ENFORCED"])
+@pytest.mark.parametrize(
+    "mode",
+    ["SHADOW", "EXPERIMENTAL_ENFORCED", "HIGH_CONFIDENCE_ENFORCED"],
+)
 def test_supported_boundary_policy_modes_are_accepted(mode):
     assert WorkerConfig(boundary_policy_mode=mode).boundary_policy_mode == mode
 

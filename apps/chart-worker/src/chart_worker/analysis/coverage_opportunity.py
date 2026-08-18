@@ -98,7 +98,7 @@ def _hold_occupancy_ratio(notes: Chart, *, start_ms: int, end_ms: int) -> float:
     return round(covered_ms / (end_ms - start_ms), 6)
 
 
-def _validate_onset_analysis(onset_analysis: OnsetAnalysis) -> None:
+def validate_onset_analysis(onset_analysis: OnsetAnalysis) -> None:
     if type(onset_analysis.sample_rate_hz) is not int or onset_analysis.sample_rate_hz <= 0:
         raise ValueError("onset sample_rate_hz must be a positive exact integer")
     if type(onset_analysis.hop_length) is not int or onset_analysis.hop_length <= 0:
@@ -163,7 +163,7 @@ def classify_coverage_interval(
         raise ValueError("end_ms must be after start_ms")
     if type(difficulty) is not str or difficulty not in DIFFICULTIES:
         raise ValueError(f"unsupported difficulty: {difficulty!r}")
-    _validate_onset_analysis(onset_analysis)
+    validate_onset_analysis(onset_analysis)
 
     hold_occupancy_ratio = _hold_occupancy_ratio(
         notes,

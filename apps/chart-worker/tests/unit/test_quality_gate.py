@@ -1,3 +1,4 @@
+from dataclasses import replace
 from importlib import import_module
 from pathlib import Path
 
@@ -10,6 +11,10 @@ from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import NoteEvent
 from chart_worker.stages.types import SongTimingAuthority
+from chart_worker.validation.timing_integrity import (
+    TimingIntegrityAssessment,
+    TimingIntegrityStatus,
+)
 
 
 def _gate():
@@ -105,6 +110,91 @@ def test_acceptance_keeps_shared_section_profile_and_report():
     assert _decision(result, "PATTERN").action is _gate().GateAction.PASS
     report = result.to_report()
     assert report["qualityProfile"] == result.profile.to_report()
+
+
+@pytest.mark.parametrize(
+    ("status", "action", "reason"),
+    [
+        (
+            TimingIntegrityStatus.NEEDS_CORROBORATION,
+            "REVIEW",
+            "TIMING_AUTHORITY_NEEDS_CORROBORATION",
+        ),
+        (
+            TimingIntegrityStatus.DAMAGED,
+            "RETRY_MAP",
+            "TIMING_AUTHORITY_DAMAGED",
+        ),
+    ],
+)
+def test_timing_integrity_uncertainty_is_visible_in_chart_acceptance(
+    status,
+    action,
+    reason,
+):
+    authority = replace(
+        _authority(),
+        timing_integrity=TimingIntegrityAssessment(
+            status=status,
+            reasons=("FIXTURE",),
+            islands=(),
+        ),
+    )
+
+    decision = _gate()._timing_identity_decision(_chart((500,)), authority)
+
+    assert decision.action.value == action
+    assert decision.reasons == (reason,)
+
+
+def test_high_confidence_terminal_silence_rejects_a_hold_releasing_deep_in_silence():
+    terminal = import_module("chart_worker.analysis.terminal_silence")
+    activity = AudioActivity(
+        frame_ms=100.0,
+        rms_db=np.array([-10.0] * 201 + [-80.0] * 100),
+        floor_db=-60.0,
+        active_onset_ms=tuple(range(500, 20_001, 500)),
+    )
+    observation = terminal.TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=30_000,
+        frame_ms=100,
+        channel_count=2,
+        candidates=tuple(
+            terminal.TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=20_000,
+                suffix_duration_ms=10_000,
+            )
+            for rms_db, peak_db in terminal.DEFAULT_THRESHOLDS_DB
+        ),
+        candidate_spread_ms=0,
+        last_onset_ms=20_000,
+    )
+    analysis = _analysis(activity.active_onset_ms, activity=activity)
+    analysis = replace(analysis, terminal_silence=observation)
+    chart = GeneratedChart(
+        notes=[NoteEvent(19_000, 0, kind="HOLD", duration_ms=5_000)],
+        key_mode=4,
+        osu_text="",
+        generator_name="terminal-hold-fixture",
+        seed=0,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+    )
+
+    result = _gate().evaluate_chart_candidate(
+        chart,
+        _authority(),
+        analysis,
+        requested_key_mode=4,
+        requested_difficulty="EASY",
+        duration_ms=30_000,
+        boundary_policy_mode="HIGH_CONFIDENCE_ENFORCED",
+    )
+
+    assert _decision(result, "SONG_BOUNDS").action is _gate().GateAction.RETRY_MAP
+    assert _decision(result, "SONG_BOUNDS").reasons == ("HOLD_END_AFTER_RELEASE",)
 
 
 def test_acceptance_uses_every_local_bpm_segment_for_hold_beats():

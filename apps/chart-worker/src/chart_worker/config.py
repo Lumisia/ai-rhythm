@@ -38,7 +38,11 @@ class WorkerConfig(BaseSettings):
         le=30.0,
     )
     difficulty_selector_mode: Literal["CURRENT", "SHADOW_V2", "V2"] = "V2"
-    boundary_policy_mode: Literal["SHADOW", "EXPERIMENTAL_ENFORCED"] = "SHADOW"
+    boundary_policy_mode: Literal[
+        "SHADOW",
+        "EXPERIMENTAL_ENFORCED",
+        "HIGH_CONFIDENCE_ENFORCED",
+    ] = "HIGH_CONFIDENCE_ENFORCED"
     beat_this_enabled: bool = True
     beat_this_checkpoint: str = "final0"
     beat_this_device: Literal["cpu", "cuda"] = "cpu"

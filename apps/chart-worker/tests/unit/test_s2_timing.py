@@ -16,6 +16,10 @@ from chart_worker.stages import s2_timing
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.types import PreparedAudio
 from chart_worker.validation.timing_authority import TimingAuthorityValidationError
+from chart_worker.validation.timing_integrity import (
+    TimingIntegrityAssessment,
+    TimingIntegrityStatus,
+)
 from chart_worker.validation.timing_review import (
     TimingAuthorityAction,
     TimingAuthorityReview,
@@ -566,6 +570,152 @@ def test_healthy_local_timing_keeps_single_standard_inference(monkeypatch, tmp_p
     assert [call.super_timing for call in generator.timing_calls] == [False]
     assert authority.local_review is not None
     assert authority.local_review.action is TimingAuthorityAction.PASS
+
+
+def test_damaged_standard_integrity_uses_super_and_never_promotes_the_damaged_candidate(
+    monkeypatch, tmp_path
+):
+    assessments = iter(
+        (
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.DAMAGED,
+                reasons=(
+                    "ACTIVE_RETURN_TIMING_ISLAND",
+                    "RECOVERY_PREFLIGHT_DAMAGED",
+                ),
+                islands=(),
+            ),
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.HEALTHY,
+                reasons=(),
+                islands=(),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        s2_timing,
+        "assess_timing_integrity",
+        lambda local_review, recovery_preflight: next(assessments),
+    )
+    generator = RecordingGenerator()
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=30_000),
+        _active_analysis(30_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "SUPER_TIMING"
+    assert authority.candidate_selection is not None
+    assert [
+        candidate.mode for candidate in authority.candidate_selection.candidates
+    ] == ["SUPER_TIMING"]
+
+
+def test_standard_needing_corroboration_compares_super_before_selection(
+    monkeypatch, tmp_path
+):
+    assessments = iter(
+        (
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.NEEDS_CORROBORATION,
+                reasons=("ACTIVE_RETURN_TIMING_ISLAND",),
+                islands=(),
+            ),
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.HEALTHY,
+                reasons=(),
+                islands=(),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        s2_timing,
+        "assess_timing_integrity",
+        lambda local_review, recovery_preflight: next(assessments),
+    )
+    generator = RecordingGenerator()
+
+    authority = run_timing_generation(
+        _prepared(tmp_path, duration_ms=30_000),
+        _active_analysis(30_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert authority.mode == "SUPER_TIMING"
+    assert authority.candidate_selection is not None
+    assert authority.candidate_selection.reason == "BETTER_TIMING_INTEGRITY"
+
+
+def test_two_uncertain_internal_candidates_use_one_independent_fallback(
+    monkeypatch, tmp_path
+):
+    assessments = iter(
+        (
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.NEEDS_CORROBORATION,
+                reasons=("ACTIVE_RETURN_TIMING_ISLAND",),
+                islands=(),
+            ),
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.NEEDS_CORROBORATION,
+                reasons=("RECOVERY_PREFLIGHT_DAMAGED",),
+                islands=(),
+            ),
+            TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.HEALTHY,
+                reasons=(),
+                islands=(),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        s2_timing,
+        "assess_timing_integrity",
+        lambda local_review, recovery_preflight: next(assessments),
+    )
+    beat_calls = []
+
+    def analyze_beats(path):
+        beat_calls.append(path)
+        beats = tuple(range(0, 30_000, 500))
+        return BeatGrid(
+            beat_ms=beats,
+            downbeat_indices=tuple(range(0, len(beats), 4)),
+            bpm=120.0,
+            beats_per_bar=4,
+            bpm_drift_pct=0.0,
+            raw_beat_count=len(beats),
+            dropped_beat_count=0,
+            residual_rms_ms=0.0,
+            residual_max_ms=0.0,
+        )
+
+    prepared = replace(_prepared(tmp_path, duration_ms=30_000), beat_this_enabled=True)
+    generator = RecordingGenerator()
+    authority = run_timing_generation(
+        prepared,
+        _active_analysis(30_000),
+        tmp_path,
+        generator=generator,
+        seed=9,
+        beat_analyzer=analyze_beats,
+    )
+
+    assert [call.super_timing for call in generator.timing_calls] == [False, True]
+    assert beat_calls == [prepared.normalized.path]
+    assert authority.mode == "BEAT_THIS_FALLBACK"
+    assert authority.candidate_selection is not None
+    assert [
+        candidate.mode for candidate in authority.candidate_selection.candidates
+    ] == ["STANDARD", "SUPER_TIMING", "BEAT_THIS_FALLBACK"]
+    assert authority.candidate_selection.reason == "BETTER_TIMING_INTEGRITY"
 
 
 def test_force_super_timing_skips_standard_and_runs_once(monkeypatch, tmp_path):

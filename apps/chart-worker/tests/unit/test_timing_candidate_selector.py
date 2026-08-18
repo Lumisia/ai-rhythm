@@ -11,6 +11,10 @@ from chart_worker.validation.timing_candidate_selector import (
     select_timing_candidate,
     timing_candidates_need_external_corroboration,
 )
+from chart_worker.validation.timing_integrity import (
+    TimingIntegrityAssessment,
+    TimingIntegrityStatus,
+)
 from chart_worker.validation.timing_review import TimingAuthorityAction
 
 
@@ -196,6 +200,44 @@ def test_clear_internal_winner_does_not_request_the_optional_model():
         best_metrical_level="BASE",
     )
 
+    assert not timing_candidates_need_external_corroboration(
+        (standard, super_timing)
+    )
+
+
+def test_healthy_integrity_outranks_a_cheaper_candidate_needing_corroboration():
+    standard = build_timing_candidate_evidence(
+        epoch=1,
+        mode="STANDARD",
+        structurally_valid=True,
+        local_review=_review(_segment(0, 0, 60_000)),
+        tempo_metrics=_tempo(),
+    )
+    super_timing = replace(
+        standard,
+        mode="SUPER_TIMING",
+        integrity=TimingIntegrityAssessment(
+            status=TimingIntegrityStatus.HEALTHY,
+            reasons=(),
+            islands=(),
+        ),
+    )
+    standard = replace(
+        standard,
+        integrity=TimingIntegrityAssessment(
+            status=TimingIntegrityStatus.NEEDS_CORROBORATION,
+            reasons=("ACTIVE_RETURN_TIMING_ISLAND",),
+            islands=(),
+        ),
+    )
+
+    selection = select_timing_candidate((standard, super_timing))
+
+    assert selection.selected_index == 1
+    assert selection.reason == "BETTER_TIMING_INTEGRITY"
+    assert selection.to_report()["candidates"][0]["timingIntegrity"]["status"] == (
+        "NEEDS_CORROBORATION"
+    )
     assert not timing_candidates_need_external_corroboration(
         (standard, super_timing)
     )

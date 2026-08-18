@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil, floor
 from typing import Literal
 
 import numpy as np
+
+from chart_worker.analysis.terminal_silence import (
+    TerminalSilenceObservation,
+    consensus_terminal_boundary_ms,
+)
 
 SILENCE_DB = -60.0
 RMS_FLOOR_PERCENTILE = 20.0
@@ -128,10 +133,15 @@ class SongBoundaryContract:
     policy_applied: bool
     policy_state: Literal["PROVISIONAL"] = "PROVISIONAL"
     confidence: Literal["UNKNOWN"] = "UNKNOWN"
-    enforcement_mode: Literal["SHADOW", "EXPERIMENTAL_ENFORCED"] = "SHADOW"
+    enforcement_mode: Literal[
+        "SHADOW",
+        "EXPERIMENTAL_ENFORCED",
+        "HIGH_CONFIDENCE_ENFORCED",
+    ] = "SHADOW"
     effective_source: Literal[
         "FULL_DURATION_BASELINE",
         "PROVISIONAL_POLICY",
+        "TERMINAL_SILENCE_CONSENSUS",
     ] = "FULL_DURATION_BASELINE"
 
     def to_report(self) -> dict[str, object]:
@@ -162,10 +172,15 @@ class SongBoundaryContract:
         return hashlib.sha256(payload).hexdigest()
 
 
-BoundaryPolicyMode = Literal["SHADOW", "EXPERIMENTAL_ENFORCED"]
+BoundaryPolicyMode = Literal[
+    "SHADOW",
+    "EXPERIMENTAL_ENFORCED",
+    "HIGH_CONFIDENCE_ENFORCED",
+]
 BoundaryEffectiveSource = Literal[
     "FULL_DURATION_BASELINE",
     "PROVISIONAL_POLICY",
+    "TERMINAL_SILENCE_CONSENSUS",
 ]
 
 
@@ -471,18 +486,48 @@ def _full_duration_contract(duration_ms: int) -> SongBoundaryContract:
     )
 
 
+def _terminal_consensus_contract(
+    duration_ms: int,
+    boundary_ms: int,
+) -> SongBoundaryContract:
+    return SongBoundaryContract(
+        version=SONG_BOUNDARY_CONTRACT_VERSION,
+        last_attack_ms=boundary_ms,
+        max_note_start_ms=min(
+            duration_ms,
+            boundary_ms + BOUNDARY_QUANTIZATION_TOLERANCE_MS,
+        ),
+        # Keep the decoder horizon long enough to close an already-open HOLD,
+        # but do not publish a release deep inside proven terminal silence.
+        release_end_ms=boundary_ms,
+        generation_end_ms=min(duration_ms, boundary_ms + HOLD_COMPLETION_GUARD_MS),
+        required_coverage_end_ms=boundary_ms,
+        quantization_tolerance_ms=BOUNDARY_QUANTIZATION_TOLERANCE_MS,
+        hold_completion_guard_ms=HOLD_COMPLETION_GUARD_MS,
+        policy_reason="TERMINAL_SILENCE_CONSENSUS",
+        policy_applied=True,
+        enforcement_mode="HIGH_CONFIDENCE_ENFORCED",
+        effective_source="TERMINAL_SILENCE_CONSENSUS",
+    )
+
+
 def evaluate_boundary_policy(
     activity: AudioActivity,
     duration_ms: int,
     *,
     enforcement_mode: BoundaryPolicyMode = "SHADOW",
+    terminal_silence: TerminalSilenceObservation | None = None,
 ) -> BoundaryPolicyEvaluation:
     """Dual-evaluate an uncalibrated boundary without hiding enforcement.
 
     The provisional detector remains observable, but the default effective
     contract is the full-duration baseline until a frozen audit calibrates it.
     """
-    if enforcement_mode not in {"SHADOW", "EXPERIMENTAL_ENFORCED"}:
+    if enforcement_mode not in {
+        "SHADOW",
+        "EXPERIMENTAL_ENFORCED",
+        "HIGH_CONFIDENCE_ENFORCED",
+    }:
         raise ValueError(f"unsupported boundary enforcement mode: {enforcement_mode}")
     observation = observe_outro(activity, duration_ms)
     decision = evaluate_outro_policy(observation)
@@ -491,6 +536,24 @@ def evaluate_boundary_policy(
     if enforcement_mode == "EXPERIMENTAL_ENFORCED":
         source: BoundaryEffectiveSource = "PROVISIONAL_POLICY"
         effective = provisional
+    elif enforcement_mode == "HIGH_CONFIDENCE_ENFORCED":
+        terminal_boundary_ms = (
+            None
+            if terminal_silence is None
+            else consensus_terminal_boundary_ms(terminal_silence)
+        )
+        if terminal_boundary_ms is None:
+            source = "FULL_DURATION_BASELINE"
+            effective = replace(
+                baseline,
+                enforcement_mode="HIGH_CONFIDENCE_ENFORCED",
+            )
+        else:
+            source = "TERMINAL_SILENCE_CONSENSUS"
+            effective = _terminal_consensus_contract(
+                duration_ms,
+                terminal_boundary_ms,
+            )
     else:
         source = "FULL_DURATION_BASELINE"
         effective = baseline
@@ -513,12 +576,14 @@ def build_song_boundary_contract(
     duration_ms: int,
     *,
     enforcement_mode: BoundaryPolicyMode = "SHADOW",
+    terminal_silence: TerminalSilenceObservation | None = None,
 ) -> SongBoundaryContract:
     """Return the explicitly selected effective note/HOLD horizon contract."""
     return evaluate_boundary_policy(
         activity,
         duration_ms,
         enforcement_mode=enforcement_mode,
+        terminal_silence=terminal_silence,
     ).effective_contract
 
 

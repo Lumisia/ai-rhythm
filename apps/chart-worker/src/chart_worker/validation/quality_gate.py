@@ -30,6 +30,7 @@ from chart_worker.validation.timing_authority import (
     TimingAuthorityValidationError,
     validate_timing_identity,
 )
+from chart_worker.validation.timing_integrity import TimingIntegrityStatus
 
 QUALITY_GATE_VERSION = "quality-gate-v4-beat-aware-coverage"
 QUIET_TRAILING_REVIEW_PROXIMITY = 0.5
@@ -122,6 +123,20 @@ def _timing_identity_decision(
             GateAction.RETRY_MAP,
             ("TIMING_REFERENCE_MISMATCH",),
         )
+    integrity = authority.timing_integrity
+    if integrity is not None:
+        if integrity.status is TimingIntegrityStatus.DAMAGED:
+            return GateDecision(
+                GateAxis.TIMING_IDENTITY,
+                GateAction.RETRY_MAP,
+                ("TIMING_AUTHORITY_DAMAGED",),
+            )
+        if integrity.status is TimingIntegrityStatus.NEEDS_CORROBORATION:
+            return GateDecision(
+                GateAxis.TIMING_IDENTITY,
+                GateAction.REVIEW,
+                ("TIMING_AUTHORITY_NEEDS_CORROBORATION",),
+            )
     return GateDecision(GateAxis.TIMING_IDENTITY, GateAction.PASS, ())
 
 
@@ -331,6 +346,7 @@ def evaluate_chart_candidate(
             onset_analysis.activity,
             duration_ms,
             enforcement_mode=boundary_policy_mode,
+            terminal_silence=onset_analysis.terminal_silence,
         )
         if onset_analysis.activity is not None
         else None

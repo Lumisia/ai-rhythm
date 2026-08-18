@@ -88,6 +88,7 @@ def _diagnose_rows(
             onsets.activity,
             duration_ms,
             enforcement_mode=boundary_policy_mode,
+            terminal_silence=onsets.terminal_silence,
         )
         .required_coverage_end_ms
         if onsets.activity is not None

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from chart_worker.validation.song_family_selector import SongSelectionComparison
     from chart_worker.validation.timing_candidate_selector import TimingCandidateSelection
     from chart_worker.validation.timing_family_review import TimingFamilyReview
+    from chart_worker.validation.timing_integrity import TimingIntegrityAssessment
 
 GenerationProvenance = Literal[
     "PRIMARY",
@@ -54,7 +55,11 @@ PLAYTEST_ONLY/REVIEW.
 class PreparedAudio:
     normalized: NormalizedAudio
     difficulty_selector_mode: Literal["CURRENT", "SHADOW_V2", "V2"] = "SHADOW_V2"
-    boundary_policy_mode: Literal["SHADOW", "EXPERIMENTAL_ENFORCED"] = "SHADOW"
+    boundary_policy_mode: Literal[
+        "SHADOW",
+        "EXPERIMENTAL_ENFORCED",
+        "HIGH_CONFIDENCE_ENFORCED",
+    ] = "HIGH_CONFIDENCE_ENFORCED"
     beat_this_enabled: bool = False
     beat_this_checkpoint: str = "final0"
     beat_this_device: Literal["cpu", "cuda"] = "cpu"
@@ -77,6 +82,7 @@ class SongTimingAuthority:
     local_review: "LocalTimingAuthorityReview | None" = None
     recovery_preflight: "RecoveryPreflight | None" = None
     candidate_selection: "TimingCandidateSelection | None" = None
+    timing_integrity: "TimingIntegrityAssessment | None" = None
 
 
 @dataclass(frozen=True, slots=True)

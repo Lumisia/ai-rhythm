@@ -105,19 +105,30 @@ def _acceptance(
     )
 
 
-def test_repair_preserves_source_and_fills_only_active_leading_middle_trailing_gaps():
+def test_repair_preserves_source_and_fills_one_bounded_active_gap():
     request = _request()
     authority = _authority()
-    analysis = _analysis(request.duration_ms)
+    analysis = _analysis(request.duration_ms, onset_step_ms=1_000)
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    gap_start_ms = 12_000
+    gap_end_ms = 20_000
     source = _raw_chart(
         authority,
         key_mode=request.key_mode,
-        rows=(10_000, 20_000, 30_000),
+        rows=tuple(
+            sorted(
+                {
+                    gap_start_ms,
+                    gap_end_ms,
+                    *(row for row in active_rows if not gap_start_ms < row < gap_end_ms),
+                }
+            )
+        ),
     )
     acceptance = _acceptance(request, source, authority, analysis)
     assert acceptance.decision(GateAxis.COVERAGE).action is GateAction.RETRY_MAP
-    gap_positions = {gap.position for gap in acceptance.timing.coverage_gaps}
-    assert {"LEADING", "MIDDLE", "TRAILING"} <= gap_positions
+    assert len(acceptance.timing.coverage_gaps) == 1
+    assert acceptance.timing.coverage_gaps[0].position == "MIDDLE"
 
     repaired, plan = build_coverage_repair_chart(
         request,
@@ -128,7 +139,7 @@ def test_repair_preserves_source_and_fills_only_active_leading_middle_trailing_g
     )
 
     assert all(note in repaired.notes for note in source.notes)
-    assert plan.repaired_gap_count == len(acceptance.timing.coverage_gaps)
+    assert plan.repaired_gap_count == 1
     assert plan.inserted_notes
     assert all(note.kind == "TAP" for note in plan.inserted_notes)
     active_onsets = set(analysis.activity.active_onset_ms)  # type: ignore[union-attr]
@@ -142,6 +153,27 @@ def test_repair_preserves_source_and_fills_only_active_leading_middle_trailing_g
         for note in plan.inserted_notes
     )
     assert repaired.bpm_events == source.bpm_events
+
+
+def test_repair_rejects_large_tap_synthesis_so_partial_remap_can_take_over():
+    request = _request()
+    authority = _authority()
+    analysis = _analysis(request.duration_ms)
+    source = _raw_chart(
+        authority,
+        key_mode=request.key_mode,
+        rows=(10_000, 20_000, 30_000),
+    )
+    acceptance = _acceptance(request, source, authority, analysis)
+
+    with pytest.raises(ValueError, match="coverage repair exceeds"):
+        build_coverage_repair_chart(
+            request,
+            source,
+            acceptance,
+            authority,
+            analysis,
+        )
 
 
 def test_repair_rejects_a_candidate_without_attack_required_gaps():
@@ -163,11 +195,29 @@ def test_repair_rejects_a_candidate_without_attack_required_gaps():
 def test_repair_never_inserts_a_tap_inside_an_open_hold_on_the_same_lane():
     request = _request()
     authority = _authority()
-    analysis = _analysis(request.duration_ms)
+    analysis = _analysis(request.duration_ms, onset_step_ms=1_000)
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    gap_start_ms = 12_000
+    gap_end_ms = 20_000
     source = GeneratedChart(
         notes=[
-            NoteEvent(time_ms=0, lane=0, kind="HOLD", duration_ms=40_000),
-            NoteEvent(time_ms=20_000, lane=1),
+            NoteEvent(time_ms=10_000, lane=0, kind="HOLD", duration_ms=20_000),
+            *(
+                NoteEvent(time_ms=row, lane=1 + index % 3)
+                for index, row in enumerate(
+                    sorted(
+                        {
+                            gap_start_ms,
+                            gap_end_ms,
+                            *(
+                                row
+                                for row in active_rows
+                                if not gap_start_ms < row < gap_end_ms
+                            ),
+                        }
+                    )
+                )
+            ),
         ],
         key_mode=4,
         osu_text="",
@@ -214,10 +264,25 @@ def test_repair_is_deterministic_across_duration_bpm_keycount_and_difficulty(
     )
     authority = _authority(bpm=bpm)
     analysis = _analysis(duration_ms, onset_step_ms=onset_step_ms)
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    gap_start_ms = duration_ms // 2 - 4_000
+    gap_end_ms = gap_start_ms + 8_000
     source = _raw_chart(
         authority,
         key_mode=key_mode,
-        rows=(duration_ms // 5, duration_ms * 4 // 5),
+        rows=tuple(
+            sorted(
+                {
+                    gap_start_ms,
+                    gap_end_ms,
+                    *(
+                        row
+                        for row in active_rows
+                        if not gap_start_ms < row < gap_end_ms
+                    ),
+                }
+            )
+        ),
     )
     acceptance = _acceptance(request, source, authority, analysis)
 

@@ -7,6 +7,10 @@ from typing import Literal
 import numpy as np
 
 from chart_worker.analysis.activity import AudioActivity
+from chart_worker.analysis.coverage_jury import (
+    LocalAudioGapEvidence,
+    measure_local_gap_evidence,
+)
 from chart_worker.analysis.coverage_opportunity import (
     MIN_PHRASE_DURATION_MS,
     MIN_STRONG_ATTACKS,
@@ -92,8 +96,9 @@ class TimingCoverageGap:
     active_frame_ratio: float
     position: Literal["LEADING", "POST_FIRST", "MIDDLE", "TRAILING"]
     opportunity: CoverageOpportunity | None = None
+    local_audio_evidence: LocalAudioGapEvidence | None = None
 
-    def to_report(self) -> dict[str, int | float | str]:
+    def to_report(self) -> dict[str, object]:
         report: dict[str, object] = {
             "startMs": self.start_ms,
             "endMs": self.end_ms,
@@ -105,6 +110,8 @@ class TimingCoverageGap:
         }
         if self.opportunity is not None:
             report["opportunity"] = self.opportunity.to_report()
+        if self.local_audio_evidence is not None:
+            report["localAudioEvidence"] = self.local_audio_evidence.to_report()
         return report
 
 
@@ -255,6 +262,16 @@ def _coverage_gaps(
             if activity is None
             else round(activity.active_frame_ratio(start_ms, end_ms), 6)
         )
+        local_audio_evidence = (
+            measure_local_gap_evidence(
+                onset_analysis,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            if onset_analysis is not None
+            and end_ms - start_ms >= MIN_PHRASE_DURATION_MS
+            else None
+        )
         opportunity = None
         if (
             onset_analysis is not None
@@ -299,6 +316,7 @@ def _coverage_gaps(
                         else "MIDDLE"
                     ),
                     opportunity=opportunity,
+                    local_audio_evidence=local_audio_evidence,
                 )
             )
             continue
@@ -320,6 +338,7 @@ def _coverage_gaps(
                     if end_ms == duration_ms
                     else "MIDDLE"
                 ),
+                local_audio_evidence=local_audio_evidence,
             )
             target = (
                 active_gaps

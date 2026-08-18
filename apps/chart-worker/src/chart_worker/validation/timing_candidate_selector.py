@@ -7,6 +7,10 @@ from typing import Literal
 
 from chart_worker.analysis.grid_alignment import TempoCandidateMetrics
 from chart_worker.validation.local_timing_review import LocalTimingAuthorityReview
+from chart_worker.validation.timing_integrity import (
+    TimingIntegrityAssessment,
+    TimingIntegrityStatus,
+)
 
 TimingMode = Literal["STANDARD", "SUPER_TIMING", "BEAT_THIS_FALLBACK"]
 MetricalLevel = Literal["HALF", "BASE", "DOUBLE"]
@@ -31,6 +35,7 @@ class TimingCandidateEvidence:
     fragmentation_active_ratio: float
     boundary_risk_count: int
     confidence: Literal["HIGH", "MEDIUM", "LOW"]
+    integrity: TimingIntegrityAssessment
     external_beat_f1_by_level: dict[str, float] | None = None
     best_external_beat_f1: float | None = None
 
@@ -59,6 +64,7 @@ class TimingCandidateEvidence:
             "fragmentationActiveRatio": self.fragmentation_active_ratio,
             "boundaryRiskCount": self.boundary_risk_count,
             "confidence": self.confidence,
+            "timingIntegrity": self.integrity.to_report(),
             "externalBeatF1ByLevel": self.external_beat_f1_by_level,
             "bestExternalBeatF1": self.best_external_beat_f1,
         }
@@ -111,6 +117,7 @@ def build_timing_candidate_evidence(
     local_review: LocalTimingAuthorityReview,
     tempo_metrics: TempoCandidateMetrics,
     boundary_risk_count: int = 0,
+    integrity: TimingIntegrityAssessment | None = None,
 ) -> TimingCandidateEvidence:
     duration = local_review.duration_evidence
     consensus = _consensus(tempo_metrics)
@@ -178,11 +185,21 @@ def build_timing_candidate_evidence(
         fragmentation_active_ratio=fragmentation_ratio,
         boundary_risk_count=boundary_risk_count,
         confidence=confidence,
+        integrity=(
+            integrity
+            if integrity is not None
+            else TimingIntegrityAssessment(
+                status=TimingIntegrityStatus.HEALTHY,
+                reasons=(),
+                islands=(),
+            )
+        ),
     )
 
 
 _REASONS = (
     "STRUCTURALLY_VALID",
+    "BETTER_TIMING_INTEGRITY",
     "LOWER_CONTRADICTED_ACTIVE_RATIO",
     "HIGHER_EXTERNAL_BEAT_F1",
     "HIGHER_MULTI_METRIC_BEAT_CONSENSUS",
@@ -201,8 +218,14 @@ def _rank(candidate: TimingCandidateEvidence) -> tuple[object, ...]:
         "SUPER_TIMING": 1,
         "BEAT_THIS_FALLBACK": 2,
     }[candidate.mode]
+    integrity_rank = {
+        TimingIntegrityStatus.HEALTHY: 0,
+        TimingIntegrityStatus.NEEDS_CORROBORATION: 1,
+        TimingIntegrityStatus.DAMAGED: 2,
+    }[candidate.integrity.status]
     return (
         0 if candidate.structurally_valid else 1,
+        integrity_rank,
         candidate.contradicted_ratio,
         -(candidate.best_external_beat_f1 or 0.0),
         -candidate.best_beat_consensus,
@@ -220,9 +243,13 @@ def timing_candidates_need_external_corroboration(
     """Use the optional model only for a measured close internal decision."""
     if len(candidates) < 2:
         return False
+    if any(candidate.mode == "BEAT_THIS_FALLBACK" for candidate in candidates):
+        return False
     ordered = sorted(candidates, key=_rank)
     first, second = ordered[:2]
     if not first.structurally_valid or not second.structurally_valid:
+        return False
+    if first.integrity.status is not second.integrity.status:
         return False
     if abs(first.contradicted_ratio - second.contradicted_ratio) > 1e-6:
         return False

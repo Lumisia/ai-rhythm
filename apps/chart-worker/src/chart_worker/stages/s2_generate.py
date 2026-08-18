@@ -31,7 +31,7 @@ from chart_worker.generation.family_selection import (
     compare_difficulty_selection as _family_compare_difficulty_selection,
 )
 from chart_worker.generation.family_selection import (
-    compare_song_selection_shadow as _family_compare_song_selection_shadow,
+    compare_song_selection as _family_compare_song_selection,
 )
 from chart_worker.generation.family_selection import (
     family_score as _family_selection_score,
@@ -83,6 +83,9 @@ from chart_worker.generation.intro_family_recovery import (
 )
 from chart_worker.generation.intro_family_recovery import (
     intro_candidate_view as _intro_view,
+)
+from chart_worker.generation.intro_family_recovery import (
+    intro_phrase_family_reviews as _intro_phrase_family_reviews,
 )
 from chart_worker.generation.intro_recovery import (
     covers_intro_anchor,
@@ -853,6 +856,7 @@ def _generation_bounds(
             onset_analysis.activity,
             prepared.normalized.duration_ms,
             enforcement_mode=prepared.boundary_policy_mode,
+            terminal_silence=onset_analysis.terminal_silence,
         )
         if onset_analysis.activity is not None
         else None
@@ -1219,7 +1223,7 @@ def _candidate_stable_id(
     )
 
 
-def _compare_song_selection_shadow(
+def _compare_song_selection(
     selections: list[
         tuple[
             dict[str, _VariantState],
@@ -1233,14 +1237,25 @@ def _compare_song_selection_shadow(
     run_dir: Path,
     intro_contract: IntroStartContract,
     boundary: SongBoundaryContract | None,
-) -> SongSelectionComparison:
-    return _family_compare_song_selection_shadow(
+    mode: str,
+) -> tuple[
+    list[
+        tuple[
+            dict[str, _VariantState],
+            dict[str, _Candidate | None],
+            DifficultyOrderReview | None,
+        ]
+    ],
+    SongSelectionComparison,
+]:
+    return _family_compare_song_selection(
         selections,
         prepared=prepared,
         authority=authority,
         run_dir=run_dir,
         intro_contract=intro_contract,
         boundary=boundary,
+        mode=mode,
     )
 
 
@@ -1845,7 +1860,10 @@ def run_generation(
         correction_reasons=intro_contract_review.correction_reasons,
     )
     timing_family_reviews = _timing_family_reviews(selections)
-    song_selection_shadow = _compare_song_selection_shadow(
+    final_song_selector_mode = (
+        "V2" if prepared.difficulty_selector_mode == "V2" else "SHADOW_V2"
+    )
+    selections, song_selection_shadow = _compare_song_selection(
         selections,
         prepared=prepared,
         authority=authority,
@@ -1856,11 +1874,36 @@ def run_generation(
                 onset_analysis.activity,
                 prepared.normalized.duration_ms,
                 enforcement_mode=prepared.boundary_policy_mode,
+                terminal_silence=onset_analysis.terminal_silence,
             )
             if onset_analysis.activity is not None
             else None
         ),
+        mode=final_song_selector_mode,
     )
+    # The enforced V2 selector may choose a different already-validated
+    # candidate.  Reports and the exact intro contract must describe the
+    # published assignment, not the pre-selector assignment.
+    final_intro_candidates = _selected_candidates(selections)
+    final_intro_views = tuple(
+        _intro_view(candidate, song_context) for candidate in final_intro_candidates
+    )
+    intro_start_contract = build_intro_start_contract(
+        song_context,
+        final_intro_views,
+    )
+    intro_contract_review = validate_exact_first_row(
+        intro_start_contract,
+        final_intro_views,
+        corrected_count=intro_contract_review.corrected_count,
+        correction_reasons=intro_contract_review.correction_reasons,
+    )
+    intro_phrase_family_reviews = _intro_phrase_family_reviews(
+        selections,
+        song_context=song_context,
+        run_dir=run_dir,
+    )
+    timing_family_reviews = _timing_family_reviews(selections)
     publication = assemble_publication(
         selections,
         prepared=prepared,

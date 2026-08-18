@@ -8,6 +8,10 @@ import pytest
 from chart_worker import pipeline
 from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
+from chart_worker.analysis.terminal_silence import (
+    TerminalSilenceObservation,
+    TerminalThresholdCandidate,
+)
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.attempt_journal import AttemptJournal
@@ -380,6 +384,12 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["timingAuthoritySelection"]["reason"] == ("ONLY_STRUCTURALLY_VALID_CANDIDATE")
     assert report["timingAuthorityLocalReview"]["action"] == "PASS"
     assert report["timingAuthorityRecoveryPreflight"]["version"] == ("recovery-preflight-v1")
+    assert report["timingAuthorityIntegrity"] == {
+        "version": "timing-integrity-v1",
+        "status": "HEALTHY",
+        "reasons": [],
+        "islands": [],
+    }
     assert report["noteMutationEnabled"] is False
     assert report["mapperatorinatorConstraintPatch"] is None
     assert report["mapperatorinatorHoldStateMode"] is None
@@ -417,6 +427,23 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["elapsedMsByStage"] == result.elapsed_ms_by_stage
     assert len(report["charts"]) == 12
     assert set(report["difficultyOrder"]) == {"4K", "6K", "7K"}
+    for key_mode in (4, 6, 7):
+        family_observation = report["difficultyOrder"][f"{key_mode}K"][
+            "finalFamilyObservation"
+        ]
+        assert family_observation["keyMode"] == key_mode
+        assert family_observation["calibrationState"] == "UNAVAILABLE"
+        assert family_observation["contractStatus"] == "UNCALIBRATED"
+        assert family_observation["provisionalConcern"] == "NONE"
+        assert family_observation["policyState"] == "OBSERVATION_ONLY"
+        assert family_observation["mutatesSelection"] is False
+        assert family_observation["mutatesCharts"] is False
+        assert [entry["difficulty"] for entry in family_observation["entries"]] == [
+            "EASY",
+            "NORMAL",
+            "HARD",
+            "EXPERT",
+        ]
     assert len(report["difficultySelectionShadow"]) == 3
     assert all(
         comparison["mode"] == "SHADOW_V2" for comparison in report["difficultySelectionShadow"]
@@ -1822,6 +1849,22 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
                 floor_db=-60.0,
                 active_onset_ms=(),
             ),
+            terminal_silence=TerminalSilenceObservation(
+                version="terminal-silence-observation-v1",
+                duration_ms=2_000,
+                frame_ms=20,
+                channel_count=2,
+                candidates=(
+                    TerminalThresholdCandidate(
+                        rms_db=-66.0,
+                        peak_db=-54.0,
+                        suffix_start_ms=1_500,
+                        suffix_duration_ms=500,
+                    ),
+                ),
+                candidate_spread_ms=0,
+                last_onset_ms=1_400,
+            ),
         )
 
     run_pipeline(
@@ -1836,6 +1879,11 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
     outro_profile = report["musicBounds"]["outroEvidenceProfile"]
+    terminal = report["musicBounds"]["terminalSilenceObservation"]
+    assert terminal["version"] == "terminal-silence-observation-v1"
+    assert terminal["policyState"] == "OBSERVATION_ONLY"
+    assert terminal["mutatesGeneration"] is False
+    assert terminal["candidates"][0]["suffixStartMs"] == 1_500
     assert outro_profile["version"] == "outro-evidence-profile-v1"
     assert outro_profile["policyState"] == "UNCALIBRATED"
     assert outro_profile["semanticClassification"] == "UNAVAILABLE"
@@ -1848,7 +1896,7 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
     boundary = report["musicBounds"]["boundaryPolicyEvaluation"]
     assert boundary["policyState"] == "PROVISIONAL"
     assert boundary["confidence"] == "UNKNOWN"
-    assert boundary["enforcementMode"] == "SHADOW"
+    assert boundary["enforcementMode"] == "HIGH_CONFIDENCE_ENFORCED"
     assert boundary["effectiveSource"] == "FULL_DURATION_BASELINE"
     assert boundary["effectiveContract"] == report["musicBounds"]["songBoundaryContract"]
     assert boundary["observationSha256"] == (

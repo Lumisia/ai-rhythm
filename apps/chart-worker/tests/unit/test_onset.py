@@ -1,3 +1,6 @@
+from pathlib import Path
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 
@@ -7,6 +10,7 @@ from chart_worker.analysis.onset import (
     BAND_NAMES,
     OnsetAnalysis,
     _canonical_onset_ms,
+    analyze_canonical_audio,
     analyze_onsets,
     annotate_notes,
     normalize_envelope,
@@ -146,6 +150,22 @@ def test_backend_failure_becomes_a_worker_error():
     with pytest.raises(WorkerError) as caught:
         analyze_onsets(AudioSignal(np.zeros((100, 2)), SAMPLE_RATE), backend=backend)
     assert caught.value.code is ErrorCode.CHART_ANALYSIS_FAILED
+
+
+def test_canonical_audio_is_loaded_once_and_binds_stereo_terminal_observation(monkeypatch):
+    signal = AudioSignal(np.zeros((1_000, 2)), 1_000)
+    loaded = Mock(return_value=signal)
+    backend = Mock(return_value=_analysis(onset_ms=(100, 500)))
+    monkeypatch.setattr("chart_worker.analysis.onset.load_audio", loaded)
+    monkeypatch.setattr("chart_worker.analysis.onset.librosa_backend", lambda: backend)
+
+    observed = analyze_canonical_audio(Path("canonical.flac"))
+
+    loaded.assert_called_once_with(Path("canonical.flac"))
+    backend.assert_called_once()
+    assert observed.terminal_silence is not None
+    assert observed.terminal_silence.channel_count == 2
+    assert observed.terminal_silence.last_onset_ms == 500
 
 
 def test_backtracked_peak_times_are_sorted_and_deduplicated():

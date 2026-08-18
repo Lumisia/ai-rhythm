@@ -9,6 +9,10 @@ import pytest
 from chart_worker.analysis.activity import AudioActivity, SongBoundaryContract
 from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.terminal_silence import (
+    TerminalSilenceObservation,
+    TerminalThresholdCandidate,
+)
 from chart_worker.analysis.timing_diagnostics import (
     TimingCoverageGap,
     TimingMetrics,
@@ -44,6 +48,7 @@ from chart_worker.stages.types import (
     PreparedAudio,
     SongTimingAuthority,
 )
+from chart_worker.validation.intro_start_contract import IntroStartContract
 from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.quality_gate import (
     GateAction,
@@ -264,6 +269,183 @@ def test_song_selection_context_changes_with_boundary_policy(tmp_path: Path):
     )
 
     assert base != changed
+
+
+def test_final_song_selection_uses_v2_after_recovery_when_configured(
+    monkeypatch,
+    tmp_path: Path,
+):
+    prepared = replace(_prepared(tmp_path), difficulty_selector_mode="V2")
+    authority = _authority(prepared, tmp_path)
+    observed_modes: list[str] = []
+
+    real_compare = family_selection.compare_song_selection
+
+    def record_mode(*args, mode, **kwargs):
+        observed_modes.append(mode)
+        return real_compare(*args, mode=mode, **kwargs)
+
+    monkeypatch.setattr(s2_generate, "_compare_song_selection", record_mode)
+
+    outcome = run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=RecordingGenerator(),
+        seed=0,
+    )
+
+    assert observed_modes == ["V2"]
+    assert outcome.song_selection_shadow.mode == "V2"
+
+
+def test_final_song_selection_refreshes_intro_family_evidence(
+    monkeypatch,
+    tmp_path: Path,
+):
+    prepared = replace(_prepared(tmp_path), difficulty_selector_mode="V2")
+    authority = _authority(prepared, tmp_path)
+    refreshes: list[int] = []
+
+    real_review = s2_generate._intro_phrase_family_reviews
+
+    def record_refresh(selections, **kwargs):
+        refreshes.append(sum(len(assignment) for _states, assignment, _review in selections))
+        return real_review(selections, **kwargs)
+
+    monkeypatch.setattr(s2_generate, "_intro_phrase_family_reviews", record_refresh)
+
+    run_generation(
+        prepared,
+        authority,
+        _analysis(),
+        tmp_path,
+        generator=RecordingGenerator(),
+        seed=0,
+    )
+
+    assert refreshes == [12]
+
+
+def test_final_song_selection_reuses_an_existing_ordered_candidate(
+    tmp_path: Path,
+):
+    prepared = replace(_prepared(tmp_path), difficulty_selector_mode="V2")
+    authority = _authority(prepared, tmp_path)
+    base_acceptance = _pass_acceptance(authority)
+    selections = []
+    current_expert = None
+    ordered_expert = None
+
+    def make_candidate(
+        *,
+        key_mode: int,
+        difficulty: str,
+        seed: int,
+        ordering_score: float,
+    ):
+        acceptance = _acceptance_for_difficulty(base_acceptance, difficulty)
+        assert acceptance.profile is not None
+        acceptance = replace(
+            acceptance,
+            profile=replace(
+                acceptance.profile,
+                difficulty_vector_v2=replace(
+                    acceptance.profile.difficulty_vector_v2,
+                    ordering_score=ordering_score,
+                ),
+            ),
+        )
+        request = GenerationRequest(
+            audio_path=prepared.normalized.path,
+            timing_reference_path=authority.reference_path,
+            key_mode=key_mode,
+            difficulty=difficulty,
+            seed=seed,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+        return s2_generate._Candidate(
+            request=request,
+            generated=GeneratedChart(
+                notes=[NoteEvent(500, 0)],
+                key_mode=key_mode,
+                osu_text="",
+                generator_name="final-family-fixture",
+                seed=seed,
+                bpm_events=authority.bpm_events,
+            ),
+            acceptance=acceptance,
+            osu_text="",
+            workdir=tmp_path / f"{key_mode}k-{difficulty}-{seed}",
+            attempt=1,
+            seed=seed,
+            provenance="PRIMARY",
+            intro_anchor_covered=True,
+        )
+
+    for key_index, key_mode in enumerate((4, 6, 7)):
+        states = {}
+        assignment = {}
+        for difficulty_index, difficulty in enumerate(
+            ("EASY", "NORMAL", "HARD", "EXPERT")
+        ):
+            state = s2_generate._VariantState(
+                key_mode,
+                difficulty,
+                key_index * 4 + difficulty_index,
+            )
+            score = float(difficulty_index + 1)
+            if key_mode == 4 and difficulty == "EXPERT":
+                score = 2.5
+            candidate = make_candidate(
+                key_mode=key_mode,
+                difficulty=difficulty,
+                seed=difficulty_index,
+                ordering_score=score,
+            )
+            state.candidates.admit(candidate)
+            states[difficulty] = state
+            assignment[difficulty] = candidate
+            if key_mode == 4 and difficulty == "EXPERT":
+                current_expert = candidate
+                ordered_expert = make_candidate(
+                    key_mode=key_mode,
+                    difficulty=difficulty,
+                    seed=99,
+                    ordering_score=4.0,
+                )
+                state.candidates.admit(ordered_expert)
+        selections.append((states, assignment, s2_generate._family_review(assignment)))
+
+    intro_contract = IntroStartContract(
+        version="intro-start-contract-v2",
+        canonical_first_row_ms=500,
+        candidate_support_count=12,
+        raw_supported=True,
+        audio_supported=True,
+        grid_distance_ms=0,
+        candidates=(),
+    )
+    selected, comparison = family_selection.compare_song_selection(
+        selections,
+        prepared=prepared,
+        authority=authority,
+        run_dir=tmp_path,
+        intro_contract=intro_contract,
+        boundary=None,
+        mode="V2",
+    )
+
+    selected_4k = next(
+        assignment
+        for states, assignment, _review in selected
+        if states["EASY"].key_mode == 4
+    )
+    assert selected_4k["EXPERT"] is ordered_expert
+    assert selected_4k["EXPERT"] is not current_expert
+    assert comparison.current_score.difficulty_violations == 1
+    assert comparison.shadow_score.difficulty_violations == 0
 
 
 def _pass_acceptance(authority: SongTimingAuthority):
@@ -3460,7 +3642,7 @@ def test_coverage_repair_outranks_gapped_raw_without_another_full_model_call(
     duration_ms = 40_000
     prepared = _prepared(tmp_path, duration_ms=duration_ms)
     authority = _authority(prepared, tmp_path)
-    analysis = _active_analysis(duration_ms)
+    analysis = _active_analysis(duration_ms, onset_step_ms=1_000)
     accepted = _pass_acceptance(authority)
 
     def evaluate(generated, *args, requested_difficulty, **kwargs):
@@ -3477,7 +3659,34 @@ def test_coverage_repair_outranks_gapped_raw_without_another_full_model_call(
         return _acceptance_for_difficulty(accepted, requested_difficulty)
 
     monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
-    generator = RecordingGenerator()
+    class OneBoundedGapGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if (request.key_mode, request.difficulty) != (4, "EASY"):
+                return generated
+            active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+            gap_start_ms = 12_000
+            gap_end_ms = 20_000
+            rows = sorted(
+                {
+                    gap_start_ms,
+                    gap_end_ms,
+                    *(
+                        row
+                        for row in active_rows
+                        if not gap_start_ms < row < gap_end_ms
+                    ),
+                }
+            )
+            return replace(
+                generated,
+                notes=[
+                    NoteEvent(time_ms=row, lane=index % request.key_mode)
+                    for index, row in enumerate(rows)
+                ],
+            )
+
+    generator = OneBoundedGapGenerator()
 
     outcome = run_generation(
         prepared,
@@ -3511,9 +3720,22 @@ def test_zero_inference_coverage_repair_precedes_a_viable_partial_model_call(
     duration_ms = 60_000
     prepared = _prepared(tmp_path, duration_ms=duration_ms)
     authority = _authority(prepared, tmp_path)
-    analysis = _active_analysis(duration_ms)
+    analysis = _active_analysis(duration_ms, onset_step_ms=1_000)
     accepted = _pass_acceptance(authority)
-    coverage_retry = _coverage_retry_acceptance(authority)
+    base_coverage_retry = _coverage_retry_acceptance(authority)
+    coverage_retry = replace(
+        base_coverage_retry,
+        timing=replace(
+            base_coverage_retry.timing,
+            coverage_gaps=(
+                replace(
+                    base_coverage_retry.timing.coverage_gaps[0],
+                    start_ms=12_000,
+                    end_ms=20_000,
+                ),
+            ),
+        ),
+    )
 
     def evaluate(generated, *args, requested_difficulty, **kwargs):
         del args, kwargs
@@ -3529,7 +3751,30 @@ def test_zero_inference_coverage_repair_precedes_a_viable_partial_model_call(
         def generate_map(self, request, workdir):
             if request.add_to_beatmap:
                 raise AssertionError("validated CPU coverage repair must run first")
-            return super().generate_map(request, workdir)
+            generated = super().generate_map(request, workdir)
+            if (request.key_mode, request.difficulty) != (4, "EASY"):
+                return generated
+            active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+            gap_start_ms = 12_000
+            gap_end_ms = 20_000
+            rows = sorted(
+                {
+                    gap_start_ms,
+                    gap_end_ms,
+                    *(
+                        row
+                        for row in active_rows
+                        if not gap_start_ms < row < gap_end_ms
+                    ),
+                }
+            )
+            return replace(
+                generated,
+                notes=[
+                    NoteEvent(time_ms=row, lane=index % request.key_mode)
+                    for index, row in enumerate(rows)
+                ],
+            )
 
     generator = PartialMustNotRun()
     outcome = run_generation(
@@ -3561,27 +3806,11 @@ def test_still_rejected_coverage_repair_does_not_suppress_partial_model_call(
     analysis = _active_analysis(duration_ms)
     accepted = _pass_acceptance(authority)
     coverage_retry = _coverage_retry_acceptance(authority)
-    alignment_retry = replace(
-        accepted,
-        action=GateAction.RETRY_MAP,
-        decisions=tuple(
-            replace(
-                decision,
-                action=GateAction.RETRY_MAP,
-                reasons=("FIXTURE_TIMING_ALIGNMENT_RETRY",),
-            )
-            if decision.axis is GateAxis.TIMING_ALIGNMENT
-            else decision
-            for decision in accepted.decisions
-        ),
-    )
 
     def evaluate(generated, *args, requested_difficulty, **kwargs):
         del args, kwargs
         if generated.generator_name == "partial-repair":
             return _acceptance_for_difficulty(accepted, requested_difficulty)
-        if generated.generator_name.startswith("coverage-repair-v1:"):
-            return _acceptance_for_difficulty(alignment_retry, requested_difficulty)
         if requested_difficulty == "EASY" and generated.key_mode == 4:
             return _acceptance_for_difficulty(coverage_retry, requested_difficulty)
         return _acceptance_for_difficulty(accepted, requested_difficulty)
@@ -3613,6 +3842,12 @@ def test_still_rejected_coverage_repair_does_not_suppress_partial_model_call(
     assert len(generator.map_calls) == 13
     assert outcome.additional_inference_calls == 1
     assert selected.provenance == "PARTIAL_REMAP"
+    missing_cpu_repair = next(
+        evidence
+        for evidence in selected.attempt_evidence
+        if evidence.get("reason") == "COVERAGE_REPAIR_REJECTED"
+    )
+    assert "inserted-note budget" in str(missing_cpu_repair["message"])
 
 
 def test_rejected_partial_remap_prefers_coverage_safe_fallback_over_gapped_raw(
@@ -3669,7 +3904,20 @@ def test_soft_coverage_review_model_repair_outranks_pass_safe_fallback(
     prepared = _prepared(tmp_path, duration_ms=60_000)
     authority = _authority(prepared, tmp_path)
     accepted = _pass_acceptance(authority)
-    coverage_retry = _coverage_retry_acceptance(authority)
+    base_coverage_retry = _coverage_retry_acceptance(authority)
+    coverage_retry = replace(
+        base_coverage_retry,
+        timing=replace(
+            base_coverage_retry.timing,
+            coverage_gaps=(
+                replace(
+                    base_coverage_retry.timing.coverage_gaps[0],
+                    start_ms=12_000,
+                    end_ms=20_000,
+                ),
+            ),
+        ),
+    )
     soft_coverage_review = replace(
         accepted,
         action=GateAction.REVIEW,
@@ -3700,12 +3948,35 @@ def test_soft_coverage_review_model_repair_outranks_pass_safe_fallback(
         return _acceptance_for_difficulty(accepted, requested_difficulty)
 
     monkeypatch.setattr(s2_generate, "evaluate_chart_candidate", evaluate)
+    analysis = _active_analysis(60_000, onset_step_ms=1_000)
+
+    class OneBoundedGapGenerator(RecordingGenerator):
+        def generate_map(self, request, workdir):
+            generated = super().generate_map(request, workdir)
+            if (request.key_mode, request.difficulty) != (4, "EASY"):
+                return generated
+            active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+            rows = sorted(
+                {
+                    12_000,
+                    20_000,
+                    *(row for row in active_rows if not 12_000 < row < 20_000),
+                }
+            )
+            return replace(
+                generated,
+                notes=[
+                    NoteEvent(time_ms=row, lane=index % request.key_mode)
+                    for index, row in enumerate(rows)
+                ],
+            )
+
     outcome = run_generation(
         prepared,
         authority,
-        _active_analysis(60_000),
+        analysis,
         tmp_path,
-        generator=RecordingGenerator(),
+        generator=OneBoundedGapGenerator(),
         seed=0,
     )
 
@@ -4056,6 +4327,62 @@ def test_uncalibrated_music_end_is_shadowed_unless_experimental_mode_is_explicit
         30_000
     }
     assert all(request.duration_ms == duration_ms for request in generator.map_calls)
+
+
+def test_high_confidence_terminal_consensus_reaches_every_generation_request(
+    tmp_path: Path,
+):
+    duration_ms = 30_000
+    prepared = _prepared(
+        tmp_path,
+        duration_ms=duration_ms,
+        boundary_policy_mode="HIGH_CONFIDENCE_ENFORCED",
+    )
+    authority = _authority(prepared, tmp_path)
+    analysis = replace(
+        _analysis(),
+        activity=AudioActivity(
+            frame_ms=100.0,
+            rms_db=np.concatenate([np.full(200, -10.0), np.full(100, -80.0)]),
+            floor_db=-60.0,
+            active_onset_ms=tuple(range(0, 20_000, 250)),
+        ),
+        terminal_silence=TerminalSilenceObservation(
+            version="terminal-silence-observation-v1",
+            duration_ms=duration_ms,
+            frame_ms=20,
+            channel_count=2,
+            candidates=tuple(
+                TerminalThresholdCandidate(
+                    rms_db=rms_db,
+                    peak_db=peak_db,
+                    suffix_start_ms=20_000,
+                    suffix_duration_ms=10_000,
+                )
+                for rms_db, peak_db in (
+                    (-72.0, -60.0),
+                    (-66.0, -54.0),
+                    (-60.0, -48.0),
+                )
+            ),
+            candidate_spread_ms=0,
+            last_onset_ms=19_750,
+        ),
+    )
+
+    generator = RecordingGenerator()
+    _run_generation(
+        prepared,
+        authority,
+        analysis,
+        tmp_path,
+        generator=generator,
+        seed=0,
+    )
+
+    assert {request.last_attack_ms for request in generator.map_calls} == {20_000}
+    assert {request.max_note_start_ms for request in generator.map_calls} == {20_070}
+    assert {request.generation_end_ms for request in generator.map_calls} == {30_000}
 
 
 def test_music_end_estimate_keeps_full_audio_when_the_tail_is_short(tmp_path: Path):

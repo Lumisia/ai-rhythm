@@ -83,6 +83,10 @@ from chart_worker.stages.types import (
     SongTimingAuthority,
 )
 from chart_worker.validation.difficulty_selector import DifficultySelectionComparison
+from chart_worker.validation.final_difficulty_family import (
+    DifficultyFamilyEntry,
+    observe_final_difficulty_family,
+)
 from chart_worker.validation.generated_chart import validate_generated_chart
 from chart_worker.validation.intro_phrase_family import IntroPhraseFamilyReview
 from chart_worker.validation.intro_start_contract import (
@@ -401,6 +405,7 @@ def _timing_authority_report(
             "timingAuthorityLocalReview": None,
             "timingAuthorityRecoveryPreflight": None,
             "timingAuthoritySelection": None,
+            "timingAuthorityIntegrity": None,
         }
     return {
         "timingAuthority": _relative(authority.reference_path, run_dir),
@@ -429,6 +434,11 @@ def _timing_authority_report(
         "timingAuthoritySelection": (
             authority.candidate_selection.to_report()
             if authority.candidate_selection is not None
+            else None
+        ),
+        "timingAuthorityIntegrity": (
+            authority.timing_integrity.to_report()
+            if authority.timing_integrity is not None
             else None
         ),
     }
@@ -545,7 +555,29 @@ def _require_difficulty_order_reports(
         if any(review != first for review in reviews[1:]):
             context.setdefault("inconsistentDifficultyOrder", []).append(key_mode)
             continue
-        reports[f"{key_mode}K"] = first.to_report()
+        report = first.to_report()
+        report["finalFamilyObservation"] = observe_final_difficulty_family(
+            key_mode,
+            tuple(
+                DifficultyFamilyEntry(
+                    difficulty=variant.difficulty,
+                    provenance=variant.provenance,
+                    project_rating=(
+                        variant.acceptance.profile.difficulty.project_rating
+                        if variant.acceptance.profile is not None
+                        else None
+                    ),
+                    ordering_score=(
+                        variant.acceptance.profile.difficulty_vector_v2.ordering_score
+                        if variant.acceptance.profile is not None
+                        else None
+                    ),
+                )
+                for variant in generated
+                if variant.key_mode == key_mode
+            ),
+        ).to_report()
+        reports[f"{key_mode}K"] = report
 
     if context:
         raise WorkerError(
@@ -1083,6 +1115,7 @@ def _run_pipeline(
             onsets.activity,
             prepared.normalized.duration_ms,
             enforcement_mode=prepared.boundary_policy_mode,
+            terminal_silence=onsets.terminal_silence,
         )
         if onsets.activity is not None
         else None
@@ -1396,6 +1429,11 @@ def _run_pipeline(
             "outroEvidenceProfile": (
                 outro_evidence_profile.to_report()
                 if outro_evidence_profile is not None
+                else None
+            ),
+            "terminalSilenceObservation": (
+                onsets.terminal_silence.to_report()
+                if onsets.terminal_silence is not None
                 else None
             ),
             "outroPolicyDecision": (

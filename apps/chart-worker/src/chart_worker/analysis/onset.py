@@ -14,6 +14,10 @@ import numpy as np
 from chart_worker.analysis.activity import AudioActivity, build_audio_activity
 from chart_worker.analysis.audio_io import AudioSignal, load_audio
 from chart_worker.analysis.beat import BeatGrid
+from chart_worker.analysis.terminal_silence import (
+    TerminalSilenceObservation,
+    observe_terminal_silence,
+)
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.schema.note import Chart
 
@@ -67,6 +71,7 @@ class OnsetAnalysis:
     onset_ms: tuple[int, ...]
     n_fft: int = N_FFT
     activity: AudioActivity | None = None
+    terminal_silence: TerminalSilenceObservation | None = None
 
     @property
     def frame_count(self) -> int:
@@ -138,7 +143,15 @@ def analyze_onsets(signal: AudioSignal, *, backend: OnsetBackend) -> OnsetAnalys
 
 def analyze_canonical_audio(path: Path) -> OnsetAnalysis:
     """Analyze the exact normalized audio later referenced by the manifest."""
-    return analyze_onsets(load_audio(path), backend=librosa_backend())
+    signal = load_audio(path)
+    analysis = analyze_onsets(signal, backend=librosa_backend())
+    return dataclasses.replace(
+        analysis,
+        terminal_silence=observe_terminal_silence(
+            signal,
+            last_onset_ms=analysis.onset_ms[-1] if analysis.onset_ms else None,
+        ),
+    )
 
 
 def mel_band_channels(

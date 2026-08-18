@@ -29,6 +29,7 @@ from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateActio
 from chart_worker.validation.song_family_selector import (
     CandidateSnapshot,
     ProtectedMetrics,
+    SelectorMode,
     SongSelectionComparison,
     TimingSectionSnapshot,
     compare_song_families,
@@ -245,7 +246,7 @@ def first_row_ms(candidate: Candidate) -> int | None:
     return min((note.time_ms for note in candidate.generated.notes), default=None)
 
 
-def compare_song_selection_shadow(
+def compare_song_selection(
     selections: list[Selection],
     *,
     prepared: PreparedAudio,
@@ -253,7 +254,8 @@ def compare_song_selection_shadow(
     run_dir: Path,
     intro_contract: IntroStartContract,
     boundary: SongBoundaryContract | None,
-) -> SongSelectionComparison:
+    mode: SelectorMode,
+) -> tuple[list[Selection], SongSelectionComparison]:
     context_id = song_selection_context_id(
         prepared,
         authority,
@@ -262,6 +264,7 @@ def compare_song_selection_shadow(
     )
     pools: dict[tuple[int, str], tuple[CandidateSnapshot, ...]] = {}
     current: dict[tuple[int, str], str | None] = {}
+    candidates_by_id: dict[str, Candidate] = {}
     for states, assignment, _review in selections:
         key_mode = next(iter(states.values())).key_mode
         for difficulty in DIFFICULTIES:
@@ -278,6 +281,7 @@ def compare_song_selection_shadow(
                 if candidate_id in ids.values():
                     raise ValueError(f"duplicate deterministic candidate id: {candidate_id}")
                 ids[id(candidate)] = candidate_id
+                candidates_by_id[candidate_id] = candidate
                 acceptance = candidate.acceptance
                 profile = acceptance.profile
                 vector = profile.difficulty_vector_v2 if profile is not None else None
@@ -336,10 +340,58 @@ def compare_song_selection_shadow(
             current[(key_mode, difficulty)] = (
                 ids[id(selected)] if selected is not None else None
             )
-    _selected, comparison = compare_song_families(
+    selected, comparison = compare_song_families(
         pools,
         current,
         canonical_first_row_ms=intro_contract.canonical_first_row_ms,
+        mode=mode,
+    )
+    if mode == "SHADOW_V2":
+        return selections, comparison
+
+    updated: list[Selection] = []
+    for states, _assignment, _review in selections:
+        key_mode = next(iter(states.values())).key_mode
+        assignment = {
+            difficulty: (
+                candidates_by_id[candidate_id]
+                if (candidate_id := selected[(key_mode, difficulty)]) is not None
+                else None
+            )
+            for difficulty in DIFFICULTIES
+        }
+        chosen = tuple(
+            candidate
+            for difficulty in DIFFICULTIES
+            if (candidate := assignment[difficulty]) is not None
+        )
+        updated.append(
+            (
+                states,
+                assignment,
+                review_candidates(chosen) if chosen else None,
+            )
+        )
+    return updated, comparison
+
+
+def compare_song_selection_shadow(
+    selections: list[Selection],
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    run_dir: Path,
+    intro_contract: IntroStartContract,
+    boundary: SongBoundaryContract | None,
+) -> SongSelectionComparison:
+    """Backward-compatible observation-only wrapper."""
+    _unchanged, comparison = compare_song_selection(
+        selections,
+        prepared=prepared,
+        authority=authority,
+        run_dir=run_dir,
+        intro_contract=intro_contract,
+        boundary=boundary,
         mode="SHADOW_V2",
     )
     return comparison
