@@ -6,6 +6,14 @@ AI 음악에서 4·6·7키 채보를 자동 생성하는 웹 리듬게임.
 > **코드는 `feat/chart-worker-foundation` 브랜치에 있다.** 이 `main` 브랜치는
 > `.gitignore`와 이 README만 추적한다. 아래 구성·실행법은 그 브랜치를 기준으로 한다.
 
+### Mapperatorinator 출처
+
+실제 채보 생성은 [OliBomby/Mapperatorinator](https://github.com/OliBomby/Mapperatorinator)를
+기반으로 한다. 이 프로젝트는 upstream의
+[`2a70eb89004da20e39b0fcbaad2686b264d5a040`](https://github.com/OliBomby/Mapperatorinator/commit/2a70eb89004da20e39b0fcbaad2686b264d5a040)
+커밋을 고정해서 사용하며, 프로젝트 전용 변경은 기능 브랜치의 패치 스택으로 관리한다.
+Mapperatorinator의 원 저작권자는 OliBomby이며 MIT License로 배포된다.
+
 ---
 
 ## 키 모드
@@ -15,13 +23,6 @@ AI 음악에서 4·6·7키 채보를 자동 생성하는 웹 리듬게임.
 6키   A  S  D  L  ;  '
 7키   A  S  D  Space  L  ;  '
 ```
-
-입력은 `KeyboardEvent.code` 기준이라 한글·영문 입력 모드와 무관하다.
-
-홈 포지션만 쓴다. 6·7키 바깥 레인을 Shift로 잡으면 새끼손가락이 홈 포지션에서
-떨어져 어느 손가락 차례인지 헷갈린다. 약지·중지·검지를 좌우 대칭으로 놓고
-7키만 가운데를 엄지로 받는다. 초기 DJMAX식 SideTrack(Shift) 배열은 이 이유로
-폐기했다.
 
 난이도는 `EASY / NORMAL / HARD / EXPERT` 4단계. 곡 하나당 `3키모드 × 4난이도 = 12개`
 채보를 생성한다.
@@ -61,14 +62,6 @@ packages/api-contracts/
 
 Demucs와 키음 stem은 현재 생성 경로에서 사용하지 않는다. PostgreSQL·Flyway·
 StoragePort는 백엔드와 함께 미구현이다.
-
-### Mapperatorinator 출처
-
-실제 채보 생성은 [OliBomby/Mapperatorinator](https://github.com/OliBomby/Mapperatorinator)를
-기반으로 한다. 이 프로젝트는 upstream의
-[`2a70eb89004da20e39b0fcbaad2686b264d5a040`](https://github.com/OliBomby/Mapperatorinator/commit/2a70eb89004da20e39b0fcbaad2686b264d5a040)
-커밋을 고정해서 사용하며, 프로젝트 전용 변경은 기능 브랜치의 패치 스택으로 관리한다.
-Mapperatorinator의 원 저작권자는 OliBomby이며 MIT License로 배포된다.
 
 ---
 
@@ -113,17 +106,3 @@ npm --prefix apps/frontend run dev
 `chart-worker` CLI 명령은 `generate`, `bench`, `recalculate-difficulty`,
 `migrate-boundary-review` 네 개다. 상시 서비스 모드는 없다.
 
----
-
-## 문서
-
-설계·조사 문서는 `docs/`에 있으며 **git에 포함하지 않는다.** 백업은 별도로 챙겨야 한다.
-
-```text
-docs/design/        Phase1~5 확정 설계 (2026-08-01 기준, 백엔드 전제)
-docs/research/      사전 조사와 로컬 프로토타입 실측 기록
-docs/심층보고서/    외부 기술 검토 보고서 v1~v6
-```
-
-작업 브랜치의 `docs/`에는 실측·분석 기록 114개가 따로 있다. 진입점은 그 브랜치의
-`docs/README.md`다.
