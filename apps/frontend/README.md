@@ -8,19 +8,6 @@
 이식했다. 현재 실행 폴더 검증, Web Audio 시계, 판정 엔진, 리뷰 마커와 키 입력은
 그대로 유지하며 구형 `game.js`, 음원과 룰 채보 JSON은 포함하지 않는다.
 
-## 실행
-
-먼저 실행 폴더 계약을 검사할 수 있다.
-
-```powershell
-npm --prefix apps/frontend run validate:run -- "C:\Git\ai-rhythm\.data\playtests\koe-direct"
-```
-
-그다음 개발 서버를 열고 화면에서 같은 실행 폴더를 선택한다.
-
-```powershell
-npm --prefix apps/frontend run dev
-```
 
 폴더 선택은 로컬 프로토타입용이다. 실제 배포에서는 서버가 준비한 동일한
 manifest·오디오·채보 계약을 URL로 불러오는 어댑터를 연결해야 하며, 최종 사용자가
