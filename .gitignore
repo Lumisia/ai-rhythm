@@ -39,6 +39,16 @@ venv/
 .mypy_cache/
 *.egg-info/
 
+# 로컬 테스트·검증 산출물
+/.codex-test-temp/
+/.codex-tmp/
+/.pytest-*/
+/.tmp/
+/.tmp-*/
+/.uv-cache*/
+/.v30-*/
+/task6-pytest-tmp/
+
 # 비밀정보
 .env
 .env.local
