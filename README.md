@@ -62,6 +62,14 @@ packages/api-contracts/
 Demucs와 키음 stem은 현재 생성 경로에서 사용하지 않는다. PostgreSQL·Flyway·
 StoragePort는 백엔드와 함께 미구현이다.
 
+### Mapperatorinator 출처
+
+실제 채보 생성은 [OliBomby/Mapperatorinator](https://github.com/OliBomby/Mapperatorinator)를
+기반으로 한다. 이 프로젝트는 upstream의
+[`2a70eb89004da20e39b0fcbaad2686b264d5a040`](https://github.com/OliBomby/Mapperatorinator/commit/2a70eb89004da20e39b0fcbaad2686b264d5a040)
+커밋을 고정해서 사용하며, 프로젝트 전용 변경은 기능 브랜치의 패치 스택으로 관리한다.
+Mapperatorinator의 원 저작권자는 OliBomby이며 MIT License로 배포된다.
+
 ---
 
 ## 핵심 설계 원칙
