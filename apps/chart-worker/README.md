@@ -75,11 +75,6 @@ grid subdivision 정렬은 이 tempo 검토와 별개의 검증 신호다.
 먼저 프로젝트가 고정한 Mapperatorinator commit에 **패치 스택 39개**를 적용한다.
 이미 적용된 상태에서는 그대로 성공한다. 패치가 추가될 때마다 다시 실행해야 한다.
 
-```powershell
-Set-Location apps\chart-worker
-.\.venv\Scripts\python.exe scripts\apply_mapperatorinator_patch.py C:\Users\PC\mapperatorinator
-```
-
 스택은 `REQUIRED_PATCHES`에 순서대로 정의돼 있고, 계열은 keycount, output-safety,
 event-times + resnap, origin/sidecar, hold-state, grammar v2~v25, v26 tail repair,
 v27 resident runtime, v28 temporal horizon, v29 decoder termination, v30 generation telemetry,
@@ -103,46 +98,14 @@ worker는 실행 전에 commit과 **스택 전체**의 적용 상태를 확인�
 PowerShell의 현재 프로세스에만 Mapperatorinator와 공유 FFmpeg 경로를 설정한다.
 환경에 맞게 실제 경로를 바꾼다.
 
-```powershell
-$mapperRoot = "C:\Users\PC\mapperatorinator"
-$mapperPython = "C:\Users\PC\mapperatorinator\.venv\Scripts\python.exe"
-$sharedFfmpegBin = "C:\path\to\shared-ffmpeg\bin"
-
-if (-not (Test-Path -LiteralPath $mapperRoot -PathType Container)) { throw "Mapperatorinator home is missing" }
-if (-not (Test-Path -LiteralPath $mapperPython -PathType Leaf)) { throw "Mapperatorinator Python is missing" }
-if (-not (Test-Path -LiteralPath "$sharedFfmpegBin\ffmpeg.exe" -PathType Leaf)) { throw "shared FFmpeg is missing" }
-if (-not (Test-Path -LiteralPath "$sharedFfmpegBin\ffprobe.exe" -PathType Leaf)) { throw "shared FFprobe is missing" }
-
-$env:MAPPERATORINATOR_HOME = $mapperRoot
-$env:MAPPERATORINATOR_PYTHON = $mapperPython
-$env:MAPPERATORINATOR_PRECISION = "fp16"
-$env:FFMPEG_BIN = "$sharedFfmpegBin\ffmpeg.exe"
-$env:FFMPEG_SHARED_BIN_DIR = $sharedFfmpegBin
-```
-
-로컬 RTX 2070은 `fp16`을 사용한다. `bf16`은 지수 범위가 넓어 수치적으로
-안정적이지만 Turing GPU에서는 지원되지 않는다. Modal의 L4·A10·A100처럼
-지원되는 GPU에서만 `MAPPERATORINATOR_PRECISION=bf16`을 선택한다.
+로컬은 `fp16`을 사용한다. `bf16`은 지수 범위가 넓어 수치적으로
+안정적이지만 Turing GPU에서는 지원되지 않는다.
 
 ## 생성과 벤치마크
 
 기존 산출물을 다른 실행 결과로 오인하지 않도록 비어 있는 새 출력 폴더를 쓴다.
 
-```powershell
-uv run --project apps/chart-worker chart-worker generate `
-  "C:\Users\PC\Desktop\Koe no Yukue (声の行く先) - Take 2.wav" `
-  --out ".data\playtests\koe-direct" `
-  --title "Koe no Yukue"
-```
-
 단계별 시간과 12개 채보 참조, 난이도 역전 경고까지 기록하려면 `bench`를 쓴다.
-
-```powershell
-uv run --project apps/chart-worker chart-worker bench `
-  "C:\Users\PC\Desktop\Koe no Yukue (声の行く先) - Take 2.wav" `
-  --out ".data\playtests\koe-direct-bench" `
-  --title "Koe no Yukue"
-```
 
 주요 산출물은 다음과 같다.
 
@@ -237,7 +200,7 @@ fake는 12개 파일과 manifest 계약을 검사하기 위한 테스트 대역�
 
 ## 2026-08-03 실제 4K NORMAL smoke
 
-`Koe no Yukue`와 RTX 2070 SUPER, `fp16`, seed 0으로 직접 생성한 결과다.
+로컬 노래를 직접 생성한 결과다.
 
 | 항목 | 결과 |
 | --- | ---: |
@@ -285,12 +248,6 @@ precision은 62.35~94.55%였다. 이 수치는 상대 RMS 분류를 추가하기
 활성도가 낮은 공백도 `REVIEW` 근거로 보존한다. 상세 표와 최신 재진단 결과는
 `../../docs/현재 구현 상태와 운영 가이드.md`에 기록한다.
 
-## 2026-08-04 keycount 패치 smoke
-
-저장된 `Ignite the Pulse` canonical audio로 4K NORMAL 한 장만 `fp16`, seed 0에서
-생성했다. 첫 시도 약 53초에 556노트(HOLD 106개)를 만들었고 raw X는 64~448,
-변환 레인은 0~3, 범위 밖 레인은 0개였다. HOLD 겹침·퇴화, 오디오 범위와 BPM을
-포함한 구조 검증도 통과했다. 사용 패치는 `mania-keycount-v1`이다.
 
 ## 개발 검증
 
@@ -303,33 +260,3 @@ uv build --project apps/chart-worker
 librosa와 soundfile은 기본 `uv sync --project apps/chart-worker`에 포함된다.
 Beat This, Demucs와 키음 stem은 현재 패키지의 생성 의존성이 아니다.
 
-## Modal 배포 경로 계약
-
-`game.flac`은 실행 패키지 안의 고정 역할명이다. 동시 요청 충돌은 파일명을 UUID로
-바꾸는 대신 실행 디렉터리를 UUID `runId`로 격리해 막는다.
-
-```text
-/tmp/jobs/<runId>/audio/game.flac
-/songs/<songId>/runs/<runId>/audio/game.flac
-```
-
-공유 Volume의 `/data/game.flac` 같은 한 경로에 여러 요청이 쓰면 안 된다. 현재
-`modal_app.py`는 `/jobs/runs/<sha256(requestId)>` 고유 run 디렉터리, L4/4 CPU/16GiB,
-min 0/max 1, concurrency 1,
-scaledown 60초, incremental-only 상주 세션, 성공 뒤 jobs Volume commit, `.remote()` 전
-로컬 $24 예약 장부까지 소스 계약으로 구현한다. object storage 업로드는 아직 없다.
-
-이 파일이 존재한다고 배포 준비가 끝난 것은 아니다. Modal SDK lock·immutable OCI build·
-model Volume manifest·fresh-container checkpoint 내구성·실제 CUDA load/시간/비용은 검증하지
-않았다. 같은 request ID의 검증된 성공 marker replay와 nonempty/no-marker 복구도 아직 없다.
-`retries=0`도 container crash 재스케줄을 완전히 막지 않으므로, 중단 입력은
-`UNKNOWN_COMPLETION`으로 처리하고 실제 `modal run`/`deploy`는 별도 승인 전 금지한다.
-
-향후 Modal 이미지에서도 모델 추론 전에 같은 적용기를 이미지 구성 단계에서 실행한다.
-이미지의 실제 설치 경로에 맞추되 의미는 다음과 같다.
-
-```dockerfile
-RUN /app/apps/chart-worker/.venv/bin/python \
-    /app/apps/chart-worker/scripts/apply_mapperatorinator_patch.py \
-    /opt/mapperatorinator
-```
