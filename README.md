@@ -2,80 +2,120 @@
 
 AI 음악에서 4·6·7키 채보를 자동 생성하는 웹 리듬게임.
 
+> 기준일 2026-08-14
+> **코드는 `feat/chart-worker-foundation` 브랜치에 있다.** 이 `main` 브랜치는
+> `.gitignore`와 이 README만 추적한다. 아래 구성·실행법은 그 브랜치를 기준으로 한다.
+
 ---
 
 ## 키 모드
 
 ```text
 4키   A  S  ;  '
-6키   ShiftLeft  A  S  ;  '  ShiftRight
-7키   ShiftLeft  A  S  Space  ;  '  ShiftRight
+6키   A  S  D  L  ;  '
+7키   A  S  D  Space  L  ;  '
 ```
 
-DJMAX 계열 사이드 트랙 구조. 외곽 Shift는 SideTrack, 중앙 Space는 FX에 대응한다.
+입력은 `KeyboardEvent.code` 기준이라 한글·영문 입력 모드와 무관하다.
 
-난이도는 `EASY / NORMAL / HARD / EXPERT` 4단계.
+홈 포지션만 쓴다. 6·7키 바깥 레인을 Shift로 잡으면 새끼손가락이 홈 포지션에서
+떨어져 어느 손가락 차례인지 헷갈린다. 약지·중지·검지를 좌우 대칭으로 놓고
+7키만 가운데를 엄지로 받는다. 초기 DJMAX식 SideTrack(Shift) 배열은 이 이유로
+폐기했다.
+
+난이도는 `EASY / NORMAL / HARD / EXPERT` 4단계. 곡 하나당 `3키모드 × 4난이도 = 12개`
+채보를 생성한다.
 
 ---
 
 ## 구성
 
+현재 존재하는 것.
+
 ```text
-apps/backend/        Spring Boot 3 / Java 21   권한·작업큐·상태 기준 시스템
-apps/frontend/       React + TS + Vite + Phaser
-apps/chart-worker/   Python 3.11 + uv          Mapperatorinator · Demucs · 후처리
-packages/            chart-schema · judgment · api-contracts
-infra/compose/       docker-compose (postgres)
+apps/chart-worker/       Python 3.11 + uv               채보 생성·검증·내보내기
+apps/frontend/           React + TS + Vite + Phaser     로컬 플레이테스터
+packages/chart-schema/   chart-v1 · playtest-run-v2 · boundary-label JSON Schema
+packages/judgment/       판정 상수
 ```
+
+아직 만들지 않은 것.
+
+```text
+apps/backend/            Spring Boot 작업 큐·권한·상태 시스템
+infra/compose/           PostgreSQL docker-compose
+packages/api-contracts/
+```
+
+`docs/design/Phase1~5`는 위 백엔드 구성을 전제한 확정 설계이지만, 현재 구현은
+로컬 CLI 실행과 브라우저 플레이테스터만으로 동작한다. 설계와 구현이 다른 지점은
+`feat/chart-worker-foundation` 브랜치의 `docs/README.md`가 정리한다.
 
 ### 도구 역할
 
 ```text
 생성   Mapperatorinator V32 단독 — 노트를 만드는 유일한 주체
-분석   Beat This! / librosa / Demucs — 노트를 만들지 않음
-저장   PostgreSQL + Flyway, StoragePort(로컬 / OCI S3 호환)
+분석   librosa (onset·활성도)      — 노트를 만들지 않음
+보조   Beat This!                  — 내부 timing 후보가 외부 근거를 요구할 때만 호출
 ```
+
+Demucs와 키음 stem은 현재 생성 경로에서 사용하지 않는다. PostgreSQL·Flyway·
+StoragePort는 백엔드와 함께 미구현이다.
 
 ---
 
 ## 핵심 설계 원칙
 
-**타이밍 불변** — 후처리는 노트의 `timeMs`를 절대 바꾸지 않는다.
-레인 배치와 노트 취사선택만 조작한다.
+**타이밍 불변** — 후처리는 노트의 `timeMs`를 바꾸지 않는다.
 
 근거: Mapperatorinator의 노트–드럼 onset 평균 오차가 8.2~10.8ms로
 룰 기반(19.1~23.6ms)의 2배 이상 정확하다. 그 정확도가 채택 이유의 전부다.
 
-**작업 큐는 Postgres다** — `FOR UPDATE SKIP LOCKED` + lease/heartbeat.
-Redis·Kafka를 도입하지 않는다.
+현재 구현은 여기서 더 나아가 **노트를 전혀 변형하지 않는다**(`noteMutationEnabled=false`).
+레인 재배치, 난이도 solver에 의한 노트 삭제, 목표 HOLD 비율을 위한 TAP/HOLD 변환은
+모두 실행하지 않는다. 예외는 어댑터의 최대 10ms 종료 경계 정규화 하나뿐이다.
+품질 문제는 노트를 고쳐서가 아니라 **다른 seed로 다시 생성해서** 해결한다.
 
-**`.osu` 원본을 영구 보관한다** — 후처리 파라미터를 바꿔 12개 채보를 재생성하는 데
-GPU 비용이 0이다. 난이도 solver와 6·7키 규칙 튜닝이 이 반복에 달렸다.
+**`.osu` 원본을 영구 보관한다** — 후처리 파라미터를 바꿔 재생성하는 데 GPU 비용이 0이다.
+
+**작업 큐는 Postgres로 한다** — `FOR UPDATE SKIP LOCKED` + lease/heartbeat.
+Redis·Kafka를 도입하지 않는다. *(설계 결정이며 아직 구현하지 않았다.)*
 
 ---
 
 ## 로컬 실행
 
+GPU 없이 12개 산출물 구조만 확인:
+
 ```bash
-docker compose -f infra/compose/docker-compose.yml up -d
-./gradlew -p apps/backend bootRun --args='--spring.profiles.active=local'
-uv run --project apps/chart-worker chart-worker serve
+uv run --project apps/chart-worker chart-worker generate ./song.wav --out .data/fake-run --generator fake
+```
+
+실제 생성에는 고정 commit의 Mapperatorinator 체크아웃과 패치 스택 적용이 필요하다.
+절차는 `apps/chart-worker/README.md`에 있다.
+
+생성한 폴더를 브라우저에서 플레이:
+
+```bash
 npm --prefix apps/frontend run dev
 ```
 
-GPU 없이 개발하려면:
+브라우저는 로컬 파일을 서버로 업로드하지 않는다.
 
-```bash
-CHART_GENERATOR=fake
-```
+`chart-worker` CLI 명령은 `generate`, `bench`, `recalculate-difficulty`,
+`migrate-boundary-review` 네 개다. 상시 서비스 모드는 없다.
 
 ---
 
 ## 문서
 
-설계·조사 문서는 `docs/` 에 있으며 git에 포함하지 않는다.
+설계·조사 문서는 `docs/`에 있으며 **git에 포함하지 않는다.** 백업은 별도로 챙겨야 한다.
 
 ```text
-docs/design/     Phase1~5 확정 설계
-docs/research/   사전 조사와 로컬 프로토타입 실측 기록
+docs/design/        Phase1~5 확정 설계 (2026-08-01 기준, 백엔드 전제)
+docs/research/      사전 조사와 로컬 프로토타입 실측 기록
+docs/심층보고서/    외부 기술 검토 보고서 v1~v6
 ```
+
+작업 브랜치의 `docs/`에는 실측·분석 기록 114개가 따로 있다. 진입점은 그 브랜치의
+`docs/README.md`다.
