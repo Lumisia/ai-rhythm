@@ -141,10 +141,21 @@ Desktop.ini
 
 # Local test evidence (generated; never commit)
 /.test-evidence/
+/.codex-tmp/
 /.integration-*/
 /.pytest-*/
+/.pytest-tmp/
 /.tmp-*/
+/pytest-*/
+/tmp-*
 /apps/chart-worker/.data/test-evidence/
+/apps/chart-worker/.codex-tmp/
 /apps/chart-worker/.integration-*/
 /apps/chart-worker/.pytest-*/
+/apps/chart-worker/.pytest-tmp/
 /apps/chart-worker/.tmp-*/
+/apps/chart-worker/.uv-cache*/
+/apps/chart-worker/pytest-*/
+/apps/chart-worker/pytest-cache-files-*/
+/apps/chart-worker/tmp-*
+/apps/chart-worker/tmpz*/
