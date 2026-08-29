@@ -56,8 +56,7 @@ timing/onset에서 `SAFE_FALLBACK`을 결정론적으로 만든다. 두 경우 �
 
 timing 요청은 `output_type=[TIMING]`, MAP 요청은 `output_type=[MAP]`과
 `in_context=[TIMING]`을 사용한다. 모든 MAP은 `cfg_scale=1.0`, `hitsounded=false`와
-정규화 오디오의 `end_time`을 사용한다. 롱노트 비율은 강제하지 않는다. 로컬 RTX 2070 기본 정밀도는 `fp16`이며,
-지원 GPU를 쓰는 배포 환경은 `MAPPERATORINATOR_PRECISION=bf16`을 선택할 수 있다.
+정규화 오디오의 `end_time`을 사용한다. 롱노트 비율은 강제하지 않는다.
 
 ## 키 모드
 
@@ -66,9 +65,6 @@ timing 요청은 `output_type=[TIMING]`, MAP 요청은 `output_type=[MAP]`과
 6키   A  S  D  L  ;  '
 7키   A  S  D  Space  L  ;  '
 ```
-
-입력은 `KeyboardEvent.code` 기준이라 한글·영문 입력 모드와 무관하다. 6키와
-7키는 Shift를 사용하지 않는다.
 
 ## 구성
 
@@ -80,10 +76,6 @@ apps/frontend/           React + TypeScript + Phaser     로컬 플레이테스�
 packages/chart-schema/   chart-v1 · playtest-run · boundary-label JSON Schema
 packages/judgment/       판정 상수
 ```
-
-아직 만들지 않은 것: `apps/backend`(Spring Boot 작업 큐), `infra/compose`(PostgreSQL),
-`packages/api-contracts`. Phase1 설계 문서는 이들을 전제하지만 이 브랜치에는 없다.
-현재는 로컬 CLI 실행과 브라우저 플레이테스터만으로 동작한다.
 
 프론트엔드는 구형 프로토타입의 화면 구성·게임 HUD·메뉴 디자인만 이식했다.
 현재 React/Phaser 게임 로직, 로컬 실행 폴더 계약, 리뷰 마커와 키 배열은 유지한다.
@@ -107,16 +99,3 @@ npm --prefix apps/frontend run dev
 브라우저는 로컬 파일을 서버로 업로드하지 않는다. 배포판에서는 서버가 생성한
 동일한 manifest·오디오·채보 계약을 URL로 제공하도록 연결할 예정이다.
 
-## 문서
-
-`docs/`는 `.gitignore` 대상이라 **Git으로 버전 관리하지 않는다.** 로컬 기록이므로
-백업은 별도로 챙겨야 한다.
-
-읽는 순서와 문서 분류는 `docs/README.md`에 있다. 실행 계약은
-`docs/현재 구현 상태와 운영 가이드.md`, chart-worker 단독 실행법은
-`apps/chart-worker/README.md`를 본다. `docs/superpowers/`는 설계·계획 이력이고,
-`docs/` 최상위의 `분석 -`, `관찰 -`, `검증 -`, `판정 -`, `조사 -` 문서는 그 시점의
-실측 기록이므로 최신 상태로 갱신하지 않는다.
-
-`.understand-anything/`, 생성한 음원, `.osu`, chart JSON, 플레이 기록,
-`.data/`는 계속 Git에서 제외한다.
