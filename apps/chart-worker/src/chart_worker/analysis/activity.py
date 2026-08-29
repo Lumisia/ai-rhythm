@@ -196,6 +196,8 @@ class BoundaryPolicyEvaluation:
     full_duration_contract: SongBoundaryContract
     effective_source: BoundaryEffectiveSource
     effective_contract: SongBoundaryContract
+    terminal_consensus_confidence: Literal["HIGH"] | None
+    terminal_consensus_boundary_ms: int | None
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -209,6 +211,8 @@ class BoundaryPolicyEvaluation:
             "fullDurationContract": self.full_duration_contract.to_report(),
             "effectiveSource": self.effective_source,
             "effectiveContract": self.effective_contract.to_report(),
+            "terminalConsensusConfidence": self.terminal_consensus_confidence,
+            "terminalConsensusBoundaryMs": self.terminal_consensus_boundary_ms,
         }
 
 
@@ -493,14 +497,15 @@ def _terminal_consensus_contract(
     return SongBoundaryContract(
         version=SONG_BOUNDARY_CONTRACT_VERSION,
         last_attack_ms=boundary_ms,
-        max_note_start_ms=min(
-            duration_ms,
-            boundary_ms + BOUNDARY_QUANTIZATION_TOLERANCE_MS,
-        ),
-        # Keep the decoder horizon long enough to close an already-open HOLD,
-        # but do not publish a release deep inside proven terminal silence.
+        # A high-confidence terminal-silence boundary is both the last legal
+        # note start and the last legal HOLD release.  Giving the decoder a
+        # later end_time while validating against this earlier release limit
+        # makes valid upstream output fail downstream and triggers an expensive
+        # whole-map retry.  The upstream Mania tail controller owns any
+        # suffix-only regeneration needed to close a HOLD at this exact cut.
+        max_note_start_ms=boundary_ms,
         release_end_ms=boundary_ms,
-        generation_end_ms=min(duration_ms, boundary_ms + HOLD_COMPLETION_GUARD_MS),
+        generation_end_ms=boundary_ms,
         required_coverage_end_ms=boundary_ms,
         quantization_tolerance_ms=BOUNDARY_QUANTIZATION_TOLERANCE_MS,
         hold_completion_guard_ms=HOLD_COMPLETION_GUARD_MS,
@@ -533,6 +538,7 @@ def evaluate_boundary_policy(
     decision = evaluate_outro_policy(observation)
     provisional = _provisional_contract(decision, duration_ms)
     baseline = _full_duration_contract(duration_ms)
+    terminal_boundary_ms: int | None = None
     if enforcement_mode == "EXPERIMENTAL_ENFORCED":
         source: BoundaryEffectiveSource = "PROVISIONAL_POLICY"
         effective = provisional
@@ -568,6 +574,10 @@ def evaluate_boundary_policy(
         full_duration_contract=baseline,
         effective_source=source,
         effective_contract=effective,
+        terminal_consensus_confidence=(
+            "HIGH" if terminal_boundary_ms is not None else None
+        ),
+        terminal_consensus_boundary_ms=terminal_boundary_ms,
     )
 
 

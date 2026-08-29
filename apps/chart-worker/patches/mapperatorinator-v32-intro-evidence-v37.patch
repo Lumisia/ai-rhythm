@@ -1,0 +1,38 @@
+diff --git a/osuT5/osuT5/inference/required_gameplay_observation.py b/osuT5/osuT5/inference/required_gameplay_observation.py
+--- a/osuT5/osuT5/inference/required_gameplay_observation.py
++++ b/osuT5/osuT5/inference/required_gameplay_observation.py
+@@ -26,7 +26,11 @@ _INTERVAL_FIELDS = (
+ )
+ _SUPPORTED_GROUP_TYPES = frozenset({"TAP", "HOLD_START"})
+ _SUPPORTED_EVIDENCE_CLASSES = frozenset(
+-    {"BROADBAND_ATTACK", "PULSE_FAMILY_CORROBORATED"}
++    {
++        "BROADBAND_ATTACK",
++        "INTRO_REGION_CORROBORATED",
++        "PULSE_FAMILY_CORROBORATED",
++    }
+ )
+ _STAGE_NAMES = (
+     "decoder",
+diff --git a/tests/test_required_gameplay_observation.py b/tests/test_required_gameplay_observation.py
+--- a/tests/test_required_gameplay_observation.py
++++ b/tests/test_required_gameplay_observation.py
+@@ -126,6 +126,18 @@ def test_v36_shadow_enforcement_uses_the_same_complete_bounded_contract():
+     assert interval.minimum_complete_groups == 1
+ 
+ 
++def test_v37_intro_region_evidence_uses_the_same_bounded_contract():
++    interval = required_gameplay_interval_from_args(
++        _shadow_args(
++            required_gameplay_interval_evidence_class="INTRO_REGION_CORROBORATED"
++        )
++    )
++
++    assert interval is not None
++    assert interval.evidence_class == "INTRO_REGION_CORROBORATED"
++    assert interval.mode == "SHADOW_ENFORCE"
++
++
+ def test_v36_shadow_rejects_more_than_one_required_group():
+     with pytest.raises(ValueError, match="exactly one"):
+         required_gameplay_interval_from_args(

@@ -1,0 +1,2248 @@
+diff --git a/config.py b/config.py
+index a5b05f1..a14490e 100644
+--- a/config.py
++++ b/config.py
+@@ -81,7 +81,7 @@ class InferenceConfig:
+     fast_decoder_loop: bool = False  # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+     super_timing_fast_loop: bool = False  # Use the fast decoder loop for super timing instead of the batched-parallel path. Separate from fast_decoder_loop because super timing's parallel path may be faster on some GPUs; benchmark before enabling.
+     write_generation_telemetry: bool = False  # Write a hash-bound evidence sidecar for bounded experiments.
+-    required_gameplay_interval_mode: str = 'OFF'  # OFF or v35 observe-only generated-origin accounting.
++    required_gameplay_interval_mode: str = 'OFF'  # OFF, OBSERVE, or v36 SHADOW_ENFORCE.
+     required_gameplay_interval_start_time: Optional[int] = None
+     required_gameplay_interval_end_time: Optional[int] = None
+     required_gameplay_interval_minimum_complete_groups: Optional[int] = None
+diff --git a/configs/inference/default.yaml b/configs/inference/default.yaml
+index c5ecc5c..556078d 100644
+--- a/configs/inference/default.yaml
++++ b/configs/inference/default.yaml
+@@ -66,7 +66,7 @@ max_batch_size: 16       # Maximum batch size for inference
+ fast_decoder_loop: false # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+ super_timing_fast_loop: false # Use the fast decoder loop for super timing instead of the batched-parallel path; benchmark on your GPU before enabling
+ write_generation_telemetry: false # Opt-in hash-bound evidence sidecar for bounded experiments
+-required_gameplay_interval_mode: 'OFF' # OFF or v35 observe-only generated-origin accounting
++required_gameplay_interval_mode: 'OFF' # OFF, OBSERVE, or v36 SHADOW_ENFORCE
+ required_gameplay_interval_start_time: null
+ required_gameplay_interval_end_time: null
+ required_gameplay_interval_minimum_complete_groups: null
+diff --git a/inference.py b/inference.py
+index f65fb65..311ddaa 100644
+--- a/inference.py
++++ b/inference.py
+@@ -678,7 +678,14 @@ def generate(
+     )
+ 
+     if args.add_to_beatmap:
+-        result = postprocessor.add_to_beatmap(result, beatmap_path)
++        result = postprocessor.add_to_beatmap(
++            result,
++            beatmap_path,
++            preserve_reference_timing=(
++                required_gameplay_interval is not None
++                and required_gameplay_interval.mode == "SHADOW_ENFORCE"
++            ),
++        )
+         if verbose:
+             logger.info("Merged generated content with reference beatmap")
+ 
+diff --git a/osuT5/osuT5/inference/compiled_decode.py b/osuT5/osuT5/inference/compiled_decode.py
+index 61e614c..bbabe52 100644
+--- a/osuT5/osuT5/inference/compiled_decode.py
++++ b/osuT5/osuT5/inference/compiled_decode.py
+@@ -28,6 +28,8 @@ from .generation_checkpoint import capture_rng_state, restore_rng_state
+ from .mania_domain import ManiaDomainError
+ from .server import get_eos_token_id, _build_generation_stats, build_logits_processors, \
+     effective_generation_limit, get_mania_hold_grammar_telemetry, model_generate, \
++    get_required_gameplay_enforcement_telemetry, \
++    reset_required_gameplay_enforcement_state, \
+     reset_mania_hold_grammar_state
+ from ..event import ContextType, EventType
+ from .logit_processors import MonotonicTimeShiftLogitsProcessor
+@@ -329,6 +331,18 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_hold_state_mode = generate_kwargs.pop(
+         'mania_hold_state_mode', 'full_scan'
+     )
++    mania_required_gameplay_interval_time_tokens = generate_kwargs.pop(
++        'mania_required_gameplay_interval_time_tokens', None
++    )
++    mania_required_gameplay_initial_time_token = generate_kwargs.pop(
++        'mania_required_gameplay_initial_time_token', None
++    )
++    mania_required_gameplay_allowed_group_types = generate_kwargs.pop(
++        'mania_required_gameplay_allowed_group_types', ()
++    )
++    mania_required_gameplay_initial_satisfied = generate_kwargs.pop(
++        'mania_required_gameplay_initial_satisfied', False
++    )
+     do_sample = generate_kwargs.pop('do_sample', True)
+     top_p = generate_kwargs.pop('top_p', 0.95)
+     top_k = generate_kwargs.pop('top_k', 0)
+@@ -346,8 +360,10 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     hard_cap = effective_generation_limit(model, max_length)
+ 
+     eff_batch = decoder_input_ids.shape[0] * (2 if (cfg_scale > 1 and negative_prompt is not None) else 1)
+-    eos_token_ids = get_eos_token_id(tokenizer, lookback_time=lookback_time,
+-                                     lookahead_time=lookahead_time, context_type=context_type)
++    eos_token_ids = tuple(get_eos_token_id(
++        tokenizer, lookback_time=lookback_time,
++        lookahead_time=lookahead_time, context_type=context_type
++    ))
+     logits_processor_list = build_logits_processors(
+         tokenizer, cfg_scale, timeshift_bias, types_first, temperature,
+         timing_temperature, mania_column_temperature, taiko_hit_temperature,
+@@ -365,6 +381,11 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+             and cfg_scale <= 1.0
+         ),
+         mania_effective_cut_time,
++        mania_required_gameplay_interval_time_tokens,
++        mania_required_gameplay_initial_time_token,
++        mania_required_gameplay_allowed_group_types,
++        mania_required_gameplay_initial_satisfied,
++        eos_token_ids,
+     )
+     # Hoist MonotonicTimeShift out of the per-step list into an O(1) incremental
+     # masker. Only safe without CFG (CFG merges the 2-stream logits before the
+@@ -399,6 +420,7 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+                                       model.dtype, cache_len)
+         _reset_cache(cache)                    # fresh generation for this window
+         reset_mania_hold_grammar_state(logits_processor_list)
++        reset_required_gameplay_enforcement_state(logits_processor_list)
+         decoder.set_encoder_hidden(enc_hidden)  # write this window's encoder state
+         if mono_mask is not None:
+             mono_mask.init_from_prompt(decoder_input_ids)  # reset per (re)attempt
+@@ -524,6 +546,19 @@ def model_generate_compiled(model, tokenizer, model_kwargs, generate_kwargs):
+     grammar_telemetry = get_mania_hold_grammar_telemetry(logits_processor_list)
+     if grammar_telemetry is not None:
+         stats["mania_hold_grammar"] = grammar_telemetry
++    required_telemetry = get_required_gameplay_enforcement_telemetry(
++        logits_processor_list
++    )
++    if required_telemetry is not None:
++        stats["required_gameplay_enforcement"] = required_telemetry
++        if required_telemetry["phase"] != "SATISFIED":
++            raise ManiaDomainError(
++                reason="REQUIRED_GAMEPLAY_INTERVAL_UNSATISFIED_AT_CUT",
++                message=(
++                    "Compiled decoder returned before satisfying required gameplay"
++                ),
++                context={"phase": required_telemetry["phase"]},
++            )
+     return result, stats
+ 
+ 
+diff --git a/osuT5/osuT5/inference/mania_domain.py b/osuT5/osuT5/inference/mania_domain.py
+index e2548a7..dc81961 100644
+--- a/osuT5/osuT5/inference/mania_domain.py
++++ b/osuT5/osuT5/inference/mania_domain.py
+@@ -12,6 +12,11 @@ ManiaDomainReason = Literal[
+     "INCOMPLETE_MANIA_GROUP_BEFORE_SCROLL",
+     "INSUFFICIENT_HOLD_CLOSURE_BUDGET",
+     "TOKEN_BUDGET_EXHAUSTED",
++    "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
++    "REQUIRED_GAMEPLAY_INTERVAL_TOKEN_BUDGET_EXHAUSTED",
++    "REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP",
++    "REQUIRED_GAMEPLAY_INTERVAL_UNSATISFIED_AT_CUT",
++    "REQUIRED_GAMEPLAY_INTERVAL_ACCOUNTING_MISMATCH",
+ ]
+ 
+ _MANIA_DOMAIN_REASONS = frozenset(
+@@ -20,6 +25,11 @@ _MANIA_DOMAIN_REASONS = frozenset(
+         "INCOMPLETE_MANIA_GROUP_BEFORE_SCROLL",
+         "INSUFFICIENT_HOLD_CLOSURE_BUDGET",
+         "TOKEN_BUDGET_EXHAUSTED",
++        "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
++        "REQUIRED_GAMEPLAY_INTERVAL_TOKEN_BUDGET_EXHAUSTED",
++        "REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP",
++        "REQUIRED_GAMEPLAY_INTERVAL_UNSATISFIED_AT_CUT",
++        "REQUIRED_GAMEPLAY_INTERVAL_ACCOUNTING_MISMATCH",
+     }
+ )
+ 
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index 510840e..14fe162 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -594,7 +594,16 @@ class Postprocessor(object):
+             return result
+ 
+     # noinspection PyProtectedMember
+-    def add_to_beatmap(self, result: str, beatmap_path: str) -> str:
++    def add_to_beatmap(
++            self,
++            result: str,
++            beatmap_path: str,
++            *,
++            preserve_reference_timing: bool = False,
++    ) -> str:
++        if type(preserve_reference_timing) is not bool:
++            raise TypeError("preserve_reference_timing must be a bool")
++
+         # Parse the result and the beatmap
+         result_beatmap = Beatmap.parse(result)
+         beatmap = Beatmap.from_path(beatmap_path)
+@@ -605,23 +614,35 @@ class Postprocessor(object):
+ 
+         # Remove all objects between start and end time
+         beatmap._hit_objects = [ho for ho in beatmap._hit_objects if ho.time < start_time or ho.time > end_time]
+-        # Also remove all timing points between start and end time
+-        beatmap.timing_points = [tp for tp in beatmap.timing_points if tp.offset < start_time or tp.offset > end_time]
++        if not preserve_reference_timing:
++            # Also remove all timing points between start and end time
++            beatmap.timing_points = [
++                tp for tp in beatmap.timing_points
++                if tp.offset < start_time or tp.offset > end_time
++            ]
+ 
+         # Get the result beatmap's hit objects and timing points between start and end time
+         result_hit_objects = [ho for ho in result_beatmap._hit_objects if start_time <= ho.time <= end_time]
+-        result_timing_points = [tp for tp in result_beatmap.timing_points if start_time <= tp.offset <= end_time]
++        result_timing_points = [
++            tp for tp in result_beatmap.timing_points
++            if start_time <= tp.offset <= end_time
++        ]
+ 
+         # Add the new objects
+         beatmap._hit_objects.extend(result_hit_objects)
+-        beatmap.timing_points.extend(result_timing_points)
++        if not preserve_reference_timing:
++            beatmap.timing_points.extend(result_timing_points)
+ 
+         # Sort the hit objects and timing points
+         beatmap._hit_objects.sort(key=lambda ho: ho.time)
+         beatmap.timing_points.sort(key=lambda tp: tp.offset)
+ 
+         # If the SV or volume or BPM differs at the start time, add a new timing point
+-        if len(result_beatmap.timing_points) > 0 and len(beatmap.timing_points) > 0:
++        if (
++                not preserve_reference_timing
++                and len(result_beatmap.timing_points) > 0
++                and len(beatmap.timing_points) > 0
++        ):
+             result_tp = result_beatmap.timing_point_at(start_time)
+             beatmap_tp = beatmap.timing_point_at(start_time)
+ 
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 82146b7..b3b628f 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -45,6 +45,9 @@ from .required_gameplay_observation import (
+     count_canonical_groups,
+     required_gameplay_interval_from_args,
+ )
++from .required_gameplay_enforcement import (
++    addressable_required_gameplay_time_tokens,
++)
+ from .server import InferenceClient, model_forward, model_generate, precompute_encoder_outputs
+ from .tail_repair import (
+     ManiaTailRepairExhausted,
+@@ -201,8 +204,10 @@ class Processor(object):
+         self.encoder_cache_identity = encoder_cache_identity
+         self.last_generation_stats: dict[str, Any] | None = None
+         self.required_gameplay_interval = required_gameplay_interval_from_args(args)
++        self._required_gameplay_enforcement_windows: set[int] = set()
+         self.last_required_gameplay_decoder = GameplayGroupStageSnapshot.empty()
+         self.last_required_gameplay_window_merge = GameplayGroupStageSnapshot.empty()
++        self._required_gameplay_enforcement_windows = set()
+ 
+     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
+         generate_kwargs2 = generate_kwargs | dict(
+@@ -327,6 +332,7 @@ class Processor(object):
+                 generation_result = generate_func(**inputs)
+         else:
+             generation_result = generate_func(**inputs)
++        self._validate_required_gameplay_enforcement_dispatch()
+         if isinstance(generation_result, set):
+             finalized_context_ids = generation_result
+ 
+@@ -438,7 +444,10 @@ class Processor(object):
+                     context["event_times"] += ref_event_times
+                     context["event_origins"] += ref_origins
+ 
+-        if self.required_gameplay_interval is not None:
++        required_gameplay_interval = getattr(
++            self, "required_gameplay_interval", None
++        )
++        if required_gameplay_interval is not None:
+             window_merge = GameplayGroupStageSnapshot.empty()
+             for context in out_context_data:
+                 if (
+@@ -455,7 +464,7 @@ class Processor(object):
+                     count_canonical_groups(
+                         groups,
+                         context["event_origins"],
+-                        self.required_gameplay_interval,
++                        required_gameplay_interval,
+                     )
+                 )
+             self.last_required_gameplay_window_merge = window_merge
+@@ -750,6 +759,61 @@ class Processor(object):
+                 context, frame_time
+             )
+ 
++        required_gameplay_kwargs: dict[str, Any] = {}
++        interval = getattr(self, "required_gameplay_interval", None)
++        if (
++            interval is not None
++            and interval.mode == "SHADOW_ENFORCE"
++            and context["context_type"] == ContextType.MAP
++            and mania_keycount is not None
++        ):
++            accepted_start = (
++                frame_time + self.lookback_time if trim_lookback else frame_time
++            )
++            accepted_end = (
++                frame_time + self.lookahead_max_time
++                if trim_lookahead
++                else frame_time + self.miliseconds_per_sequence
++            )
++            effective_cut = (
++                self.end_time + 10
++                if self.end_time is not None
++                else round(song_length)
++            )
++            addressable_tokens = addressable_required_gameplay_time_tokens(
++                tokenizer=self.tokenizer,
++                frame_time_ms=frame_time,
++                interval_start_ms=interval.start_ms,
++                interval_end_ms=interval.end_ms,
++                accepted_start_ms=accepted_start,
++                accepted_end_ms=accepted_end,
++                accepted_end_inclusive=not trim_lookahead,
++                effective_cut_ms=effective_cut,
++                max_note_start_ms=(
++                    self.last_attack_time
++                    if self.last_attack_time is not None
++                    else effective_cut
++                ),
++            )
++            if addressable_tokens is not None:
++                required_gameplay_kwargs = {
++                    "mania_required_gameplay_interval_time_tokens": (
++                        addressable_tokens
++                    ),
++                    "mania_required_gameplay_initial_time_token": (
++                        mania_prompt_current_time_token
++                    ),
++                    "mania_required_gameplay_allowed_group_types": (
++                        interval.allowed_group_types
++                    ),
++                    "mania_required_gameplay_initial_satisfied": False,
++                }
++                if not hasattr(
++                    self, "_required_gameplay_enforcement_windows"
++                ):
++                    self._required_gameplay_enforcement_windows = set()
++                self._required_gameplay_enforcement_windows.add(wi)
++
+         try:
+             result, generation_stats = self.model_generate(
+                 model_kwargs | dict(
+@@ -787,7 +851,37 @@ class Processor(object):
+                     if self.last_attack_time is not None
+                     else None
+                 ),
++                **required_gameplay_kwargs,
+             )
++            if required_gameplay_kwargs:
++                telemetry = (
++                    generation_stats.get("required_gameplay_enforcement")
++                    if isinstance(generation_stats, dict)
++                    else None
++                )
++                if not isinstance(telemetry, dict):
++                    raise ManiaDomainError(
++                        reason=(
++                            "REQUIRED_GAMEPLAY_INTERVAL_ACCOUNTING_MISMATCH"
++                        ),
++                        message=(
++                            "Required gameplay decoder telemetry is missing"
++                        ),
++                        context={"windowId": wi},
++                    )
++                if telemetry.get("phase") != "SATISFIED":
++                    raise ManiaDomainError(
++                        reason=(
++                            "REQUIRED_GAMEPLAY_INTERVAL_UNSATISFIED_AT_CUT"
++                        ),
++                        message=(
++                            "Required gameplay window returned unsatisfied"
++                        ),
++                        context={
++                            "windowId": wi,
++                            "phase": telemetry.get("phase"),
++                        },
++                    )
+             self._record_generation_stats(generation_stats)
+             if progress_bar is not None:
+                 self._update_tokens_per_second_meter(
+@@ -816,6 +910,39 @@ class Processor(object):
+         except ManiaDomainError as error:
+             raise error.with_source_window(wi) from error
+ 
++    @staticmethod
++    def _is_required_gameplay_domain_error(error: object) -> bool:
++        return (
++            isinstance(error, ManiaDomainError)
++            and error.reason.startswith("REQUIRED_GAMEPLAY_INTERVAL_")
++        )
++
++    def _validate_required_gameplay_enforcement_dispatch(self) -> None:
++        interval = getattr(self, "required_gameplay_interval", None)
++        if interval is None or interval.mode != "SHADOW_ENFORCE":
++            return
++        window_count = len(self._required_gameplay_enforcement_windows)
++        if window_count == 1:
++            return
++        reason = (
++            "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE"
++            if window_count == 0
++            else "REQUIRED_GAMEPLAY_INTERVAL_ACCOUNTING_MISMATCH"
++        )
++        raise ManiaDomainError(
++            reason=reason,
++            message=(
++                "Required gameplay interval must belong to exactly one accepted "
++                "decoder window"
++            ),
++            context={
++                "windowCount": window_count,
++                "windowIds": sorted(
++                    self._required_gameplay_enforcement_windows
++                ),
++            },
++        )
++
+     @staticmethod
+     def _hash_tensor(hasher: Any, label: str, tensor: torch.Tensor) -> None:
+         value = tensor.detach().cpu().contiguous()
+@@ -1052,6 +1179,8 @@ class Processor(object):
+             run_attempt(0, 0, root_store)
+             return
+         except (ManiaDomainError, ManiaTailRepairRequired) as error:
++            if self._is_required_gameplay_domain_error(error):
++                raise
+             current_error = error
+ 
+         last_attempted: tuple[int, ...] = ()
+@@ -1123,6 +1252,8 @@ class Processor(object):
+                 self._record_tail_repair_windows(last_attempted)
+                 return
+             except (ManiaDomainError, ManiaTailRepairRequired) as error:
++                if self._is_required_gameplay_domain_error(error):
++                    raise
+                 current_error = error
+                 last_attempted = last_attempted_in_run
+                 spent_windows += len(last_attempted)
+@@ -2000,7 +2131,10 @@ class Processor(object):
+             EventOrigin.generated(window_id, token_index)
+             for token_index in token_indices
+         ]
+-        if self.required_gameplay_interval is not None and mania_keycount is not None:
++        required_gameplay_interval = getattr(
++            self, "required_gameplay_interval", None
++        )
++        if required_gameplay_interval is not None and mania_keycount is not None:
+             if source_window_id is None:
+                 raise ValueError(
+                     "required gameplay observation requires a source window identity"
+@@ -2010,7 +2144,7 @@ class Processor(object):
+                     count_canonical_groups(
+                         generated_groups,
+                         generated_origins,
+-                        self.required_gameplay_interval,
++                        required_gameplay_interval,
+                     )
+                 )
+             )
+diff --git a/osuT5/osuT5/inference/required_gameplay_enforcement.py b/osuT5/osuT5/inference/required_gameplay_enforcement.py
+new file mode 100644
+index 0000000..96ee800
+--- /dev/null
++++ b/osuT5/osuT5/inference/required_gameplay_enforcement.py
+@@ -0,0 +1,482 @@
++"""Bounded decoder obligation for a generated Mania gameplay interval."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from enum import Enum
++import math
++
++import torch
++from transformers import LogitsProcessor
++
++from ..event import EventType
++from .mania_domain import ManiaDomainError
++
++
++_MILLISECONDS_PER_STEP = 10
++
++
++def _finite_number(value: object, name: str) -> float:
++    if type(value) not in {int, float}:
++        raise TypeError(f"{name} must be an exact finite int or float")
++    if not math.isfinite(value):
++        raise ValueError(f"{name} must be finite")
++    return float(value)
++
++
++def addressable_required_gameplay_time_tokens(
++    *,
++    tokenizer,
++    frame_time_ms: int | float,
++    interval_start_ms: int,
++    interval_end_ms: int,
++    accepted_start_ms: int | float,
++    accepted_end_ms: int | float,
++    accepted_end_inclusive: bool,
++    effective_cut_ms: int | float,
++    max_note_start_ms: int | float,
++) -> tuple[int, int] | None:
++    """Map one absolute interval to the sole accepted decoder window.
++
++    Adjacent accepted cores are half-open except for the final core. Token
++    addressability is evaluated using the decoder's actual 10ms/+5ms decode
++    semantics rather than by rounding the interval endpoints.
++    """
++    if type(interval_start_ms) is not int or type(interval_end_ms) is not int:
++        raise TypeError("required gameplay interval bounds must be exact ints")
++    if interval_start_ms >= interval_end_ms:
++        raise ValueError("required gameplay interval start must precede end")
++    if type(accepted_end_inclusive) is not bool:
++        raise TypeError("accepted_end_inclusive must be an exact bool")
++    frame_time = _finite_number(frame_time_ms, "frame_time_ms")
++    accepted_start = _finite_number(accepted_start_ms, "accepted_start_ms")
++    accepted_end = _finite_number(accepted_end_ms, "accepted_end_ms")
++    effective_cut = _finite_number(effective_cut_ms, "effective_cut_ms")
++    max_note_start = _finite_number(max_note_start_ms, "max_note_start_ms")
++    if accepted_start >= accepted_end:
++        raise ValueError("accepted window start must precede end")
++
++    midpoint = (interval_start_ms + interval_end_ms) / 2
++    owns_midpoint = accepted_start <= midpoint < accepted_end or (
++        accepted_end_inclusive and midpoint == accepted_end
++    )
++    if not owns_midpoint:
++        return None
++
++    time_start = tokenizer.event_start[EventType.TIME_SHIFT]
++    time_end = tokenizer.event_end[EventType.TIME_SHIFT]
++    time_range = tokenizer.event_range[EventType.TIME_SHIFT]
++    expected_size = time_range.max_value - time_range.min_value + 1
++    if time_end - time_start != expected_size:
++        raise ManiaDomainError(
++            reason="REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
++            message="Tokenizer time token domain is not contiguous",
++            context={
++                "tokenCount": time_end - time_start,
++                "valueCount": expected_size,
++            },
++        )
++
++    candidates: list[int] = []
++    for token in range(time_start, time_end):
++        value = time_range.min_value + token - time_start
++        decoded_ms = (
++            frame_time
++            + value * _MILLISECONDS_PER_STEP
++            + (_MILLISECONDS_PER_STEP // 2 if value >= 0 else 0)
++        )
++        accepted = accepted_start <= decoded_ms < accepted_end or (
++            accepted_end_inclusive and decoded_ms == accepted_end
++        )
++        if (
++            accepted
++            and interval_start_ms <= decoded_ms <= interval_end_ms
++            and decoded_ms <= effective_cut
++            and decoded_ms <= max_note_start
++        ):
++            candidates.append(token)
++
++    if not candidates:
++        raise ManiaDomainError(
++            reason="REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
++            message=(
++                "Designated decoder window has no accepted time token in the "
++                "required gameplay interval"
++            ),
++            context={
++                "intervalStartMs": interval_start_ms,
++                "intervalEndMs": interval_end_ms,
++                "acceptedStartMs": accepted_start,
++                "acceptedEndMs": accepted_end,
++                "effectiveCutMs": effective_cut,
++                "maxNoteStartMs": max_note_start,
++            },
++        )
++    return candidates[0], candidates[-1]
++
++
++class RequiredGameplayEnforcementPhase(str, Enum):
++    UNSATISFIED = "UNSATISFIED"
++    GROUP_PENDING = "GROUP_PENDING"
++    SATISFIED = "SATISFIED"
++
++
++@dataclass(frozen=True)
++class RequiredGameplayEnforcementSnapshot:
++    phase: RequiredGameplayEnforcementPhase
++    current_time_token: int | None
++    pending_lane: int | None
++    complete_group_count: int
++
++
++class RequiredGameplayIntervalLogitsProcessor(LogitsProcessor):
++    """Prevent early escape until one generated gameplay group is complete.
++
++    This processor is deliberately incapable of choosing a lane or note type.
++    While the obligation is pending it masks only termination tokens and time
++    tokens strictly after the closed required interval.
++    """
++
++    def __init__(
++        self,
++        tokenizer,
++        *,
++        interval_start_time_token: int,
++        interval_end_time_token: int,
++        initial_satisfied: bool,
++        max_sequence_length: int,
++        hold_start_closure_addressable: bool,
++        initial_time_token: int | None = None,
++        eos_token_ids: tuple[int, ...] | None = None,
++        allowed_group_types: tuple[str, ...] = ("TAP", "HOLD_START"),
++        state_mode: str = "full_scan",
++    ) -> None:
++        if type(interval_start_time_token) is not int:
++            raise TypeError("interval_start_time_token must be an exact int")
++        if type(interval_end_time_token) is not int:
++            raise TypeError("interval_end_time_token must be an exact int")
++        if type(initial_satisfied) is not bool:
++            raise TypeError("initial_satisfied must be an exact bool")
++        if type(max_sequence_length) is not int or max_sequence_length <= 0:
++            raise TypeError("max_sequence_length must be a positive exact int")
++        if type(hold_start_closure_addressable) is not bool:
++            raise TypeError(
++                "hold_start_closure_addressable must be an exact bool"
++            )
++        if initial_time_token is not None and type(initial_time_token) is not int:
++            raise TypeError("initial_time_token must be an exact int or None")
++        if type(allowed_group_types) is not tuple or (
++            not allowed_group_types
++            or len(set(allowed_group_types)) != len(allowed_group_types)
++            or any(
++                type(item) is not str
++                or item not in {"TAP", "HOLD_START"}
++                for item in allowed_group_types
++            )
++        ):
++            raise ValueError("allowed_group_types must be a supported exact tuple")
++        if type(state_mode) is not str or state_mode not in {
++            "full_scan",
++            "incremental",
++            "incremental_verify",
++        }:
++            raise ValueError("state_mode is unsupported")
++
++        self._time_start = tokenizer.event_start[EventType.TIME_SHIFT]
++        self._time_end = tokenizer.event_end[EventType.TIME_SHIFT]
++        if not (
++            self._time_start <= interval_start_time_token
++            <= interval_end_time_token < self._time_end
++        ):
++            raise ManiaDomainError(
++                reason="REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
++                message="Required gameplay interval is outside decoder time tokens",
++                context={
++                    "intervalStartTimeToken": interval_start_time_token,
++                    "intervalEndTimeToken": interval_end_time_token,
++                    "timeTokenStart": self._time_start,
++                    "timeTokenEndExclusive": self._time_end,
++                },
++            )
++
++        self._interval_start = interval_start_time_token
++        self._interval_end = interval_end_time_token
++        if initial_time_token is not None and not (
++            self._time_start <= initial_time_token < self._time_end
++        ):
++            raise ManiaDomainError(
++                reason="REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
++                message="Initial time token is outside decoder time tokens",
++                context={"initialTimeToken": initial_time_token},
++            )
++        self._column_start = tokenizer.event_start[EventType.MANIA_COLUMN]
++        self._column_end = tokenizer.event_end[EventType.MANIA_COLUMN]
++        self._tap_token = tokenizer.event_start[EventType.CIRCLE]
++        self._hold_start_token = tokenizer.event_start[EventType.HOLD_NOTE]
++        self._hold_end_token = tokenizer.event_start[EventType.HOLD_NOTE_END]
++        self._hold_sustain_token = tokenizer.event_start.get(
++            EventType.HOLD_NOTE_SUSTAIN
++        )
++        if eos_token_ids is None:
++            eos_token_ids = tuple(
++                dict.fromkeys(
++                    [tokenizer.eos_id, *tokenizer.context_eos.values()]
++                )
++            )
++        if type(eos_token_ids) is not tuple or any(
++            type(token) is not int or token < 0 for token in eos_token_ids
++        ):
++            raise TypeError("eos_token_ids must be an exact non-negative int tuple")
++        self._termination_tokens = tuple(dict.fromkeys(eos_token_ids))
++        self._max_sequence_length = max_sequence_length
++        self._hold_start_closure_addressable = hold_start_closure_addressable
++        self._initial_time_token = initial_time_token
++        self._allowed_group_types = frozenset(allowed_group_types)
++        self._state_mode = state_mode
++        self._prompt_length: int | None = None
++        self._processed_length: int | None = None
++        self._initial_satisfied = initial_satisfied
++        self._snapshot = self._initial_snapshot()
++        self._telemetry = {
++            "fullScanRows": 0,
++            "incrementalRows": 0,
++            "verificationRows": 0,
++            "suffixTokensParsed": 0,
++        }
++
++    def _initial_snapshot(self) -> RequiredGameplayEnforcementSnapshot:
++        return RequiredGameplayEnforcementSnapshot(
++            phase=(
++                RequiredGameplayEnforcementPhase.SATISFIED
++                if self._initial_satisfied
++                else RequiredGameplayEnforcementPhase.UNSATISFIED
++            ),
++            current_time_token=self._initial_time_token,
++            pending_lane=None,
++            complete_group_count=1 if self._initial_satisfied else 0,
++        )
++
++    def snapshot(self) -> RequiredGameplayEnforcementSnapshot:
++        return self._snapshot
++
++    def telemetry(self) -> dict[str, int]:
++        return dict(self._telemetry)
++
++    def reset_incremental_state(self) -> None:
++        self._prompt_length = None
++        self._processed_length = None
++        self._snapshot = self._initial_snapshot()
++
++    def _advance(
++        self,
++        snapshot: RequiredGameplayEnforcementSnapshot,
++        raw_tokens: list[int],
++    ) -> RequiredGameplayEnforcementSnapshot:
++        current_time = snapshot.current_time_token
++        pending_lane = snapshot.pending_lane
++        complete_group_count = snapshot.complete_group_count
++
++        for raw_token in raw_tokens:
++            if complete_group_count:
++                break
++            token = int(raw_token)
++            if self._time_start <= token < self._time_end:
++                if pending_lane is not None:
++                    self._accounting_mismatch(
++                        "Time transition encountered before group completion"
++                    )
++                current_time = token
++                continue
++            if self._column_start <= token < self._column_end:
++                if pending_lane is not None:
++                    self._accounting_mismatch(
++                        "Second lane encountered before group completion"
++                    )
++                pending_lane = token - self._column_start
++                continue
++            if token in {
++                self._tap_token,
++                self._hold_start_token,
++                self._hold_end_token,
++                self._hold_sustain_token,
++            }:
++                if pending_lane is None:
++                    self._accounting_mismatch(
++                        "Gameplay type encountered without a lane"
++                    )
++                in_interval = (
++                    current_time is not None
++                    and self._interval_start <= current_time <= self._interval_end
++                )
++                group_type = {
++                    self._tap_token: "TAP",
++                    self._hold_start_token: "HOLD_START",
++                }.get(token)
++                closes_obligation = group_type in self._allowed_group_types and (
++                    token == self._tap_token or (
++                    token == self._hold_start_token
++                    and self._hold_start_closure_addressable
++                    )
++                )
++                if in_interval and closes_obligation:
++                    complete_group_count += 1
++                pending_lane = None
++
++        if complete_group_count:
++            phase = RequiredGameplayEnforcementPhase.SATISFIED
++        elif pending_lane is not None:
++            phase = RequiredGameplayEnforcementPhase.GROUP_PENDING
++        else:
++            phase = RequiredGameplayEnforcementPhase.UNSATISFIED
++        return RequiredGameplayEnforcementSnapshot(
++            phase=phase,
++            current_time_token=current_time,
++            pending_lane=pending_lane,
++            complete_group_count=complete_group_count,
++        )
++
++    def _full_replay(
++        self, input_ids: torch.LongTensor
++    ) -> RequiredGameplayEnforcementSnapshot:
++        assert self._prompt_length is not None
++        return self._advance(
++            self._initial_snapshot(),
++            [int(token) for token in input_ids[0, self._prompt_length:].tolist()],
++        )
++
++    def _update_snapshot(self, input_ids: torch.LongTensor) -> None:
++        assert self._prompt_length is not None
++        current_length = int(input_ids.shape[1])
++        if self._state_mode == "full_scan":
++            self._snapshot = self._full_replay(input_ids)
++            self._telemetry["fullScanRows"] += 1
++            self._telemetry["suffixTokensParsed"] += (
++                current_length - self._prompt_length
++            )
++            return
++
++        if self._processed_length is None:
++            self._processed_length = self._prompt_length
++        if current_length < self._processed_length:
++            self._accounting_mismatch(
++                "Connected generation prefix shrank without an explicit reset"
++            )
++        suffix = [
++            int(token)
++            for token in input_ids[0, self._processed_length:current_length].tolist()
++        ]
++        self._snapshot = self._advance(self._snapshot, suffix)
++        self._processed_length = current_length
++        self._telemetry["incrementalRows"] += 1
++        self._telemetry["suffixTokensParsed"] += len(suffix)
++        if self._state_mode == "incremental_verify":
++            oracle = self._full_replay(input_ids)
++            self._telemetry["verificationRows"] += 1
++            if oracle != self._snapshot:
++                self._accounting_mismatch(
++                    "Incremental required-gameplay state disagrees with full replay"
++                )
++
++    def _accounting_mismatch(self, message: str) -> None:
++        raise ManiaDomainError(
++            reason="REQUIRED_GAMEPLAY_INTERVAL_ACCOUNTING_MISMATCH",
++            message=message,
++            context={"phase": self._snapshot.phase.value},
++        )
++
++    @staticmethod
++    def _any_finite(
++        scores: torch.FloatTensor,
++        token_ids: tuple[int, ...] | range,
++    ) -> bool:
++        ids = tuple(token for token in token_ids if token is not None)
++        return bool(ids) and bool(torch.isfinite(scores[0, list(ids)]).any())
++
++    def _has_legal_progress(self, scores: torch.FloatTensor) -> bool:
++        if (
++            self._snapshot.phase
++            is RequiredGameplayEnforcementPhase.GROUP_PENDING
++        ):
++            return self._any_finite(
++                scores,
++                tuple(
++                    token
++                    for token in (
++                        self._tap_token,
++                        self._hold_start_token,
++                        self._hold_end_token,
++                        self._hold_sustain_token,
++                    )
++                    if token is not None
++                ),
++            )
++        interval_times = range(
++            self._interval_start,
++            self._interval_end + 1,
++        )
++        current_in_interval = (
++            self._snapshot.current_time_token is not None
++            and self._interval_start
++            <= self._snapshot.current_time_token
++            <= self._interval_end
++        )
++        return self._any_finite(scores, interval_times) or (
++            current_in_interval
++            and self._any_finite(
++                scores,
++                range(self._column_start, self._column_end),
++            )
++        )
++
++    def __call__(
++        self,
++        input_ids: torch.LongTensor,
++        scores: torch.FloatTensor,
++    ) -> torch.FloatTensor:
++        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
++            raise ValueError("required gameplay enforcement supports batch size 1")
++        if self._initial_satisfied:
++            return scores
++        if self._prompt_length is None:
++            self._prompt_length = int(input_ids.shape[1])
++        self._update_snapshot(input_ids)
++        if self._snapshot.phase is RequiredGameplayEnforcementPhase.SATISFIED:
++            return scores
++
++        remaining_tokens = self._max_sequence_length - int(input_ids.shape[1])
++        if (
++            self._snapshot.phase
++            is RequiredGameplayEnforcementPhase.GROUP_PENDING
++        ):
++            required_tokens = 2
++        elif (
++            self._snapshot.current_time_token is not None
++            and self._interval_start
++            <= self._snapshot.current_time_token
++            <= self._interval_end
++        ):
++            required_tokens = 3
++        else:
++            required_tokens = 4
++        if remaining_tokens < required_tokens:
++            raise ManiaDomainError(
++                reason="REQUIRED_GAMEPLAY_INTERVAL_TOKEN_BUDGET_EXHAUSTED",
++                message="Insufficient decoder budget for required gameplay group",
++                context={
++                    "remainingTokens": remaining_tokens,
++                    "requiredTokens": required_tokens,
++                    "phase": self._snapshot.phase.value,
++                },
++            )
++
++        processed = scores.clone()
++        for token in self._termination_tokens:
++            processed[:, token] = -torch.inf
++        processed[:, self._interval_end + 1:self._time_end] = -torch.inf
++        if not self._has_legal_progress(processed):
++            raise ManiaDomainError(
++                reason="REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP",
++                message="Existing decoder constraints leave no legal token",
++                context={"phase": self._snapshot.phase.value},
++            )
++        return processed
+diff --git a/osuT5/osuT5/inference/required_gameplay_observation.py b/osuT5/osuT5/inference/required_gameplay_observation.py
+index 8cf44a0..8aeef5c 100644
+--- a/osuT5/osuT5/inference/required_gameplay_observation.py
++++ b/osuT5/osuT5/inference/required_gameplay_observation.py
+@@ -119,8 +119,15 @@ class RequiredGameplayIntervalObservation:
+         if self.evidence_class not in _SUPPORTED_EVIDENCE_CLASSES:
+             raise ValueError("required interval evidence class is unsupported")
+         _sha256(self.evidence_digest, "required interval evidence digest")
+-        if self.mode != "OBSERVE":
+-            raise ValueError("required interval runtime is observe-only")
++        if self.mode not in {"OBSERVE", "SHADOW_ENFORCE"}:
++            raise ValueError("required interval runtime mode is unsupported")
++        if (
++            self.mode == "SHADOW_ENFORCE"
++            and self.minimum_complete_groups != 1
++        ):
++            raise ValueError(
++                "v36 shadow enforcement requires exactly one complete group"
++            )
+ 
+     def to_dict(self) -> dict[str, Any]:
+         return {
+@@ -194,9 +201,6 @@ def required_gameplay_interval_from_args(
+         if any(value is not None for value in values.values()):
+             raise ValueError("required gameplay interval OFF rejects stray values")
+         return None
+-    if mode == "SHADOW_ENFORCE":
+-        raise ValueError("required gameplay interval v35 is observe-only")
+-
+     interval = RequiredGameplayIntervalObservation(
+         start_ms=values["required_gameplay_interval_start_time"],
+         end_ms=values["required_gameplay_interval_end_time"],
+@@ -210,6 +214,7 @@ def required_gameplay_interval_from_args(
+         ),
+         evidence_class=values["required_gameplay_interval_evidence_class"],
+         evidence_digest=values["required_gameplay_interval_evidence_digest"],
++        mode=mode,
+     )
+     if getattr(args, "gamemode", None) != 3:
+         raise ValueError("required gameplay observation requires mania")
+diff --git a/osuT5/osuT5/inference/server.py b/osuT5/osuT5/inference/server.py
+index 88c8526..089772d 100644
+--- a/osuT5/osuT5/inference/server.py
++++ b/osuT5/osuT5/inference/server.py
+@@ -16,6 +16,10 @@ from .logit_processors import ConditionalTemperatureLogitsWarper, get_beat_type_
+     ManiaColumnBeforeTypeLogitsProcessor, ManiaHoldStateLogitsProcessor, \
+     ManiaStartBoundaryLogitsProcessor, _max_decoded_time_shift_value
+ from .cache_utils import get_cache
++from .mania_domain import ManiaDomainError
++from .required_gameplay_enforcement import (
++    RequiredGameplayIntervalLogitsProcessor,
++)
+ from ..model import Mapperatorinator
+ from ..tokenizer import Tokenizer
+ 
+@@ -108,7 +112,12 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+                             mania_max_sequence_length=None,
+                             mania_hold_state_mode="full_scan",
+                             mania_hold_state_incremental_eligible=True,
+-                            mania_effective_cut_time=None):
++                            mania_effective_cut_time=None,
++                            mania_required_gameplay_interval_time_tokens=None,
++                            mania_required_gameplay_initial_time_token=None,
++                            mania_required_gameplay_allowed_group_types=(),
++                            mania_required_gameplay_initial_satisfied=False,
++                            mania_required_gameplay_eos_token_ids=()):
+     """Create the logits processors used by every generate path."""
+     if types_first and mania_open_hold_columns is not None:
+         raise ValueError(
+@@ -185,6 +194,36 @@ def build_logits_processors(tokenizer, cfg_scale, timeshift_bias, types_first,
+         logits_processor_list.append(TemperatureLogitsWarper(temperature))
+     if lookback_time > 0:
+         logits_processor_list.append(LookbackBiasLogitsWarper(lookback_time, tokenizer, types_first, device))
++    if mania_required_gameplay_interval_time_tokens is not None:
++        if (
++            type(mania_required_gameplay_interval_time_tokens) is not tuple
++            or len(mania_required_gameplay_interval_time_tokens) != 2
++        ):
++            raise TypeError(
++                "mania required gameplay interval tokens must be an exact pair"
++            )
++        logits_processor_list.append(
++            RequiredGameplayIntervalLogitsProcessor(
++                tokenizer,
++                interval_start_time_token=(
++                    mania_required_gameplay_interval_time_tokens[0]
++                ),
++                interval_end_time_token=(
++                    mania_required_gameplay_interval_time_tokens[1]
++                ),
++                initial_satisfied=mania_required_gameplay_initial_satisfied,
++                max_sequence_length=mania_max_sequence_length,
++                hold_start_closure_addressable=True,
++                initial_time_token=mania_required_gameplay_initial_time_token,
++                eos_token_ids=mania_required_gameplay_eos_token_ids,
++                allowed_group_types=mania_required_gameplay_allowed_group_types,
++                state_mode=(
++                    mania_hold_state_mode
++                    if mania_hold_state_incremental_eligible
++                    else "full_scan"
++                ),
++            )
++        )
+     return logits_processor_list
+ 
+ 
+@@ -201,6 +240,28 @@ def reset_mania_hold_grammar_state(logits_processors) -> None:
+             processor.reset_incremental_state()
+ 
+ 
++def get_required_gameplay_enforcement_telemetry(
++    logits_processors,
++) -> dict[str, object] | None:
++    for processor in logits_processors:
++        if isinstance(processor, RequiredGameplayIntervalLogitsProcessor):
++            snapshot = processor.snapshot()
++            return {
++                **processor.telemetry(),
++                "phase": snapshot.phase.value,
++                "currentTimeToken": snapshot.current_time_token,
++                "pendingLane": snapshot.pending_lane,
++                "completeGroupCount": snapshot.complete_group_count,
++            }
++    return None
++
++
++def reset_required_gameplay_enforcement_state(logits_processors) -> None:
++    for processor in logits_processors:
++        if isinstance(processor, RequiredGameplayIntervalLogitsProcessor):
++            processor.reset_incremental_state()
++
++
+ @torch.no_grad()
+ def precompute_encoder_outputs(model, frames: torch.Tensor, cond_kwargs: dict,
+                                song_positions: torch.Tensor | None = None,
+@@ -356,6 +417,18 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     mania_hold_state_mode = generate_kwargs.pop(
+         'mania_hold_state_mode', 'full_scan'
+     )
++    mania_required_gameplay_interval_time_tokens = generate_kwargs.pop(
++        'mania_required_gameplay_interval_time_tokens', None
++    )
++    mania_required_gameplay_initial_time_token = generate_kwargs.pop(
++        'mania_required_gameplay_initial_time_token', None
++    )
++    mania_required_gameplay_allowed_group_types = generate_kwargs.pop(
++        'mania_required_gameplay_allowed_group_types', ()
++    )
++    mania_required_gameplay_initial_satisfied = generate_kwargs.pop(
++        'mania_required_gameplay_initial_satisfied', False
++    )
+     if context_type is not None:
+         context_type = ContextType(context_type)  # Convert to ContextType enum
+ 
+@@ -363,6 +436,14 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     effective_max_length = effective_generation_limit(
+         model, generate_kwargs.get('max_length')
+     )
++    eos_token_ids = tuple(
++        get_eos_token_id(
++            tokenizer,
++            lookback_time=lookback_time,
++            lookahead_time=lookahead_time,
++            context_type=context_type,
++        )
++    )
+ 
+     # Create the logits processors
+     logits_processor_list = build_logits_processors(
+@@ -382,6 +463,11 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+             and cfg_scale <= 1.0
+         ),
+         mania_effective_cut_time,
++        mania_required_gameplay_interval_time_tokens,
++        mania_required_gameplay_initial_time_token,
++        mania_required_gameplay_allowed_group_types,
++        mania_required_gameplay_initial_satisfied,
++        eos_token_ids,
+     )
+ 
+     # Prepare cache
+@@ -397,7 +483,7 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+             use_cache=True,
+             past_key_values=cache,
+             logits_processor=logits_processor_list,
+-            eos_token_id=get_eos_token_id(tokenizer, lookback_time=lookback_time, lookahead_time=lookahead_time, context_type=context_type),
++            eos_token_id=eos_token_ids,
+         )
+         elapsed_seconds = time.perf_counter() - start_time
+ 
+@@ -406,6 +492,19 @@ def model_generate(model, tokenizer, model_kwargs, generate_kwargs):
+     grammar_telemetry = get_mania_hold_grammar_telemetry(logits_processor_list)
+     if grammar_telemetry is not None:
+         stats["mania_hold_grammar"] = grammar_telemetry
++    required_telemetry = get_required_gameplay_enforcement_telemetry(
++        logits_processor_list
++    )
++    if required_telemetry is not None:
++        stats["required_gameplay_enforcement"] = required_telemetry
++        if required_telemetry["phase"] != "SATISFIED":
++            raise ManiaDomainError(
++                reason="REQUIRED_GAMEPLAY_INTERVAL_UNSATISFIED_AT_CUT",
++                message=(
++                    "Stock decoder returned before satisfying required gameplay"
++                ),
++                context={"phase": required_telemetry["phase"]},
++            )
+ 
+     return result, stats
+ 
+diff --git a/osuT5/osuT5/inference/tail_repair.py b/osuT5/osuT5/inference/tail_repair.py
+index aa47131..bd2e584 100644
+--- a/osuT5/osuT5/inference/tail_repair.py
++++ b/osuT5/osuT5/inference/tail_repair.py
+@@ -377,6 +377,22 @@ def run_with_mania_tail_terminal(
+             flush=True,
+         )
+         raise SystemExit(1) from error
++    except ManiaDomainError as error:
++        if not error.reason.startswith("REQUIRED_GAMEPLAY_INTERVAL_"):
++            raise
++        print(
++            _format_terminal_line(
++                {
++                    "version": 1,
++                    "status": "FAILURE",
++                    "code": "MANIA_REQUIRED_GAMEPLAY_FAILED",
++                    "context": error.to_dict(),
++                }
++            ),
++            file=stream,
++            flush=True,
++        )
++        raise SystemExit(1) from error
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+diff --git a/tests/test_mania_event_times.py b/tests/test_mania_event_times.py
+index a7e0b7e..09ca418 100644
+--- a/tests/test_mania_event_times.py
++++ b/tests/test_mania_event_times.py
+@@ -5,7 +5,7 @@ from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
+-from slider import TimingPoint
++from slider import Beatmap, TimingPoint
+ 
+ from osuT5.osuT5.event import Event, EventType
+ from osuT5.osuT5.inference.origin import EventOrigin
+@@ -157,6 +157,76 @@ def test_inference_rebinds_mania_objects_after_partial_merge_before_write():
+     assert merge_index < rebind_index < write_index
+ 
+ 
++def test_required_gameplay_partial_merge_preserves_reference_timing_bytes(
++    tmp_path: Path,
++):
++    postprocessor = make_postprocessor()
++    reference_events = [
++        Event(EventType.TIME_SHIFT, 100),
++        Event(EventType.POS_X, 64),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++        Event(EventType.TIME_SHIFT, 2_000),
++        Event(EventType.POS_X, 192),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++    reference_timing_points = [
++        TimingPoint(timedelta(milliseconds=0), 500, 4, 2, -1, 60, None, False),
++        TimingPoint(timedelta(milliseconds=500), -80, 4, 2, -1, 60, None, False),
++    ]
++    reference_path = tmp_path / "reference.osu"
++    reference_path.write_text(
++        postprocessor.generate(
++            reference_events,
++            BeatmapConfig(mode=3, circle_size=4),
++            timing=reference_timing_points,
++            event_times=[100] * 4 + [2_000] * 4,
++        ),
++        encoding="utf-8-sig",
++    )
++    generated_events = [
++        Event(EventType.TIME_SHIFT, 400),
++        Event(EventType.POS_X, 320),
++        Event(EventType.POS_Y, 192),
++        Event(EventType.CIRCLE, 0),
++    ]
++    generated = postprocessor.generate(
++        generated_events,
++        BeatmapConfig(mode=3, circle_size=4),
++        timing=[
++            TimingPoint(timedelta(milliseconds=0), 500, 4, 2, -1, 60, None, False),
++            TimingPoint(timedelta(milliseconds=750), -20, 4, 2, -1, 60, None, False),
++        ],
++        event_times=[400] * 4,
++    )
++    postprocessor.start_time = 0
++    postprocessor.end_time = 1_000
++    reference_timing = [tp.pack() for tp in Beatmap.from_path(reference_path).timing_points]
++
++    merged = postprocessor.add_to_beatmap(
++        generated,
++        str(reference_path),
++        preserve_reference_timing=True,
++    )
++    merged_beatmap = Beatmap.parse(merged)
++
++    assert [tp.pack() for tp in merged_beatmap.timing_points] == reference_timing
++    assert [round(item.time.total_seconds() * 1000) for item in merged_beatmap._hit_objects] == [
++        400,
++        2_000,
++    ]
++
++
++def test_inference_preserves_reference_timing_only_for_shadow_enforcement():
++    source = (Path(__file__).parents[1] / "inference.py").read_text(
++        encoding="utf-8"
++    )
++
++    assert "preserve_reference_timing=(" in source
++    assert 'required_gameplay_interval.mode == "SHADOW_ENFORCE"' in source
++
++
+ def test_resnap_updates_event_tokens_and_explicit_times_together():
+     events = [
+         Event(EventType.TIME_SHIFT, 110),
+diff --git a/tests/test_mania_tail_repair.py b/tests/test_mania_tail_repair.py
+index 317c625..36dd2d6 100644
+--- a/tests/test_mania_tail_repair.py
++++ b/tests/test_mania_tail_repair.py
+@@ -323,6 +323,38 @@ def test_terminal_boundary_flushes_once_and_exits_nonzero_only_for_exhaustion():
+     assert ordinary_stream.flush_count == 0
+ 
+ 
++def test_terminal_boundary_preserves_required_gameplay_domain_failure():
++    failure = ManiaDomainError(
++        reason="REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP",
++        message="required interval has no legal group completion",
++        generated_token_index=17,
++        source_window_id=3,
++        context={"requiredStartMs": 409, "requiredEndMs": 549},
++    )
++    stream = io.StringIO()
++
++    with pytest.raises(SystemExit) as captured:
++        tail_repair.run_with_mania_tail_terminal(
++            lambda: (_ for _ in ()).throw(failure),
++            stream=stream,
++        )
++
++    assert captured.value.code == 1
++    lines = stream.getvalue().splitlines()
++    assert len(lines) == 1
++    record = json.loads(
++        lines[0].removeprefix(
++            tail_repair.MAPPERATORINATOR_INVOCATION_RESULT_PREFIX
++        )
++    )
++    assert record == {
++        "version": 1,
++        "status": "FAILURE",
++        "code": "MANIA_REQUIRED_GAMEPLAY_FAILED",
++        "context": failure.to_dict(),
++    }
++
++
+ class _FakeTokenizer:
+     pad_id = 0
+     eos_id = 999
+diff --git a/tests/test_required_gameplay_decode_paths.py b/tests/test_required_gameplay_decode_paths.py
+new file mode 100644
+index 0000000..3aa9671
+--- /dev/null
++++ b/tests/test_required_gameplay_decode_paths.py
+@@ -0,0 +1,125 @@
++from types import SimpleNamespace
++
++import torch
++
++from osuT5.osuT5.event import ContextType, EventType
++from osuT5.osuT5.inference import compiled_decode, server
++
++
++class _Tokenizer:
++    pad_id = 0
++    sos_id = 1
++    eos_id = 2
++    context_eos = {ContextType.MAP: 3}
++    event_start = {EventType.TIME_SHIFT: 30}
++    event_end = {EventType.TIME_SHIFT: 40}
++
++
++def test_stock_decode_threads_exact_required_contract_and_termination_ids(
++    monkeypatch,
++):
++    captured = {}
++
++    def capture_build(*args):
++        captured["args"] = args
++        return []
++
++    class _Model:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=20)
++        generation_config = SimpleNamespace(max_length=20)
++
++        @staticmethod
++        def generate(**kwargs):
++            return kwargs["decoder_input_ids"]
++
++    monkeypatch.setattr(server, "build_logits_processors", capture_build)
++    monkeypatch.setattr(server, "get_cache", lambda *_args: None)
++
++    server.model_generate(
++        _Model(),
++        _Tokenizer(),
++        {
++            "inputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": torch.tensor([[1]]),
++        },
++        {
++            "context_type": ContextType.MAP.value,
++            "mania_open_hold_columns": None,
++            "mania_required_gameplay_interval_time_tokens": (32, 34),
++            "mania_required_gameplay_initial_time_token": 32,
++            "mania_required_gameplay_allowed_group_types": ("TAP",),
++            "mania_required_gameplay_initial_satisfied": False,
++        },
++    )
++
++    args = captured["args"]
++    assert args[19:24] == (
++        (32, 34),
++        32,
++        ("TAP",),
++        False,
++        (2, 3),
++    )
++
++
++def test_compiled_decode_threads_same_required_contract(monkeypatch):
++    captured = {}
++
++    def capture_build(*args):
++        captured["args"] = args
++        return []
++
++    class _Decoder:
++        @staticmethod
++        def set_encoder_hidden(_hidden):
++            return None
++
++    class _Model:
++        device = torch.device("cpu")
++        dtype = torch.float32
++        config = SimpleNamespace(max_target_positions=1)
++
++        @staticmethod
++        def prepare_inputs_for_generation(*_args, **_kwargs):
++            return {}
++
++        def __call__(self, **_kwargs):
++            return SimpleNamespace(logits=torch.zeros((1, 1, 128)))
++
++    monkeypatch.setattr(compiled_decode, "neutralize_dynamic_rope", lambda _m: None)
++    monkeypatch.setattr(compiled_decode, "build_logits_processors", capture_build)
++    monkeypatch.setattr(
++        compiled_decode,
++        "_get_decoder",
++        lambda *_args: (_Decoder(), object()),
++    )
++    monkeypatch.setattr(compiled_decode, "_reset_cache", lambda _cache: None)
++
++    compiled_decode.model_generate_compiled(
++        _Model(),
++        _Tokenizer(),
++        {
++            "encoder_outputs": torch.zeros((1, 1, 1)),
++            "decoder_input_ids": torch.tensor([[1]]),
++        },
++        {
++            "context_type": ContextType.MAP.value,
++            "mania_open_hold_columns": None,
++            "max_length": 1,
++            "mania_required_gameplay_interval_time_tokens": (32, 34),
++            "mania_required_gameplay_initial_time_token": 32,
++            "mania_required_gameplay_allowed_group_types": ("HOLD_START", "TAP"),
++            "mania_required_gameplay_initial_satisfied": True,
++        },
++    )
++
++    args = captured["args"]
++    assert args[19:24] == (
++        (32, 34),
++        32,
++        ("HOLD_START", "TAP"),
++        True,
++        (2, 3),
++    )
+diff --git a/tests/test_required_gameplay_decoder_integration.py b/tests/test_required_gameplay_decoder_integration.py
+new file mode 100644
+index 0000000..393ee53
+--- /dev/null
++++ b/tests/test_required_gameplay_decoder_integration.py
+@@ -0,0 +1,128 @@
++from types import SimpleNamespace
++
++import torch
++
++from osuT5.osuT5.event import EventType
++from osuT5.osuT5.inference.logit_processors import (
++    ManiaHoldStateLogitsProcessor,
++)
++from osuT5.osuT5.inference.required_gameplay_enforcement import (
++    RequiredGameplayIntervalLogitsProcessor,
++)
++from osuT5.osuT5.inference.server import (
++    build_logits_processors,
++    get_required_gameplay_enforcement_telemetry,
++    reset_required_gameplay_enforcement_state,
++)
++
++
++class _Tokenizer:
++    sos_id = 1
++    eos_id = 2
++    context_eos = {"map": 3, "timing": 4}
++    event_start = {
++        EventType.MANIA_COLUMN: 10,
++        EventType.TIME_SHIFT: 30,
++        EventType.CIRCLE: 50,
++        EventType.HOLD_NOTE: 51,
++        EventType.HOLD_NOTE_END: 52,
++        EventType.HOLD_NOTE_SUSTAIN: 53,
++        EventType.MANIA_KEYCOUNT: 100,
++    }
++    event_end = {
++        EventType.MANIA_COLUMN: 14,
++        EventType.TIME_SHIFT: 40,
++        EventType.MANIA_KEYCOUNT: 104,
++    }
++    event_range = {
++        EventType.MANIA_KEYCOUNT: SimpleNamespace(min_value=1),
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=-2, max_value=7),
++    }
++
++
++def _build(**overrides):
++    kwargs = dict(
++        tokenizer=_Tokenizer(),
++        cfg_scale=1.0,
++        timeshift_bias=0,
++        types_first=False,
++        temperature=1.0,
++        timing_temperature=1.0,
++        mania_column_temperature=1.0,
++        taiko_hit_temperature=1.0,
++        lookback_time=0,
++        device="cpu",
++        mania_open_hold_columns=(),
++        mania_max_sequence_length=20,
++    )
++    kwargs.update(overrides)
++    return build_logits_processors(**kwargs)
++
++
++def test_ordinary_stack_has_no_required_gameplay_processor():
++    processors = _build()
++
++    assert not any(
++        isinstance(item, RequiredGameplayIntervalLogitsProcessor)
++        for item in processors
++    )
++
++
++def test_required_gameplay_processor_is_composed_after_existing_grammar():
++    processors = _build(
++        mania_required_gameplay_interval_time_tokens=(32, 34),
++        mania_required_gameplay_initial_time_token=32,
++        mania_required_gameplay_allowed_group_types=("TAP", "HOLD_START"),
++        mania_required_gameplay_initial_satisfied=False,
++        mania_required_gameplay_eos_token_ids=(2, 3),
++    )
++
++    hold_index = next(
++        index
++        for index, item in enumerate(processors)
++        if isinstance(item, ManiaHoldStateLogitsProcessor)
++    )
++    required_index = next(
++        index
++        for index, item in enumerate(processors)
++        if isinstance(item, RequiredGameplayIntervalLogitsProcessor)
++    )
++    assert hold_index < required_index
++    assert required_index == len(processors) - 1
++
++    scores = torch.zeros((1, 128), dtype=torch.float32)
++    prefix_without_lane = torch.tensor([[103, 1, 32]])
++    processed = processors(prefix_without_lane, scores)
++
++    assert torch.isneginf(processed[0, 50])
++    assert torch.isneginf(processed[0, 51])
++    assert torch.isneginf(processed[0, 2])
++    assert torch.isneginf(processed[0, 3])
++    assert processed[0, 4] == scores[0, 4]
++
++
++def test_required_gameplay_telemetry_and_reset_are_explicit():
++    processors = _build(
++        mania_required_gameplay_interval_time_tokens=(32, 34),
++        mania_required_gameplay_initial_time_token=32,
++        mania_required_gameplay_allowed_group_types=("TAP",),
++        mania_required_gameplay_initial_satisfied=False,
++        mania_required_gameplay_eos_token_ids=(2,),
++        mania_hold_state_mode="incremental",
++    )
++    required = next(
++        item
++        for item in processors
++        if isinstance(item, RequiredGameplayIntervalLogitsProcessor)
++    )
++    prompt = torch.tensor([[103, 1]])
++    required(prompt, torch.zeros((1, 128)))
++    required(torch.tensor([[103, 1, 10, 50]]), torch.zeros((1, 128)))
++    assert required.snapshot().phase.value == "SATISFIED"
++    assert get_required_gameplay_enforcement_telemetry(processors)[
++        "phase"
++    ] == "SATISFIED"
++
++    reset_required_gameplay_enforcement_state(processors)
++
++    assert required.snapshot().phase.value == "UNSATISFIED"
+diff --git a/tests/test_required_gameplay_enforcement.py b/tests/test_required_gameplay_enforcement.py
+new file mode 100644
+index 0000000..aa10e19
+--- /dev/null
++++ b/tests/test_required_gameplay_enforcement.py
+@@ -0,0 +1,353 @@
++import importlib
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from osuT5.osuT5.event import EventType
++from osuT5.osuT5.inference.mania_domain import ManiaDomainError
++class _Tokenizer:
++    sos_id = 1
++    eos_id = 2
++    context_eos = {"map": 3}
++    event_start = {
++        EventType.MANIA_COLUMN: 10,
++        EventType.TIME_SHIFT: 30,
++        EventType.CIRCLE: 50,
++        EventType.HOLD_NOTE: 51,
++        EventType.HOLD_NOTE_END: 52,
++        EventType.HOLD_NOTE_SUSTAIN: 53,
++        EventType.MANIA_KEYCOUNT: 100,
++    }
++    event_end = {
++        EventType.MANIA_COLUMN: 14,
++        EventType.TIME_SHIFT: 40,
++        EventType.MANIA_KEYCOUNT: 104,
++    }
++    event_range = {
++        EventType.MANIA_KEYCOUNT: SimpleNamespace(min_value=1),
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=-2, max_value=7),
++    }
++
++
++PROMPT = torch.tensor([[100, 1]], dtype=torch.long)
++
++
++def _scores(*, all_masked: bool = False) -> torch.Tensor:
++    if all_masked:
++        return torch.full((1, 128), -torch.inf, dtype=torch.float32)
++    return torch.arange(128, dtype=torch.float32).reshape(1, 128)
++
++
++def _enforcement():
++    return importlib.import_module(
++        "osuT5.osuT5.inference.required_gameplay_enforcement"
++    )
++
++
++def _phase(name: str):
++    return getattr(_enforcement().RequiredGameplayEnforcementPhase, name)
++
++
++def _processor(
++    *,
++    initial_satisfied: bool = False,
++    max_sequence_length: int = 20,
++    hold_start_closure_addressable: bool = True,
++    **kwargs,
++):
++    kwargs.setdefault("initial_time_token", 32)
++    return _enforcement().RequiredGameplayIntervalLogitsProcessor(
++        _Tokenizer(),
++        interval_start_time_token=32,
++        interval_end_time_token=34,
++        initial_satisfied=initial_satisfied,
++        max_sequence_length=max_sequence_length,
++        hold_start_closure_addressable=hold_start_closure_addressable,
++        **kwargs,
++    )
++
++
++def test_unsatisfied_masks_only_termination_and_time_strictly_after_interval():
++    processor = _processor()
++    scores = _scores()
++
++    processed = processor(PROMPT, scores)
++
++    assert torch.isneginf(processed[0, 2])
++    assert torch.isneginf(processed[0, 3])
++    assert processed[0, 34] == scores[0, 34]
++    assert torch.isneginf(processed[0, 35:40]).all()
++    allowed = torch.ones(128, dtype=torch.bool)
++    allowed[[2, 3]] = False
++    allowed[35:40] = False
++    assert torch.equal(processed[0, allowed], scores[0, allowed])
++    assert processed[0, 10] == scores[0, 10]
++    assert processed[0, 50] == scores[0, 50]
++    assert processed[0, 51] == scores[0, 51]
++    assert processor.snapshot().phase == _phase("UNSATISFIED")
++
++
++def test_generated_complete_tap_satisfies_and_becomes_an_exact_noop():
++    processor = _processor()
++    processor(PROMPT, _scores())
++    generated_tap = torch.tensor([[100, 1, 32, 10, 50]], dtype=torch.long)
++    scores = _scores()
++
++    processed = processor(generated_tap, scores)
++
++    assert torch.equal(processed, scores)
++    snapshot = processor.snapshot()
++    assert snapshot.phase == _phase("SATISFIED")
++    assert snapshot.complete_group_count == 1
++    assert snapshot.current_time_token == 32
++
++
++def test_prompt_group_never_satisfies_generated_origin_obligation():
++    processor = _processor()
++    prompt_with_group = torch.tensor([[100, 1, 32, 10, 50]], dtype=torch.long)
++
++    processed = processor(prompt_with_group, _scores())
++
++    assert torch.isneginf(processed[0, 2])
++    assert processor.snapshot().phase == _phase("UNSATISFIED")
++    assert processor.snapshot().complete_group_count == 0
++
++
++def test_prompt_time_can_be_inherited_without_prompt_group_satisfying():
++    processor = _processor(initial_time_token=33)
++    processor(PROMPT, _scores())
++
++    processed = processor(
++        torch.tensor([[100, 1, 10, 50]], dtype=torch.long),
++        _scores(),
++    )
++
++    assert torch.equal(processed, _scores())
++    assert processor.snapshot().phase == _phase("SATISFIED")
++    assert processor.snapshot().current_time_token == 33
++
++
++def test_explicit_termination_tokens_do_not_mask_unrelated_context_eos():
++    processor = _processor(eos_token_ids=(2,))
++
++    processed = processor(PROMPT, _scores())
++
++    assert torch.isneginf(processed[0, 2])
++    assert processed[0, 3] == _scores()[0, 3]
++
++
++def test_allowed_group_types_are_respected_without_type_score_boosting():
++    processor = _processor(allowed_group_types=("TAP",))
++    processor(PROMPT, _scores())
++    scores = _scores()
++
++    after_hold = processor(
++        torch.tensor([[100, 1, 32, 10, 51]], dtype=torch.long),
++        scores,
++    )
++
++    assert processor.snapshot().phase == _phase("UNSATISFIED")
++    assert after_hold[0, 50] == scores[0, 50]
++    assert after_hold[0, 51] == scores[0, 51]
++
++
++def test_hold_sustain_completes_structure_but_never_satisfies_obligation():
++    processor = _processor()
++    processor(PROMPT, _scores())
++
++    processed = processor(
++        torch.tensor([[100, 1, 32, 10, 53]], dtype=torch.long),
++        _scores(),
++    )
++
++    assert processor.snapshot().phase == _phase("UNSATISFIED")
++    assert processor.snapshot().pending_lane is None
++    assert torch.isneginf(processed[0, 2])
++
++
++@pytest.mark.parametrize("mode", ["full_scan", "incremental", "incremental_verify"])
++def test_state_modes_make_identical_decisions_across_connected_prefixes(mode):
++    processor = _processor(state_mode=mode)
++    prefixes = [
++        PROMPT,
++        torch.tensor([[100, 1, 32]], dtype=torch.long),
++        torch.tensor([[100, 1, 32, 10]], dtype=torch.long),
++        torch.tensor([[100, 1, 32, 10, 50]], dtype=torch.long),
++    ]
++    phases = []
++
++    for prefix in prefixes:
++        processor(prefix, _scores())
++        phases.append(processor.snapshot().phase)
++
++    assert phases == [
++        _phase("UNSATISFIED"),
++        _phase("UNSATISFIED"),
++        _phase("GROUP_PENDING"),
++        _phase("SATISFIED"),
++    ]
++    telemetry = processor.telemetry()
++    expected_incremental = 0 if mode == "full_scan" else len(prefixes)
++    assert telemetry["incrementalRows"] == expected_incremental
++    assert telemetry["verificationRows"] == (
++        len(prefixes) if mode == "incremental_verify" else 0
++    )
++
++
++def test_incremental_mode_reset_does_not_leak_satisfaction_to_next_attempt():
++    processor = _processor(state_mode="incremental")
++    processor(PROMPT, _scores())
++    processor(torch.tensor([[100, 1, 32, 10, 50]]), _scores())
++    assert processor.snapshot().phase == _phase("SATISFIED")
++
++    processor.reset_incremental_state()
++    processed = processor(PROMPT, _scores())
++
++    assert processor.snapshot().phase == _phase("UNSATISFIED")
++    assert torch.isneginf(processed[0, 2])
++
++
++def test_pending_generated_group_preserves_note_scores_and_masks_escape():
++    processor = _processor()
++    processor(PROMPT, _scores())
++    pending = torch.tensor([[100, 1, 33, 11]], dtype=torch.long)
++    scores = _scores()
++
++    processed = processor(pending, scores)
++
++    assert processor.snapshot().phase == _phase("GROUP_PENDING")
++    assert processed[0, 50] == scores[0, 50]
++    assert processed[0, 51] == scores[0, 51]
++    assert torch.isneginf(processed[0, 2])
++    assert torch.isneginf(processed[0, 35:40]).all()
++
++
++@pytest.mark.parametrize("time_token", [32, 34])
++def test_closed_interval_boundaries_allow_a_complete_tap(time_token):
++    processor = _processor()
++    processor(PROMPT, _scores())
++
++    processor(
++        torch.tensor([[100, 1, time_token, 10, 50]], dtype=torch.long),
++        _scores(),
++    )
++
++    assert processor.snapshot().phase == _phase("SATISFIED")
++
++
++def test_group_before_interval_does_not_satisfy():
++    processor = _processor()
++    processor(PROMPT, _scores())
++
++    processed = processor(
++        torch.tensor([[100, 1, 31, 10, 50]], dtype=torch.long),
++        _scores(),
++    )
++
++    assert processor.snapshot().phase == _phase("UNSATISFIED")
++    assert torch.isneginf(processed[0, 2])
++
++
++@pytest.mark.parametrize(
++    ("addressable", "expected_phase"),
++    [
++        (True, "SATISFIED"),
++        (False, "UNSATISFIED"),
++    ],
++)
++def test_hold_start_satisfies_only_when_closure_is_addressable(
++    addressable,
++    expected_phase,
++):
++    processor = _processor(hold_start_closure_addressable=addressable)
++    processor(PROMPT, _scores())
++
++    processed = processor(
++        torch.tensor([[100, 1, 32, 10, 51]], dtype=torch.long),
++        _scores(),
++    )
++
++    assert processor.snapshot().phase == _phase(expected_phase)
++    if addressable:
++        assert torch.equal(processed, _scores())
++    else:
++        assert torch.isneginf(processed[0, 2])
++
++
++def test_initial_satisfaction_is_an_exact_noop_and_does_not_scan_prompt():
++    processor = _processor(initial_satisfied=True)
++    scores = _scores()
++
++    processed = processor(PROMPT, scores)
++
++    assert torch.equal(processed, scores)
++    assert processor.snapshot().phase == _phase("SATISFIED")
++    assert processor.snapshot().complete_group_count == 1
++
++
++def test_unsatisfied_preflight_rejects_insufficient_group_and_eos_budget():
++    processor = _processor(max_sequence_length=PROMPT.shape[1] + 2)
++
++    with pytest.raises(ManiaDomainError) as caught:
++        processor(PROMPT, _scores())
++
++    assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_TOKEN_BUDGET_EXHAUSTED"
++    assert caught.value.context == {
++        "remainingTokens": 2,
++        "requiredTokens": 3,
++        "phase": "UNSATISFIED",
++    }
++
++
++def test_preflight_reserves_time_transition_when_current_time_is_outside():
++    processor = _processor(
++        initial_time_token=31,
++        max_sequence_length=PROMPT.shape[1] + 3,
++    )
++
++    with pytest.raises(ManiaDomainError) as caught:
++        processor(PROMPT, _scores())
++
++    assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_TOKEN_BUDGET_EXHAUSTED"
++    assert caught.value.context["requiredTokens"] == 4
++
++
++def test_all_masked_after_obligation_mask_is_no_legal_group_not_fallback():
++    processor = _processor()
++
++    with pytest.raises(ManiaDomainError) as caught:
++        processor(PROMPT, _scores(all_masked=True))
++
++    assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP"
++    assert caught.value.context["phase"] == "UNSATISFIED"
++
++
++def test_unrelated_finite_token_does_not_hide_no_legal_group():
++    processor = _processor(initial_time_token=31)
++    scores = _scores(all_masked=True)
++    scores[0, 120] = 0.0
++
++    with pytest.raises(ManiaDomainError) as caught:
++        processor(PROMPT, scores)
++
++    assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP"
++
++
++@pytest.mark.parametrize(
++    ("start", "end"),
++    [(34, 32), (29, 32), (32, 40), (True, 34)],
++)
++def test_non_addressable_or_malformed_token_interval_fails_closed(start, end):
++    with pytest.raises((TypeError, ManiaDomainError)) as caught:
++        _enforcement().RequiredGameplayIntervalLogitsProcessor(
++            _Tokenizer(),
++            interval_start_time_token=start,
++            interval_end_time_token=end,
++            initial_satisfied=False,
++            max_sequence_length=20,
++            hold_start_closure_addressable=True,
++        )
++
++    if isinstance(caught.value, ManiaDomainError):
++        assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE"
+diff --git a/tests/test_required_gameplay_observation.py b/tests/test_required_gameplay_observation.py
+index a7d193f..d35f898 100644
+--- a/tests/test_required_gameplay_observation.py
++++ b/tests/test_required_gameplay_observation.py
+@@ -108,6 +108,12 @@ def _observe_args(**overrides):
+     return _args(**(values | overrides))
+ 
+ 
++def _shadow_args(**overrides):
++    return _observe_args(
++        **({"required_gameplay_interval_mode": "SHADOW_ENFORCE"} | overrides)
++    )
++
++
+ def test_off_has_no_observer_and_rejects_a_half_contract():
+     assert required_gameplay_interval_from_args(_args()) is None
+ 
+@@ -135,10 +141,24 @@ def test_hydra_context_enums_are_normalized_to_contract_names():
+     assert interval is not None
+ 
+ 
++def test_v36_shadow_enforcement_uses_the_same_complete_bounded_contract():
++    interval = required_gameplay_interval_from_args(_shadow_args())
++
++    assert interval is not None
++    assert interval.mode == "SHADOW_ENFORCE"
++    assert interval.minimum_complete_groups == 1
++
++
++def test_v36_shadow_rejects_more_than_one_required_group():
++    with pytest.raises(ValueError, match="exactly one"):
++        required_gameplay_interval_from_args(
++            _shadow_args(required_gameplay_interval_minimum_complete_groups=2)
++        )
++
++
+ @pytest.mark.parametrize(
+     ("override", "message"),
+     [
+-        ({"required_gameplay_interval_mode": "SHADOW_ENFORCE"}, "observe-only"),
+         ({"required_gameplay_interval_mode": "UNKNOWN"}, "mode"),
+         ({"required_gameplay_interval_start_time": True}, "start"),
+         ({"required_gameplay_interval_end_time": 5000}, "before"),
+diff --git a/tests/test_required_gameplay_processor_window.py b/tests/test_required_gameplay_processor_window.py
+new file mode 100644
+index 0000000..d7da6c2
+--- /dev/null
++++ b/tests/test_required_gameplay_processor_window.py
+@@ -0,0 +1,158 @@
++from dataclasses import replace
++from types import MethodType, SimpleNamespace
++
++import torch
++import pytest
++
++from osuT5.osuT5.event import ContextType, EventType
++from osuT5.osuT5.inference.processor import Processor
++from osuT5.osuT5.inference.mania_domain import ManiaDomainError
++from osuT5.osuT5.inference.required_gameplay_observation import (
++    RequiredGameplayIntervalObservation,
++)
++
++
++class _Tokenizer:
++    pad_id = 0
++    eos_id = 2
++    context_eos = {ContextType.MAP: 3}
++    event_start = {
++        EventType.TIME_SHIFT: 30,
++        EventType.MANIA_COLUMN: 140,
++        EventType.CIRCLE: 160,
++        EventType.HOLD_NOTE: 161,
++        EventType.HOLD_NOTE_END: 162,
++    }
++    event_end = {
++        EventType.TIME_SHIFT: 133,
++        EventType.MANIA_COLUMN: 144,
++    }
++    event_range = {
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=-2, max_value=100)
++    }
++
++
++def _interval(mode="SHADOW_ENFORCE"):
++    return RequiredGameplayIntervalObservation(
++        start_ms=409,
++        end_ms=549,
++        minimum_complete_groups=1,
++        allowed_group_types=("HOLD_START", "TAP"),
++        evidence_class="BROADBAND_ATTACK",
++        evidence_digest="a" * 64,
++        mode=mode,
++    )
++
++
++def _processor(interval):
++    processor = Processor.__new__(Processor)
++    processor.required_gameplay_interval = interval
++    processor.tokenizer = _Tokenizer()
++    processor.lookback_time = 0.0
++    processor.lookahead_time = 0.0
++    processor.lookahead_max_time = 1_000.0
++    processor.miliseconds_per_sequence = 1_000.0
++    processor.last_attack_time = 900
++    processor.end_time = 1_000
++    processor.types_first = False
++    processor.prepare_context_sequences = MethodType(
++        lambda self, *_args, **_kwargs: None,
++        processor,
++    )
++    processor.get_prompts = MethodType(
++        lambda self, *_args, **_kwargs: (torch.tensor([[1]]), None),
++        processor,
++    )
++    processor._mania_prompt_open_hold_columns = MethodType(
++        lambda self, *_args: (), processor
++    )
++    processor._mania_prompt_group_signatures = MethodType(
++        lambda self, *_args: (), processor
++    )
++    processor._mania_prompt_current_time_token = MethodType(
++        lambda self, *_args: 32, processor
++    )
++    processor._record_generation_stats = MethodType(
++        lambda self, _stats: None, processor
++    )
++    processor.add_predicted_tokens_to_context = MethodType(
++        lambda self, *_args, **_kwargs: None, processor
++    )
++    return processor
++
++
++def _run_window(processor):
++    captured = {}
++
++    def model_generate(self, _model_kwargs, **kwargs):
++        captured.update(kwargs)
++        return torch.tensor([[1, 2]]), {
++            "required_gameplay_enforcement": {
++                "phase": "SATISFIED",
++                "completeGroupCount": 1,
++            }
++        }
++
++    processor.model_generate = MethodType(model_generate, processor)
++    processor._generate_sequential_window(
++        context={"context_type": ContextType.MAP},
++        context_index=0,
++        in_context=[],
++        out_context=[],
++        req_special_tokens=[],
++        model_kwargs={},
++        enc_hidden=torch.zeros((1, 1, 1)),
++        wi=0,
++        frame_time=0.0,
++        n_windows=1,
++        song_length=1_000.0,
++        mania_keycount=4,
++        progress_bar=None,
++        tokens_per_second_meter={},
++    )
++    return captured
++
++
++def test_shadow_window_threads_exact_addressable_contract():
++    processor = _processor(_interval())
++    captured = _run_window(processor)
++
++    assert captured["mania_required_gameplay_interval_time_tokens"] == (73, 86)
++    assert captured["mania_required_gameplay_initial_time_token"] == 32
++    assert captured["mania_required_gameplay_allowed_group_types"] == (
++        "HOLD_START",
++        "TAP",
++    )
++    assert captured["mania_required_gameplay_initial_satisfied"] is False
++    assert processor._required_gameplay_enforcement_windows == {0}
++
++
++def test_observe_window_does_not_thread_enforcement_kwargs():
++    captured = _run_window(_processor(replace(_interval(), mode="OBSERVE")))
++
++    assert not any(
++        key.startswith("mania_required_gameplay_") for key in captured
++    )
++
++
++def test_shadow_invocation_without_one_owned_window_fails_closed():
++    processor = _processor(_interval())
++    processor._required_gameplay_enforcement_windows = set()
++
++    with pytest.raises(ManiaDomainError) as caught:
++        processor._validate_required_gameplay_enforcement_dispatch()
++
++    assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE"
++
++
++@pytest.mark.parametrize(
++    ("reason", "expected"),
++    [
++        ("REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP", True),
++        ("TOKEN_BUDGET_EXHAUSTED", False),
++    ],
++)
++def test_required_gameplay_failure_is_not_consumed_by_tail_retry(reason, expected):
++    error = ManiaDomainError(reason=reason, message="failure")
++
++    assert Processor._is_required_gameplay_domain_error(error) is expected
+diff --git a/tests/test_required_gameplay_window_addressability.py b/tests/test_required_gameplay_window_addressability.py
+new file mode 100644
+index 0000000..157926c
+--- /dev/null
++++ b/tests/test_required_gameplay_window_addressability.py
+@@ -0,0 +1,98 @@
++from types import SimpleNamespace
++
++import pytest
++
++from osuT5.osuT5.event import EventType
++from osuT5.osuT5.inference.mania_domain import ManiaDomainError
++from osuT5.osuT5.inference.required_gameplay_enforcement import (
++    addressable_required_gameplay_time_tokens,
++)
++
++
++class _Tokenizer:
++    event_start = {EventType.TIME_SHIFT: 30}
++    event_end = {EventType.TIME_SHIFT: 133}
++    event_range = {
++        EventType.TIME_SHIFT: SimpleNamespace(min_value=-2, max_value=100)
++    }
++
++
++def _tokens(**overrides):
++    kwargs = dict(
++        tokenizer=_Tokenizer(),
++        frame_time_ms=0.0,
++        interval_start_ms=409,
++        interval_end_ms=549,
++        accepted_start_ms=0.0,
++        accepted_end_ms=1_000.0,
++        accepted_end_inclusive=False,
++        effective_cut_ms=1_000.0,
++        max_note_start_ms=900.0,
++    )
++    kwargs.update(overrides)
++    return addressable_required_gameplay_time_tokens(**kwargs)
++
++
++def test_translation_uses_exact_decoder_half_step_semantics():
++    # Values 41..54 decode to 415..545ms. Value 40 decodes to 405ms and
++    # value 55 to 555ms, so neither belongs to the closed 409..549ms interval.
++    assert _tokens() == (73, 86)
++
++
++def test_negative_relative_tokens_do_not_receive_positive_half_step():
++    assert _tokens(
++        frame_time_ms=100.0,
++        interval_start_ms=80,
++        interval_end_ms=95,
++        accepted_start_ms=0,
++        accepted_end_ms=100,
++        effective_cut_ms=100,
++        max_note_start_ms=100,
++    ) == (30, 31)
++
++
++def test_adjacent_windows_assign_midpoint_once_using_half_open_core():
++    first = _tokens(
++        interval_start_ms=490,
++        interval_end_ms=510,
++        accepted_start_ms=0,
++        accepted_end_ms=500,
++    )
++    second = _tokens(
++        interval_start_ms=490,
++        interval_end_ms=510,
++        accepted_start_ms=500,
++        accepted_end_ms=1_000,
++    )
++
++    assert first is None
++    assert second == (82, 82)
++
++
++def test_final_window_can_own_interval_center_on_closed_end():
++    assert _tokens(
++        interval_start_ms=990,
++        interval_end_ms=1_010,
++        accepted_start_ms=500,
++        accepted_end_ms=1_000,
++        accepted_end_inclusive=True,
++        effective_cut_ms=1_000,
++        max_note_start_ms=1_000,
++    ) == (131, 131)
++
++
++@pytest.mark.parametrize(
++    "override",
++    [
++        {"effective_cut_ms": 408},
++        {"max_note_start_ms": 408},
++        {"interval_start_ms": True},
++        {"frame_time_ms": float("nan")},
++    ],
++)
++def test_designated_but_unreachable_interval_fails_closed(override):
++    with pytest.raises((TypeError, ValueError, ManiaDomainError)) as caught:
++        _tokens(**override)
++
++    if isinstance(caught.value, ManiaDomainError):
++        assert caught.value.reason == "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE"

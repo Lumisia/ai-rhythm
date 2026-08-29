@@ -1,4 +1,4 @@
-"""Zero-inference exact-first-row reselection under the intro contract."""
+"""Legacy exact-row observation with free fallback when no region is known."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def apply_intro_start_contract(
     selections: list[Selection],
     song_context: SongAnalysisContext,
 ) -> tuple[list[Selection], IntroStartContract, IntroContractReview]:
-    """Apply exact matching only by free candidate reselection, never mutation."""
+    """Use exact matching only when adaptive region evidence is unavailable."""
 
     initial = _selected_candidates(selections)
     contract = build_intro_start_contract(
@@ -96,8 +96,13 @@ def apply_intro_start_contract(
     canonical_ms = contract.canonical_first_row_ms
     correction_reasons: list[str] = []
     corrected_count = 0
-    correction_supported = contract.audio_supported or (
-        contract.raw_supported and contract.candidate_support_count >= 2
+    region_authoritative = (
+        contract.intro_region is not None
+        and contract.intro_region.status == "CONFIRMED"
+    )
+    correction_supported = not region_authoritative and (
+        contract.audio_supported
+        or (contract.raw_supported and contract.candidate_support_count >= 2)
     )
     updated = []
     for states, original_assignment, _original_review in selections:

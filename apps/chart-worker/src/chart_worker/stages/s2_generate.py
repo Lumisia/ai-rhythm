@@ -2,18 +2,27 @@
 
 import json
 from bisect import bisect_right
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+from time import perf_counter
 
 from chart_worker.analysis.activity import (
     SongBoundaryContract,
     build_song_boundary_contract,
     estimate_music_end_ms,
 )
+from chart_worker.analysis.coverage_opportunity import CoverageKind
 from chart_worker.analysis.grid_alignment import measure_note_grid_alignment
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.song_context import SongAnalysisContext
+from chart_worker.analysis.timing_diagnostics import TimingCoverageGap
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.attempt_journal import AttemptJournal
+from chart_worker.generation.candidate_payload_store import (
+    persist_candidate_payload,
+    verify_candidate_payload,
+)
 from chart_worker.generation.candidate_state import (
     Candidate as _Candidate,
 )
@@ -21,9 +30,33 @@ from chart_worker.generation.candidate_state import (
     VariantState as _VariantState,
 )
 from chart_worker.generation.candidate_state import (
-    candidate_evidence as _candidate_evidence,
+    candidate_quality_snapshot as _candidate_quality_snapshot,
 )
 from chart_worker.generation.coverage_repair import build_coverage_repair_chart
+from chart_worker.generation.difficulty_family_compiler import (
+    DifficultyFamilyCompilerDecision,
+    DifficultyFamilyCompilerSlot,
+    compile_difficulty_family_shadow,
+    materialize_compiled_family,
+    persist_difficulty_family_compiler_payloads,
+)
+from chart_worker.generation.difficulty_shadow_challenger import (
+    bind_required_gameplay_interval,
+    build_required_gameplay_evidence_for_shadow,
+    choose_difficulty_shadow_target,
+    difficulty_shadow_slots,
+    difficulty_shadow_target_failure_reason,
+    execute_difficulty_shadow_challenger,
+    execute_difficulty_shadow_full_map_challenger,
+    plan_difficulty_shadow_full_map,
+    plan_difficulty_shadow_partial_repair,
+)
+from chart_worker.generation.family_selection import (
+    apply_safe_family_assignment as _family_apply_safe_family_assignment,
+)
+from chart_worker.generation.family_selection import (
+    build_song_selection_evidence_v3 as _build_song_selection_evidence_v3,
+)
 from chart_worker.generation.family_selection import (
     candidate_stable_id as _family_candidate_stable_id,
 )
@@ -38,9 +71,6 @@ from chart_worker.generation.family_selection import (
 )
 from chart_worker.generation.family_selection import (
     first_row_ms as _family_first_row_ms,
-)
-from chart_worker.generation.family_selection import (
-    has_complete_model_family as _family_has_complete_model_family,
 )
 from chart_worker.generation.family_selection import (
     review_candidates as _family_review_candidates,
@@ -87,11 +117,17 @@ from chart_worker.generation.intro_family_recovery import (
 from chart_worker.generation.intro_family_recovery import (
     intro_phrase_family_reviews as _intro_phrase_family_reviews,
 )
+from chart_worker.generation.intro_family_recovery import (
+    intro_recovery_targets as _intro_recovery_targets,
+)
 from chart_worker.generation.intro_recovery import (
     covers_intro_anchor,
 )
 from chart_worker.generation.intro_recovery import (
     execute_intro_retry as _execute_intro_retry,
+)
+from chart_worker.generation.intro_recovery import (
+    intro_phrase_recovery_end_ms as _intro_phrase_recovery_end_ms,
 )
 from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedChart
 from chart_worker.generation.osu_writer import notes_to_osu_mania
@@ -109,9 +145,13 @@ from chart_worker.generation.recovery import (
 )
 from chart_worker.generation.recovery_router import (
     RecoveryRequest,
-    intro_phrase_recovery_request,
+    difficulty_shadow_recovery_request,
+    intro_region_recovery_request,
     plan_recoveries,
     timing_family_recovery_request,
+)
+from chart_worker.generation.required_gameplay_interval import (
+    RequiredGameplayIntervalMode,
 )
 from chart_worker.generation.timing_family_recovery import (
     apply_timing_family_recovery as _apply_timing_family_recovery,
@@ -131,10 +171,21 @@ from chart_worker.stages.types import (
     PreparedAudio,
     SongTimingAuthority,
 )
+from chart_worker.validation.candidate_replacement import (
+    decide_candidate_replacement as _decide_candidate_replacement,
+)
+from chart_worker.validation.coverage_family_review import (
+    CoverageFamilyVerdict,
+    CoverageGapMember,
+    review_coverage_family,
+)
 from chart_worker.validation.difficulty_order import DifficultyOrderReview
 from chart_worker.validation.difficulty_selector import (
     DifficultySelectionComparison,
     SelectionMode,
+)
+from chart_worker.validation.final_difficulty_family import (
+    CURRENT_DIFFICULTY_FAMILY_CALIBRATION_STATE,
 )
 from chart_worker.validation.generated_chart import (
     GeneratedChartValidationError,
@@ -153,19 +204,31 @@ from chart_worker.validation.outro_family_review import (
     review_outro_family,
 )
 from chart_worker.validation.quality_gate import (
+    CandidateDisposition,
     ChartAcceptance,
     GateAction,
     GateAxis,
     evaluate_chart_candidate,
 )
+from chart_worker.validation.safe_family_assignment import (
+    SafeFamilyAssignmentDecision,
+)
 from chart_worker.validation.serialized_candidate import (
     validate_serialized_candidate as _validate_serialized_candidate,
 )
-from chart_worker.validation.song_family_selector import SongSelectionComparison
+from chart_worker.validation.song_family_selector import (
+    MATCHED_F1_EPSILON,
+    MATCHED_PRECISION_EPSILON,
+    SongSelectionComparison,
+)
+from chart_worker.validation.song_family_selector_v3 import (
+    evaluate_shadow_v3_proposal,
+)
 from chart_worker.validation.timing_authority import (
     TimingAuthorityValidationError,
     validate_timing_identity,
 )
+from chart_worker.validation.timing_integrity import TimingIntegrityStatus
 
 _VARIANT_COUNT = len(KEY_MODES) * len(DIFFICULTIES)
 _RETRYABLE_GENERATION_CODES = {
@@ -182,10 +245,7 @@ def _should_retry(error: Exception) -> bool:
 
 def _is_crash(error: Exception) -> bool:
     """출력물이 없거나 쓸 수 없는 실패. 품질 예산 대신 크래시 예산을 쓴다."""
-    return (
-        isinstance(error, WorkerError)
-        and error.code is ErrorCode.CHART_GENERATION_FAILED
-    )
+    return isinstance(error, WorkerError) and error.code is ErrorCode.CHART_GENERATION_FAILED
 
 
 def _is_tail_repair_exhausted(error: Exception) -> bool:
@@ -313,10 +373,13 @@ def _is_localized_coverage_failure(acceptance: ChartAcceptance) -> bool:
 
 
 def _timing_segment_id(authority: SongTimingAuthority, time_ms: int) -> int | None:
-    index = bisect_right(
-        [event.time_ms for event in authority.bpm_events],
-        time_ms,
-    ) - 1
+    index = (
+        bisect_right(
+            [event.time_ms for event in authority.bpm_events],
+            time_ms,
+        )
+        - 1
+    )
     return index if index >= 0 else None
 
 
@@ -393,15 +456,9 @@ def _acceptance_timing_failures(
                 state,
                 authority,
                 seed=seed,
-                family=(
-                    "RESNAP_COLLISION" if observed_resnap else "DUPLICATE_NOTE"
-                ),
+                family=("RESNAP_COLLISION" if observed_resnap else "DUPLICATE_NOTE"),
                 time_ms=time_ms,
-                evidence=(
-                    {"resnapCollisions": collision_evidence}
-                    if collision_evidence
-                    else None
-                ),
+                evidence=({"resnapCollisions": collision_evidence} if collision_evidence else None),
             )
             if signature is not None:
                 signatures.append(signature)
@@ -476,9 +533,7 @@ def _block_full_length_retry(
         "attempt": attempt,
     }
     state.publication_block_reason = (
-        "QUALITY_GATE_REJECTED"
-        if reason == "HARD_SAFE_RAW_AVAILABLE"
-        else reason
+        "QUALITY_GATE_REJECTED" if reason == "HARD_SAFE_RAW_AVAILABLE" else reason
     )
 
 
@@ -500,14 +555,12 @@ def _raw_playtest_score(
     noncoverage_retries = sum(
         decision.action is GateAction.RETRY_MAP
         for decision in acceptance.decisions
-        if decision.axis
-        not in {GateAxis.STRUCTURE, GateAxis.TIMING_IDENTITY, GateAxis.COVERAGE}
+        if decision.axis not in {GateAxis.STRUCTURE, GateAxis.TIMING_IDENTITY, GateAxis.COVERAGE}
     )
     attack_gaps = tuple(
         gap
         for gap in acceptance.timing.coverage_gaps
-        if gap.opportunity is None
-        or gap.opportunity.kind.value == "ATTACK_REQUIRED"
+        if gap.opportunity is None or gap.opportunity.kind.value == "ATTACK_REQUIRED"
     )
     precision = acceptance.timing.overall.matched_precision_50
     return (
@@ -524,8 +577,7 @@ def _attack_gap_summary(acceptance: ChartAcceptance) -> tuple[int, int]:
     gaps = tuple(
         gap
         for gap in acceptance.timing.coverage_gaps
-        if gap.opportunity is None
-        or gap.opportunity.kind.value == "ATTACK_REQUIRED"
+        if gap.opportunity is None or gap.opportunity.kind.value == "ATTACK_REQUIRED"
     )
     return len(gaps), sum(gap.end_ms - gap.start_ms for gap in gaps)
 
@@ -550,16 +602,57 @@ def _playtest_candidate_score(
     return (
         attack_count,
         attack_total_ms,
-        _gate_action_rank(
-            candidate.acceptance.decision(GateAxis.TIMING_ALIGNMENT).action
-        ),
+        _gate_action_rank(candidate.acceptance.decision(GateAxis.TIMING_ALIGNMENT).action),
         provenance_rank,
-        _gate_action_rank(
-            candidate.acceptance.decision(GateAxis.COVERAGE).action
-        ),
+        _gate_action_rank(candidate.acceptance.decision(GateAxis.COVERAGE).action),
         candidate.attempt,
         candidate.seed,
     )
+
+
+def _coverage_repair_preserves_timing(
+    source: ChartAcceptance,
+    repaired: ChartAcceptance,
+) -> bool:
+    """Reject deterministic repair that degrades its own source candidate.
+
+    This is intentionally a source-local guard.  It does not claim that F1 is
+    musical quality or compare unrelated fallback patterns with different
+    absolute difficulty; it only prevents a mutation from making its input's
+    one-to-one onset agreement materially worse.
+    """
+
+    source_metrics = source.timing.overall
+    repaired_metrics = repaired.timing.overall
+    for baseline, challenger, epsilon in (
+        (
+            source_metrics.matched_f1_50,
+            repaired_metrics.matched_f1_50,
+            MATCHED_F1_EPSILON,
+        ),
+        (
+            source_metrics.matched_precision_50,
+            repaired_metrics.matched_precision_50,
+            MATCHED_PRECISION_EPSILON,
+        ),
+    ):
+        if baseline is not None and (
+            challenger is None or challenger < baseline - epsilon
+        ):
+            return False
+    return True
+
+
+def _interval_substantially_overlaps_gap(
+    interval: tuple[int, int],
+    gap: TimingCoverageGap,
+) -> bool:
+    start_ms, end_ms = interval
+    intersection_ms = min(end_ms, gap.end_ms) - max(start_ms, gap.start_ms)
+    if intersection_ms <= 0:
+        return False
+    shorter_ms = min(end_ms - start_ms, gap.end_ms - gap.start_ms)
+    return intersection_ms / shorter_ms >= 0.5
 
 
 def _coverage_repair_candidate(
@@ -569,6 +662,7 @@ def _coverage_repair_candidate(
     prepared: PreparedAudio,
     authority: SongTimingAuthority,
     onset_analysis: OnsetAnalysis,
+    approved_intervals: tuple[tuple[int, int], ...] = (),
 ) -> _Candidate:
     repaired, plan = build_coverage_repair_chart(
         source.request,
@@ -576,6 +670,7 @@ def _coverage_repair_candidate(
         source.acceptance,
         authority,
         onset_analysis,
+        approved_intervals=approved_intervals,
     )
     acceptance = evaluate_chart_candidate(
         repaired,
@@ -590,8 +685,22 @@ def _coverage_repair_candidate(
         raise ValueError("coverage repair failed hard safety gates")
     source_summary = _attack_gap_summary(source.acceptance)
     repaired_summary = _attack_gap_summary(acceptance)
-    if repaired_summary >= source_summary:
+    if approved_intervals:
+        if any(
+            _interval_substantially_overlaps_gap(interval, gap)
+            for interval in approved_intervals
+            for gap in acceptance.timing.coverage_gaps
+        ):
+            raise ValueError("coverage repair did not remove the jury-approved gap")
+        for axis in (GateAxis.TIMING_ALIGNMENT, GateAxis.COVERAGE, GateAxis.PATTERN):
+            if _gate_action_rank(acceptance.decision(axis).action) > _gate_action_rank(
+                source.acceptance.decision(axis).action
+            ):
+                raise ValueError(f"coverage repair worsened the {axis.value} gate")
+    elif repaired_summary >= source_summary:
         raise ValueError("coverage repair did not strictly improve active gaps")
+    if not _coverage_repair_preserves_timing(source.acceptance, acceptance):
+        raise ValueError("coverage repair materially worsened source timing metrics")
     osu_text = _serialized_candidate_text(
         repaired,
         authority=authority,
@@ -607,7 +716,11 @@ def _coverage_repair_candidate(
         attempt=source.attempt,
         seed=source.seed,
         provenance="COVERAGE_REPAIR",
-        recovery_reason="ACTIVE_COVERAGE_GAP_REPAIRED",
+        recovery_reason=(
+            "JURY_APPROVED_ACTIVE_GAP_REPAIRED"
+            if approved_intervals
+            else "ACTIVE_COVERAGE_GAP_REPAIRED"
+        ),
         intro_anchor_covered=_intro_anchor_covered(repaired, authority),
         coverage_repair_gap_count=plan.repaired_gap_count,
     )
@@ -620,6 +733,9 @@ def _coverage_repair_candidate(
             "sourceAttackGapTotalMs": source_summary[1],
             "resultAttackGapCount": repaired_summary[0],
             "resultAttackGapTotalMs": repaired_summary[1],
+            "juryApprovedIntervals": [
+                {"startMs": start_ms, "endMs": end_ms} for start_ms, end_ms in approved_intervals
+            ],
             "repairPlan": plan.to_report(),
         }
     )
@@ -686,6 +802,7 @@ def _safe_fallback_candidate(
     base_seed: int,
     authority_epoch: int,
     recovery_reason: str = "NO_STRUCTURALLY_SAFE_MODEL_CANDIDATE",
+    register: bool = True,
 ) -> _Candidate:
     seed = base_seed + state.flat_index
     boundary, music_end_ms = _generation_bounds(prepared, onset_analysis)
@@ -753,15 +870,16 @@ def _safe_fallback_candidate(
         recovery_reason=recovery_reason,
         intro_anchor_covered=_intro_anchor_covered(generated, authority),
     )
-    state.candidates.add_safe_fallback(candidate)
-    state.attempt_evidence.append(
-        {
-            "reason": "SAFE_FALLBACK_CREATED",
-            "recoveryPlan": plan.to_report(),
-            "modelAttemptCount": state.budget.next_attempt - 1,
-            "sourceFailure": state.publication_block_reason,
-        }
-    )
+    if register:
+        state.candidates.add_safe_fallback(candidate)
+        state.attempt_evidence.append(
+            {
+                "reason": "SAFE_FALLBACK_CREATED",
+                "recoveryPlan": plan.to_report(),
+                "modelAttemptCount": state.budget.next_attempt - 1,
+                "sourceFailure": state.publication_block_reason,
+            }
+        )
     return candidate
 
 
@@ -845,6 +963,160 @@ def _complete_playtest_selections(
             assignment[difficulty] = candidate
         completed.append((states, assignment, _family_review(assignment)))
     return completed
+
+
+def _coverage_gap_member(
+    candidate: _Candidate,
+    difficulty: str,
+    gap: TimingCoverageGap,
+) -> CoverageGapMember:
+    opportunity = gap.opportunity
+    return CoverageGapMember(
+        key_mode=candidate.generated.key_mode,
+        difficulty=difficulty,
+        start_ms=gap.start_ms,
+        end_ms=gap.end_ms,
+        model_backed=candidate.provenance != "SAFE_FALLBACK",
+        hold_occupancy_ratio=(opportunity.hold_occupancy_ratio if opportunity is not None else 0.0),
+        opportunity_kind=(
+            opportunity.kind if opportunity is not None else CoverageKind.UNCERTAIN
+        ),
+    )
+
+
+def _apply_chart_specific_coverage_recovery(
+    selections: list[_Selection],
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+) -> list[_Selection]:
+    """Repair only a frozen-family, audio-corroborated chart-specific omission."""
+
+    frozen: list[
+        tuple[
+            int,
+            str,
+            _VariantState,
+            _Candidate,
+            TimingCoverageGap,
+            CoverageGapMember,
+        ]
+    ] = []
+    for selection_index, (states, assignment, _review) in enumerate(selections):
+        for difficulty in DIFFICULTIES:
+            candidate = assignment[difficulty]
+            if candidate is None:
+                continue
+            for gap in (
+                *candidate.acceptance.timing.coverage_gaps,
+                *candidate.acceptance.timing.uncertain_coverage_gaps,
+            ):
+                frozen.append(
+                    (
+                        selection_index,
+                        difficulty,
+                        states[difficulty],
+                        candidate,
+                        gap,
+                        _coverage_gap_member(candidate, difficulty, gap),
+                    )
+                )
+
+    timing_status = (
+        authority.timing_integrity.status
+        if authority.timing_integrity is not None
+        else TimingIntegrityStatus.NEEDS_CORROBORATION
+    )
+    approved: dict[tuple[int, str], set[tuple[int, int]]] = {}
+    for (
+        selection_index,
+        difficulty,
+        state,
+        candidate,
+        gap,
+        target,
+    ) in frozen:
+        opportunity = gap.opportunity
+        local_audio = gap.local_audio_evidence
+        if (
+            candidate.acceptance.decision(GateAxis.COVERAGE).action is not GateAction.REVIEW
+            or gap.position != "MIDDLE"
+            or opportunity is None
+            or opportunity.kind is not CoverageKind.UNCERTAIN
+            or local_audio is None
+        ):
+            continue
+        siblings = tuple(
+            member
+            for _index, _difficulty, _state, sibling_candidate, _gap, member in frozen
+            if sibling_candidate is not candidate
+        )
+        review = review_coverage_family(
+            target,
+            siblings,
+            local_audio,
+            timing_status=timing_status,
+        )
+        state.attempt_evidence.append(
+            {
+                "reason": "COVERAGE_FAMILY_REVIEW_DECISION",
+                "targetInterval": {
+                    "startMs": gap.start_ms,
+                    "endMs": gap.end_ms,
+                },
+                "decision": review.to_report(),
+                "mutatesSelection": (
+                    review.verdict is CoverageFamilyVerdict.CHART_SPECIFIC_OMISSION
+                ),
+            }
+        )
+        if review.verdict is CoverageFamilyVerdict.CHART_SPECIFIC_OMISSION:
+            approved.setdefault((selection_index, difficulty), set()).add(
+                (gap.start_ms, gap.end_ms)
+            )
+
+    recovered: list[_Selection] = []
+    for selection_index, (states, original_assignment, _review) in enumerate(selections):
+        assignment = dict(original_assignment)
+        for difficulty in DIFFICULTIES:
+            intervals = tuple(sorted(approved.get((selection_index, difficulty), ())))
+            if not intervals:
+                continue
+            source = assignment[difficulty]
+            if source is None:
+                continue
+            state = states[difficulty]
+            try:
+                assignment[difficulty] = _coverage_repair_candidate(
+                    state,
+                    source,
+                    prepared=prepared,
+                    authority=authority,
+                    onset_analysis=onset_analysis,
+                    approved_intervals=intervals,
+                )
+            except (
+                GeneratedChartValidationError,
+                TimingAuthorityValidationError,
+                TypeError,
+                ValueError,
+                WorkerError,
+            ) as error:
+                state.attempt_evidence.append(
+                    {
+                        "reason": "JURY_APPROVED_COVERAGE_REPAIR_REJECTED",
+                        "sourceSeed": source.seed,
+                        "approvedIntervals": [
+                            {"startMs": start_ms, "endMs": end_ms} for start_ms, end_ms in intervals
+                        ],
+                        "errorType": type(error).__name__,
+                        "message": str(error),
+                        "originalSelectionPreserved": True,
+                    }
+                )
+        recovered.append((states, assignment, _family_review(assignment)))
+    return recovered
 
 
 def _generation_bounds(
@@ -955,11 +1227,21 @@ def _generate_next_pass(
                 "gateReport": gate_report,
             }
             if generated.resnap_diagnostics.status != "UNOBSERVED":
-                evidence["resnapDiagnostics"] = (
-                    generated.resnap_diagnostics.to_report()
-                )
+                evidence["resnapDiagnostics"] = generated.resnap_diagnostics.to_report()
             if acceptance.action is GateAction.RETRY_MAP:
                 state.budget.record_quality_attempt()
+                evidence.update(
+                    {
+                        "reason": (
+                            "HARD_REJECT_RETRY"
+                            if acceptance.disposition is CandidateDisposition.HARD_REJECT
+                            else "QUALITY_DEFECT_ROUTED_TO_RECOVERY"
+                        ),
+                        "candidateDisposition": acceptance.disposition.value,
+                        "repairEligible": acceptance.repair_eligible,
+                        "repairAxes": [axis.value for axis in acceptance.repair_axes],
+                    }
+                )
                 timing_failures = _acceptance_timing_failures(
                     state,
                     authority,
@@ -1046,12 +1328,10 @@ def _generate_next_pass(
                             attempt=attempt,
                             seed=attempt_seed,
                             provenance="RETRY",
-                            intro_anchor_covered=_intro_anchor_covered(
-                                generated, authority
-                            ),
+                            intro_anchor_covered=_intro_anchor_covered(generated, authority),
                         )
                     )
-                if raw_captured and not timing_failures:
+                if raw_captured:
                     _block_full_length_retry(
                         state,
                         reason="HARD_SAFE_RAW_AVAILABLE",
@@ -1175,10 +1455,6 @@ def _family_score(
     return _family_selection_score(assignment, review)
 
 
-def _has_complete_model_family(states: dict[str, _VariantState]) -> bool:
-    return _family_has_complete_model_family(states)
-
-
 def _select_family(
     states: dict[str, _VariantState],
 ) -> tuple[dict[str, _Candidate | None], DifficultyOrderReview | None]:
@@ -1223,6 +1499,34 @@ def _candidate_stable_id(
     )
 
 
+def _persist_selection_candidate_payloads(
+    selections,
+    *,
+    run_dir: Path,
+) -> None:
+    for states, _assignment, _review in selections:
+        for state in states.values():
+            for candidate in state.candidates.evidence_candidates:
+                persist_candidate_payload(
+                    run_dir=run_dir,
+                    osu_text=candidate.osu_text,
+                )
+
+
+def _verify_selection_candidate_payloads(
+    selections,
+    *,
+    run_dir: Path,
+) -> None:
+    for states, _assignment, _review in selections:
+        for state in states.values():
+            for candidate in state.candidates.evidence_candidates:
+                verify_candidate_payload(
+                    run_dir=run_dir,
+                    osu_text=candidate.osu_text,
+                )
+
+
 def _compare_song_selection(
     selections: list[
         tuple[
@@ -1257,6 +1561,286 @@ def _compare_song_selection(
         boundary=boundary,
         mode=mode,
     )
+
+
+def _apply_safe_family_assignment(
+    selections: list[_Selection],
+    *,
+    run_dir: Path,
+    intro_contract: IntroStartContract,
+    boundary: SongBoundaryContract | None,
+    song_context: SongAnalysisContext,
+    post_resolution_ordering: bool = False,
+):
+    return _family_apply_safe_family_assignment(
+        selections,
+        run_dir=run_dir,
+        intro_contract=intro_contract,
+        boundary=boundary,
+        song_context=song_context,
+        post_resolution_ordering=post_resolution_ordering,
+    )
+
+
+def _unresolved_family_key_modes(
+    decisions: tuple[SafeFamilyAssignmentDecision, ...],
+) -> set[int]:
+    """Return only families that still require a new candidate.
+
+    Compiler status is intentionally absent from this decision.  A failed
+    compiler may be harmless when preserved candidates already form a valid
+    family, while a successful compiler may still leave only candidates that
+    the safety selector must reject.
+    """
+
+    return {
+        decision.key_mode
+        for decision in decisions
+        if decision.family_feasibility_status == "UNAVAILABLE"
+    }
+
+
+def _is_canonical_safe_fallback(candidate: _Candidate) -> bool:
+    return (
+        candidate.provenance == "SAFE_FALLBACK"
+        and candidate.recovery_reason != "DIFFICULTY_FAMILY_COMPILER_V1"
+    )
+
+
+def _ensure_coherent_safe_fallback_family_candidates(
+    selections: list[_Selection],
+    *,
+    unresolved_key_modes: set[int],
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    base_seed: int,
+    authority_epoch: int,
+) -> set[int]:
+    """Supply all four deterministic fallback candidates as one key-family.
+
+    Building is staged so a failure in one difficulty cannot leave a partial
+    family in the repositories. Existing canonical fallbacks are reused;
+    compiler proposals do not count because they are derived from a model
+    anchor rather than the shared recovery authority.
+    """
+
+    supplied: set[int] = set()
+    for states, _assignment, _review in selections:
+        key_mode = next(iter(states.values())).key_mode
+        if key_mode not in unresolved_key_modes:
+            continue
+        staged: dict[str, _Candidate] = {}
+        try:
+            for difficulty in DIFFICULTIES:
+                state = states[difficulty]
+                if any(
+                    _is_canonical_safe_fallback(candidate)
+                    for candidate in state.candidates.safe_fallbacks
+                ):
+                    continue
+                staged[difficulty] = _safe_fallback_candidate(
+                    state,
+                    prepared=prepared,
+                    authority=authority,
+                    onset_analysis=onset_analysis,
+                    run_dir=run_dir,
+                    base_seed=base_seed,
+                    authority_epoch=authority_epoch,
+                    recovery_reason="ATOMIC_DIFFICULTY_FAMILY_FALLBACK",
+                    register=False,
+                )
+            for candidate in staged.values():
+                persist_candidate_payload(
+                    run_dir=run_dir,
+                    osu_text=candidate.osu_text,
+                )
+        except (OSError, TypeError, ValueError, WorkerError) as error:
+            evidence = {
+                "reason": "ATOMIC_DIFFICULTY_FAMILY_FALLBACK_UNAVAILABLE",
+                "keyMode": key_mode,
+                "errorType": type(error).__name__,
+                "message": str(error),
+                "createdDifficulties": [],
+                "mutatesSelection": False,
+            }
+            for state in states.values():
+                state.attempt_evidence.append(dict(evidence))
+            continue
+
+        for difficulty, candidate in staged.items():
+            state = states[difficulty]
+            state.candidates.add_safe_fallback(candidate)
+            state.attempt_evidence.append(
+                {
+                    "reason": "ATOMIC_DIFFICULTY_FAMILY_FALLBACK_CREATED",
+                    "keyMode": key_mode,
+                    "difficulty": difficulty,
+                    "modelAttemptCount": state.budget.next_attempt - 1,
+                    "sourceFailure": state.publication_block_reason,
+                    "mutatesSelection": False,
+                }
+            )
+        supplied.add(key_mode)
+    return supplied
+
+
+def _compile_difficulty_family_shadows(
+    selections: list[_Selection],
+    *,
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    onset_analysis: OnsetAnalysis,
+    run_dir: Path,
+    clock: Callable[[], float] | None = None,
+    enforce: bool = False,
+) -> tuple[DifficultyFamilyCompilerDecision, ...]:
+    """Evaluate deterministic family proposals and optionally admit them for selection.
+
+    Even in ENFORCED mode the compiler does not own the published assignment.
+    It only registers structurally verified proposals as safe fallbacks; the
+    final safe-family selector applies target-local non-regression constraints.
+    """
+
+    if clock is None:
+        clock = perf_counter
+    decisions = []
+    for states, assignment, _review in selections:
+        key_mode = next(iter(states.values())).key_mode
+        selected = tuple(assignment[difficulty] for difficulty in DIFFICULTIES)
+        compiler_started = clock()
+        decision = None
+        try:
+            if any(candidate is None for candidate in selected):
+                decision = DifficultyFamilyCompilerDecision(
+                    key_mode=key_mode,
+                    status="UNAVAILABLE",
+                    reason="INCOMPLETE_SELECTED_FAMILY",
+                    anchor_candidate_id=None,
+                    anchor_source_difficulty=None,
+                    proposals=(),
+                    proposals_evaluated=0,
+                )
+            else:
+                candidates = tuple(candidate for candidate in selected if candidate is not None)
+                source_candidates: dict[str, _Candidate] = {}
+                slots = tuple(
+                    DifficultyFamilyCompilerSlot(
+                        difficulty=difficulty,
+                        candidate_id=_candidate_stable_id(
+                            candidate,
+                            key_mode=key_mode,
+                            difficulty=difficulty,
+                            run_dir=run_dir,
+                        ),
+                        candidate_payload_sha256=persist_candidate_payload(
+                            run_dir=run_dir,
+                            osu_text=candidate.osu_text,
+                        ).sha256,
+                        generated=candidate.generated,
+                        acceptance=candidate.acceptance,
+                        osu_text=candidate.osu_text,
+                        provenance=candidate.provenance,
+                    )
+                    for difficulty, candidate in zip(
+                        DIFFICULTIES,
+                        candidates,
+                        strict=True,
+                    )
+                )
+                source_candidates = {
+                    slot.candidate_id: candidate
+                    for slot, candidate in zip(slots, candidates, strict=True)
+                }
+
+                def evaluate_candidate(
+                    generated: GeneratedChart,
+                    target_difficulty: str,
+                    _key_mode: int = key_mode,
+                ) -> ChartAcceptance:
+                    return evaluate_chart_candidate(
+                        generated,
+                        authority,
+                        onset_analysis,
+                        requested_key_mode=_key_mode,
+                        requested_difficulty=target_difficulty,
+                        duration_ms=prepared.normalized.duration_ms,
+                        boundary_policy_mode=prepared.boundary_policy_mode,
+                    )
+
+                def serialize_candidate(
+                    generated: GeneratedChart,
+                    _key_mode: int = key_mode,
+                ) -> str:
+                    return _serialized_candidate_text(
+                        generated,
+                        authority=authority,
+                        prepared=prepared,
+                        key_mode=_key_mode,
+                    )
+
+                decision = compile_difficulty_family_shadow(
+                    slots,
+                    authority=authority,
+                    onset_analysis=onset_analysis,
+                    duration_ms=prepared.normalized.duration_ms,
+                    boundary_policy_mode=prepared.boundary_policy_mode,
+                    evaluate_candidate=evaluate_candidate,
+                    serialize_candidate=serialize_candidate,
+                    clock=clock,
+                )
+                decision = persist_difficulty_family_compiler_payloads(
+                    decision,
+                    run_dir=run_dir,
+                    clock=clock,
+                )
+                if enforce and decision.status == "COMPILED":
+                    decision = replace(decision, publication_mode="ENFORCED")
+                    compiled_assignment = materialize_compiled_family(
+                        decision,
+                        source_candidates=source_candidates,
+                        current_assignment=assignment,
+                    )
+                    for difficulty, candidate in compiled_assignment.items():
+                        states[difficulty].candidates.add_safe_fallback(candidate)
+        except Exception as error:  # noqa: BLE001 - optional SHADOW must not abort output
+            failure_total_ms = max(0.0, (clock() - compiler_started) * 1_000.0)
+            decision = DifficultyFamilyCompilerDecision(
+                key_mode=key_mode,
+                status="UNAVAILABLE",
+                reason="COMPILER_EXECUTION_FAILED",
+                anchor_candidate_id=None,
+                anchor_source_difficulty=None,
+                proposals=(),
+                proposals_evaluated=0,
+                failure_type=type(error).__name__,
+                failure_message=str(error),
+                solver_wall_ms=(
+                    decision.solver_wall_ms if decision is not None else round(failure_total_ms, 6)
+                ),
+                candidate_evaluation_wall_ms=(
+                    decision.candidate_evaluation_wall_ms if decision is not None else 0.0
+                ),
+                payload_persistence_wall_ms=(
+                    max(0.0, round(failure_total_ms - decision.solver_wall_ms, 6))
+                    if decision is not None
+                    else 0.0
+                ),
+            )
+        evidence = {
+            "reason": (
+                "DIFFICULTY_FAMILY_COMPILER_ENFORCED_DECISION"
+                if decision.publication_mode == "ENFORCED"
+                else "DIFFICULTY_FAMILY_COMPILER_SHADOW_DECISION"
+            ),
+            "decision": decision.to_report(),
+            "mutatesSelection": False,
+        }
+        for state in states.values():
+            state.attempt_evidence.append(dict(evidence))
+        decisions.append(decision)
+    return tuple(decisions)
 
 
 def _first_row_ms(candidate: _Candidate) -> int | None:
@@ -1305,6 +1889,7 @@ def _apply_intro_phrase_family_recovery(
     inference_budget: AdditionalInferenceBudget,
     allow_model_retry: bool = True,
     block_unresolved: bool = True,
+    model_retry_target: tuple[int, str] | None = None,
 ) -> tuple[list[_Selection], tuple[IntroPhraseFamilyReview, ...]]:
     return _apply_intro_phrase_family_recovery_impl(
         selections,
@@ -1322,6 +1907,7 @@ def _apply_intro_phrase_family_recovery(
         intro_anchor_covered=_intro_anchor_covered,
         allow_model_retry=allow_model_retry,
         block_unresolved=block_unresolved,
+        model_retry_target=model_retry_target,
     )
 
 
@@ -1341,6 +1927,12 @@ def _try_intro_contract_retry(
     evidence_prefix: str = "INTRO_CONTRACT",
     workdir_name: str = "intro-contract-retry",
 ) -> _Candidate | None:
+    rows = sorted({note.time_ms for note in source.generated.notes})
+    partial_end_ms = _intro_phrase_recovery_end_ms(
+        rows[1] if len(rows) >= 2 else None,
+        authority.bpm_events,
+        duration_ms=prepared.normalized.duration_ms,
+    )
     return _execute_intro_retry(
         state,
         source,
@@ -1358,30 +1950,7 @@ def _try_intro_contract_retry(
         recovery_reason=recovery_reason,
         evidence_prefix=evidence_prefix,
         workdir_name=workdir_name,
-    )
-
-
-def _record_order_retry(
-    state: _VariantState,
-    review: DifficultyOrderReview,
-    *,
-    run_dir: Path,
-) -> None:
-    candidate = state.candidates.admitted[-1]
-    evidence = _candidate_evidence(
-        candidate,
-        reason="DIFFICULTY_ORDER_INVERTED",
-        run_dir=run_dir,
-    )
-    evidence["difficultyOrder"] = review.to_report()
-    state.attempt_evidence.append(evidence)
-    state.attempt_errors.append(
-        json.dumps(
-            evidence,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        partial_end_ms=partial_end_ms,
     )
 
 
@@ -1407,7 +1976,7 @@ def run_generation(
     if authority_epoch < 1:
         raise ValueError("authority_epoch must be positive")
     inference_budget = AdditionalInferenceBudget(
-        limit=_VARIANT_COUNT + 2,
+        limit=1,
         work_limit_ms=prepared.normalized.duration_ms,
     )
     song_context = SongAnalysisContext.build(
@@ -1493,53 +2062,6 @@ def run_generation(
                     raise
                 state.exhausted_error = error
 
-        # 역전 재생성: 게이트 통과 후보가 있는 난이도들 사이에서만.
-        # 후보가 하나도 없는 난이도는 기준점으로 쓰지 않는다. 망가진
-        # 조합에 맞추려고 멀쩡한 조합을 끌어내리는 일이 없어야 한다.
-        while (
-            model_inference_disabled_by is None
-            and not _has_complete_model_family(states)
-        ):
-            present = tuple(
-                states[difficulty].candidates.admitted[-1]
-                for difficulty in DIFFICULTIES
-                if states[difficulty].candidates.admitted
-            )
-            if len(present) < 2:
-                break
-            latest_review = _review_candidates(present)
-            if latest_review.status != "RETRY":
-                break
-            progressed = False
-            for difficulty in DIFFICULTIES:
-                if difficulty not in latest_review.retry_difficulties:
-                    continue
-                state = states[difficulty]
-                if not state.candidates.admitted or not state.budget_left:
-                    continue
-                try:
-                    candidate = _generate_next_pass(
-                        state,
-                        prepared=prepared,
-                        authority=authority,
-                        onset_analysis=onset_analysis,
-                        run_dir=run_dir,
-                        generator=generator,
-                        base_seed=seed,
-                        authority_epoch=authority_epoch,
-                        allow_timing_escalation=allow_timing_escalation,
-                    )
-                except WorkerError as error:
-                    if error.code is not ErrorCode.CHART_CANDIDATES_EXHAUSTED:
-                        raise
-                    continue
-                _record_order_retry(state, latest_review, run_dir=run_dir)
-                state.candidates.admit(candidate)
-                progressed = True
-                if _has_complete_model_family(states):
-                    break
-            if not progressed:
-                break
         state_families.append(states)
 
     # A deterministic, revalidated TAP-only repair is cheaper and safer than
@@ -1594,6 +2116,7 @@ def run_generation(
             if inference_budget.remaining_work_ms is not None
             else 0
         ),
+        available_calls=inference_budget.remaining,
     )
     if partial_plans:
         router_report = partial_router_plan.to_report()
@@ -1632,9 +2155,7 @@ def run_generation(
                 partial_plan.source.attempt + 1,
             )
             partial_seed = (
-                seed
-                + partial_plan.state.flat_index
-                + MAX_VARIANT_ATTEMPTS * _VARIANT_COUNT
+                seed + partial_plan.state.flat_index + MAX_VARIANT_ATTEMPTS * _VARIANT_COUNT
             )
             _block_full_length_retry_after_tail_exhaustion(
                 partial_plan.state,
@@ -1686,9 +2207,7 @@ def run_generation(
                     _review_candidates(chosen) if chosen else None,
                 )
             )
-        selection_shadows = tuple(
-            comparison for _states, _assignment, comparison in compared
-        )
+        selection_shadows = tuple(comparison for _states, _assignment, comparison in compared)
 
     # First apply every zero-cost reselection. Only then compare the remaining
     # model-backed recoveries so source-code order cannot spend the song budget.
@@ -1721,14 +2240,12 @@ def run_generation(
         intro_anchor_covered=_intro_anchor_covered,
         allow_model_retry=False,
     )
-    unresolved_intro = sorted(
-        (review for review in intro_phrase_family_reviews if review.status == "DEFECT"),
-        key=lambda review: (
-            review.gap_delta_ms or 0,
-            review.gap_ratio or 0.0,
-            -review.hard.key_mode,
-        ),
-        reverse=True,
+    intro_targets = _intro_recovery_targets(
+        selections,
+        song_context=song_context,
+        authority=authority,
+        duration_ms=prepared.normalized.duration_ms,
+        run_dir=run_dir,
     )
     timing_outliers = sorted(
         (review for review in timing_family_reviews if review.status == "OUTLIER"),
@@ -1739,19 +2256,21 @@ def run_generation(
         reverse=True,
     )
     family_requests: list[RecoveryRequest] = []
-    if unresolved_intro and model_inference_disabled_by is None:
+    if (
+        intro_targets
+        and model_inference_disabled_by is None
+    ):
+        intro_target = intro_targets[0]
         family_requests.append(
-            intro_phrase_recovery_request(
-                key_mode=unresolved_intro[0].hard.key_mode,
-                song_duration_ms=prepared.normalized.duration_ms,
+            intro_region_recovery_request(
+                key_mode=intro_target.key_mode,
+                difficulty=intro_target.difficulty,
+                window_ms=intro_target.partial_end_ms,
             )
         )
     if timing_outliers and model_inference_disabled_by is None:
         timing_target = timing_outliers[0]
-        if (
-            timing_target.target_key_mode is not None
-            and timing_target.difficulty is not None
-        ):
+        if timing_target.target_key_mode is not None and timing_target.difficulty is not None:
             family_requests.append(
                 timing_family_recovery_request(
                     key_mode=timing_target.target_key_mode,
@@ -1766,6 +2285,7 @@ def run_generation(
             if inference_budget.remaining_work_ms is not None
             else 0
         ),
+        available_calls=inference_budget.remaining,
     )
     if family_requests:
         router_report = family_router_plan.to_report()
@@ -1785,20 +2305,22 @@ def run_generation(
     selected_family_request = next(iter(family_router_plan.selected), None)
     if selected_family_request is not None:
         if selected_family_request.kind is RecoveryKind.INTRO:
-            selections, intro_phrase_family_reviews = (
-                _apply_intro_phrase_family_recovery(
-                    selections,
-                    song_context,
-                    prepared=prepared,
-                    authority=authority,
-                    onset_analysis=onset_analysis,
-                    run_dir=run_dir,
-                    generator=generator,
-                    base_seed=seed,
-                    authority_epoch=authority_epoch,
-                    inference_budget=inference_budget,
-                    block_unresolved=False,
-                )
+            selections, intro_phrase_family_reviews = _apply_intro_phrase_family_recovery(
+                selections,
+                song_context,
+                prepared=prepared,
+                authority=authority,
+                onset_analysis=onset_analysis,
+                run_dir=run_dir,
+                generator=generator,
+                base_seed=seed,
+                authority_epoch=authority_epoch,
+                inference_budget=inference_budget,
+                block_unresolved=False,
+                model_retry_target=(
+                    selected_family_request.key_mode,
+                    selected_family_request.difficulty,
+                ),
             )
         elif selected_family_request.kind is RecoveryKind.TIMING_FAMILY:
             selections, timing_family_reviews = _apply_timing_family_recovery(
@@ -1815,6 +2337,7 @@ def run_generation(
                 serialize_candidate=_serialized_candidate_text,
                 intro_anchor_covered=_intro_anchor_covered,
             )
+
     selections = _complete_playtest_selections(
         selections,
         prepared=prepared,
@@ -1824,11 +2347,15 @@ def run_generation(
         base_seed=seed,
         authority_epoch=authority_epoch,
     )
-    selections, intro_start_contract, intro_contract_review = (
-        _apply_intro_start_contract(
-            selections,
-            song_context,
-        )
+    selections = _apply_chart_specific_coverage_recovery(
+        selections,
+        prepared=prepared,
+        authority=authority,
+        onset_analysis=onset_analysis,
+    )
+    selections, intro_start_contract, intro_contract_review = _apply_intro_start_contract(
+        selections,
+        song_context,
     )
     # Exact first-row equality remains free. Revalidate the phrase contract
     # afterwards, but do not start a second inference layer.
@@ -1860,8 +2387,17 @@ def run_generation(
         correction_reasons=intro_contract_review.correction_reasons,
     )
     timing_family_reviews = _timing_family_reviews(selections)
-    final_song_selector_mode = (
-        "V2" if prepared.difficulty_selector_mode == "V2" else "SHADOW_V2"
+    _persist_selection_candidate_payloads(selections, run_dir=run_dir)
+    final_song_selector_mode = "V2" if prepared.difficulty_selector_mode == "V2" else "SHADOW_V2"
+    song_boundary = (
+        build_song_boundary_contract(
+            onset_analysis.activity,
+            prepared.normalized.duration_ms,
+            enforcement_mode=prepared.boundary_policy_mode,
+            terminal_silence=onset_analysis.terminal_silence,
+        )
+        if onset_analysis.activity is not None
+        else None
     )
     selections, song_selection_shadow = _compare_song_selection(
         selections,
@@ -1869,17 +2405,360 @@ def run_generation(
         authority=authority,
         run_dir=run_dir,
         intro_contract=intro_start_contract,
-        boundary=(
-            build_song_boundary_contract(
-                onset_analysis.activity,
-                prepared.normalized.duration_ms,
-                enforcement_mode=prepared.boundary_policy_mode,
-                terminal_silence=onset_analysis.terminal_silence,
-            )
-            if onset_analysis.activity is not None
-            else None
-        ),
+        boundary=song_boundary,
         mode=final_song_selector_mode,
+    )
+    difficulty_family_compiler_shadow: tuple[
+        DifficultyFamilyCompilerDecision, ...
+    ] = ()
+    unresolved_compiler_key_modes: set[int] = set()
+    bounded_difficulty_recovery_admitted = False
+    if prepared.difficulty_family_resolution_enabled:
+        # Relabelling four already-safe, unique payloads is lossless and much
+        # cheaper than deleting rows or invoking the model.  The final pass
+        # below runs again after any bounded recovery and is the reported one.
+        selections, _pre_resolution_assignments = _apply_safe_family_assignment(
+            selections,
+            run_dir=run_dir,
+            intro_contract=intro_start_contract,
+            boundary=song_boundary,
+            song_context=song_context,
+        )
+        difficulty_family_compiler_shadow = _compile_difficulty_family_shadows(
+            selections,
+            prepared=prepared,
+            authority=authority,
+            onset_analysis=onset_analysis,
+            run_dir=run_dir,
+            enforce=True,
+        )
+        # Compiler proposals are only candidates.  Re-run the safety selector
+        # before deciding whether an extra model call is actually necessary.
+        selections, post_compiler_assignments = _apply_safe_family_assignment(
+            selections,
+            run_dir=run_dir,
+            intro_contract=intro_start_contract,
+            boundary=song_boundary,
+            song_context=song_context,
+        )
+        unresolved_compiler_key_modes = _unresolved_family_key_modes(
+            post_compiler_assignments
+        )
+    # Spend the optional research-only call against the assignment that the
+    # enforced V2 selector actually chose.  Planning earlier can target a
+    # transient fallback that V2 already replaces and leave the real final
+    # inversion without a challenger.
+    if (
+        (
+            prepared.difficulty_shadow_challenger_enabled
+            or bool(unresolved_compiler_key_modes)
+        )
+        and model_inference_disabled_by is None
+    ):
+        shadow_scope = (
+            [
+                selection
+                for selection in selections
+                if next(iter(selection[0].values())).key_mode
+                in unresolved_compiler_key_modes
+            ]
+            if unresolved_compiler_key_modes
+            else selections
+        )
+        shadow_slots = difficulty_shadow_slots(shadow_scope)
+        difficulty_shadow_target = choose_difficulty_shadow_target(shadow_slots)
+        if difficulty_shadow_target is None:
+            target_reason = difficulty_shadow_target_failure_reason(shadow_slots)
+            for states, _assignment, _review in selections:
+                for state in states.values():
+                    state.attempt_evidence.append(
+                        {
+                            "reason": target_reason,
+                            "calibrationState": (
+                                CURRENT_DIFFICULTY_FAMILY_CALIBRATION_STATE
+                            ),
+                            "mutatesSelection": False,
+                        }
+                    )
+        if difficulty_shadow_target is not None:
+            target_states, target_assignment, _target_review = next(
+                selection
+                for selection in selections
+                if next(iter(selection[0].values())).key_mode
+                == difficulty_shadow_target.key_mode
+            )
+            target_state = target_states[difficulty_shadow_target.difficulty]
+            partial_decision = plan_difficulty_shadow_partial_repair(
+                difficulty_shadow_target,
+                target_state.candidates.playtest_candidates,
+                authority.bpm_events,
+                duration_ms=prepared.normalized.duration_ms,
+            )
+            if partial_decision.plan is not None:
+                required_evidence_decision = (
+                    build_required_gameplay_evidence_for_shadow(
+                        selections,
+                        source=partial_decision.plan.source,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                    )
+                )
+                target_state.attempt_evidence.append(
+                    {
+                        "reason": "REQUIRED_GAMEPLAY_EVIDENCE_DECISION",
+                        "decision": required_evidence_decision.to_report(),
+                        "mutatesSelection": False,
+                    }
+                )
+                partial_decision = bind_required_gameplay_interval(
+                    partial_decision,
+                    evidence=required_evidence_decision.evidence,
+                    bpm_events=authority.bpm_events,
+                    duration_ms=prepared.normalized.duration_ms,
+                    mode=RequiredGameplayIntervalMode.SHADOW_ENFORCE,
+                )
+            target_state.attempt_evidence.append(
+                {
+                    "reason": "DIFFICULTY_SHADOW_PARTIAL_PLAN",
+                    "difficultyShadowTarget": {
+                        "easierDifficulty": (
+                            difficulty_shadow_target.easier_difficulty
+                        ),
+                        "harderDifficulty": difficulty_shadow_target.difficulty,
+                        "easierRating": difficulty_shadow_target.easier_rating,
+                        "harderRating": difficulty_shadow_target.harder_rating,
+                        "ratingDeficit": difficulty_shadow_target.rating_deficit,
+                        "minimumRating": difficulty_shadow_target.minimum_rating,
+                        "maximumRating": difficulty_shadow_target.maximum_rating,
+                    },
+                    "decision": partial_decision.to_report(),
+                    "mutatesSelection": False,
+                }
+            )
+            full_map_decision = None
+            if partial_decision.plan is None:
+                full_map_decision = plan_difficulty_shadow_full_map(
+                    difficulty_shadow_target,
+                    target_assignment[difficulty_shadow_target.difficulty],
+                )
+                target_state.attempt_evidence.append(
+                    {
+                        "reason": "DIFFICULTY_SHADOW_FULL_MAP_PLAN",
+                        "decision": full_map_decision.to_report(),
+                        "mutatesSelection": False,
+                    }
+                )
+            if partial_decision.plan is not None or (
+                full_map_decision is not None and full_map_decision.plan is not None
+            ):
+                partial_plan = partial_decision.plan
+                full_map_plan = (
+                    full_map_decision.plan if full_map_decision is not None else None
+                )
+                planned_work_ms = (
+                    partial_plan.window.end_ms - partial_plan.window.start_ms
+                    if partial_plan is not None
+                    else prepared.normalized.duration_ms
+                )
+                difficulty_shadow_request = difficulty_shadow_recovery_request(
+                    key_mode=difficulty_shadow_target.key_mode,
+                    difficulty=difficulty_shadow_target.difficulty,
+                    window_ms=planned_work_ms,
+                )
+                recovery_plan = plan_recoveries(
+                    (difficulty_shadow_request,),
+                    available_generation_ms=(
+                        inference_budget.remaining_work_ms
+                        if inference_budget.remaining_work_ms is not None
+                        else 0
+                    ),
+                    available_calls=inference_budget.remaining,
+                )
+                target_state.attempt_evidence.append(
+                    {
+                        "reason": "RECOVERY_ROUTER_DECISION",
+                        "requestId": difficulty_shadow_request.request_id,
+                        "plan": recovery_plan.to_report(),
+                    }
+                )
+                if recovery_plan.selected:
+                    execute_shadow = (
+                        execute_difficulty_shadow_challenger
+                        if partial_plan is not None
+                        else execute_difficulty_shadow_full_map_challenger
+                    )
+                    execution_plan = (
+                        partial_plan if partial_plan is not None else full_map_plan
+                    )
+                    assert execution_plan is not None
+                    challenger = execute_shadow(
+                        target_state,
+                        execution_plan,
+                        prepared=prepared,
+                        authority=authority,
+                        onset_analysis=onset_analysis,
+                        run_dir=run_dir,
+                        generator=generator,
+                        base_seed=seed,
+                        authority_epoch=authority_epoch,
+                        inference_budget=inference_budget,
+                        evaluate_candidate=evaluate_chart_candidate,
+                        serialize_candidate=_serialized_candidate_text,
+                        intro_anchor_covered=_intro_anchor_covered,
+                    )
+                    if challenger is not None:
+                        persist_candidate_payload(
+                            run_dir=run_dir,
+                            osu_text=challenger.osu_text,
+                        )
+                        selected_current = target_assignment[
+                            difficulty_shadow_target.difficulty
+                        ]
+                        if selected_current is None:
+                            raise AssertionError(
+                                "difficulty shadow target must have a final selection"
+                            )
+                        replacement_veto = _decide_candidate_replacement(
+                            _candidate_quality_snapshot(selected_current),
+                            _candidate_quality_snapshot(challenger),
+                            stage=(
+                                "DIFFICULTY_BOUNDED_RECOVERY"
+                                if difficulty_shadow_target.key_mode
+                                in unresolved_compiler_key_modes
+                                else "DIFFICULTY_SHADOW_REPORT_ONLY"
+                            ),
+                            objective_improved=True,
+                        )
+                        unique_against_family = all(
+                            candidate is None
+                            or target_difficulty
+                            == difficulty_shadow_target.difficulty
+                            or candidate.osu_text != challenger.osu_text
+                            for target_difficulty, candidate in target_assignment.items()
+                        )
+                        production_authority = (
+                            difficulty_shadow_target.key_mode
+                            in unresolved_compiler_key_modes
+                            and replacement_veto.accepted
+                            and unique_against_family
+                        )
+                        if production_authority:
+                            target_state.candidates.admit(challenger)
+                            target_assignment[
+                                difficulty_shadow_target.difficulty
+                            ] = challenger
+                            bounded_difficulty_recovery_admitted = True
+                        else:
+                            target_state.candidates.add_shadow(challenger)
+                        target_state.attempt_evidence.append(
+                            {
+                                "reason": (
+                                    "DIFFICULTY_BOUNDED_RECOVERY_ADMITTED"
+                                    if production_authority
+                                    else "DIFFICULTY_SHADOW_FALLBACK_VETO_REPORTED"
+                                ),
+                                "replacementPolicyAccepted": replacement_veto.accepted,
+                                "uniqueAgainstFamily": unique_against_family,
+                                "productionAuthority": production_authority,
+                                "decision": replacement_veto.to_report(),
+                                "mutatesSelection": production_authority,
+                            }
+                        )
+                else:
+                    target_state.attempt_evidence.append(
+                        {
+                            "reason": (
+                                "BUDGET_EXHAUSTED_AFTER_HIGHER_PRIORITY_RECOVERY"
+                            ),
+                            "requestId": difficulty_shadow_request.request_id,
+                            "router": recovery_plan.to_report(),
+                            "budget": inference_budget.to_report(),
+                            "mutatesSelection": False,
+                        }
+                    )
+    if bounded_difficulty_recovery_admitted:
+        post_recovery_decisions = _compile_difficulty_family_shadows(
+            selections,
+            prepared=prepared,
+            authority=authority,
+            onset_analysis=onset_analysis,
+            run_dir=run_dir,
+            enforce=True,
+        )
+        post_by_key = {
+            decision.key_mode: decision for decision in post_recovery_decisions
+        }
+        difficulty_family_compiler_shadow = tuple(
+            post_by_key.get(decision.key_mode, decision)
+            if decision.key_mode in unresolved_compiler_key_modes
+            else decision
+            for decision in difficulty_family_compiler_shadow
+        )
+    # This is the sole publication-authoritative family selection.  It runs
+    # after every deterministic proposal and optional bounded challenger has
+    # entered the repositories.
+    selections, safe_family_assignments = _apply_safe_family_assignment(
+        selections,
+        run_dir=run_dir,
+        intro_contract=intro_start_contract,
+        boundary=song_boundary,
+        song_context=song_context,
+        post_resolution_ordering=(
+            not prepared.difficulty_family_resolution_enabled
+        ),
+    )
+    if prepared.difficulty_family_resolution_enabled:
+        final_unresolved_key_modes = _unresolved_family_key_modes(
+            safe_family_assignments
+        )
+        supplied_fallback_key_modes = (
+            _ensure_coherent_safe_fallback_family_candidates(
+                selections,
+                unresolved_key_modes=final_unresolved_key_modes,
+                prepared=prepared,
+                authority=authority,
+                onset_analysis=onset_analysis,
+                run_dir=run_dir,
+                base_seed=seed,
+                authority_epoch=authority_epoch,
+            )
+            if final_unresolved_key_modes
+            else set()
+        )
+        if supplied_fallback_key_modes:
+            selections, safe_family_assignments = _apply_safe_family_assignment(
+                selections,
+                run_dir=run_dir,
+                intro_contract=intro_start_contract,
+                boundary=song_boundary,
+                song_context=song_context,
+            )
+        # Candidate generation, repair, compiler proposals, bounded inference,
+        # and coherent fallback supply are now complete.  Freeze that payload
+        # set and map its measured difficulty order to the four public labels.
+        selections, safe_family_assignments = _apply_safe_family_assignment(
+            selections,
+            run_dir=run_dir,
+            intro_contract=intro_start_contract,
+            boundary=song_boundary,
+            song_context=song_context,
+            post_resolution_ordering=True,
+        )
+    # Freeze report evidence only after every production-authoritative relabel,
+    # bounded challenger, and deterministic compiler mutation is complete.
+    # The shadow proposal still points to immutable candidate IDs preserved in
+    # the repositories, while currentAssignment now matches publication.
+    song_selection_evidence_v3 = _build_song_selection_evidence_v3(
+        selections,
+        prepared=prepared,
+        authority=authority,
+        run_dir=run_dir,
+        song_context=song_context,
+        boundary=song_boundary,
+    )
+    song_selection_shadow_v3 = evaluate_shadow_v3_proposal(
+        song_selection_evidence_v3,
+        proposal=tuple(sorted(song_selection_shadow.shadow_assignment.items())),
     )
     # The enforced V2 selector may choose a different already-validated
     # candidate.  Reports and the exact intro contract must describe the
@@ -1904,6 +2783,28 @@ def run_generation(
         run_dir=run_dir,
     )
     timing_family_reviews = _timing_family_reviews(selections)
+    if (
+        not prepared.difficulty_family_resolution_enabled
+        and prepared.difficulty_family_compiler_shadow_enabled
+    ):
+        difficulty_family_compiler_shadow = _compile_difficulty_family_shadows(
+            selections,
+            prepared=prepared,
+            authority=authority,
+            onset_analysis=onset_analysis,
+            run_dir=run_dir,
+        )
+    for states, _assignment, order_review in selections:
+        if order_review is None or order_review.status != "RETRY":
+            continue
+        evidence = {
+            "reason": "DIFFICULTY_ORDER_UNRESOLVED_NO_CALIBRATED_RETRY",
+            "calibrationState": CURRENT_DIFFICULTY_FAMILY_CALIBRATION_STATE,
+            "difficultyOrder": order_review.to_report(),
+        }
+        for state in states.values():
+            state.attempt_evidence.append(dict(evidence))
+    _verify_selection_candidate_payloads(selections, run_dir=run_dir)
     publication = assemble_publication(
         selections,
         prepared=prepared,
@@ -1923,8 +2824,7 @@ def run_generation(
                 ),
                 last_note_end_ms=max(
                     (
-                        note.time_ms
-                        + (note.duration_ms if note.kind == "HOLD" else 0)
+                        note.time_ms + (note.duration_ms if note.kind == "HOLD" else 0)
                         for note in variant.generated.notes
                     ),
                     default=0,
@@ -1938,6 +2838,10 @@ def run_generation(
         missing=tuple(missing),
         difficulty_selection_shadows=selection_shadows,
         song_selection_shadow=song_selection_shadow,
+        song_selection_evidence_v3=song_selection_evidence_v3,
+        song_selection_shadow_v3=song_selection_shadow_v3,
+        safe_family_assignments=safe_family_assignments,
+        difficulty_family_compiler_shadow=difficulty_family_compiler_shadow,
         intro_start_contract=intro_start_contract,
         intro_contract_review=intro_contract_review,
         intro_phrase_family_reviews=intro_phrase_family_reviews,
@@ -1945,8 +2849,6 @@ def run_generation(
         outro_family_review=outro_family_review,
         additional_inference_calls=inference_budget.used,
         additional_inference_work_ms=inference_budget.used_work_ms,
-        additional_inference_work_limit_ms=(
-            inference_budget.work_limit_ms or 0
-        ),
+        additional_inference_work_limit_ms=(inference_budget.work_limit_ms or 0),
         diagnostic_raw_candidates=publication.diagnostic_raw_candidates,
     )

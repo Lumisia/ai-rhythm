@@ -61,9 +61,10 @@ def test_long_active_leading_gap_retries_with_stable_evidence():
             "gridDistanceMs": 10,
             "aggregatePercentileRank": 0.5,
             "prominentBandCount": 0,
-            "pulseContinuationMatches": 1,
-            "pulseContinuationOpportunities": 4,
-        },
+                "pulseContinuationMatches": 1,
+                "pulseContinuationOpportunities": 4,
+                "supportedPulseMs": [510, 1_051, 1_456, 1_996, 2_537],
+            },
     }
 
 

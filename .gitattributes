@@ -1,2 +1,3 @@
-# Unified diff files require a single-space prefix on blank context lines.
-apps/chart-worker/patches/*.patch -whitespace
+# Unified diff files require stable LF line endings and a single-space prefix
+# on blank context lines, including on Windows checkouts.
+apps/chart-worker/patches/*.patch text eol=lf -whitespace

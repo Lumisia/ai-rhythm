@@ -6,6 +6,8 @@ from pathlib import Path
 from chart_worker.schema.note import coerce_int
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
+from .required_gameplay_interval import RequiredGameplayIntervalV1
+
 GAMEMODE_MANIA = 3
 PRECISION = "fp16"
 """v32.yaml 기본값은 bf16 이다. Turing(sm_75)은 bf16 을 지원하지 않는다."""
@@ -76,6 +78,7 @@ class GenerationRequest:
     partial_start_ms: int | None = None
     partial_end_ms: int | None = None
     add_to_beatmap: bool = False
+    required_gameplay_interval: RequiredGameplayIntervalV1 | None = None
     """표준화 단계가 이미 재놨다. fake 생성기와 start/end 지정에 쓴다."""
 
     def __post_init__(self) -> None:
@@ -153,6 +156,33 @@ class GenerationRequest:
                 raise ValueError("partial generation requires add_to_beatmap")
         elif self.add_to_beatmap:
             raise ValueError("add_to_beatmap requires a partial range")
+        if self.required_gameplay_interval is not None:
+            if type(self.required_gameplay_interval) is not RequiredGameplayIntervalV1:
+                raise TypeError(
+                    "required_gameplay_interval must be RequiredGameplayIntervalV1"
+                )
+            if partial_values[0] is None or partial_values[1] is None:
+                raise ValueError(
+                    "required gameplay interval requires partial generation"
+                )
+            interval = self.required_gameplay_interval
+            assert self.partial_start_ms is not None
+            assert self.partial_end_ms is not None
+            if not (
+                self.partial_start_ms <= interval.start_ms
+                and interval.end_ms <= self.partial_end_ms
+            ):
+                raise ValueError(
+                    "required gameplay interval must fit within the partial range"
+                )
+            if type(self.seed) is not int:
+                raise TypeError(
+                    "required gameplay interval requires an exact integer seed"
+                )
+            if not 0 <= self.seed < 2**32:
+                raise ValueError(
+                    "required gameplay interval seed must be within uint32"
+                )
         if not YEAR_RANGE[0] <= self.year <= YEAR_RANGE[1]:
             raise ValueError(f"year must be within {YEAR_RANGE}, got {self.year}")
 

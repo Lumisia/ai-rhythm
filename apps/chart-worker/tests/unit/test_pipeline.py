@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -38,6 +39,29 @@ from chart_worker.validation.timing_review import (
 )
 from tests.support import fake_dependencies
 
+_FAKE_UNCORROBORATED_INTRO_ANCHOR_REPORT = {
+    "status": "UNCERTAIN",
+    "anchorMs": 0,
+    "anchorGridMs": 0,
+    "gridDistanceMs": 0,
+    "aggregatePercentileRank": 0.625,
+    "prominentBandCount": 0,
+    "pulseContinuationMatches": 4,
+    "pulseContinuationOpportunities": 4,
+    "supportedPulseMs": list(range(0, 4_001, 250)),
+}
+
+
+def test_family_reassigned_primary_is_playtest_only_recovery() -> None:
+    variant = SimpleNamespace(
+        provenance="PRIMARY",
+        family_assignment_kind="REASSIGNED",
+        acceptance=SimpleNamespace(action=GateAction.PASS),
+    )
+
+    assert pipeline._variant_is_playtest_only(variant) is True
+    assert pipeline._playability_tier(variant) == "RECOVERY_PLAYABLE"
+
 
 class _RecordingInferenceSession:
     def __init__(self) -> None:
@@ -73,6 +97,71 @@ def _song_session_config() -> WorkerConfig:
     )
 
 
+def test_pipeline_propagates_difficulty_shadow_challenger_opt_in(
+    monkeypatch,
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    base = dependencies.prepare(
+        source,
+        tmp_path / "base",
+        WorkerConfig(),
+    )
+    monkeypatch.setattr(pipeline, "run_prepare", lambda *_args, **_kwargs: base)
+
+    prepared = pipeline._prepare_stage(
+        source,
+        tmp_path / "run",
+        WorkerConfig(difficulty_shadow_challenger_enabled=True),
+    )
+
+    assert prepared.difficulty_shadow_challenger_enabled is True
+
+
+def test_pipeline_propagates_difficulty_family_compiler_shadow_opt_in(
+    monkeypatch,
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    base = dependencies.prepare(
+        source,
+        tmp_path / "base",
+        WorkerConfig(),
+    )
+    monkeypatch.setattr(pipeline, "run_prepare", lambda *_args, **_kwargs: base)
+
+    prepared = pipeline._prepare_stage(
+        source,
+        tmp_path / "run",
+        WorkerConfig(difficulty_family_compiler_shadow_enabled=True),
+    )
+
+    assert prepared.difficulty_family_compiler_shadow_enabled is True
+
+
+def test_pipeline_propagates_enforced_unique_family_resolution(
+    monkeypatch,
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    base = dependencies.prepare(source, tmp_path / "base", WorkerConfig())
+    monkeypatch.setattr(pipeline, "run_prepare", lambda *_args, **_kwargs: base)
+
+    prepared = pipeline._prepare_stage(
+        source,
+        tmp_path / "run",
+        WorkerConfig(difficulty_family_resolution_enabled=False),
+    )
+
+    assert prepared.difficulty_family_resolution_enabled is False
+
+
 def test_pipeline_owns_one_song_session_across_timing_and_maps(tmp_path: Path):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
@@ -91,9 +180,7 @@ def test_pipeline_owns_one_song_session_across_timing_and_maps(tmp_path: Path):
         dependencies=replace(
             dependencies,
             config=_song_session_config(),
-            open_inference_session=lambda _config, run_dir: (
-                opened.append(run_dir) or session
-            ),
+            open_inference_session=lambda _config, run_dir: opened.append(run_dir) or session,
             bind_inference_session=lambda generator, observed: (
                 bound.append((generator, observed)) or generator
             ),
@@ -307,10 +394,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert manifest.audio.keys is None
     assert manifest.keysound_manifest_path is None
     assert all(chart.production_eligible for chart in manifest.charts)
-    assert all(
-        chart.distribution_tier == "PRODUCTION_CANDIDATE"
-        for chart in manifest.charts
-    )
+    assert all(chart.distribution_tier == "PRODUCTION_CANDIDATE" for chart in manifest.charts)
     assert not (output_dir / "analysis").exists()
 
     report = json.loads((output_dir / "generation-report.json").read_text())
@@ -330,6 +414,24 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert report["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
     assert report["additionalInferenceWorkMs"] == 0
     assert report["additionalInferenceWorkLimitMs"] == 10_000
+    assert report["difficultyFamilyCompilerShadow"] == []
+    assert report["difficultyFamilyResolution"] == []
+    assert report["safeFamilyAssignmentPolicy"] == {
+        "version": "safe-family-assignment-v3",
+        "payloadUniqueness": "HARD_PUBLICATION_INVARIANT",
+        "familyFeasibility": "HARD_BEFORE_RANKING",
+        "relativeDifficultyMode": "RELABEL_UNIQUE_THEN_BOUNDED_RESOLUTION",
+        "resolutionOrder": [
+            "EXISTING_UNIQUE_RELABEL",
+            "DETERMINISTIC_FAMILY_COMPILER",
+            "ONE_CALL_TARGETED_GENERATION",
+            "COHERENT_CANONICAL_FAMILY_FALLBACK",
+            "FAIL_CLOSED",
+        ],
+        "maxConfirmedIntroDelayBeats": 8.0,
+        "maxSafeSubstitutesPerKey": 20,
+        "additionalModelCallsMax": 1,
+    }
     assert report["timingAuthority"] == "audio/timing-reference.osu"
     assert report["timingAuthoritySha256"] == sha256_file(
         output_dir / "audio" / "timing-reference.osu"
@@ -366,16 +468,7 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         "onsetCount": 0,
         "activeOnsetCount": 0,
         "activeFrameRatio": 0.0,
-        "introAnchor": {
-            "status": "NON_RHYTHMIC",
-            "anchorMs": None,
-            "anchorGridMs": None,
-            "gridDistanceMs": None,
-            "aggregatePercentileRank": None,
-            "prominentBandCount": 0,
-            "pulseContinuationMatches": 0,
-            "pulseContinuationOpportunities": 0,
-        },
+        "introAnchor": _FAKE_UNCORROBORATED_INTRO_ANCHOR_REPORT,
     }
     assert report["timingAuthorityLocalReview"]["version"] == (
         "local-timing-review-v2-duration-weighted"
@@ -428,15 +521,17 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert len(report["charts"]) == 12
     assert set(report["difficultyOrder"]) == {"4K", "6K", "7K"}
     for key_mode in (4, 6, 7):
-        family_observation = report["difficultyOrder"][f"{key_mode}K"][
-            "finalFamilyObservation"
-        ]
+        family_observation = report["difficultyOrder"][f"{key_mode}K"]["finalFamilyObservation"]
         assert family_observation["keyMode"] == key_mode
-        assert family_observation["calibrationState"] == "UNAVAILABLE"
+        assert family_observation["calibrationState"] == "PILOT_ONLY"
         assert family_observation["contractStatus"] == "UNCALIBRATED"
+        assert family_observation["productionCalibrationEnforced"] is False
         assert family_observation["provisionalConcern"] == "NONE"
-        assert family_observation["policyState"] == "OBSERVATION_ONLY"
+        assert family_observation["resolutionStatus"] == "NO_OBSERVED_CONCERN"
+        assert family_observation["policyState"] == "REPORTING_ENFORCED"
         assert family_observation["mutatesSelection"] is False
+        assert family_observation["mutatesCharts"] is False
+        assert family_observation["mutatesQualityStatus"] is True
         assert family_observation["mutatesCharts"] is False
         assert [entry["difficulty"] for entry in family_observation["entries"]] == [
             "EASY",
@@ -455,17 +550,31 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         report["songSelectionShadow"]["currentAssignment"]
         == (report["songSelectionShadow"]["shadowAssignment"])
     )
-    assert report["introStartContract"]["version"] == "intro-start-contract-v2"
+    replay_input = report["songSelectionShadow"]["replayInput"]
+    assert replay_input["version"] == "song-selection-replay-v2"
+    protected_metrics = replay_input["candidates"][0]["protectedMetrics"]
+    assert {
+        "rowCount",
+        "onsetCount",
+        "matchedCount50",
+        "matchedPrecision50",
+        "matchedRecall50",
+        "matchedF150",
+    } <= set(protected_metrics)
+    v3_evidence = report["songSelectionEvidenceV3"]
+    assert v3_evidence["version"] == "song-selection-evidence-v3"
+    assert v3_evidence["mutatesSelection"] is False
+    assert v3_evidence["additionalModelCalls"] == 0
+    assert len(v3_evidence["candidates"]) == len(replay_input["candidates"])
+    assert len(report["songSelectionEvidenceV3Sha256"]) == 64
+    assert report["songSelectionShadowV3"]["mode"] == "SHADOW_V3"
+    assert report["songSelectionShadowV3"]["mutatesSelection"] is False
+    assert report["songSelectionShadowV3"]["blockers"] == ["CALIBRATION_UNAVAILABLE"]
+    assert report["introStartContract"]["version"] == "intro-start-contract-v3"
     assert report["introContractReview"]["status"] == "PASS"
     assert len(report["introPhraseFamilyReviews"]) == 3
-    assert all(
-        review["status"] == "PASS"
-        for review in report["introPhraseFamilyReviews"]
-    )
-    assert (
-        report["outroFamilyReview"]["version"]
-        == "outro-family-review-v3-tiered-start-shadow"
-    )
+    assert all(review["status"] == "PASS" for review in report["introPhraseFamilyReviews"])
+    assert report["outroFamilyReview"]["version"] == "outro-family-review-v3-tiered-start-shadow"
     assert report["outroFamilyReview"]["mode"] == "SHADOW"
     assert report["outroFamilyReview"]["mutatesCharts"] is False
     assert report["outroFamilyReview"]["additionalInferenceCalls"] == 0
@@ -738,26 +847,79 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
         "onsetCount": 0,
         "activeOnsetCount": 0,
         "activeFrameRatio": 0.0,
-        "introAnchor": {
-            "status": "NON_RHYTHMIC",
-            "anchorMs": None,
-            "anchorGridMs": None,
-            "gridDistanceMs": None,
-            "aggregatePercentileRank": None,
-            "prominentBandCount": 0,
-            "pulseContinuationMatches": 0,
-            "pulseContinuationOpportunities": 0,
-        },
+        "introAnchor": _FAKE_UNCORROBORATED_INTRO_ANCHOR_REPORT,
     }
     assert report["timingAuthorityLocalReview"]["version"] == (
         "local-timing-review-v2-duration-weighted"
     )
-    assert report["timingAuthorityRecoveryPreflight"]["version"] == (
-        "recovery-preflight-v1"
-    )
+    assert report["timingAuthorityRecoveryPreflight"]["version"] == ("recovery-preflight-v1")
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v2.json").exists()
+
+
+def test_v2_only_difficulty_inversion_forces_review_instead_of_false_pass(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    output_dir = tmp_path / "run"
+    dependencies = fake_dependencies()
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        changed = []
+        for variant in outcome.variants:
+            if (variant.key_mode, variant.difficulty) != (4, "EXPERT"):
+                changed.append(variant)
+                continue
+            profile = variant.acceptance.profile
+            assert profile is not None
+            changed.append(
+                replace(
+                    variant,
+                    acceptance=replace(
+                        variant.acceptance,
+                        profile=replace(
+                            profile,
+                            difficulty_vector_v2=replace(
+                                profile.difficulty_vector_v2,
+                                ordering_score=-1.0,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        return replace(outcome, variants=tuple(changed))
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=output_dir,
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(dependencies, generation=generation),
+    )
+
+    report = json.loads((output_dir / "generation-report.json").read_text())
+    observation = report["difficultyOrder"]["4K"]["finalFamilyObservation"]
+    assert observation["provisionalConcern"] == "METRIC_DISAGREEMENT"
+    assert observation["resolutionStatus"] == "UNRESOLVED"
+    assert observation["requiresReview"] is True
+    assert report["difficultyReviewRequired"] is True
+    assert report["timingReviewRequired"] is False
+    assert report["status"] == "REVIEW"
+    assert report["outcomeStatusV2"]["quality"] == "REVIEW"
 
 
 def test_generation_failure_report_projects_durable_attempt_journal(tmp_path: Path):
@@ -877,7 +1039,9 @@ def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path)
     [("fake", None), ("mapperatorinator", "incremental_verify")],
 )
 def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
-    generator: str, hold_state_mode: str | None, tmp_path: Path,
+    generator: str,
+    hold_state_mode: str | None,
+    tmp_path: Path,
 ):
     source = tmp_path / "fixture.wav"
     source.write_bytes(b"source")
@@ -1187,9 +1351,7 @@ def test_pipeline_allows_hard_safe_fallback_only_as_playtest_output(
         (output_dir / "playtest-run-v2.json").read_text()
     )
     chart = next(
-        item
-        for item in manifest.charts
-        if (item.key_mode, item.difficulty) == (4, "EASY")
+        item for item in manifest.charts if (item.key_mode, item.difficulty) == (4, "EASY")
     )
     assert chart.provenance == provenance
     assert chart.production_eligible is False
@@ -1677,9 +1839,7 @@ def test_generation_report_preserves_blocked_intro_phrase_defect(tmp_path: Path)
                     4,
                     "EXPERT",
                     "INTRO_PHRASE_DEFECT_UNRESOLVED",
-                    attempt_evidence=(
-                        {"reason": "INTRO_PHRASE_DEFECT_PUBLICATION_BLOCKED"},
-                    ),
+                    attempt_evidence=({"reason": "INTRO_PHRASE_DEFECT_PUBLICATION_BLOCKED"},),
                 ),
             ),
             intro_phrase_family_reviews=(review,),
@@ -1701,12 +1861,8 @@ def test_generation_report_preserves_blocked_intro_phrase_defect(tmp_path: Path)
     assert report["publishable"] is False
     assert report["timingReviewRequired"] is True
     assert report["introPhraseFamilyReviews"][0]["status"] == "DEFECT"
-    assert report["introPhraseFamilyReviews"][0]["reason"] == (
-        "ISOLATED_EXPERT_FIRST_ROW"
-    )
-    assert report["missingCharts"][0]["reason"] == (
-        "INTRO_PHRASE_DEFECT_UNRESOLVED"
-    )
+    assert report["introPhraseFamilyReviews"][0]["reason"] == ("ISOLATED_EXPERT_FIRST_ROW")
+    assert report["missingCharts"][0]["reason"] == ("INTRO_PHRASE_DEFECT_UNRESOLVED")
 
 
 def test_intro_phrase_review_observation_does_not_downgrade_or_block_song(
@@ -1753,9 +1909,7 @@ def test_intro_phrase_review_observation_does_not_downgrade_or_block_song(
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
     assert report["status"] == "PASS"
     assert report["publishable"] is False
-    assert report["publicationDecision"]["reasonCodes"] == [
-        "BOUNDARY_POLICY_UNCALIBRATED"
-    ]
+    assert report["publicationDecision"]["reasonCodes"] == ["BOUNDARY_POLICY_UNCALIBRATED"]
     assert report["timingReviewRequired"] is False
     assert report["introPhraseFamilyReviews"][0]["status"] == "REVIEW"
     assert report["introPhraseFamilyReviews"][0]["reason"] == "EXPERT_EARLY_GHOST"
@@ -1899,9 +2053,7 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
     assert boundary["enforcementMode"] == "HIGH_CONFIDENCE_ENFORCED"
     assert boundary["effectiveSource"] == "FULL_DURATION_BASELINE"
     assert boundary["effectiveContract"] == report["musicBounds"]["songBoundaryContract"]
-    assert boundary["observationSha256"] == (
-        boundary["provisionalDecision"]["observationSha256"]
-    )
+    assert boundary["observationSha256"] == (boundary["provisionalDecision"]["observationSha256"])
     assert report["boundaryPublicationAssessment"] == {
         "version": "boundary-publication-assessment-v1",
         "evidenceStatus": "AVAILABLE",
@@ -1916,14 +2068,13 @@ def test_pipeline_passes_shared_activity_to_every_chart_diagnostic(tmp_path: Pat
     assert len(report["charts"]) == 12
     assert all(chart["timingDiagnostics"]["activeOnsetCount"] == 0 for chart in report["charts"])
     assert all(
-        "LOW_ACTIVE_ONSET_SUPPORT"
-        in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
+        "LOW_ACTIVE_ONSET_SUPPORT" in chart["acceptanceDecisions"]["TIMING_ALIGNMENT"]["reasons"]
         for chart in report["charts"]
     )
     assert len(list((tmp_path / "run" / "charts").glob("*.json"))) == 12
 
 
-def test_missing_variant_exports_diagnostic_raw_without_entering_normal_charts(
+def test_hard_safe_quality_rejection_enters_normal_playtest_as_diagnostic_only(
     tmp_path: Path,
 ):
     source = tmp_path / "fixture.wav"
@@ -1954,16 +2105,18 @@ def test_missing_variant_exports_diagnostic_raw_without_entering_normal_charts(
             attempt_errors=("fixture quality rejection",),
             attempt_evidence=({"reason": "QUALITY_GATE_RETRY"},),
         )
+        playtest_fallback = replace(
+            dropped,
+            provenance="RAW_UNVERIFIED",
+            production_eligible=False,
+            family_resolution_state="UNRESOLVED",
+            family_resolution_reasons=("QUALITY_REJECTED_HARD_SAFE_PLAYTEST_RETURN",),
+            recovery_reason="QUALITY_REJECTED_HARD_SAFE_PLAYTEST_RETURN",
+        )
         return replace(
             outcome,
-            variants=tuple(kept),
-            missing=(
-                MissingVariant(
-                    key_mode=dropped.key_mode,
-                    difficulty=dropped.difficulty,
-                    reason="QUALITY_GATE_REJECTED",
-                ),
-            ),
+            variants=(playtest_fallback, *kept),
+            missing=(),
             diagnostic_raw_candidates=(diagnostic,),
         )
 
@@ -1988,31 +2141,28 @@ def test_missing_variant_exports_diagnostic_raw_without_entering_normal_charts(
         ),
     )
 
-    diagnostic_path = (
-        run_dir
-        / "diagnostic-raw-fallback"
-        / "4k-easy"
-        / "map.osu"
-    )
+    diagnostic_path = run_dir / "diagnostic-raw-fallback" / "4k-easy" / "map.osu"
     assert diagnostic_path.is_file()
     assert diagnostic_path not in result.chart_paths
     assert diagnostic_path not in result.raw_osu_paths
     report = json.loads((run_dir / "generation-report.json").read_text(encoding="utf-8"))
-    assert len(report["charts"]) == 11
-    assert report["missingCharts"] == [
-        {
-            "keyMode": 4,
-            "difficulty": "EASY",
-            "reason": "QUALITY_GATE_REJECTED",
-            "attemptErrors": [],
-            "attemptEvidence": [],
-        }
+    assert len(report["charts"]) == 12
+    assert report["missingCharts"] == []
+    fallback = next(
+        chart
+        for chart in report["charts"]
+        if chart["keyMode"] == 4 and chart["difficulty"] == "EASY"
+    )
+    assert fallback["provenance"] == "RAW_UNVERIFIED"
+    assert fallback["productionEligible"] is False
+    assert fallback["playabilityTier"] == "DIAGNOSTIC_ONLY"
+    assert fallback["familyResolutionState"] == "UNRESOLVED"
+    assert fallback["familyResolutionReasons"] == [
+        "QUALITY_REJECTED_HARD_SAFE_PLAYTEST_RETURN"
     ]
     assert report["diagnosticRawFallbacks"][0]["path"].endswith("/map.osu")
     assert report["diagnosticRawFallbacks"][0]["productionEligible"] is False
-    manifest = json.loads(
-        (diagnostic_path.parent / "manifest-v1.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((diagnostic_path.parent / "manifest-v1.json").read_text(encoding="utf-8"))
     assert manifest["decision"] == "PLAYTEST_ONLY"
     assert manifest["identity"]["patchSetId"] == CONSTRAINT_PATCH_ID
 
@@ -2052,9 +2202,7 @@ def test_outro_family_shadow_finding_marks_review_without_spending_generation_bu
 
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
     assert report["outroFamilyReview"]["status"] == "REVIEW"
-    assert report["outroFamilyReview"]["findings"][0]["reason"] == (
-        "OUTRO_FAMILY_EARLY_START"
-    )
+    assert report["outroFamilyReview"]["findings"][0]["reason"] == ("OUTRO_FAMILY_EARLY_START")
     assert report["status"] == "REVIEW"
     assert report["timingReviewRequired"] is True
     assert report["additionalInferenceCalls"] == 0

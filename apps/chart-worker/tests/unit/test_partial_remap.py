@@ -1,6 +1,11 @@
 from chart_worker.analysis.timing_diagnostics import TimingCoverageGap
 from chart_worker.generation.osu_parser import OsuBpmEvent
-from chart_worker.generation.partial_remap import build_partial_remap_window
+from chart_worker.generation.partial_remap import (
+    PartialRemapWindow,
+    build_partial_remap_window,
+    expand_partial_remap_window,
+    partial_suffix_signature,
+)
 from chart_worker.schema.note import NoteEvent
 
 
@@ -75,4 +80,48 @@ def test_window_declines_a_repair_that_would_replace_most_of_the_song():
             duration_ms=60_000,
         )
         is None
+    )
+
+
+def test_public_window_expansion_extends_through_crossing_hold_and_enforces_cap():
+    notes = [NoteEvent(1_000, 0, "HOLD", 4_500)]
+
+    assert expand_partial_remap_window(
+        notes,
+        start_ms=0,
+        end_ms=4_000,
+        duration_ms=10_000,
+    ) == PartialRemapWindow(start_ms=0, end_ms=5_500)
+    assert (
+        expand_partial_remap_window(
+            notes,
+            start_ms=0,
+            end_ms=5_500,
+            duration_ms=6_000,
+        )
+        is None
+    )
+
+
+def test_suffix_signature_ignores_window_objects_but_binds_hold_end_and_lane():
+    base = [
+        NoteEvent(1_000, 0),
+        NoteEvent(5_001, 1, "HOLD", 2_000),
+    ]
+    same_suffix = [
+        NoteEvent(2_000, 3),
+        NoteEvent(5_001, 1, "HOLD", 2_000),
+    ]
+    changed_suffix = [
+        NoteEvent(2_000, 3),
+        NoteEvent(5_001, 2, "HOLD", 2_100),
+    ]
+
+    assert partial_suffix_signature(base, end_ms=5_000) == partial_suffix_signature(
+        same_suffix,
+        end_ms=5_000,
+    )
+    assert partial_suffix_signature(base, end_ms=5_000) != partial_suffix_signature(
+        changed_suffix,
+        end_ms=5_000,
     )

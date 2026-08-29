@@ -5,6 +5,8 @@ import numpy as np
 from chart_worker.analysis.audio_io import AudioSignal
 from chart_worker.analysis.terminal_silence import (
     DEFAULT_THRESHOLDS_DB,
+    TerminalSilenceObservation,
+    TerminalThresholdCandidate,
     consensus_terminal_boundary_ms,
     observe_terminal_silence,
 )
@@ -134,3 +136,157 @@ def test_short_padding_and_threshold_disagreement_are_not_enforceable() -> None:
 
     assert consensus_terminal_boundary_ms(padding) is None
     assert consensus_terminal_boundary_ms(fade) is None
+
+
+def test_consensus_uses_the_common_silent_intersection_not_equal_start_times() -> None:
+    observation = TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=345_229,
+        frame_ms=20,
+        channel_count=2,
+        candidates=tuple(
+            TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=start_ms,
+                suffix_duration_ms=345_229 - start_ms,
+            )
+            for (rms_db, peak_db), start_ms in zip(
+                DEFAULT_THRESHOLDS_DB,
+                (318_700, 318_320, 318_180),
+                strict=True,
+            )
+        ),
+        candidate_spread_ms=520,
+        last_onset_ms=316_853,
+    )
+
+    assert consensus_terminal_boundary_ms(observation) == 318_700
+
+
+def test_common_silent_intersection_still_rejects_late_onset_and_short_suffix() -> None:
+    def observation(*, duration_ms: int, latest_start_ms: int, last_onset_ms: int):
+        starts = (latest_start_ms, latest_start_ms - 200, latest_start_ms - 400)
+        return TerminalSilenceObservation(
+            version="terminal-silence-observation-v1",
+            duration_ms=duration_ms,
+            frame_ms=20,
+            channel_count=2,
+            candidates=tuple(
+                TerminalThresholdCandidate(
+                    rms_db=rms_db,
+                    peak_db=peak_db,
+                    suffix_start_ms=start_ms,
+                    suffix_duration_ms=duration_ms - start_ms,
+                )
+                for (rms_db, peak_db), start_ms in zip(
+                    DEFAULT_THRESHOLDS_DB,
+                    starts,
+                    strict=True,
+                )
+            ),
+            candidate_spread_ms=400,
+            last_onset_ms=last_onset_ms,
+        )
+
+    assert (
+        consensus_terminal_boundary_ms(
+            observation(
+                duration_ms=10_000,
+                latest_start_ms=6_000,
+                last_onset_ms=6_100,
+            )
+        )
+        is None
+    )
+    assert (
+        consensus_terminal_boundary_ms(
+            observation(
+                duration_ms=10_000,
+                latest_start_ms=7_001,
+                last_onset_ms=7_000,
+            )
+        )
+        is None
+    )
+
+
+def test_stable_threshold_crossings_accept_a_near_minimum_strict_suffix() -> None:
+    """Catch falling back to full duration for a stable 3-second terminal region."""
+    observation = TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=156_012,
+        frame_ms=20,
+        channel_count=2,
+        candidates=tuple(
+            TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=start_ms,
+                suffix_duration_ms=156_012 - start_ms,
+            )
+            for (rms_db, peak_db), start_ms in zip(
+                DEFAULT_THRESHOLDS_DB,
+                (153_140, 153_040, 152_960),
+                strict=True,
+            )
+        ),
+        candidate_spread_ms=180,
+        last_onset_ms=152_341,
+    )
+
+    assert consensus_terminal_boundary_ms(observation) == 153_140
+
+
+def test_broad_fade_crossings_do_not_borrow_duration_from_the_lenient_detector() -> None:
+    """Catch treating a wide threshold disagreement as stable terminal silence."""
+    observation = TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=10_000,
+        frame_ms=20,
+        channel_count=2,
+        candidates=tuple(
+            TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=start_ms,
+                suffix_duration_ms=10_000 - start_ms,
+            )
+            for (rms_db, peak_db), start_ms in zip(
+                DEFAULT_THRESHOLDS_DB,
+                (7_000, 5_000, 2_000),
+                strict=True,
+            )
+        ),
+        candidate_spread_ms=5_000,
+        last_onset_ms=1_000,
+    )
+
+    assert consensus_terminal_boundary_ms(observation) is None
+
+
+def test_consensus_rejects_a_spread_field_that_does_not_match_candidates() -> None:
+    """Catch trusting report metadata that disagrees with the measured starts."""
+    observation = TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=10_000,
+        frame_ms=20,
+        channel_count=2,
+        candidates=tuple(
+            TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=start_ms,
+                suffix_duration_ms=10_000 - start_ms,
+            )
+            for (rms_db, peak_db), start_ms in zip(
+                DEFAULT_THRESHOLDS_DB,
+                (6_900, 6_800, 6_700),
+                strict=True,
+            )
+        ),
+        candidate_spread_ms=0,
+        last_onset_ms=6_000,
+    )
+
+    assert consensus_terminal_boundary_ms(observation) is None

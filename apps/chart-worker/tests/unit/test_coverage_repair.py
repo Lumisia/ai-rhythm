@@ -70,6 +70,27 @@ def _analysis(duration_ms: int, *, onset_step_ms: int = 500) -> OnsetAnalysis:
     )
 
 
+def _analysis_with_song_relative_weak_middle(
+    duration_ms: int,
+    *,
+    gap_start_ms: int,
+    gap_end_ms: int,
+) -> OnsetAnalysis:
+    analysis = _analysis(duration_ms, onset_step_ms=1_000)
+    strength = analysis.strength.copy()
+    for time_ms in analysis.onset_ms:
+        if gap_start_ms < time_ms < gap_end_ms:
+            strength[round(time_ms / 100)] = 0.4
+    return OnsetAnalysis(
+        sample_rate_hz=analysis.sample_rate_hz,
+        hop_length=analysis.hop_length,
+        strength=strength,
+        band_strength=np.vstack((strength, strength, strength)),
+        onset_ms=analysis.onset_ms,
+        activity=analysis.activity,
+    )
+
+
 def _raw_chart(
     authority: SongTimingAuthority,
     *,
@@ -78,8 +99,7 @@ def _raw_chart(
 ) -> GeneratedChart:
     return GeneratedChart(
         notes=[
-            NoteEvent(time_ms=time_ms, lane=index % key_mode)
-            for index, time_ms in enumerate(rows)
+            NoteEvent(time_ms=time_ms, lane=index % key_mode) for index, time_ms in enumerate(rows)
         ],
         key_mode=key_mode,
         osu_text="",
@@ -192,8 +212,86 @@ def test_repair_rejects_a_candidate_without_attack_required_gaps():
         build_coverage_repair_chart(request, source, acceptance, authority, analysis)
 
 
-def test_repair_never_inserts_a_tap_inside_an_open_hold_on_the_same_lane():
-    request = _request()
+def test_repair_rejects_family_jury_approved_uncertain_interval():
+    request = _request(difficulty="EXPERT")
+    authority = _authority()
+    gap_start_ms = 12_000
+    gap_end_ms = 20_000
+    analysis = _analysis_with_song_relative_weak_middle(
+        request.duration_ms,
+        gap_start_ms=gap_start_ms,
+        gap_end_ms=gap_end_ms,
+    )
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    source = _raw_chart(
+        authority,
+        key_mode=request.key_mode,
+        rows=tuple(
+            sorted(
+                {
+                    gap_start_ms,
+                    gap_end_ms,
+                    *(row for row in active_rows if not gap_start_ms < row < gap_end_ms),
+                }
+            )
+        ),
+    )
+    acceptance = _acceptance(request, source, authority, analysis)
+    coverage_gap = acceptance.timing.uncertain_coverage_gaps[0]
+    assert acceptance.decision(GateAxis.COVERAGE).action is GateAction.REVIEW
+    assert coverage_gap.opportunity is not None
+    assert coverage_gap.opportunity.kind.value == "UNCERTAIN"
+
+    with pytest.raises(ValueError, match="attack-required coverage gap"):
+        build_coverage_repair_chart(
+            request,
+            source,
+            acceptance,
+            authority,
+            analysis,
+            approved_intervals=((coverage_gap.start_ms, coverage_gap.end_ms),),
+        )
+
+
+def test_repair_rejects_an_approved_interval_not_present_in_gate_evidence():
+    request = _request(difficulty="EXPERT")
+    authority = _authority()
+    gap_start_ms = 12_000
+    gap_end_ms = 20_000
+    analysis = _analysis_with_song_relative_weak_middle(
+        request.duration_ms,
+        gap_start_ms=gap_start_ms,
+        gap_end_ms=gap_end_ms,
+    )
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    source = _raw_chart(
+        authority,
+        key_mode=request.key_mode,
+        rows=tuple(
+            sorted(
+                {
+                    gap_start_ms,
+                    gap_end_ms,
+                    *(row for row in active_rows if not gap_start_ms < row < gap_end_ms),
+                }
+            )
+        ),
+    )
+    acceptance = _acceptance(request, source, authority, analysis)
+
+    with pytest.raises(ValueError, match="gate evidence"):
+        build_coverage_repair_chart(
+            request,
+            source,
+            acceptance,
+            authority,
+            analysis,
+            approved_intervals=((13_000, 19_000),),
+        )
+
+
+def test_expert_repair_uses_free_lanes_for_global_attacks_under_a_hold():
+    request = _request(difficulty="EXPERT")
     authority = _authority()
     analysis = _analysis(request.duration_ms, onset_step_ms=1_000)
     active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
@@ -209,11 +307,7 @@ def test_repair_never_inserts_a_tap_inside_an_open_hold_on_the_same_lane():
                         {
                             gap_start_ms,
                             gap_end_ms,
-                            *(
-                                row
-                                for row in active_rows
-                                if not gap_start_ms < row < gap_end_ms
-                            ),
+                            *(row for row in active_rows if not gap_start_ms < row < gap_end_ms),
                         }
                     )
                 )
@@ -236,10 +330,97 @@ def test_repair_never_inserts_a_tap_inside_an_open_hold_on_the_same_lane():
         analysis,
     )
 
+    assert plan.repair_modes == ("UNDER_HOLD_POLYPHONY",)
+    assert plan.repaired_intervals == ((gap_start_ms, gap_end_ms),)
     assert plan.inserted_notes
     assert all(note.lane != 0 for note in plan.inserted_notes)
     reparsed = _acceptance(request, repaired, authority, analysis)
     assert reparsed.decision(GateAxis.STRUCTURE).action is GateAction.PASS
+
+
+@pytest.mark.parametrize("difficulty", ("EASY", "NORMAL"))
+def test_lower_difficulty_repair_rejects_global_attacks_under_a_long_hold(
+    difficulty: str,
+):
+    request = _request(difficulty=difficulty)
+    authority = _authority()
+    analysis = _analysis(request.duration_ms, onset_step_ms=1_000)
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    gap_start_ms = 4_000
+    gap_end_ms = 30_000
+    source = GeneratedChart(
+        notes=[
+            NoteEvent(
+                time_ms=gap_start_ms,
+                lane=0,
+                kind="HOLD",
+                duration_ms=gap_end_ms - gap_start_ms,
+            ),
+            *(NoteEvent(time_ms=row, lane=1) for row in active_rows if row >= gap_end_ms),
+        ],
+        key_mode=request.key_mode,
+        osu_text="",
+        generator_name="lower-difficulty-long-hold",
+        seed=7,
+        bpm_events=authority.bpm_events,
+    )
+    acceptance = _acceptance(request, source, authority, analysis)
+    assert acceptance.decision(GateAxis.COVERAGE).action is GateAction.RETRY_MAP
+
+    with pytest.raises(ValueError, match="attack-required coverage gap"):
+        build_coverage_repair_chart(
+            request,
+            source,
+            acceptance,
+            authority,
+            analysis,
+        )
+
+
+def test_repair_uses_only_the_unoccupied_tail_after_a_crossing_hold():
+    request = _request(difficulty="HARD")
+    authority = _authority()
+    analysis = _analysis(request.duration_ms, onset_step_ms=1_000)
+    active_rows = analysis.activity.active_onset_ms  # type: ignore[union-attr]
+    gap_end_ms = next(row for row in active_rows if row > 20_000)
+    source = GeneratedChart(
+        notes=[
+            *(
+                NoteEvent(time_ms=row, lane=index % request.key_mode)
+                for index, row in enumerate(
+                    row
+                    for row in active_rows
+                    if not 10_000 < row < 20_000
+                )
+            ),
+            NoteEvent(time_ms=10_000, lane=0, kind="HOLD", duration_ms=4_000),
+        ],
+        key_mode=request.key_mode,
+        osu_text="",
+        generator_name="raw-model-with-crossing-hold",
+        seed=7,
+        bpm_events=authority.bpm_events,
+    )
+    acceptance = _acceptance(request, source, authority, analysis)
+    gap = next(
+        gap
+        for gap in acceptance.timing.coverage_gaps
+        if gap.row_span_start_ms == 10_000 and gap.end_ms == gap_end_ms
+    )
+    assert gap.unoccupied_start_ms == 14_000
+
+    _, plan = build_coverage_repair_chart(
+        request,
+        source,
+        acceptance,
+        authority,
+        analysis,
+    )
+
+    assert plan.repaired_intervals == ((14_000, gap_end_ms),)
+    assert plan.repair_modes == ("VACANT_INTERVAL",)
+    assert plan.inserted_notes
+    assert all(14_000 < note.time_ms < gap_end_ms for note in plan.inserted_notes)
 
 
 @pytest.mark.parametrize(
@@ -275,23 +456,15 @@ def test_repair_is_deterministic_across_duration_bpm_keycount_and_difficulty(
                 {
                     gap_start_ms,
                     gap_end_ms,
-                    *(
-                        row
-                        for row in active_rows
-                        if not gap_start_ms < row < gap_end_ms
-                    ),
+                    *(row for row in active_rows if not gap_start_ms < row < gap_end_ms),
                 }
             )
         ),
     )
     acceptance = _acceptance(request, source, authority, analysis)
 
-    first = build_coverage_repair_chart(
-        request, source, acceptance, authority, analysis
-    )
-    second = build_coverage_repair_chart(
-        request, source, acceptance, authority, analysis
-    )
+    first = build_coverage_repair_chart(request, source, acceptance, authority, analysis)
+    second = build_coverage_repair_chart(request, source, acceptance, authority, analysis)
 
     assert first == second
     repaired, plan = first

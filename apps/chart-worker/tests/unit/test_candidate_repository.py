@@ -9,6 +9,7 @@ def test_candidate_repository_keeps_all_trust_levels_separate():
     repository.admit("verified")
     repository.reject("raw")
     repository.add_safe_fallback("safe")
+    repository.add_shadow("shadow")
     repository.remember_partial_source("partial")
 
     assert repository.admitted == ("verified",)
@@ -16,6 +17,8 @@ def test_candidate_repository_keeps_all_trust_levels_separate():
     assert repository.safe_fallbacks == ("safe",)
     assert repository.partial_sources == ("partial",)
     assert repository.playtest_candidates == ("verified", "raw", "safe")
+    assert repository.shadow_candidates == ("shadow",)
+    assert repository.evidence_candidates == ("verified", "raw", "safe", "shadow")
 
     with pytest.raises(AttributeError):
         repository.admitted.append("bypass")
@@ -29,3 +32,4 @@ def test_candidate_repository_lists_are_not_shared_between_variants():
 
     assert second.admitted == ()
     assert second.safe_fallbacks == ()
+    assert second.shadow_candidates == ()

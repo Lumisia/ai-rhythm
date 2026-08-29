@@ -135,6 +135,7 @@ class RecoveryKind(str, Enum):
     PARTIAL_REMAP = "PARTIAL_REMAP"
     INTRO = "INTRO"
     TIMING_FAMILY = "TIMING_FAMILY"
+    DIFFICULTY_SHADOW = "DIFFICULTY_SHADOW"
 
 
 @dataclass(slots=True)

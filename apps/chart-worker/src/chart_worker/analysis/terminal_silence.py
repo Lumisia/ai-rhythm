@@ -20,6 +20,9 @@ DEFAULT_THRESHOLDS_DB: tuple[tuple[float, float], ...] = (
 MIN_CONSENSUS_SUFFIX_MS = 3_000
 """Ignore codec padding and short production tails when enforcing a boundary."""
 
+MAX_CONSENSUS_SPREAD_RATIO = 0.10
+"""Reject fades whose threshold crossings consume too much of the silent tail."""
+
 
 @dataclass(frozen=True, slots=True)
 class TerminalThresholdCandidate:
@@ -64,11 +67,14 @@ class TerminalSilenceObservation:
 def consensus_terminal_boundary_ms(
     observation: TerminalSilenceObservation,
 ) -> int | None:
-    """Return one conservative boundary only when every fixed detector agrees.
+    """Return the start of the silent intersection shared by every detector.
 
     This is deliberately narrower than semantic music-end detection.  It only
-    recognizes a long, contiguous file-ending suffix whose stereo-aware RMS
-    and peak measurements agree across the frozen threshold grid.
+    recognizes a long, contiguous file-ending suffix where the stereo-aware
+    RMS and peak measurements all classify the same final interval as silent.
+    Different thresholds need not cross on the same frame: choosing the latest
+    start is the conservative intersection and never includes a frame rejected
+    by one of the fixed detectors.
     """
     if not isinstance(observation, TerminalSilenceObservation):
         raise TypeError("observation must be a TerminalSilenceObservation")
@@ -78,8 +84,7 @@ def consensus_terminal_boundary_ms(
         raise ValueError("terminal frame size must be a positive exact integer")
     expected_thresholds = set(DEFAULT_THRESHOLDS_DB)
     actual_thresholds = {
-        (candidate.rms_db, candidate.peak_db)
-        for candidate in observation.candidates
+        (candidate.rms_db, candidate.peak_db) for candidate in observation.candidates
     }
     if (
         len(observation.candidates) != len(DEFAULT_THRESHOLDS_DB)
@@ -93,18 +98,33 @@ def consensus_terminal_boundary_ms(
             or type(candidate.suffix_duration_ms) is not int
             or candidate.suffix_start_ms < 0
             or candidate.suffix_start_ms > observation.duration_ms
-            or candidate.suffix_duration_ms
-            != observation.duration_ms - candidate.suffix_start_ms
+            or candidate.suffix_duration_ms != observation.duration_ms - candidate.suffix_start_ms
         ):
             return None
         starts.append(candidate.suffix_start_ms)
     latest_start_ms = max(starts)
-    if max(starts) - min(starts) > observation.frame_ms * 2:
+    earliest_start_ms = min(starts)
+    measured_spread_ms = latest_start_ms - earliest_start_ms
+    if (
+        type(observation.candidate_spread_ms) is not int
+        or observation.candidate_spread_ms != measured_spread_ms
+    ):
         return None
-    if observation.duration_ms - latest_start_ms < MIN_CONSENSUS_SUFFIX_MS:
+    longest_suffix_ms = observation.duration_ms - earliest_start_ms
+    if longest_suffix_ms < MIN_CONSENSUS_SUFFIX_MS:
+        return None
+    # The minimum duration belongs to the corroborated terminal region, not to
+    # one exact dB crossing.  Closely clustered fixed thresholds are measurement
+    # uncertainty around that region; a wide disagreement is a fade and remains
+    # non-enforceable.  The returned boundary is still the latest/strictest start.
+    if measured_spread_ms > longest_suffix_ms * MAX_CONSENSUS_SPREAD_RATIO:
         return None
     if observation.last_onset_ms is not None:
-        if type(observation.last_onset_ms) is not int:
+        if (
+            type(observation.last_onset_ms) is not int
+            or observation.last_onset_ms < 0
+            or observation.last_onset_ms > observation.duration_ms
+        ):
             return None
         if observation.last_onset_ms > latest_start_ms:
             return None

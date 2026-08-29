@@ -16,6 +16,7 @@ class CandidateRepository(Generic[CandidateT]):
         "_partial_sources",
         "_raw_rejected",
         "_safe_fallbacks",
+        "_shadow_candidates",
     )
 
     def __init__(
@@ -24,11 +25,13 @@ class CandidateRepository(Generic[CandidateT]):
         admitted: Iterable[CandidateT] = (),
         raw_rejected: Iterable[CandidateT] = (),
         safe_fallbacks: Iterable[CandidateT] = (),
+        shadow_candidates: Iterable[CandidateT] = (),
         partial_sources: Iterable[CandidateT] = (),
     ) -> None:
         self._admitted = list(admitted)
         self._raw_rejected = list(raw_rejected)
         self._safe_fallbacks = list(safe_fallbacks)
+        self._shadow_candidates = list(shadow_candidates)
         self._partial_sources = list(partial_sources)
 
     @property
@@ -49,6 +52,16 @@ class CandidateRepository(Generic[CandidateT]):
         return (*self._admitted, *self._raw_rejected, *self._safe_fallbacks)
 
     @property
+    def shadow_candidates(self) -> tuple[CandidateT, ...]:
+        """Research-only candidates that selectors must never publish."""
+        return tuple(self._shadow_candidates)
+
+    @property
+    def evidence_candidates(self) -> tuple[CandidateT, ...]:
+        """All payloads preserved for offline evidence and replay."""
+        return (*self.playtest_candidates, *self._shadow_candidates)
+
+    @property
     def partial_sources(self) -> tuple[CandidateT, ...]:
         return tuple(self._partial_sources)
 
@@ -60,6 +73,9 @@ class CandidateRepository(Generic[CandidateT]):
 
     def add_safe_fallback(self, candidate: CandidateT) -> None:
         self._safe_fallbacks.append(candidate)
+
+    def add_shadow(self, candidate: CandidateT) -> None:
+        self._shadow_candidates.append(candidate)
 
     def remember_partial_source(self, candidate: CandidateT) -> None:
         self._partial_sources.append(candidate)

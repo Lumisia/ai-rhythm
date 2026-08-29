@@ -1,0 +1,1072 @@
+diff --git a/config.py b/config.py
+index 6630e14..a5b05f1 100644
+--- a/config.py
++++ b/config.py
+@@ -81,6 +81,13 @@ class InferenceConfig:
+     fast_decoder_loop: bool = False  # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+     super_timing_fast_loop: bool = False  # Use the fast decoder loop for super timing instead of the batched-parallel path. Separate from fast_decoder_loop because super timing's parallel path may be faster on some GPUs; benchmark before enabling.
+     write_generation_telemetry: bool = False  # Write a hash-bound evidence sidecar for bounded experiments.
++    required_gameplay_interval_mode: str = 'OFF'  # OFF or v35 observe-only generated-origin accounting.
++    required_gameplay_interval_start_time: Optional[int] = None
++    required_gameplay_interval_end_time: Optional[int] = None
++    required_gameplay_interval_minimum_complete_groups: Optional[int] = None
++    required_gameplay_interval_allowed_group_types: Optional[list[str]] = None
++    required_gameplay_interval_evidence_class: Optional[str] = None
++    required_gameplay_interval_evidence_digest: Optional[str] = None
+ 
+     # Metadata settings
+     bpm: Optional[int] = None  # Beats per minute of input audio
+diff --git a/configs/inference/default.yaml b/configs/inference/default.yaml
+index 83db7c9..c5ecc5c 100644
+--- a/configs/inference/default.yaml
++++ b/configs/inference/default.yaml
+@@ -66,6 +66,13 @@ max_batch_size: 16       # Maximum batch size for inference
+ fast_decoder_loop: false # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+ super_timing_fast_loop: false # Use the fast decoder loop for super timing instead of the batched-parallel path; benchmark on your GPU before enabling
+ write_generation_telemetry: false # Opt-in hash-bound evidence sidecar for bounded experiments
++required_gameplay_interval_mode: 'OFF' # OFF or v35 observe-only generated-origin accounting
++required_gameplay_interval_start_time: null
++required_gameplay_interval_end_time: null
++required_gameplay_interval_minimum_complete_groups: null
++required_gameplay_interval_allowed_group_types: null
++required_gameplay_interval_evidence_class: null
++required_gameplay_interval_evidence_digest: null
+ resnap_events: true      # Resnap events to the timing after generation
+ snap_near_perfect_overlaps: true  # Snap nearly overlapping positions to each other
+ 
+diff --git a/inference.py b/inference.py
+index f2ec844..f65fb65 100644
+--- a/inference.py
++++ b/inference.py
+@@ -37,6 +37,12 @@ from osuT5.osuT5.inference import (
+ from osuT5.osuT5.inference.encoder_cache import ExactEncoderCache
+ from osuT5.osuT5.inference.generation_telemetry import write_generation_telemetry
+ from osuT5.osuT5.inference.origin import merge_origin_streams
++from osuT5.osuT5.inference.required_gameplay_observation import (
++    count_mania_objects,
++    required_gameplay_invocation_digest,
++    required_gameplay_interval_from_args,
++    write_generation_origin_diagnostics,
++)
+ from osuT5.osuT5.inference.server import InferenceClient
+ from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
+ from osuT5.osuT5.inference.tail_repair import (
+@@ -511,6 +517,7 @@ def generate(
+             raise ValueError(f"Beatmap file must have .osu extension: {beatmap_path}")
+     if (output_path is None or output_path == "") and (not args.add_to_beatmap or not args.overwrite_reference_beatmap or args.export_osz):
+         raise ValueError("Output path is required.")
++    required_gameplay_interval = required_gameplay_interval_from_args(args)
+ 
+     preprocessor = Preprocessor(args, parallel=args.parallel)
+     encoder_cache_identity = None
+@@ -549,6 +556,7 @@ def generate(
+     # Auto generate timing if not provided in in_context and required for the model and this output_type
+     timing_events, timing_times, timing = None, None, None
+     event_origins = None
++    required_gameplay_stages = None
+     if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
+         super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer)
+         timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
+@@ -600,6 +608,15 @@ def generate(
+         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
+             timing = postprocessor.generate_timing(events)
+ 
++        if required_gameplay_interval is not None:
++            canonical_stage = postprocessor.observe_mania_objects(
++                events,
++                event_times,
++                event_origins,
++                key_count=round(beatmap_config.circle_size),
++                interval=required_gameplay_interval,
++            )
++
+         # Resnap timing events
+         if args.resnap_events and timing is not None:
+             if args.gamemode == 3 and ContextType.MAP in output_type:
+@@ -621,6 +638,20 @@ def generate(
+                     event_times,
+                     timing,
+                 )
++        if required_gameplay_interval is not None:
++            resnap_stage = postprocessor.observe_mania_objects(
++                events,
++                event_times,
++                event_origins,
++                key_count=round(beatmap_config.circle_size),
++                interval=required_gameplay_interval,
++            )
++            required_gameplay_stages = (
++                processor.last_required_gameplay_decoder,
++                processor.last_required_gameplay_window_merge,
++                canonical_stage,
++                resnap_stage,
++            )
+     else:
+         events, event_times = timing_events, timing_times
+ 
+@@ -657,6 +688,14 @@ def generate(
+             key_count=round(beatmap_config.circle_size),
+         )
+ 
++    if required_gameplay_interval is not None:
++        if required_gameplay_stages is None:
++            raise ValueError("required gameplay stages were not observed")
++        final_stage = count_mania_objects(
++            postprocessor.last_mania_objects_report["maniaObjects"],
++            required_gameplay_interval,
++        )
++
+     if args.add_to_beatmap and args.overwrite_reference_beatmap:
+         output_osu_path = Path(beatmap_path)
+     else:
+@@ -678,6 +717,19 @@ def generate(
+                 seed=args.seed,
+                 collisions=resnap_collisions,
+             )
++        if required_gameplay_interval is not None:
++            write_generation_origin_diagnostics(
++                result_path,
++                evidence_digest=required_gameplay_interval.evidence_digest,
++                invocation_digest=required_gameplay_invocation_digest(
++                    args,
++                    audio_path=Path(audio_path),
++                    reference_path=Path(beatmap_path),
++                    interval=required_gameplay_interval,
++                ),
++                interval=required_gameplay_interval,
++                stages=(*required_gameplay_stages, final_stage),
++            )
+         if args.write_generation_telemetry:
+             if type(processor.last_generation_stats) is not dict:
+                 raise ValueError("generation telemetry requires processor statistics")
+diff --git a/osuT5/osuT5/inference/postprocessor.py b/osuT5/osuT5/inference/postprocessor.py
+index f0a442e..510840e 100644
+--- a/osuT5/osuT5/inference/postprocessor.py
++++ b/osuT5/osuT5/inference/postprocessor.py
+@@ -17,6 +17,10 @@ from slider import Beatmap, Circle, HoldNote, TimingPoint
+ 
+ from config import InferenceConfig
+ from .origin import EventOrigin
++from .required_gameplay_observation import (
++    RequiredGameplayIntervalObservation,
++    count_mania_objects,
++)
+ from .slider_path import SliderPath
+ from .timing_points_change import TimingPointsChange, sort_timing_points
+ from ..dataset.data_utils import get_groups, Group, get_median_mpb, BEAT_TYPES
+@@ -208,6 +212,35 @@ class Postprocessor(object):
+         self.logger = logging.getLogger(__name__) if logger is None else logger.getChild(__name__)
+         self.last_mania_objects_report = {"maniaObjects": [], "duplicates": []}
+ 
++    def observe_mania_objects(
++            self,
++            events: list[Event],
++            event_times: list[int],
++            event_origins: list[EventOrigin],
++            *,
++            key_count: int,
++            interval: RequiredGameplayIntervalObservation,
++    ):
++        """Build a disposable canonical snapshot without mutating output state."""
++        if len(events) != len(event_times) or len(events) != len(event_origins):
++            raise ValueError(
++                "events, event_times, and event_origins must have equal length"
++            )
++        groups, group_indices = get_groups(
++            events,
++            event_times=event_times,
++            types_first=self.types_first,
++        )
++        if self.snap_near_perfect_overlaps_enabled:
++            self.snap_near_perfect_overlaps(groups)
++        mania_objects, _duplicate_group_ids, _duplicates = self._build_mania_objects(
++            groups,
++            group_indices,
++            event_origins,
++            key_count,
++        )
++        return count_mania_objects(mania_objects, interval)
++
+     def generate(
+             self,
+             events: list[Event],
+diff --git a/osuT5/osuT5/inference/processor.py b/osuT5/osuT5/inference/processor.py
+index 7bde8ec..82146b7 100644
+--- a/osuT5/osuT5/inference/processor.py
++++ b/osuT5/osuT5/inference/processor.py
+@@ -40,6 +40,11 @@ from .mania_grammar import (
+     replay_mania_hold_state,
+ )
+ from .origin import EventOrigin
++from .required_gameplay_observation import (
++    GameplayGroupStageSnapshot,
++    count_canonical_groups,
++    required_gameplay_interval_from_args,
++)
+ from .server import InferenceClient, model_forward, model_generate, precompute_encoder_outputs
+ from .tail_repair import (
+     ManiaTailRepairExhausted,
+@@ -195,6 +200,9 @@ class Processor(object):
+         self.encoder_cache = encoder_cache
+         self.encoder_cache_identity = encoder_cache_identity
+         self.last_generation_stats: dict[str, Any] | None = None
++        self.required_gameplay_interval = required_gameplay_interval_from_args(args)
++        self.last_required_gameplay_decoder = GameplayGroupStageSnapshot.empty()
++        self.last_required_gameplay_window_merge = GameplayGroupStageSnapshot.empty()
+ 
+     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
+         generate_kwargs2 = generate_kwargs | dict(
+@@ -311,6 +319,8 @@ class Processor(object):
+             )
+             inputs["requested_out_context"] = out_context
+         self._reset_generation_stats()
++        self.last_required_gameplay_decoder = GameplayGroupStageSnapshot.empty()
++        self.last_required_gameplay_window_merge = GameplayGroupStageSnapshot.empty()
+         finalized_context_ids: set[int] = set()
+         if isinstance(self.model, InferenceClient):
+             with self.model:
+@@ -428,6 +438,28 @@ class Processor(object):
+                     context["event_times"] += ref_event_times
+                     context["event_origins"] += ref_origins
+ 
++        if self.required_gameplay_interval is not None:
++            window_merge = GameplayGroupStageSnapshot.empty()
++            for context in out_context_data:
++                if (
++                        context["context_type"] != ContextType.MAP
++                        or generation_config.gamemode != 3
++                ):
++                    continue
++                groups = canonical_mania_groups(
++                    context["events"],
++                    context["event_times"],
++                    keycount=generation_config.keycount,
++                )
++                window_merge = window_merge.merge(
++                    count_canonical_groups(
++                        groups,
++                        context["event_origins"],
++                        self.required_gameplay_interval,
++                    )
++                )
++            self.last_required_gameplay_window_merge = window_merge
++
+         # Turn mania key column into X position
+         for context in out_context_data:
+             if context["context_type"] != ContextType.MAP or generation_config.gamemode != 3:
+@@ -1963,13 +1995,29 @@ class Processor(object):
+                 keycount=mania_keycount,
+             )
+ 
+-        candidate_events = existing_events + result
+-        candidate_times = existing_times
+         window_id = -1 if source_window_id is None else source_window_id
+-        candidate_origins = existing_origins + [
++        generated_origins = [
+             EventOrigin.generated(window_id, token_index)
+             for token_index in token_indices
+         ]
++        if self.required_gameplay_interval is not None and mania_keycount is not None:
++            if source_window_id is None:
++                raise ValueError(
++                    "required gameplay observation requires a source window identity"
++                )
++            self.last_required_gameplay_decoder = (
++                self.last_required_gameplay_decoder.merge(
++                    count_canonical_groups(
++                        generated_groups,
++                        generated_origins,
++                        self.required_gameplay_interval,
++                    )
++                )
++            )
++
++        candidate_events = existing_events + result
++        candidate_times = existing_times
++        candidate_origins = existing_origins + generated_origins
+         update_event_times(
+             candidate_events,
+             candidate_times,
+diff --git a/osuT5/osuT5/inference/required_gameplay_observation.py b/osuT5/osuT5/inference/required_gameplay_observation.py
+new file mode 100644
+index 0000000..8cf44a0
+--- /dev/null
++++ b/osuT5/osuT5/inference/required_gameplay_observation.py
+@@ -0,0 +1,485 @@
++"""Observe-only generated-origin accounting for a bounded gameplay interval."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import uuid
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Iterable, Sequence
++
++
++GENERATION_ORIGIN_DIAGNOSTICS_VERSION = "generation-origin-diagnostics-v1"
++GENERATION_ORIGIN_DIAGNOSTICS_SUFFIX = ".origin.json"
++REQUIRED_GAMEPLAY_INVOCATION_VERSION = "required-gameplay-invocation-v1"
++_MAX_DIAGNOSTICS_BYTES = 1_048_576
++_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
++_INTERVAL_FIELDS = (
++    "required_gameplay_interval_start_time",
++    "required_gameplay_interval_end_time",
++    "required_gameplay_interval_minimum_complete_groups",
++    "required_gameplay_interval_allowed_group_types",
++    "required_gameplay_interval_evidence_class",
++    "required_gameplay_interval_evidence_digest",
++)
++_SUPPORTED_GROUP_TYPES = frozenset({"TAP", "HOLD_START"})
++_SUPPORTED_EVIDENCE_CLASSES = frozenset(
++    {"BROADBAND_ATTACK", "PULSE_FAMILY_CORROBORATED"}
++)
++_STAGE_NAMES = (
++    "decoder",
++    "windowMerge",
++    "canonical",
++    "resnap",
++    "finalSerialization",
++)
++
++
++def _exact_int(value: Any, name: str, *, minimum: int = 0) -> int:
++    if type(value) is not int:
++        raise TypeError(f"{name} must be an exact integer")
++    if value < minimum:
++        raise ValueError(f"{name} must be at least {minimum}")
++    return value
++
++
++def _sha256(value: Any, name: str) -> str:
++    if type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None:
++        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
++    return value
++
++
++def _sha256_path(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as stream:
++        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _regular_file(path: Path, name: str) -> Path:
++    path = Path(path)
++    if path.is_symlink() or not path.is_file():
++        raise FileNotFoundError(f"{name} must be an existing regular file")
++    return path.resolve()
++
++
++def _context_values(values: Any, name: str) -> list[str]:
++    if type(values) is not list:
++        raise TypeError(f"{name} must be an exact list")
++    result = []
++    for value in values:
++        if type(value) is str:
++            item = value
++        else:
++            enum_name = getattr(value, "name", None)
++            item = enum_name if type(enum_name) is str else getattr(value, "value", None)
++        if type(item) is not str:
++            raise TypeError(f"{name} contains an unsupported context value")
++        result.append(item.upper())
++    return result
++
++
++@dataclass(frozen=True, slots=True)
++class RequiredGameplayIntervalObservation:
++    start_ms: int
++    end_ms: int
++    minimum_complete_groups: int
++    allowed_group_types: tuple[str, ...]
++    evidence_class: str
++    evidence_digest: str
++    mode: str = "OBSERVE"
++
++    def __post_init__(self) -> None:
++        _exact_int(self.start_ms, "required interval start")
++        _exact_int(self.end_ms, "required interval end")
++        if self.start_ms >= self.end_ms:
++            raise ValueError("required interval start must be before end")
++        _exact_int(
++            self.minimum_complete_groups,
++            "required interval minimum complete groups",
++            minimum=1,
++        )
++        if type(self.allowed_group_types) is not tuple:
++            raise TypeError("required interval allowed group types must be a tuple")
++        if (
++            not self.allowed_group_types
++            or len(set(self.allowed_group_types)) != len(self.allowed_group_types)
++            or any(item not in _SUPPORTED_GROUP_TYPES for item in self.allowed_group_types)
++        ):
++            raise ValueError("required interval allowed group types are invalid")
++        object.__setattr__(
++            self,
++            "allowed_group_types",
++            tuple(sorted(self.allowed_group_types)),
++        )
++        if self.evidence_class not in _SUPPORTED_EVIDENCE_CLASSES:
++            raise ValueError("required interval evidence class is unsupported")
++        _sha256(self.evidence_digest, "required interval evidence digest")
++        if self.mode != "OBSERVE":
++            raise ValueError("required interval runtime is observe-only")
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "startMs": self.start_ms,
++            "endMs": self.end_ms,
++            "minimumCompleteGroups": self.minimum_complete_groups,
++            "allowedGroupTypes": list(self.allowed_group_types),
++            "evidenceClass": self.evidence_class,
++            "mode": self.mode,
++        }
++
++
++@dataclass(frozen=True, slots=True)
++class _ObservedGroup:
++    identity: str
++    group_type: str
++    start_ms: int
++    in_required_interval: bool
++
++
++@dataclass(frozen=True, slots=True)
++class GameplayGroupStageSnapshot:
++    groups: tuple[_ObservedGroup, ...]
++
++    def __post_init__(self) -> None:
++        by_identity: dict[str, _ObservedGroup] = {}
++        for group in self.groups:
++            if type(group) is not _ObservedGroup:
++                raise TypeError("stage snapshot groups must be observed groups")
++            previous = by_identity.get(group.identity)
++            if previous is not None and previous != group:
++                raise ValueError("one generated-origin identity changed semantics")
++            by_identity[group.identity] = group
++        object.__setattr__(
++            self,
++            "groups",
++            tuple(by_identity[key] for key in sorted(by_identity)),
++        )
++
++    @classmethod
++    def empty(cls) -> "GameplayGroupStageSnapshot":
++        return cls(())
++
++    def merge(
++        self, other: "GameplayGroupStageSnapshot"
++    ) -> "GameplayGroupStageSnapshot":
++        if type(other) is not GameplayGroupStageSnapshot:
++            raise TypeError("stage snapshot merge requires the same type")
++        return GameplayGroupStageSnapshot(self.groups + other.groups)
++
++    def to_count_dict(self) -> dict[str, int]:
++        interval = [group for group in self.groups if group.in_required_interval]
++        return {
++            "totalGeneratedCompleteGroups": len(self.groups),
++            "intervalGeneratedCompleteGroups": len(interval),
++            "tapGroups": sum(group.group_type == "TAP" for group in interval),
++            "holdStartGroups": sum(
++                group.group_type == "HOLD_START" for group in interval
++            ),
++        }
++
++
++def required_gameplay_interval_from_args(
++    args: Any,
++) -> RequiredGameplayIntervalObservation | None:
++    mode = getattr(args, "required_gameplay_interval_mode", "OFF")
++    if type(mode) is not str or mode not in {"OFF", "OBSERVE", "SHADOW_ENFORCE"}:
++        raise ValueError("required gameplay interval mode is unsupported")
++    values = {name: getattr(args, name, None) for name in _INTERVAL_FIELDS}
++    if mode == "OFF":
++        if any(value is not None for value in values.values()):
++            raise ValueError("required gameplay interval OFF rejects stray values")
++        return None
++    if mode == "SHADOW_ENFORCE":
++        raise ValueError("required gameplay interval v35 is observe-only")
++
++    interval = RequiredGameplayIntervalObservation(
++        start_ms=values["required_gameplay_interval_start_time"],
++        end_ms=values["required_gameplay_interval_end_time"],
++        minimum_complete_groups=values[
++            "required_gameplay_interval_minimum_complete_groups"
++        ],
++        allowed_group_types=tuple(
++            values["required_gameplay_interval_allowed_group_types"]
++            if type(values["required_gameplay_interval_allowed_group_types"]) is list
++            else ()
++        ),
++        evidence_class=values["required_gameplay_interval_evidence_class"],
++        evidence_digest=values["required_gameplay_interval_evidence_digest"],
++    )
++    if getattr(args, "gamemode", None) != 3:
++        raise ValueError("required gameplay observation requires mania")
++    if getattr(args, "add_to_beatmap", None) is not True:
++        raise ValueError("required gameplay observation requires partial generation")
++    start_time = getattr(args, "start_time", None)
++    end_time = getattr(args, "end_time", None)
++    if type(start_time) is not int or type(end_time) is not int:
++        raise ValueError("required gameplay observation requires a partial range")
++    if not start_time <= interval.start_ms < interval.end_ms <= end_time:
++        raise ValueError("required gameplay interval must fit the partial range")
++    seed = getattr(args, "seed", None)
++    if type(seed) is not int or not 0 <= seed < 2**32:
++        raise ValueError("required gameplay observation requires an exact uint32 seed")
++    if getattr(args, "resnap_events", None) is not True:
++        raise ValueError("required gameplay observation requires resnap events")
++    if getattr(args, "parallel", None) is not False:
++        raise ValueError("required gameplay observation requires sequential generation")
++    if getattr(args, "super_timing", None) is not False:
++        raise ValueError("required gameplay observation does not support super timing")
++    if "MAP" not in _context_values(getattr(args, "output_type", None), "output_type"):
++        raise ValueError("required gameplay observation requires MAP output")
++    if "TIMING" not in _context_values(getattr(args, "in_context", None), "in_context"):
++        raise ValueError("required gameplay observation requires TIMING context")
++    return interval
++
++
++def _origin_value(origin: Any, name: str) -> Any:
++    if type(origin) is dict:
++        mapping = {
++            "kind": "kind",
++            "source_window_id": "sourceWindowId",
++            "source_token_index": "sourceTokenIndex",
++        }
++        return origin.get(mapping[name])
++    return getattr(origin, name, None)
++
++
++def _generated_identity(origins: Iterable[Any]) -> str | None:
++    generated = set()
++    for origin in origins:
++        if _origin_value(origin, "kind") != "GENERATED":
++            continue
++        window = _origin_value(origin, "source_window_id")
++        token = _origin_value(origin, "source_token_index")
++        if type(window) is not int or window < 0 or type(token) is not int or token < 0:
++            raise ValueError("generated origin identity is malformed")
++        generated.add((window, token))
++    if not generated:
++        return None
++    canonical = json.dumps(
++        sorted(generated),
++        ensure_ascii=True,
++        separators=(",", ":"),
++    ).encode("ascii")
++    return hashlib.sha256(b"required-gameplay-group-origin-v1\0" + canonical).hexdigest()
++
++
++def _observed_group(
++    *,
++    origins: Iterable[Any],
++    group_type: str,
++    start_ms: int,
++    interval: RequiredGameplayIntervalObservation,
++) -> _ObservedGroup | None:
++    identity = _generated_identity(origins)
++    if identity is None:
++        return None
++    return _ObservedGroup(
++        identity=identity,
++        group_type=group_type,
++        start_ms=start_ms,
++        in_required_interval=(
++            group_type in interval.allowed_group_types
++            and interval.start_ms <= start_ms <= interval.end_ms
++        ),
++    )
++
++
++def count_canonical_groups(
++    groups: Sequence[Any],
++    event_origins: Sequence[Any],
++    interval: RequiredGameplayIntervalObservation,
++) -> GameplayGroupStageSnapshot:
++    if type(interval) is not RequiredGameplayIntervalObservation:
++        raise TypeError("canonical group counting requires a typed interval")
++    observed = []
++    event_origins = list(event_origins)
++    for group in groups:
++        name = getattr(getattr(group, "event_type", None), "name", None)
++        group_type = {"CIRCLE": "TAP", "HOLD_NOTE": "HOLD_START"}.get(name)
++        if group_type is None:
++            continue
++        indices = getattr(group, "event_indices", None)
++        if type(indices) is not tuple or not indices:
++            raise ValueError("canonical group event indices are missing")
++        if any(type(index) is not int or not 0 <= index < len(event_origins) for index in indices):
++            raise ValueError("canonical group event indices are outside origins")
++        start_ms = _exact_int(getattr(group, "time_ms", None), "group start")
++        item = _observed_group(
++            origins=(event_origins[index] for index in indices),
++            group_type=group_type,
++            start_ms=start_ms,
++            interval=interval,
++        )
++        if item is not None:
++            observed.append(item)
++    return GameplayGroupStageSnapshot(tuple(observed))
++
++
++def count_mania_objects(
++    objects: Sequence[Any],
++    interval: RequiredGameplayIntervalObservation,
++) -> GameplayGroupStageSnapshot:
++    observed = []
++    for obj in objects:
++        if type(obj) is dict:
++            kind = obj.get("kind")
++            start_ms = obj.get("startTimeMs")
++            origins = obj.get("startOrigins")
++        else:
++            kind = getattr(obj, "kind", None)
++            start_ms = getattr(obj, "start_time_ms", None)
++            origins = getattr(obj, "start_origins", None)
++        group_type = {"TAP": "TAP", "HOLD": "HOLD_START"}.get(kind)
++        if group_type is None or type(origins) not in (list, tuple):
++            raise ValueError("mania object origin accounting is malformed")
++        item = _observed_group(
++            origins=origins,
++            group_type=group_type,
++            start_ms=_exact_int(start_ms, "mania object start"),
++            interval=interval,
++        )
++        if item is not None:
++            observed.append(item)
++    return GameplayGroupStageSnapshot(tuple(observed))
++
++
++def first_loss_stage(stages: Sequence[GameplayGroupStageSnapshot]) -> str | None:
++    if len(stages) != len(_STAGE_NAMES):
++        raise ValueError("origin accounting requires exactly five stages")
++    counts = [
++        stage.to_count_dict()["intervalGeneratedCompleteGroups"] for stage in stages
++    ]
++    for index in range(1, len(counts)):
++        if counts[index] < counts[index - 1]:
++            return _STAGE_NAMES[index]
++    return None
++
++
++def required_gameplay_invocation_digest(
++    args: Any,
++    *,
++    audio_path: Path,
++    reference_path: Path,
++    interval: RequiredGameplayIntervalObservation,
++) -> str:
++    audio_path = _regular_file(audio_path, "audio_path")
++    reference_path = _regular_file(reference_path, "reference_path")
++    descriptors = getattr(args, "descriptors", None)
++    if type(descriptors) is not list or any(type(item) is not str for item in descriptors):
++        raise TypeError("descriptors must be an exact string list")
++    payload = {
++        "version": REQUIRED_GAMEPLAY_INVOCATION_VERSION,
++        "input": {
++            "audioSha256": _sha256_path(audio_path),
++            "referenceSha256": _sha256_path(reference_path),
++        },
++        "runtime": {
++            "configName": "v32",
++            "fastDecoderLoop": getattr(args, "fast_decoder_loop"),
++            "maniaHoldStateMode": getattr(args, "mania_hold_state_mode"),
++            "precision": getattr(args, "precision"),
++            "resnapEvents": getattr(args, "resnap_events"),
++        },
++        "generation": {
++            "addToBeatmap": getattr(args, "add_to_beatmap"),
++            "cfgScale": getattr(args, "cfg_scale"),
++            "descriptors": list(descriptors),
++            "difficulty": getattr(args, "difficulty"),
++            "endTimeMs": getattr(args, "end_time"),
++            "gamemode": getattr(args, "gamemode"),
++            "inContext": _context_values(getattr(args, "in_context"), "in_context"),
++            "keycount": getattr(args, "keycount"),
++            "lastAttackTimeMs": getattr(args, "last_attack_time"),
++            "outputType": _context_values(getattr(args, "output_type"), "output_type"),
++            "parallel": getattr(args, "parallel"),
++            "seed": getattr(args, "seed"),
++            "startTimeMs": getattr(args, "start_time"),
++            "superTiming": getattr(args, "super_timing"),
++            "year": getattr(args, "year"),
++        },
++        "requiredGameplayInterval": {
++            "allowedGroupTypes": list(interval.allowed_group_types),
++            "endTimeMs": interval.end_ms,
++            "evidenceClass": interval.evidence_class,
++            "evidenceDigest": interval.evidence_digest,
++            "minimumCompleteGroups": interval.minimum_complete_groups,
++            "mode": interval.mode,
++            "startTimeMs": interval.start_ms,
++        },
++    }
++    canonical = json.dumps(
++        payload,
++        ensure_ascii=True,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    ).encode("ascii")
++    return hashlib.sha256(canonical).hexdigest()
++
++
++def write_generation_origin_diagnostics(
++    output_path: Path,
++    *,
++    evidence_digest: str,
++    invocation_digest: str,
++    interval: RequiredGameplayIntervalObservation,
++    stages: Sequence[GameplayGroupStageSnapshot],
++) -> Path:
++    output_path = _regular_file(output_path, "output_path")
++    _sha256(evidence_digest, "evidence digest")
++    _sha256(invocation_digest, "invocation digest")
++    if len(stages) != len(_STAGE_NAMES) or any(
++        type(stage) is not GameplayGroupStageSnapshot for stage in stages
++    ):
++        raise ValueError("origin accounting requires five typed stages")
++    counts = [stage.to_count_dict() for stage in stages]
++    for previous, current in zip(counts, counts[1:]):
++        if (
++            current["totalGeneratedCompleteGroups"]
++            > previous["totalGeneratedCompleteGroups"]
++            or current["intervalGeneratedCompleteGroups"]
++            > previous["intervalGeneratedCompleteGroups"]
++        ):
++            raise ValueError("generated-origin stage counts must not increase")
++    payload = {
++        "version": GENERATION_ORIGIN_DIAGNOSTICS_VERSION,
++        "output": {
++            "fileName": output_path.name,
++            "size": output_path.stat().st_size,
++            "sha256": _sha256_path(output_path),
++        },
++        "evidenceDigest": evidence_digest,
++        "invocationDigest": invocation_digest,
++        "requiredInterval": interval.to_dict(),
++        "stages": dict(zip(_STAGE_NAMES, counts)),
++        "firstLossStage": first_loss_stage(stages),
++    }
++    encoded = (
++        json.dumps(
++            payload,
++            ensure_ascii=True,
++            sort_keys=True,
++            separators=(",", ":"),
++            allow_nan=False,
++        )
++        + "\n"
++    ).encode("utf-8")
++    if len(encoded) > _MAX_DIAGNOSTICS_BYTES:
++        raise ValueError("generation-origin diagnostics exceeds 1 MiB")
++    sidecar = output_path.with_suffix(GENERATION_ORIGIN_DIAGNOSTICS_SUFFIX)
++    temporary = sidecar.with_name(f".{sidecar.name}.{uuid.uuid4().hex}.tmp")
++    try:
++        with temporary.open("xb") as stream:
++            stream.write(encoded)
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, sidecar)
++    finally:
++        if temporary.exists():
++            temporary.unlink()
++    return sidecar
+diff --git a/tests/test_required_gameplay_observation.py b/tests/test_required_gameplay_observation.py
+new file mode 100644
+index 0000000..a7d193f
+--- /dev/null
++++ b/tests/test_required_gameplay_observation.py
+@@ -0,0 +1,286 @@
++import hashlib
++import importlib.util
++import json
++import sys
++from enum import Enum
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++from omegaconf import OmegaConf
++
++MODULE_PATH = (
++    Path(__file__).parents[1]
++    / "osuT5"
++    / "osuT5"
++    / "inference"
++    / "required_gameplay_observation.py"
++)
++SPEC = importlib.util.spec_from_file_location(
++    "required_gameplay_observation_under_test",
++    MODULE_PATH,
++)
++assert SPEC is not None and SPEC.loader is not None
++MODULE = importlib.util.module_from_spec(SPEC)
++sys.modules[SPEC.name] = MODULE
++SPEC.loader.exec_module(MODULE)
++
++GENERATION_ORIGIN_DIAGNOSTICS_VERSION = (
++    MODULE.GENERATION_ORIGIN_DIAGNOSTICS_VERSION
++)
++GameplayGroupStageSnapshot = MODULE.GameplayGroupStageSnapshot
++count_canonical_groups = MODULE.count_canonical_groups
++first_loss_stage = MODULE.first_loss_stage
++required_gameplay_invocation_digest = MODULE.required_gameplay_invocation_digest
++required_gameplay_interval_from_args = MODULE.required_gameplay_interval_from_args
++write_generation_origin_diagnostics = MODULE.write_generation_origin_diagnostics
++
++
++def _context(value):
++    return SimpleNamespace(value=value)
++
++
++class _HydraContext(Enum):
++    TIMING = "timing"
++    MAP = "map"
++
++
++def _origin(kind, window=None, token=None, reference=None):
++    return SimpleNamespace(
++        kind=kind,
++        source_window_id=window,
++        source_token_index=token,
++        reference_event_index=reference,
++    )
++
++
++def _group(time_ms, lane, event_type, *indices):
++    return SimpleNamespace(
++        time_ms=time_ms,
++        lane=lane,
++        event_type=SimpleNamespace(name=event_type),
++        event_indices=indices,
++    )
++
++
++def _args(**overrides):
++    values = {
++        "required_gameplay_interval_mode": "OFF",
++        "required_gameplay_interval_start_time": None,
++        "required_gameplay_interval_end_time": None,
++        "required_gameplay_interval_minimum_complete_groups": None,
++        "required_gameplay_interval_allowed_group_types": None,
++        "required_gameplay_interval_evidence_class": None,
++        "required_gameplay_interval_evidence_digest": None,
++        "gamemode": 3,
++        "keycount": 4,
++        "difficulty": 2.0,
++        "year": 2023,
++        "seed": 17,
++        "precision": "fp16",
++        "add_to_beatmap": True,
++        "start_time": 4000,
++        "end_time": 8000,
++        "last_attack_time": 18000,
++        "mania_hold_state_mode": "incremental",
++        "in_context": [_context("TIMING")],
++        "output_type": [_context("MAP")],
++        "cfg_scale": 1.0,
++        "descriptors": ["style/mixed rice", "streams/bursts"],
++        "parallel": False,
++        "super_timing": False,
++        "fast_decoder_loop": True,
++        "resnap_events": True,
++    }
++    return SimpleNamespace(**(values | overrides))
++
++
++def _observe_args(**overrides):
++    values = {
++        "required_gameplay_interval_mode": "OBSERVE",
++        "required_gameplay_interval_start_time": 5000,
++        "required_gameplay_interval_end_time": 6000,
++        "required_gameplay_interval_minimum_complete_groups": 1,
++        "required_gameplay_interval_allowed_group_types": ["HOLD_START", "TAP"],
++        "required_gameplay_interval_evidence_class": "BROADBAND_ATTACK",
++        "required_gameplay_interval_evidence_digest": "a" * 64,
++    }
++    return _args(**(values | overrides))
++
++
++def test_off_has_no_observer_and_rejects_a_half_contract():
++    assert required_gameplay_interval_from_args(_args()) is None
++
++    with pytest.raises(ValueError, match="OFF.*stray"):
++        required_gameplay_interval_from_args(
++            _args(required_gameplay_interval_start_time=5000)
++        )
++
++
++def test_default_yaml_preserves_off_as_a_string_not_yaml_boolean():
++    config = OmegaConf.load(Path(__file__).parents[1] / "configs" / "inference" / "default.yaml")
++
++    assert config.required_gameplay_interval_mode == "OFF"
++    assert type(config.required_gameplay_interval_mode) is str
++
++
++def test_hydra_context_enums_are_normalized_to_contract_names():
++    interval = required_gameplay_interval_from_args(
++        _observe_args(
++            in_context=[_HydraContext.TIMING],
++            output_type=[_HydraContext.MAP],
++        )
++    )
++
++    assert interval is not None
++
++
++@pytest.mark.parametrize(
++    ("override", "message"),
++    [
++        ({"required_gameplay_interval_mode": "SHADOW_ENFORCE"}, "observe-only"),
++        ({"required_gameplay_interval_mode": "UNKNOWN"}, "mode"),
++        ({"required_gameplay_interval_start_time": True}, "start"),
++        ({"required_gameplay_interval_end_time": 5000}, "before"),
++        ({"required_gameplay_interval_minimum_complete_groups": 0}, "minimum"),
++        ({"required_gameplay_interval_allowed_group_types": ["TAP", "TAP"]}, "allowed"),
++        ({"required_gameplay_interval_allowed_group_types": ["HOLD_END"]}, "allowed"),
++        ({"required_gameplay_interval_evidence_class": "UNKNOWN"}, "evidence class"),
++        ({"required_gameplay_interval_evidence_digest": "bad"}, "digest"),
++        ({"gamemode": 0}, "mania"),
++        ({"add_to_beatmap": False}, "partial"),
++        ({"start_time": None}, "partial"),
++        ({"end_time": None}, "partial"),
++        ({"start_time": 5500}, "fit"),
++        ({"end_time": 5500}, "fit"),
++        ({"seed": None}, "seed"),
++        ({"resnap_events": False}, "resnap"),
++    ],
++)
++def test_observe_contract_rejects_ambiguous_or_unsupported_values(override, message):
++    with pytest.raises((TypeError, ValueError), match=message):
++        required_gameplay_interval_from_args(_observe_args(**override))
++
++
++def _events():
++    groups = [
++        _group(5000, 0, "CIRCLE", 0, 1),
++        _group(5000, 1, "CIRCLE", 2, 3),
++        _group(6000, 2, "HOLD_NOTE", 4, 5),
++        _group(6500, 2, "HOLD_NOTE_END", 6, 7),
++    ]
++    origins = [_origin("GENERATED", 7, index) for index in range(8)]
++    return groups, origins
++
++
++def test_group_snapshot_counts_chords_boundaries_and_hold_starts_not_ends():
++    interval = required_gameplay_interval_from_args(_observe_args())
++    assert interval is not None
++    groups, origins = _events()
++
++    snapshot = count_canonical_groups(groups, origins, interval)
++
++    assert snapshot.to_count_dict() == {
++        "totalGeneratedCompleteGroups": 3,
++        "intervalGeneratedCompleteGroups": 3,
++        "tapGroups": 2,
++        "holdStartGroups": 1,
++    }
++
++
++def test_reference_groups_do_not_satisfy_and_origin_identity_deduplicates():
++    interval = required_gameplay_interval_from_args(_observe_args())
++    assert interval is not None
++    groups, origins = _events()
++    reference = list(origins)
++    for index in groups[0].event_indices:
++        reference[index] = _origin("REFERENCE", reference=index)
++
++    first = count_canonical_groups(groups, reference, interval)
++    second = count_canonical_groups(groups, reference, interval)
++    merged = first.merge(second)
++
++    assert first.to_count_dict()["intervalGeneratedCompleteGroups"] == 2
++    assert merged == first
++
++
++def test_incomplete_group_fails_instead_of_being_hidden():
++    interval = required_gameplay_interval_from_args(_observe_args())
++    assert interval is not None
++    groups = [_group(5000, 0, "CIRCLE")]
++    with pytest.raises(ValueError, match="event indices"):
++        count_canonical_groups(
++            groups,
++            [],
++            interval,
++        )
++
++
++def test_first_loss_is_counted_only_after_decoder():
++    interval = required_gameplay_interval_from_args(_observe_args())
++    assert interval is not None
++    groups, origins = _events()
++    full = count_canonical_groups(groups, origins, interval)
++    empty = GameplayGroupStageSnapshot.empty()
++
++    assert first_loss_stage((full, full, empty, empty, empty)) == "canonical"
++    assert first_loss_stage((empty, empty, empty, empty, empty)) is None
++
++
++def test_invocation_digest_is_path_free_and_matches_worker_contract(tmp_path: Path):
++    audio = tmp_path / "title.flac"
++    reference = tmp_path / "reference.osu"
++    audio.write_bytes(b"canonical-audio")
++    reference.write_bytes(b"canonical-reference")
++    interval = required_gameplay_interval_from_args(_observe_args())
++    assert interval is not None
++
++    digest = required_gameplay_invocation_digest(
++        _observe_args(),
++        audio_path=audio,
++        reference_path=reference,
++        interval=interval,
++    )
++
++    assert digest == "84bdae33e91b705cad0eb52bcc5478a29153fc9ceb911d29b1006aaae398bbcc"
++    renamed = tmp_path / "renamed"
++    renamed.mkdir()
++    audio2 = renamed / "other.flac"
++    reference2 = renamed / "other.osu"
++    audio2.write_bytes(audio.read_bytes())
++    reference2.write_bytes(reference.read_bytes())
++    assert required_gameplay_invocation_digest(
++        _observe_args(),
++        audio_path=audio2,
++        reference_path=reference2,
++        interval=interval,
++    ) == digest
++
++
++def test_writer_binds_output_and_emits_first_loss_without_mutation(tmp_path: Path):
++    output = tmp_path / "out.osu"
++    output.write_bytes(b"osu file format v14\n")
++    interval = required_gameplay_interval_from_args(_observe_args())
++    assert interval is not None
++    groups, origins = _events()
++    full = count_canonical_groups(groups, origins, interval)
++    empty = GameplayGroupStageSnapshot.empty()
++    before = output.read_bytes()
++
++    sidecar = write_generation_origin_diagnostics(
++        output,
++        evidence_digest="a" * 64,
++        invocation_digest="b" * 64,
++        interval=interval,
++        stages=(full, full, empty, empty, empty),
++    )
++
++    assert output.read_bytes() == before
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    assert payload["version"] == GENERATION_ORIGIN_DIAGNOSTICS_VERSION
++    assert payload["firstLossStage"] == "canonical"
++    assert payload["output"] == {
++        "fileName": output.name,
++        "size": len(before),
++        "sha256": hashlib.sha256(before).hexdigest(),
++    }

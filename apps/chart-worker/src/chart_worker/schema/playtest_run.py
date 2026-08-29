@@ -72,6 +72,18 @@ class RunChartRefV2(RunChartRef):
         "RAW_UNVERIFIED",
         "SAFE_FALLBACK",
     ] = "PRIMARY"
+    family_assignment_kind: Literal[
+        "ORIGINAL",
+        "REASSIGNED",
+        "EMERGENCY_DUPLICATE",
+    ] = "ORIGINAL"
+    source_difficulty: Difficulty | None = None
+    family_resolution_state: Literal[
+        "RESOLVED",
+        "NARROW_REVIEW",
+        "UNRESOLVED",
+    ] = "RESOLVED"
+    family_resolution_reasons: list[str] = Field(default_factory=list)
     production_eligible: bool = True
     distribution_tier: Literal["PRODUCTION_CANDIDATE", "PLAYTEST_ONLY"] = (
         "PRODUCTION_CANDIDATE"
@@ -85,18 +97,43 @@ class RunChartRefV2(RunChartRef):
 
     @model_validator(mode="after")
     def _check_distribution_tier(self) -> Self:
-        is_fallback = self.provenance in {
+        provenance_fallback = self.provenance in {
             "COVERAGE_REPAIR",
             "RAW_UNVERIFIED",
             "SAFE_FALLBACK",
         }
+        family_adapted = self.family_assignment_kind != "ORIGINAL"
+        if family_adapted and self.source_difficulty is None:
+            raise ValueError("adapted family assignment requires source difficulty")
+        if (
+            self.family_assignment_kind == "ORIGINAL"
+            and self.source_difficulty is not None
+            and self.source_difficulty != self.difficulty
+        ):
+            raise ValueError("original family assignment source difficulty must match target")
+        is_fallback = provenance_fallback or family_adapted
+        family_unresolved = self.family_resolution_state != "RESOLVED"
+        if family_unresolved and not self.family_resolution_reasons:
+            raise ValueError("unresolved family state requires reason codes")
+        if not family_unresolved and self.family_resolution_reasons:
+            raise ValueError("resolved family state cannot carry unresolved reasons")
+        if self.family_resolution_reasons != sorted(
+            set(self.family_resolution_reasons)
+        ):
+            raise ValueError("family resolution reasons must be sorted and unique")
         if is_fallback and (
             self.production_eligible or self.distribution_tier != "PLAYTEST_ONLY"
         ):
             raise ValueError(
-                "fallback provenance must be PLAYTEST_ONLY and not production eligible"
+                "fallback provenance or family assignment must be PLAYTEST_ONLY "
+                "and not production eligible"
             )
-        if not is_fallback and (
+        if family_unresolved and (
+            self.production_eligible
+            or self.distribution_tier != "PLAYTEST_ONLY"
+        ):
+            raise ValueError("unresolved family must be playtest-only")
+        if not is_fallback and not family_unresolved and (
             not self.production_eligible
             or self.distribution_tier != "PRODUCTION_CANDIDATE"
         ):
@@ -117,10 +154,13 @@ class RunChartRefV2(RunChartRef):
             self.playability_tier != "DIAGNOSTIC_ONLY"
         ):
             raise ValueError("RAW_UNVERIFIED must be DIAGNOSTIC_ONLY")
-        if self.provenance in {"COVERAGE_REPAIR", "SAFE_FALLBACK"} and (
+        if (
+            self.provenance in {"COVERAGE_REPAIR", "SAFE_FALLBACK"}
+            or family_adapted
+        ) and (
             self.playability_tier == "MODEL_PLAYABLE"
         ):
-            raise ValueError("recovery provenance cannot be MODEL_PLAYABLE")
+            raise ValueError("recovery provenance or family assignment cannot be MODEL_PLAYABLE")
         return self
 
 

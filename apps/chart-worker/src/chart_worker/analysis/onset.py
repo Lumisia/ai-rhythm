@@ -14,6 +14,10 @@ import numpy as np
 from chart_worker.analysis.activity import AudioActivity, build_audio_activity
 from chart_worker.analysis.audio_io import AudioSignal, load_audio
 from chart_worker.analysis.beat import BeatGrid
+from chart_worker.analysis.leading_silence import (
+    LeadingSilenceObservation,
+    observe_leading_silence,
+)
 from chart_worker.analysis.terminal_silence import (
     TerminalSilenceObservation,
     observe_terminal_silence,
@@ -71,6 +75,7 @@ class OnsetAnalysis:
     onset_ms: tuple[int, ...]
     n_fft: int = N_FFT
     activity: AudioActivity | None = None
+    leading_silence: LeadingSilenceObservation | None = None
     terminal_silence: TerminalSilenceObservation | None = None
 
     @property
@@ -147,6 +152,10 @@ def analyze_canonical_audio(path: Path) -> OnsetAnalysis:
     analysis = analyze_onsets(signal, backend=librosa_backend())
     return dataclasses.replace(
         analysis,
+        leading_silence=observe_leading_silence(
+            signal,
+            first_onset_ms=analysis.onset_ms[0] if analysis.onset_ms else None,
+        ),
         terminal_silence=observe_terminal_silence(
             signal,
             last_onset_ms=analysis.onset_ms[-1] if analysis.onset_ms else None,

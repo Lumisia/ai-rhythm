@@ -1,13 +1,30 @@
+import io
 import json
+import os
+import shutil
+import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
+import chart_worker.cli as cli_module
 from chart_worker.cli import app
 from chart_worker.errors import ErrorCode, WorkerError
 
 runner = CliRunner()
+
+
+@pytest.fixture
+def workspace_tmp_path():
+    root = Path.cwd() / ".pytest-cli-workspace" / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root)
 
 
 def test_generate_cli_requires_existing_source(tmp_path: Path):
@@ -17,6 +34,10 @@ def test_generate_cli_requires_existing_source(tmp_path: Path):
     )
     assert result.exit_code == 2
     assert "does not exist" in result.output
+
+
+def test_cli_disables_rich_markup_for_redirect_safe_parser_errors():
+    assert app.rich_markup_mode is None
 
 
 def test_generate_cli_writes_worker_error_as_json(monkeypatch, tmp_path: Path):
@@ -61,9 +82,7 @@ def test_generate_cli_defaults_to_mapperatorinator(monkeypatch, tmp_path: Path):
         return SimpleNamespace(manifest_path=tmp_path / "manifest.json")
 
     monkeypatch.setattr("chart_worker.cli.run_pipeline", succeed)
-    result = runner.invoke(
-        app, ["generate", str(source), "--out", str(tmp_path / "run")]
-    )
+    result = runner.invoke(app, ["generate", str(source), "--out", str(tmp_path / "run")])
 
     assert result.exit_code == 0
     assert captured["options"].generator == "mapperatorinator"
@@ -151,3 +170,65 @@ def test_migrate_boundary_review_cli_prints_summary_path(monkeypatch, tmp_path: 
     assert captured["target_root"] == target
     assert captured["migrated_at"].tzinfo is not None
     assert str(target / "migration-summary.json") in result.output
+
+
+def test_replay_family_v3_cli_is_read_only(monkeypatch, workspace_tmp_path: Path):
+    report_path = workspace_tmp_path / "generation-report.json"
+    report_path.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def succeed(path):
+        captured["path"] = path
+        return {
+            "verifiedCandidatePayloadCount": 12,
+            "storedShadowMatches": True,
+            "additionalModelCalls": 0,
+            "mutatesArtifacts": False,
+        }
+
+    monkeypatch.setattr("chart_worker.cli.replay_generation_report_v3", succeed)
+    result = runner.invoke(app, ["replay-family-v3", str(report_path)])
+
+    assert result.exit_code == 0
+    assert captured["path"] == report_path
+    assert json.loads(result.output)["additionalModelCalls"] == 0
+
+
+def test_export_pairwise_v3_cli_prints_terminal_path(monkeypatch, workspace_tmp_path: Path):
+    source = workspace_tmp_path / "pairwise-source.json"
+    source.write_text("{}", encoding="utf-8")
+    output = workspace_tmp_path / "pairwise-export"
+    terminal = output / "export-terminal-v1.json"
+    captured = {}
+
+    def succeed(source_path, output_path):
+        captured.update(source=source_path, output=output_path)
+        return terminal
+
+    monkeypatch.setattr("chart_worker.cli.export_pairwise_task_bundle_v1", succeed)
+    result = runner.invoke(
+        app,
+        ["export-pairwise-v3", str(source), "--out", str(output)],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {"source": source, "output": output}
+    assert str(terminal) in result.output
+
+
+@pytest.mark.parametrize("err", (False, True))
+def test_cli_text_output_uses_utf8_when_parent_stream_is_strict_cp949(
+    monkeypatch,
+    err: bool,
+):
+    raw = io.BytesIO()
+    parent_stream = io.TextIOWrapper(raw, encoding="cp949", errors="strict")
+    stream_name = "stderr" if err else "stdout"
+    monkeypatch.setattr(sys, stream_name, parent_stream)
+
+    cli_module._echo_cli_text("C:/songs/隈/🔥/generation-report.json", err=err)
+    parent_stream.flush()
+
+    assert raw.getvalue().decode("utf-8") == (
+        f"C:/songs/隈/🔥/generation-report.json{os.linesep}"
+    )

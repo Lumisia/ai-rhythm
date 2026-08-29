@@ -100,6 +100,16 @@ export type PlayabilityTier =
   | "RECOVERY_PLAYABLE"
   | "DIAGNOSTIC_ONLY";
 
+export type FamilyAssignmentKind =
+  | "ORIGINAL"
+  | "REASSIGNED"
+  | "EMERGENCY_DUPLICATE";
+
+export type FamilyResolutionState =
+  | "RESOLVED"
+  | "NARROW_REVIEW"
+  | "UNRESOLVED";
+
 export interface CoverageSummary {
   firstNoteTimeMs: number | null;
   maxGapMs: number;
@@ -112,6 +122,10 @@ export interface RunChartRef extends AudioFileRef {
   keyMode: KeyMode;
   difficulty: Difficulty;
   provenance?: GenerationProvenance;
+  familyAssignmentKind?: FamilyAssignmentKind;
+  familyResolutionState?: FamilyResolutionState;
+  familyResolutionReasons?: string[];
+  sourceDifficulty?: Difficulty | null;
   productionEligible?: boolean;
   distributionTier?: "PRODUCTION_CANDIDATE" | "PLAYTEST_ONLY";
   playabilityTier?: PlayabilityTier;

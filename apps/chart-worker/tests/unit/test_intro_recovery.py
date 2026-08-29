@@ -1,5 +1,8 @@
+import math
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
 from chart_worker.generation import intro_recovery
@@ -11,6 +14,8 @@ from chart_worker.generation.generation_control import (
 from chart_worker.generation.intro_recovery import (
     build_intro_recovery_plan,
     execute_intro_retry,
+    intro_phrase_recovery_end_ms,
+    intro_region_recovery_end_ms,
 )
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.generation.params import GenerationRequest
@@ -79,6 +84,87 @@ def test_anchor_at_or_after_first_event_needs_no_leading_recovery():
         )
         is None
     )
+
+
+def test_phrase_window_uses_local_variable_bpm_for_four_beat_context():
+    assert intro_phrase_recovery_end_ms(
+        12_000,
+        (OsuBpmEvent(0, 120.0), OsuBpmEvent(10_000, 240.0)),
+        duration_ms=20_000,
+    ) == 13_000
+
+
+def test_phrase_window_integrates_a_bpm_change_inside_the_context() -> None:
+    assert intro_phrase_recovery_end_ms(
+        9_000,
+        (OsuBpmEvent(0, 120.0), OsuBpmEvent(10_000, 240.0)),
+        duration_ms=20_000,
+    ) == 10_500
+
+
+def test_phrase_window_declines_a_near_full_song_remap():
+    assert (
+        intro_phrase_recovery_end_ms(
+            17_000,
+            (OsuBpmEvent(0, 120.0),),
+            duration_ms=20_000,
+        )
+        is None
+    )
+
+
+def test_region_window_adds_local_four_beat_context_without_following_late_chart():
+    assert intro_region_recovery_end_ms(
+        4_320,
+        (OsuBpmEvent(0, 120.0),),
+        duration_ms=20_000,
+    ) == 6_320
+
+
+def test_region_window_integrates_non_aligned_variable_bpm_change():
+    assert intro_region_recovery_end_ms(
+        4_000,
+        (OsuBpmEvent(0, 120.0), OsuBpmEvent(4_750, 240.0)),
+        duration_ms=20_000,
+    ) == 5_375
+
+
+def test_region_window_declines_when_tempo_authority_starts_after_intro():
+    """A confirmed intro must not invent tempo before the first authority event."""
+
+    assert (
+        intro_region_recovery_end_ms(
+            3_741,
+            (OsuBpmEvent(6_937, 87.0),),
+            duration_ms=250_039,
+        )
+        is None
+    )
+
+
+def test_region_window_accepts_a_valid_pre_zero_tempo_event():
+    assert intro_region_recovery_end_ms(
+        4_000,
+        (OsuBpmEvent(-1_000, 120.0),),
+        duration_ms=20_000,
+    ) == 6_000
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (OsuBpmEvent(6_937, 0.0),),
+        (OsuBpmEvent(6_937, math.inf),),
+        (OsuBpmEvent(6_937, 120.0), OsuBpmEvent(6_937, 140.0)),
+    ],
+)
+def test_region_window_does_not_hide_a_malformed_late_tempo_map(events):
+    with pytest.raises(ValueError):
+        intro_region_recovery_end_ms(
+            3_741,
+            events,
+            duration_ms=250_039,
+        )
 
 
 def test_intro_retry_does_not_spend_budget_after_tail_exhaustion(monkeypatch, tmp_path: Path):

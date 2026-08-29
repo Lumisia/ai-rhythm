@@ -27,6 +27,11 @@ from chart_worker.generation.inference_execution import (
 )
 from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent
+from chart_worker.generation.required_gameplay_interval import (
+    RequiredGameplayIntervalV1,
+    advance_tempo_map_beats,
+    tempo_map_addresses,
+)
 from chart_worker.schema.note import Chart
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
@@ -41,6 +46,7 @@ from chart_worker.validation.timing_authority import (
 )
 
 INTRO_CONTEXT_BEATS = 4
+MAX_INTRO_RECOVERY_FRACTION = 0.80
 _VARIANT_COUNT = len(KEY_MODES) * len(DIFFICULTIES)
 
 EvaluateCandidate = Callable[..., ChartAcceptance]
@@ -115,6 +121,67 @@ def intro_anchor_distance_ms(
     return min(abs(note.time_ms - evidence.anchor_grid_ms) for note in notes)
 
 
+def intro_phrase_recovery_end_ms(
+    second_row_ms: int | None,
+    bpm_events: tuple[OsuBpmEvent, ...],
+    *,
+    duration_ms: int,
+) -> int | None:
+    """Return a phrase-bounded end for an isolated leading-gap remap."""
+
+    if second_row_ms is None:
+        return None
+    if type(second_row_ms) is not int or second_row_ms < 0:
+        raise ValueError("second_row_ms must be a non-negative exact integer or None")
+    if type(duration_ms) is not int or duration_ms <= 0:
+        raise ValueError("duration_ms must be a positive exact integer")
+    if not bpm_events or second_row_ms >= duration_ms:
+        return None
+    end_ms = min(
+        duration_ms,
+        advance_tempo_map_beats(
+            second_row_ms,
+            float(INTRO_CONTEXT_BEATS),
+            bpm_events,
+        ),
+    )
+    if end_ms / duration_ms > MAX_INTRO_RECOVERY_FRACTION:
+        return None
+    return end_ms
+
+
+def intro_region_recovery_end_ms(
+    region_end_ms: int | None,
+    bpm_events: tuple[OsuBpmEvent, ...],
+    *,
+    duration_ms: int,
+) -> int | None:
+    """Bound an intro repair by audio evidence plus local tempo context.
+
+    Unlike the legacy phrase repair, this window is independent of the
+    defective chart's next row.  A chart that starts a minute late therefore
+    cannot turn an intro-only repair into a near-full-song inference.
+    """
+
+    # A timing authority whose first event follows the confirmed intro does
+    # not define how four beats should advance from that region.  Decline the
+    # optional recovery window instead of inventing a pre-authority tempo.
+    # Keep malformed inputs on the normal validation path below so they still
+    # fail explicitly rather than being mistaken for unavailable evidence.
+    if (
+        type(region_end_ms) is int
+        and region_end_ms >= 0
+        and not tempo_map_addresses(region_end_ms, bpm_events)
+    ):
+        return None
+
+    return intro_phrase_recovery_end_ms(
+        region_end_ms,
+        bpm_events,
+        duration_ms=duration_ms,
+    )
+
+
 def covers_intro_anchor(notes: Chart, evidence: IntroAnchorEvidence) -> bool:
     distance = intro_anchor_distance_ms(notes, evidence)
     return distance is not None and distance <= GRID_SUPPORT_WINDOW_MS
@@ -138,8 +205,10 @@ def execute_intro_retry(
     recovery_reason: str = "INTRO_START_CONTRACT",
     evidence_prefix: str = "INTRO_CONTRACT",
     workdir_name: str = "intro-contract-retry",
+    partial_end_ms: int | None = None,
+    required_gameplay_interval: RequiredGameplayIntervalV1 | None = None,
 ) -> Candidate | None:
-    """Generate one full-map alternate seed for an unresolved intro policy."""
+    """Generate one phrase-bounded alternate for an unresolved intro policy."""
 
     if state.full_length_retry_blocked_by is not None:
         state.attempt_evidence.append(
@@ -151,7 +220,16 @@ def execute_intro_retry(
         return None
     if state.recovery.was_attempted(RecoveryKind.INTRO):
         return None
-    if not inference_budget.consume(prepared.normalized.duration_ms):
+    if (
+        type(partial_end_ms) is not int
+        or partial_end_ms <= 0
+        or partial_end_ms > prepared.normalized.duration_ms
+    ):
+        state.attempt_evidence.append(
+            {"reason": f"{evidence_prefix}_LOCAL_WINDOW_UNAVAILABLE"}
+        )
+        return None
+    if not inference_budget.consume(partial_end_ms):
         state.attempt_evidence.append(
             {
                 "reason": f"{evidence_prefix}_RETRY_BUDGET_EXHAUSTED",
@@ -166,13 +244,25 @@ def execute_intro_retry(
     attempt = state.budget.next_attempt
     retry_seed = base_seed + state.flat_index + (attempt - 1) * _VARIANT_COUNT
     state.budget.reserve_additional_attempt(seed=retry_seed)
+    reference_path = (
+        run_dir
+        / "raw"
+        / "work"
+        / f"epoch-{authority_epoch}"
+        / "intro-references"
+        / (
+            f"{state.key_mode}k-{state.difficulty.lower()}-"
+            f"attempt-{source.attempt}.osu"
+        )
+    )
     request = replace(
         source.request,
-        timing_reference_path=authority.reference_path,
+        timing_reference_path=reference_path,
         seed=retry_seed,
-        partial_start_ms=None,
-        partial_end_ms=None,
-        add_to_beatmap=False,
+        partial_start_ms=0,
+        partial_end_ms=partial_end_ms,
+        add_to_beatmap=True,
+        required_gameplay_interval=required_gameplay_interval,
     )
     workdir = (
         run_dir
@@ -185,6 +275,8 @@ def execute_intro_retry(
     purpose = f"{evidence_prefix}_RETRY"
     inference_completed = False
     try:
+        reference_path.parent.mkdir(parents=True, exist_ok=True)
+        reference_path.write_text(source.osu_text, encoding="utf-8")
         generated = run_inference_with_journal(
             state,
             generator=generator,
@@ -226,6 +318,7 @@ def execute_intro_retry(
                 else f"{evidence_prefix}_RETRY_REJECTED"
             ),
             "gateReport": acceptance.to_report(),
+            "partialWindow": {"startMs": 0, "endMs": partial_end_ms},
         }
         state.attempt_evidence.append(evidence)
         if acceptance.action is GateAction.RETRY_MAP:
@@ -279,7 +372,7 @@ def execute_intro_retry(
             workdir=workdir,
             attempt=attempt,
             seed=retry_seed,
-            provenance="RETRY",
+            provenance="INTRO_RECOVERY",
             recovery_reason=recovery_reason,
             intro_anchor_covered=intro_anchor_covered(generated, authority),
         )

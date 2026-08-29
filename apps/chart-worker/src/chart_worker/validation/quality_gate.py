@@ -51,6 +51,28 @@ class GateAction(StrEnum):
     REVIEW = "REVIEW"
 
 
+class CandidateDisposition(StrEnum):
+    ADMIT = "ADMIT"
+    REVIEW = "REVIEW"
+    QUALITY_DEFECT = "QUALITY_DEFECT"
+    HARD_REJECT = "HARD_REJECT"
+
+
+_HARD_REJECT_AXES = frozenset(
+    {
+        GateAxis.STRUCTURE,
+        GateAxis.SONG_BOUNDS,
+        GateAxis.TIMING_IDENTITY,
+    }
+)
+_SUPPORTED_REPAIR_AXES = frozenset(
+    {
+        GateAxis.TIMING_ALIGNMENT,
+        GateAxis.COVERAGE,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class GateDecision:
     axis: GateAxis
@@ -67,6 +89,43 @@ class ChartAcceptance:
     profile: ChartQualityProfile | None = None
     structure_error: dict[str, object] | None = None
 
+    @property
+    def retry_axes(self) -> tuple[GateAxis, ...]:
+        return tuple(
+            decision.axis
+            for decision in self.decisions
+            if decision.action is GateAction.RETRY_MAP
+        )
+
+    @property
+    def disposition(self) -> CandidateDisposition:
+        retry_axes = set(self.retry_axes)
+        if retry_axes.intersection(_HARD_REJECT_AXES):
+            return CandidateDisposition.HARD_REJECT
+        if retry_axes:
+            return CandidateDisposition.QUALITY_DEFECT
+        if any(
+            decision.action is GateAction.REVIEW for decision in self.decisions
+        ):
+            return CandidateDisposition.REVIEW
+        return CandidateDisposition.ADMIT
+
+    @property
+    def repair_axes(self) -> tuple[GateAxis, ...]:
+        if self.disposition is not CandidateDisposition.QUALITY_DEFECT:
+            return ()
+        return tuple(
+            axis for axis in self.retry_axes if axis in _SUPPORTED_REPAIR_AXES
+        )
+
+    @property
+    def repair_eligible(self) -> bool:
+        return (
+            self.disposition is CandidateDisposition.QUALITY_DEFECT
+            and bool(self.retry_axes)
+            and set(self.retry_axes).issubset(_SUPPORTED_REPAIR_AXES)
+        )
+
     def decision(self, axis: GateAxis) -> GateDecision:
         """Return the independently recorded decision for one acceptance axis."""
         for decision in self.decisions:
@@ -78,6 +137,9 @@ class ChartAcceptance:
         """Serialize only stable machine-readable acceptance evidence."""
         return {
             "action": self.action.value,
+            "candidateDisposition": self.disposition.value,
+            "repairEligible": self.repair_eligible,
+            "repairAxes": [axis.value for axis in self.repair_axes],
             "decisions": {
                 decision.axis.value: {
                     "action": decision.action.value,
@@ -167,43 +229,42 @@ def _song_bounds_decision(
 
 def _coverage_decision(timing: TimingDiagnostics) -> GateDecision:
     active_reasons = tuple(
-        (
-            f"ATTACK_REQUIRED_{gap.position}_GAP"
-            if gap.opportunity is not None
-            and gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
-            else f"ACTIVE_{gap.position}_GAP"
-        )
+        f"ATTACK_REQUIRED_{gap.position}_GAP"
         for gap in timing.coverage_gaps
-        if gap.opportunity is None
-        or gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
+        if gap.opportunity is not None
+        and gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
     )
     if active_reasons:
         return GateDecision(GateAxis.COVERAGE, GateAction.RETRY_MAP, active_reasons)
-    insufficient_active_reasons = tuple(
-        f"INSUFFICIENT_COVERAGE_EVIDENCE_{gap.position}_GAP"
-        for gap in timing.coverage_gaps
-        if gap.opportunity is not None
-        and gap.opportunity.kind is CoverageKind.INSUFFICIENT_EVIDENCE
+    uncertain_reasons = tuple(
+        f"UNCERTAIN_COVERAGE_EVIDENCE_{gap.position}_GAP"
+        for gap in timing.uncertain_coverage_gaps
     )
     quiet_reasons = tuple(
         (
-            f"SUSTAIN_REPRESENTABLE_{gap.position}_GAP"
+            f"SUSTAIN_COVERED_{gap.position}_GAP"
             if gap.opportunity is not None
-            and gap.opportunity.kind is CoverageKind.SUSTAIN_REPRESENTABLE
-            else f"INSUFFICIENT_COVERAGE_EVIDENCE_{gap.position}_GAP"
+            and gap.opportunity.kind is CoverageKind.SUSTAIN_COVERED
+            else f"MUSICAL_REST_OR_SIMPLIFICATION_{gap.position}_GAP"
             if gap.opportunity is not None
+            and gap.opportunity.kind
+            is CoverageKind.MUSICAL_REST_OR_SIMPLIFICATION
             else f"QUIET_{gap.position}_GAP"
         )
         for gap in timing.quiet_coverage_gaps
     )
-    if insufficient_active_reasons:
+    if uncertain_reasons:
         return GateDecision(
             GateAxis.COVERAGE,
             GateAction.REVIEW,
-            (*insufficient_active_reasons, *quiet_reasons),
+            (*uncertain_reasons, *quiet_reasons),
         )
     if quiet_reasons:
-        if any(gap.opportunity is not None for gap in timing.quiet_coverage_gaps):
+        if any(
+            gap.opportunity is not None
+            and gap.opportunity.kind is CoverageKind.SUSTAIN_COVERED
+            for gap in timing.quiet_coverage_gaps
+        ):
             return GateDecision(GateAxis.COVERAGE, GateAction.REVIEW, quiet_reasons)
         near_active_trailing = any(
             gap.position == "TRAILING"

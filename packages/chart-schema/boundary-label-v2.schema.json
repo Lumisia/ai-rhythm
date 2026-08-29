@@ -101,7 +101,8 @@
             {
               "enum": [
                 "SHADOW",
-                "EXPERIMENTAL_ENFORCED"
+                "EXPERIMENTAL_ENFORCED",
+                "HIGH_CONFIDENCE_ENFORCED"
               ],
               "type": "string"
             },

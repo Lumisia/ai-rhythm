@@ -7,9 +7,11 @@ from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.song_context import LocalTempoMap, SongAnalysisContext
 from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.schema.note import NoteEvent
+from chart_worker.validation.intro_region_contract import IntroRegionContract
 from chart_worker.validation.intro_start_contract import (
     IntroAlignmentEvidence,
     IntroCandidateView,
+    IntroStartContract,
     align_first_row,
     build_intro_start_contract,
     validate_exact_first_row,
@@ -80,6 +82,78 @@ def test_contract_rejects_near_but_not_exact_first_rows():
     assert contract.canonical_first_row_ms == 500
     assert review.status == "REVIEW"
     assert review.mismatches == ((4, "D11", 501),)
+
+
+def test_confirmed_region_accepts_distinct_first_rows_but_keeps_exact_observation():
+    song_context = replace(
+        context(first_timing_ms=442, onsets=(21, 224, 459, 683, 896)),
+        intro_anchor=IntroAnchorEvidence(
+            status="CONFIRMED",
+            anchor_ms=21,
+            anchor_grid_ms=0,
+            grid_distance_ms=21,
+            aggregate_percentile_rank=0.78,
+            prominent_band_count=1,
+            pulse_continuation_matches=4,
+            pulse_continuation_opportunities=4,
+            supported_pulse_ms=(0, 231, 462, 692, 923),
+        ),
+    )
+    candidates = tuple(
+        candidate(key_mode, difficulty, first_row_ms, audio_supported=True)
+        for (key_mode, difficulty), first_row_ms in zip(
+            (
+                (key_mode, difficulty)
+                for key_mode in (4, 6, 7)
+                for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+            ),
+            (903, 211, 211, 95, 903, 903, 95, 95, 903, 672, 442, 95),
+            strict=True,
+        )
+    )
+
+    contract = build_intro_start_contract(song_context, candidates)
+    review = validate_exact_first_row(contract, candidates)
+
+    assert contract.version == "intro-start-contract-v3"
+    assert contract.intro_region is not None
+    assert contract.intro_region.allowed_first_row_ms == (0, 993)
+    assert review.status == "PASS"
+    assert review.mismatches == ()
+    assert len(review.exact_mismatches) > 0
+
+
+def test_legacy_v2_pass_keeps_exact_first_row_semantics():
+    candidates = (
+        candidate(4, "EASY", 100, audio_supported=True),
+        candidate(4, "NORMAL", 500, audio_supported=True),
+    )
+    legacy_contract = IntroStartContract(
+        version="intro-start-contract-v2",
+        canonical_first_row_ms=500,
+        candidate_support_count=1,
+        raw_supported=True,
+        audio_supported=True,
+        grid_distance_ms=0,
+        candidates=candidates,
+        intro_region=IntroRegionContract(
+            version="intro-region-contract-v1",
+            status="CONFIRMED",
+            allowed_first_row_ms=(0, 993),
+            leading_silence_end_ms=None,
+            anchor_ms=100,
+            anchor_grid_ms=0,
+            supported_pulse_ms=(0, 231, 462, 692, 923),
+            quantization_tolerance_ms=70,
+            reasons=("AUDIO_SUPPORTED_INTRO_REGION",),
+        ),
+    )
+
+    review = validate_exact_first_row(legacy_contract, candidates)
+
+    assert review.status == "REVIEW"
+    assert review.mismatches == ((4, "EASY", 100),)
+    assert review.exact_mismatches == review.mismatches
 
 
 def test_audio_supported_time_before_first_timing_point_can_be_canonical():

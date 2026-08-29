@@ -2,8 +2,10 @@ import pytest
 
 from chart_worker.validation.intro_phrase_family import (
     IntroPhraseChartView,
+    corroborate_intro_phrase_review,
     review_intro_phrase_pair,
 )
+from chart_worker.validation.intro_region_contract import IntroRegionCandidateReview
 
 
 def view(
@@ -81,6 +83,63 @@ def test_late_expert_start_is_separate_from_post_first_gap_defect():
         view("HARD", 0, 250, 0.5),
         view("EXPERT", 12_000, 12_250, 0.5),
         start_delta_beats=24.0,
+    )
+
+    assert result.status == "REVIEW"
+    assert result.reason == "EXPERT_LATE_START"
+
+
+def test_confirmed_region_promotes_late_expert_start_to_a_recoverable_defect():
+    base = review_intro_phrase_pair(
+        view("HARD", 211, 442, 0.5),
+        view("EXPERT", 20_748, 20_979, 0.5),
+        start_delta_beats=44.5,
+    )
+
+    result = corroborate_intro_phrase_review(
+        base,
+        hard_region=IntroRegionCandidateReview(
+            "PASS",
+            "WITHIN_CONFIRMED_INTRO_REGION",
+            211,
+            (0, 993),
+        ),
+        expert_region=IntroRegionCandidateReview(
+            "DEFECT",
+            "CONFIRMED_INTRO_REGION_MISSED",
+            20_748,
+            (0, 993),
+            lateness_ms=19_755,
+        ),
+    )
+
+    assert result.status == "DEFECT"
+    assert result.reason == "EXPERT_OUTSIDE_CONFIRMED_INTRO_REGION"
+    assert result.should_recover is True
+
+
+def test_region_corroboration_fails_closed_without_a_safe_hard_control():
+    base = review_intro_phrase_pair(
+        view("HARD", 5_000, 5_250, 0.5),
+        view("EXPERT", 20_748, 20_979, 0.5),
+        start_delta_beats=31.5,
+    )
+
+    result = corroborate_intro_phrase_review(
+        base,
+        hard_region=IntroRegionCandidateReview(
+            "UNKNOWN",
+            "INTRO_REGION_EVIDENCE_UNAVAILABLE",
+            5_000,
+            None,
+        ),
+        expert_region=IntroRegionCandidateReview(
+            "DEFECT",
+            "CONFIRMED_INTRO_REGION_MISSED",
+            20_748,
+            (0, 993),
+            lateness_ms=19_755,
+        ),
     )
 
     assert result.status == "REVIEW"

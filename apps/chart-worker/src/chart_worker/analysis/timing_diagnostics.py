@@ -1,7 +1,6 @@
 """Read-only onset alignment diagnostics for generated note rows."""
 
 from dataclasses import dataclass
-from itertools import pairwise
 from typing import Literal
 
 import numpy as np
@@ -19,6 +18,7 @@ from chart_worker.analysis.coverage_opportunity import (
     classify_coverage_interval,
 )
 from chart_worker.analysis.event_matching import maximum_ordered_match_count
+from chart_worker.analysis.gameplay_occupancy import gameplay_intervals
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.analysis.song_context import LocalTempoMap
 from chart_worker.generation.osu_parser import OsuBpmEvent
@@ -97,6 +97,16 @@ class TimingCoverageGap:
     position: Literal["LEADING", "POST_FIRST", "MIDDLE", "TRAILING"]
     opportunity: CoverageOpportunity | None = None
     local_audio_evidence: LocalAudioGapEvidence | None = None
+    row_span_start_ms: int | None = None
+    unoccupied_start_ms: int | None = None
+
+    @property
+    def unoccupied_duration_ms(self) -> int:
+        return self.end_ms - (
+            self.start_ms
+            if self.unoccupied_start_ms is None
+            else self.unoccupied_start_ms
+        )
 
     def to_report(self) -> dict[str, object]:
         report: dict[str, object] = {
@@ -107,6 +117,23 @@ class TimingCoverageGap:
             "activeOnsetCount": self.active_onset_count,
             "activeFrameRatio": self.active_frame_ratio,
             "position": self.position,
+            "rowSpanStartMs": (
+                self.start_ms
+                if self.row_span_start_ms is None
+                else self.row_span_start_ms
+            ),
+            "rowSpanDurationMs": self.end_ms
+            - (
+                self.start_ms
+                if self.row_span_start_ms is None
+                else self.row_span_start_ms
+            ),
+            "unoccupiedStartMs": (
+                self.start_ms
+                if self.unoccupied_start_ms is None
+                else self.unoccupied_start_ms
+            ),
+            "unoccupiedDurationMs": self.unoccupied_duration_ms,
         }
         if self.opportunity is not None:
             report["opportunity"] = self.opportunity.to_report()
@@ -126,6 +153,8 @@ class TimingDiagnostics:
     quiet_coverage_gaps: tuple[TimingCoverageGap, ...]
     overall: TimingMetrics
     sections: tuple[TimingSection, ...]
+    uncertain_coverage_gaps: tuple[TimingCoverageGap, ...] = ()
+    max_row_span_gap_ms: int = 0
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -136,6 +165,10 @@ class TimingDiagnostics:
             "maxGapMs": self.max_gap_ms,
             "coverageGaps": [gap.to_report() for gap in self.coverage_gaps],
             "quietCoverageGaps": [gap.to_report() for gap in self.quiet_coverage_gaps],
+            "uncertainCoverageGaps": [
+                gap.to_report() for gap in self.uncertain_coverage_gaps
+            ],
+            "maxRowSpanGapMs": self.max_row_span_gap_ms,
             "overall": self.overall.to_report(),
             "sections": [section.to_report() for section in self.sections],
         }
@@ -243,80 +276,109 @@ def _coverage_gaps(
     onset_analysis: OnsetAnalysis | None,
     tempo_map: LocalTempoMap | None,
     difficulty: str | None,
-) -> tuple[tuple[TimingCoverageGap, ...], tuple[TimingCoverageGap, ...]]:
+) -> tuple[
+    tuple[TimingCoverageGap, ...],
+    tuple[TimingCoverageGap, ...],
+    tuple[TimingCoverageGap, ...],
+]:
     coverage_rows = tuple(row for row in rows if 0 <= row <= duration_ms)
-    boundaries = tuple(sorted({0, duration_ms, *coverage_rows}))
     first_row_ms = coverage_rows[0] if coverage_rows else None
     second_row_ms = coverage_rows[1] if len(coverage_rows) >= 2 else None
     active_gaps = []
     quiet_gaps = []
-    for start_ms, end_ms in pairwise(boundaries):
+    uncertain_gaps = []
+    for interval in gameplay_intervals(notes, start_ms=0, end_ms=duration_ms):
+        row_span_start_ms = interval.row_span_start_ms
+        start_ms = interval.unoccupied_start_ms
+        end_ms = interval.end_ms
+        # A HOLD occupies one lane, not the whole Mania playfield.  Measure the
+        # true all-row vacancy from ``start_ms``, but classify audible attacks
+        # over the complete row span.  The repair layer decides whether the
+        # interval is a vacant phrase or under-HOLD polyphony.
+        opportunity_start_ms = row_span_start_ms
         onset_start = int(np.searchsorted(onsets, start_ms, side="right"))
         onset_end = int(np.searchsorted(onsets, end_ms, side="left"))
         onset_count = onset_end - onset_start
         active_start = int(np.searchsorted(active_onsets, start_ms, side="right"))
         active_end = int(np.searchsorted(active_onsets, end_ms, side="left"))
         active_onset_count = active_end - active_start
+        opportunity_active_start = int(
+            np.searchsorted(active_onsets, opportunity_start_ms, side="right")
+        )
+        opportunity_active_onset_count = active_end - opportunity_active_start
         active_frame_ratio = (
             1.0
             if activity is None
             else round(activity.active_frame_ratio(start_ms, end_ms), 6)
         )
+        opportunity_active_frame_ratio = (
+            1.0
+            if activity is None
+            else round(
+                activity.active_frame_ratio(opportunity_start_ms, end_ms),
+                6,
+            )
+        )
         local_audio_evidence = (
             measure_local_gap_evidence(
                 onset_analysis,
-                start_ms=start_ms,
+                start_ms=opportunity_start_ms,
                 end_ms=end_ms,
             )
             if onset_analysis is not None
-            and end_ms - start_ms >= MIN_PHRASE_DURATION_MS
+            and end_ms - opportunity_start_ms >= MIN_PHRASE_DURATION_MS
             else None
         )
         opportunity = None
         if (
             onset_analysis is not None
-            and activity is not None
             and tempo_map is not None
             and difficulty is not None
-            and end_ms - start_ms >= MIN_PHRASE_DURATION_MS
-            and active_onset_count >= min(MIN_STRONG_ATTACKS.values())
-            and active_frame_ratio >= ACTIVE_GAP_MIN_FRAME_RATIO
+            and end_ms - opportunity_start_ms >= MIN_PHRASE_DURATION_MS
+            and opportunity_active_onset_count
+            >= min(MIN_STRONG_ATTACKS.values())
+            and (
+                activity is None
+                or opportunity_active_frame_ratio
+                >= ACTIVE_GAP_MIN_FRAME_RATIO
+            )
         ):
             opportunity = classify_coverage_interval(
                 notes,
                 onset_analysis,
                 tempo_map,
-                start_ms=start_ms,
+                start_ms=opportunity_start_ms,
                 end_ms=end_ms,
                 difficulty=difficulty,
             )
-            # Insufficient evidence must not erase a legacy active gap.  The
-            # quality gate can downgrade it to REVIEW, while recovery/timing
-            # preflight still sees that the generated grid has not proved
-            # coverage.  Only positive sustain evidence moves a gap to quiet.
             target = (
-                quiet_gaps
-                if opportunity.kind is CoverageKind.SUSTAIN_REPRESENTABLE
-                else active_gaps
+                active_gaps
+                if opportunity.kind is CoverageKind.ATTACK_REQUIRED
+                else uncertain_gaps
+                if opportunity.kind is CoverageKind.UNCERTAIN
+                else quiet_gaps
             )
             target.append(
                 TimingCoverageGap(
-                    start_ms=start_ms,
+                    start_ms=opportunity_start_ms,
                     end_ms=end_ms,
                     onset_count=onset_count,
                     active_onset_count=active_onset_count,
                     active_frame_ratio=active_frame_ratio,
                     position=(
                         "POST_FIRST"
-                        if start_ms == first_row_ms and end_ms == second_row_ms
+                        if row_span_start_ms == first_row_ms
+                        and end_ms == second_row_ms
                         else "LEADING"
-                        if start_ms == 0 and end_ms == first_row_ms
+                        if row_span_start_ms == 0 and end_ms == first_row_ms
                         else "TRAILING"
                         if end_ms == duration_ms
                         else "MIDDLE"
                     ),
                     opportunity=opportunity,
                     local_audio_evidence=local_audio_evidence,
+                    row_span_start_ms=row_span_start_ms,
+                    unoccupied_start_ms=start_ms,
                 )
             )
             continue
@@ -339,6 +401,8 @@ def _coverage_gaps(
                     else "MIDDLE"
                 ),
                 local_audio_evidence=local_audio_evidence,
+                row_span_start_ms=row_span_start_ms,
+                unoccupied_start_ms=start_ms,
             )
             target = (
                 active_gaps
@@ -347,7 +411,7 @@ def _coverage_gaps(
                 else quiet_gaps
             )
             target.append(gap)
-    return tuple(active_gaps), tuple(quiet_gaps)
+    return tuple(active_gaps), tuple(quiet_gaps), tuple(uncertain_gaps)
 
 
 def _time_after_beats(
@@ -462,7 +526,7 @@ def diagnose_chart_timing(
         )
     )
     overall = _metrics(rows, onsets)
-    coverage_gaps, quiet_coverage_gaps = _coverage_gaps(
+    coverage_gaps, quiet_coverage_gaps, uncertain_coverage_gaps = _coverage_gaps(
         notes,
         rows,
         onsets,
@@ -520,13 +584,37 @@ def diagnose_chart_timing(
     elif (
         overall.precision_50 < OVERALL_PRECISION_50_MIN
         or coverage_gaps
+        or uncertain_coverage_gaps
         or any(section.status == "REVIEW" for section in sections)
     ):
         status = "REVIEW"
     else:
         status = "PASS"
 
-    max_gap_ms = max((right - left for left, right in pairwise(rows)), default=0)
+    occupancy_intervals = (
+        gameplay_intervals(
+            notes,
+            start_ms=0,
+            end_ms=coverage_end_ms,
+        )
+        if coverage_end_ms > 0
+        else ()
+    )
+    coverage_row_set = {row for row in rows if 0 <= row <= coverage_end_ms}
+    inter_row_intervals = tuple(
+        interval
+        for interval in occupancy_intervals
+        if interval.row_span_start_ms in coverage_row_set
+        and interval.end_ms in coverage_row_set
+    )
+    max_gap_ms = max(
+        (interval.unoccupied_duration_ms for interval in inter_row_intervals),
+        default=0,
+    )
+    max_row_span_gap_ms = max(
+        (interval.row_span_duration_ms for interval in inter_row_intervals),
+        default=0,
+    )
     return TimingDiagnostics(
         status=status,
         onset_count=int(onsets.size),
@@ -537,4 +625,6 @@ def diagnose_chart_timing(
         quiet_coverage_gaps=quiet_coverage_gaps,
         overall=overall,
         sections=tuple(sections),
+        uncertain_coverage_gaps=uncertain_coverage_gaps,
+        max_row_span_gap_ms=max_row_span_gap_ms,
     )

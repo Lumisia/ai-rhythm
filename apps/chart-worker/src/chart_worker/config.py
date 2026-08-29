@@ -38,6 +38,9 @@ class WorkerConfig(BaseSettings):
         le=30.0,
     )
     difficulty_selector_mode: Literal["CURRENT", "SHADOW_V2", "V2"] = "V2"
+    difficulty_shadow_challenger_enabled: bool = False
+    difficulty_family_compiler_shadow_enabled: bool = False
+    difficulty_family_resolution_enabled: bool = True
     boundary_policy_mode: Literal[
         "SHADOW",
         "EXPERIMENTAL_ENFORCED",

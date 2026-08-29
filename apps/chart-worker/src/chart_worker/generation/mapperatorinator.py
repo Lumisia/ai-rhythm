@@ -5,6 +5,7 @@
 """
 
 import json
+import math
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -15,6 +16,11 @@ from typing import Literal, Protocol
 from chart_worker.audio.runner import CommandError, CommandResult, CommandRunner
 from chart_worker.config import WorkerConfig
 from chart_worker.errors import ErrorCode, WorkerError
+from chart_worker.generation.generation_origin_diagnostics import (
+    GenerationOriginDiagnostics,
+    GenerationOriginDiagnosticsError,
+    read_generation_origin_diagnostics,
+)
 from chart_worker.generation.inference_session import InferenceSession, InvocationResult
 from chart_worker.generation.mapperatorinator_patch import require_mapperatorinator_patch
 from chart_worker.generation.osu_parser import OsuBeatmap, OsuBpmEvent, parse_osu_file
@@ -24,6 +30,9 @@ from chart_worker.generation.params import (
     PRECISION,
     GenerationRequest,
     TimingGenerationRequest,
+)
+from chart_worker.generation.required_gameplay_invocation import (
+    required_gameplay_invocation_digest,
 )
 from chart_worker.generation.resnap_diagnostics import (
     RESNAP_DIAGNOSTICS_VERSION,
@@ -91,6 +100,7 @@ class GeneratedChart:
     resnap_diagnostics: ResnapDiagnostics = field(
         default_factory=ResnapDiagnostics.unobserved
     )
+    origin_diagnostics: GenerationOriginDiagnostics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +322,40 @@ def build_map_command(
                 "add_to_beatmap=true",
             ]
         )
+    required_interval = request.required_gameplay_interval
+    if required_interval is not None:
+        allowed_group_types = ",".join(
+            item.value for item in required_interval.allowed_group_types
+        )
+        argv.extend(
+            [
+                f"required_gameplay_interval_mode={required_interval.mode.value}",
+                (
+                    "required_gameplay_interval_start_time="
+                    f"{required_interval.start_ms}"
+                ),
+                (
+                    "required_gameplay_interval_end_time="
+                    f"{required_interval.end_ms}"
+                ),
+                (
+                    "required_gameplay_interval_minimum_complete_groups="
+                    f"{required_interval.minimum_complete_groups}"
+                ),
+                (
+                    "required_gameplay_interval_allowed_group_types="
+                    f"[{allowed_group_types}]"
+                ),
+                (
+                    "required_gameplay_interval_evidence_class="
+                    f"{required_interval.evidence_class.value}"
+                ),
+                (
+                    "required_gameplay_interval_evidence_digest="
+                    f"{required_interval.evidence_digest}"
+                ),
+            ]
+        )
     if request.max_note_start_ms is not None:
         argv.append(f"last_attack_time={request.max_note_start_ms}")
     if request.seed is not None:
@@ -489,6 +533,81 @@ def _require_partial_rejoin_context(
     return dict(value)
 
 
+_REQUIRED_GAMEPLAY_FAILURE_CONTEXT_KEYS = frozenset(
+    {
+        "version",
+        "reason",
+        "message",
+        "lane",
+        "timeMs",
+        "timeTokenId",
+        "eventIndex",
+        "decoderTokenIndex",
+        "generatedTokenIndex",
+        "rowIndex",
+        "sourceWindowId",
+        "context",
+    }
+)
+_REQUIRED_GAMEPLAY_FAILURE_REASONS = frozenset(
+    {
+        "REQUIRED_GAMEPLAY_INTERVAL_NOT_ADDRESSABLE",
+        "REQUIRED_GAMEPLAY_INTERVAL_TOKEN_BUDGET_EXHAUSTED",
+        "REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP",
+        "REQUIRED_GAMEPLAY_INTERVAL_UNSATISFIED_AT_CUT",
+        "REQUIRED_GAMEPLAY_INTERVAL_ACCOUNTING_MISMATCH",
+    }
+)
+
+
+def _require_required_gameplay_failure_context(
+    value: object,
+    *,
+    returncode: int,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != _REQUIRED_GAMEPLAY_FAILURE_CONTEXT_KEYS:
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    if value["version"] != 1 or type(value["version"]) is not int:
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    if value["reason"] not in _REQUIRED_GAMEPLAY_FAILURE_REASONS:
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    message = value["message"]
+    if type(message) is not str or not message or len(message) > 512:
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+
+    for context_field in (
+        "lane",
+        "timeTokenId",
+        "eventIndex",
+        "decoderTokenIndex",
+        "generatedTokenIndex",
+        "rowIndex",
+        "sourceWindowId",
+    ):
+        item = value[context_field]
+        if item is not None and not (type(item) is int and item >= 0):
+            raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    time_ms = value["timeMs"]
+    if time_ms is not None and not (
+        type(time_ms) in {int, float}
+        and math.isfinite(time_ms)
+        and time_ms >= 0
+    ):
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    if type(value["context"]) is not dict:
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    try:
+        encoded = json.dumps(value["context"], allow_nan=False, separators=(",", ":"))
+    except (TypeError, ValueError, RecursionError):
+        raise _protocol_failure(
+            "INVALID_REQUIRED_GAMEPLAY_CONTEXT",
+            returncode=returncode,
+        ) from None
+    if len(encoded) > 8_192:
+        raise _protocol_failure("INVALID_REQUIRED_GAMEPLAY_CONTEXT", returncode=returncode)
+    return dict(value)
+
+
 _TERMINAL_FAILURE_CODES: dict[str, tuple[ErrorCode, str, Callable[..., dict[str, object]]]] = {
     ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED.value: (
         ErrorCode.MANIA_TAIL_REPAIR_EXHAUSTED,
@@ -499,6 +618,11 @@ _TERMINAL_FAILURE_CODES: dict[str, tuple[ErrorCode, str, Callable[..., dict[str,
         ErrorCode.MANIA_PARTIAL_REJOIN_INVALID,
         "Mapperatorinator could not rejoin the partial Mania interval",
         _require_partial_rejoin_context,
+    ),
+    ErrorCode.MANIA_REQUIRED_GAMEPLAY_FAILED.value: (
+        ErrorCode.MANIA_REQUIRED_GAMEPLAY_FAILED,
+        "Mapperatorinator could not satisfy the required gameplay interval",
+        _require_required_gameplay_failure_context,
     ),
 }
 
@@ -682,6 +806,24 @@ class MapperatorinatorGenerator:
                 sidecar_mismatch,
                 context={"path": str(osu_path.with_suffix(".resnap.json"))},
             )
+        origin_diagnostics: GenerationOriginDiagnostics | None = None
+        if request.required_gameplay_interval is not None:
+            try:
+                origin_diagnostics = read_generation_origin_diagnostics(
+                    osu_path,
+                    interval=request.required_gameplay_interval,
+                    expected_invocation_digest=required_gameplay_invocation_digest(
+                        self.config,
+                        request,
+                    ),
+                    resnap_diagnostics=resnap_diagnostics,
+                )
+            except GenerationOriginDiagnosticsError as error:
+                raise WorkerError(
+                    ErrorCode.CHART_GENERATION_FAILED,
+                    f"required origin diagnostics are missing, stale, or invalid: {error}",
+                    context={"path": str(osu_path.with_suffix(".origin.json"))},
+                ) from error
         notes, boundary_changed = _normalize_end_boundary(
             beatmap.notes,
             duration_ms=request.duration_ms,
@@ -711,4 +853,5 @@ class MapperatorinatorGenerator:
             seed=request.seed,
             bpm_events=beatmap.bpm_events,
             resnap_diagnostics=resnap_diagnostics,
+            origin_diagnostics=origin_diagnostics,
         )

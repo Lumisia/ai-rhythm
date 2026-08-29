@@ -302,6 +302,51 @@
           "title": "Provenance",
           "type": "string"
         },
+        "familyAssignmentKind": {
+          "default": "ORIGINAL",
+          "enum": [
+            "ORIGINAL",
+            "REASSIGNED",
+            "EMERGENCY_DUPLICATE"
+          ],
+          "title": "Familyassignmentkind",
+          "type": "string"
+        },
+        "sourceDifficulty": {
+          "anyOf": [
+            {
+              "enum": [
+                "EASY",
+                "NORMAL",
+                "HARD",
+                "EXPERT"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sourcedifficulty"
+        },
+        "familyResolutionState": {
+          "default": "RESOLVED",
+          "enum": [
+            "RESOLVED",
+            "NARROW_REVIEW",
+            "UNRESOLVED"
+          ],
+          "title": "Familyresolutionstate",
+          "type": "string"
+        },
+        "familyResolutionReasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Familyresolutionreasons",
+          "type": "array"
+        },
         "productionEligible": {
           "default": true,
           "title": "Productioneligible",

@@ -1,11 +1,14 @@
 """로컬 chart-worker 명령줄 인터페이스."""
 
 import json
+import os
+import sys
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
+import click
 import typer
 
 from chart_worker.analysis.difficulty_shadow import recalculate_batch
@@ -13,8 +16,26 @@ from chart_worker.bench import run_benchmark
 from chart_worker.boundary_review_migration import migrate_boundary_review
 from chart_worker.errors import WorkerError
 from chart_worker.pipeline import PipelineOptions, run_pipeline
+from chart_worker.validation.family_replay_v3 import replay_generation_report_v3
+from chart_worker.validation.pairwise_export import export_pairwise_task_bundle_v1
 
-app = typer.Typer(no_args_is_help=True)
+# Rich error panels contain box-drawing characters that Windows redirected
+# CP949 streams cannot represent reliably.  Plain Click/Typer formatting keeps
+# parser errors portable while command output uses the explicit UTF-8 helper
+# below.
+app = typer.Typer(no_args_is_help=True, rich_markup_mode=None)
+
+
+def _echo_cli_text(message: str, *, err: bool = False) -> None:
+    """Write CLI output through an explicit UTF-8 redirect-safe stream."""
+
+    stream = sys.stderr if err else sys.stdout
+    binary_stream = getattr(stream, "buffer", None)
+    if binary_stream is not None and not stream.isatty():
+        payload = f"{message}{os.linesep}".encode("utf-8", errors="backslashreplace")
+        click.echo(payload, file=binary_stream, nl=False)
+        return
+    click.echo(message, file=stream)
 
 
 class GeneratorOption(str, Enum):
@@ -41,7 +62,10 @@ def _run_or_exit(options: PipelineOptions) -> Path:
     try:
         return run_pipeline(options).manifest_path
     except WorkerError as error:
-        typer.echo(json.dumps(_worker_error_payload(error), ensure_ascii=False), err=True)
+        _echo_cli_text(
+            json.dumps(_worker_error_payload(error), ensure_ascii=False),
+            err=True,
+        )
         raise typer.Exit(1) from error
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
@@ -70,7 +94,7 @@ def generate(
             seed=seed,
         )
     )
-    typer.echo(str(manifest_path))
+    _echo_cli_text(str(manifest_path))
 
 
 @app.command()
@@ -98,11 +122,14 @@ def bench(
             )
         )
     except WorkerError as error:
-        typer.echo(json.dumps(_worker_error_payload(error), ensure_ascii=False), err=True)
+        _echo_cli_text(
+            json.dumps(_worker_error_payload(error), ensure_ascii=False),
+            err=True,
+        )
         raise typer.Exit(1) from error
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
-    typer.echo(str(result.report_path))
+    _echo_cli_text(str(result.report_path))
 
 
 @app.command("recalculate-difficulty")
@@ -118,7 +145,7 @@ def recalculate_difficulty(
         recalculate_batch(batch_dir, out)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
-    typer.echo(str(out))
+    _echo_cli_text(str(out))
 
 
 @app.command("migrate-boundary-review")
@@ -138,7 +165,38 @@ def migrate_boundary_review_command(
         )
     except (TypeError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
-    typer.echo(str(summary.target_root / "migration-summary.json"))
+    _echo_cli_text(str(summary.target_root / "migration-summary.json"))
+
+
+@app.command("replay-family-v3")
+def replay_family_v3(
+    report: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+) -> None:
+    """Verify and replay one archived report without model calls or file mutation."""
+    try:
+        replay = replay_generation_report_v3(report)
+    except (OSError, TypeError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    _echo_cli_text(json.dumps(replay, ensure_ascii=False, sort_keys=True))
+
+
+@app.command("export-pairwise-v3")
+def export_pairwise_v3(
+    source: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+    out: Annotated[Path, typer.Option("--out", "-o")],
+) -> None:
+    """Export hash-bound private and blinded human-review task bundles."""
+    try:
+        terminal_path = export_pairwise_task_bundle_v1(source, out)
+    except (OSError, TypeError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    _echo_cli_text(str(terminal_path))
 
 
 if __name__ == "__main__":  # pragma: no cover

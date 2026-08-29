@@ -143,7 +143,15 @@ def review_recovery_preflight(
                 boundary_policy_mode,
                 difficulty,
             )
-            if candidate.rows and not diagnostics.coverage_gaps:
+            # A fallback divisor needs positive evidence that it covers the
+            # active phrases.  UNCERTAIN is intentionally non-actionable for
+            # destructive retry, but it is not proof that a recovery grid is
+            # safe enough to publish either.
+            if (
+                candidate.rows
+                and not diagnostics.coverage_gaps
+                and not diagnostics.uncertain_coverage_gaps
+            ):
                 viable_divisors.append(divisor)
 
         if not selected_diagnostics.coverage_gaps:

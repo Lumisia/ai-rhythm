@@ -8,8 +8,10 @@ candidate should be regenerated.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
+
+from chart_worker.validation.intro_region_contract import IntroRegionCandidateReview
 
 NEAR_START_MAX_MS = 1_000
 NEAR_START_MAX_BEATS = 1.0
@@ -24,6 +26,7 @@ IntroPhraseReason = Literal[
     "CONSISTENT",
     "ISOLATED_EXPERT_FIRST_ROW",
     "EXPERT_LATE_START",
+    "EXPERT_OUTSIDE_CONFIRMED_INTRO_REGION",
     "EXPERT_EARLY_GHOST",
     "SHARED_LONG_SILENCE_POSSIBLE_NORMAL",
     "INSUFFICIENT_ROWS",
@@ -218,3 +221,36 @@ def review_intro_phrase_pair(
         gap_delta_ms,
         gap_ratio,
     )
+
+
+def corroborate_intro_phrase_review(
+    review: IntroPhraseFamilyReview,
+    *,
+    hard_region: IntroRegionCandidateReview,
+    expert_region: IntroRegionCandidateReview,
+) -> IntroPhraseFamilyReview:
+    """Promote only an audio-confirmed relative late start to a defect.
+
+    The HARD chart is a control, not the source of truth: it must independently
+    pass the same song-level intro-region contract.  Unknown or conflicting
+    evidence preserves the provisional REVIEW result.
+    """
+
+    if type(review) is not IntroPhraseFamilyReview:
+        raise TypeError("review must be an IntroPhraseFamilyReview")
+    if type(hard_region) is not IntroRegionCandidateReview:
+        raise TypeError("hard_region must be an IntroRegionCandidateReview")
+    if type(expert_region) is not IntroRegionCandidateReview:
+        raise TypeError("expert_region must be an IntroRegionCandidateReview")
+    if (
+        review.reason == "EXPERT_LATE_START"
+        and hard_region.status == "PASS"
+        and expert_region.status == "DEFECT"
+        and expert_region.reason == "CONFIRMED_INTRO_REGION_MISSED"
+    ):
+        return replace(
+            review,
+            status="DEFECT",
+            reason="EXPERT_OUTSIDE_CONFIRMED_INTRO_REGION",
+        )
+    return review

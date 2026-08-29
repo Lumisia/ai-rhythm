@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,15 @@ from chart_worker.generation.params import (
     REQUESTED_STAR,
     GenerationRequest,
     TimingGenerationRequest,
+)
+from chart_worker.generation.required_gameplay_interval import (
+    RequiredGameplayEvidenceClass,
+    RequiredGameplayGroupType,
+    RequiredGameplayIntervalMode,
+    RequiredGameplayIntervalV1,
+)
+from chart_worker.generation.required_gameplay_invocation import (
+    required_gameplay_invocation_digest,
 )
 from chart_worker.validation.generated_chart import (
     GeneratedChartValidationError,
@@ -80,6 +90,26 @@ def _request(**overrides):
     return GenerationRequest(**(values | overrides))
 
 
+def _required_interval(
+    *,
+    start_ms: int = 4_430,
+    end_ms: int = 4_570,
+    mode: RequiredGameplayIntervalMode = RequiredGameplayIntervalMode.OBSERVE,
+) -> RequiredGameplayIntervalV1:
+    return RequiredGameplayIntervalV1(
+        start_ms=start_ms,
+        end_ms=end_ms,
+        minimum_complete_groups=1,
+        allowed_group_types=(
+            RequiredGameplayGroupType.TAP,
+            RequiredGameplayGroupType.HOLD_START,
+        ),
+        evidence_class=RequiredGameplayEvidenceClass.BROADBAND_ATTACK,
+        evidence_digest="a" * 64,
+        mode=mode,
+    )
+
+
 def _pairs(argv):
     return dict(item.split("=", 1) for item in argv if "=" in item)
 
@@ -97,6 +127,115 @@ def _fake_run(osu_text=MINI_OSU, fail=False, resnap_sidecar=None):
         if resnap_sidecar is not None:
             osu_path.with_suffix(".resnap.json").write_text(
                 json.dumps(resnap_sidecar),
+                encoding="utf-8",
+            )
+        return CommandResult(argv, 0, "", "")
+
+    return run
+
+
+def _required_interval_run(
+    config: WorkerConfig,
+    request: GenerationRequest,
+    *,
+    write_origin: bool = True,
+):
+    def run(argv):
+        output_dir = Path(
+            next(item for item in argv if item.startswith("output_path=")).split("=", 1)[1]
+            .strip("'")
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        osu_path = output_dir / "out.osu"
+        osu_path.write_text(MINI_OSU, encoding="utf-8")
+        osu_sha = hashlib.sha256(osu_path.read_bytes()).hexdigest()
+        origin = {
+            "kind": "GENERATED",
+            "sourceWindowId": 0,
+            "sourceTokenIndex": 7,
+            "referenceEventIndex": None,
+        }
+        osu_path.with_suffix(".resnap.json").write_text(
+            json.dumps(
+                {
+                    "version": "mania-origin-v2-osu-bound",
+                    "seed": 17,
+                    "osuSha256": osu_sha,
+                    "collisions": [],
+                    "maniaObjects": [
+                        {
+                            "objectId": 0,
+                            "lane": 0,
+                            "kind": "TAP",
+                            "startTimeMs": 1000,
+                            "endTimeMs": None,
+                            "startGroupId": 0,
+                            "endGroupId": None,
+                            "startOrigins": [origin],
+                            "endOrigins": [],
+                        },
+                        {
+                            "objectId": 1,
+                            "lane": 1,
+                            "kind": "TAP",
+                            "startTimeMs": 1200,
+                            "endTimeMs": None,
+                            "startGroupId": 1,
+                            "endGroupId": None,
+                            "startOrigins": [origin],
+                            "endOrigins": [],
+                        },
+                    ],
+                    "duplicates": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        if write_origin:
+            interval = request.required_gameplay_interval
+            assert interval is not None
+            count = {
+                "totalGeneratedCompleteGroups": 2,
+                "intervalGeneratedCompleteGroups": 1,
+                "tapGroups": 1,
+                "holdStartGroups": 0,
+            }
+            osu_path.with_suffix(".origin.json").write_text(
+                json.dumps(
+                    {
+                        "version": "generation-origin-diagnostics-v1",
+                        "output": {
+                            "fileName": osu_path.name,
+                            "size": osu_path.stat().st_size,
+                            "sha256": osu_sha,
+                        },
+                        "evidenceDigest": interval.evidence_digest,
+                        "invocationDigest": required_gameplay_invocation_digest(
+                            config, request
+                        ),
+                        "requiredInterval": {
+                            "startMs": interval.start_ms,
+                            "endMs": interval.end_ms,
+                            "minimumCompleteGroups": interval.minimum_complete_groups,
+                            "allowedGroupTypes": [
+                                item.value for item in interval.allowed_group_types
+                            ],
+                            "evidenceClass": interval.evidence_class.value,
+                            "mode": interval.mode.value,
+                        },
+                        "stages": {
+                            name: count
+                            for name in (
+                                "decoder",
+                                "windowMerge",
+                                "canonical",
+                                "resnap",
+                                "finalSerialization",
+                            )
+                        },
+                        "firstLossStage": None,
+                    }
+                ),
                 encoding="utf-8",
             )
         return CommandResult(argv, 0, "", "")
@@ -356,6 +495,142 @@ def test_partial_map_command_replaces_only_the_requested_window(config, tmp_path
     assert pairs["start_time"] == "4000"
     assert pairs["end_time"] == "12000"
     assert pairs["add_to_beatmap"] == "true"
+
+
+def test_observe_required_gameplay_interval_is_serialized_only_for_partial_map(
+    config,
+    tmp_path,
+):
+    request = _request(
+        seed=17,
+        partial_start_ms=4_000,
+        partial_end_ms=12_000,
+        add_to_beatmap=True,
+        required_gameplay_interval=_required_interval(),
+    )
+
+    pairs = _pairs(build_map_command(config, request, tmp_path / "partial"))
+
+    assert pairs["required_gameplay_interval_mode"] == "OBSERVE"
+    assert pairs["required_gameplay_interval_start_time"] == "4430"
+    assert pairs["required_gameplay_interval_end_time"] == "4570"
+    assert pairs["required_gameplay_interval_minimum_complete_groups"] == "1"
+    assert pairs["required_gameplay_interval_allowed_group_types"] == "[HOLD_START,TAP]"
+    assert (
+        pairs["required_gameplay_interval_evidence_class"]
+        == "BROADBAND_ATTACK"
+    )
+    assert pairs["required_gameplay_interval_evidence_digest"] == "a" * 64
+
+
+def test_full_map_request_rejects_a_required_gameplay_interval():
+    with pytest.raises(ValueError, match="partial generation"):
+        _request(required_gameplay_interval=_required_interval())
+
+
+@pytest.mark.parametrize(
+    "interval",
+    [
+        _required_interval(start_ms=3_999),
+        _required_interval(end_ms=12_001),
+    ],
+)
+def test_partial_request_rejects_required_interval_outside_its_window(interval):
+    with pytest.raises(ValueError, match="required gameplay interval.*partial"):
+        _request(
+            partial_start_ms=4_000,
+            partial_end_ms=12_000,
+            add_to_beatmap=True,
+            required_gameplay_interval=interval,
+        )
+
+
+def test_v36_adapter_serializes_shadow_enforcement_for_partial_challenger(
+    config,
+    tmp_path,
+):
+    request = _request(
+        seed=17,
+        partial_start_ms=4_000,
+        partial_end_ms=12_000,
+        add_to_beatmap=True,
+        required_gameplay_interval=_required_interval(
+            mode=RequiredGameplayIntervalMode.SHADOW_ENFORCE
+        ),
+    )
+
+    pairs = _pairs(build_map_command(config, request, tmp_path / "partial"))
+
+    assert pairs["required_gameplay_interval_mode"] == "SHADOW_ENFORCE"
+    assert pairs["required_gameplay_interval_start_time"] == "4430"
+    assert pairs["required_gameplay_interval_end_time"] == "4570"
+
+
+def test_dataclass_replace_preserves_the_required_interval_identity():
+    interval = _required_interval()
+    request = _request(
+        seed=17,
+        partial_start_ms=4_000,
+        partial_end_ms=12_000,
+        add_to_beatmap=True,
+        required_gameplay_interval=interval,
+    )
+
+    replaced = replace(request, seed=17)
+
+    assert replaced.required_gameplay_interval is interval
+
+
+def _required_generation_request(tmp_path: Path) -> GenerationRequest:
+    audio = tmp_path / "audio.flac"
+    reference = tmp_path / "reference.osu"
+    audio.write_bytes(b"audio")
+    reference.write_text(TIMING_OSU, encoding="utf-8")
+    return _request(
+        audio_path=audio,
+        timing_reference_path=reference,
+        seed=17,
+        partial_start_ms=0,
+        partial_end_ms=2_000,
+        add_to_beatmap=True,
+        required_gameplay_interval=_required_interval(start_ms=900, end_ms=1_100),
+    )
+
+
+def test_generator_requires_and_returns_independently_bound_origin_diagnostics(
+    config, tmp_path
+):
+    request = _required_generation_request(tmp_path)
+    result = MapperatorinatorGenerator(
+        config=config,
+        run=_required_interval_run(config, request),
+        verify_patch=lambda _home: None,
+    ).generate_map(request, tmp_path / "work")
+
+    assert result.origin_diagnostics is not None
+    assert result.origin_diagnostics.first_loss_stage is None
+    assert (
+        result.origin_diagnostics.final_serialization.interval_generated_complete_groups
+        == 1
+    )
+
+
+def test_generator_rejects_missing_required_origin_diagnostics(config, tmp_path):
+    request = _required_generation_request(tmp_path)
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_required_interval_run(config, request, write_origin=False),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError, match="origin diagnostics"):
+        generator.generate_map(request, tmp_path / "work")
+
+
+def test_ordinary_map_command_has_no_required_gameplay_overrides(config, tmp_path):
+    argv = build_map_command(config, _request(), tmp_path / "ordinary")
+
+    assert not any(item.startswith("required_gameplay_interval_") for item in argv)
 
 
 @pytest.mark.parametrize(
@@ -1363,6 +1638,21 @@ PARTIAL_REJOIN_CONTEXT = {
     "earliestGeneratedSourceWindowId": None,
 }
 
+REQUIRED_GAMEPLAY_FAILURE_CONTEXT = {
+    "version": 1,
+    "reason": "REQUIRED_GAMEPLAY_INTERVAL_NO_LEGAL_GROUP",
+    "message": "required interval has no legal group completion",
+    "lane": None,
+    "timeMs": 500,
+    "timeTokenId": 50,
+    "eventIndex": None,
+    "decoderTokenIndex": 21,
+    "generatedTokenIndex": 17,
+    "rowIndex": None,
+    "sourceWindowId": 3,
+    "context": {"requiredStartMs": 409, "requiredEndMs": 549},
+}
+
 
 def test_generator_accepts_an_economically_bounded_single_tail_repair(
     config, tmp_path
@@ -1437,6 +1727,61 @@ def test_generator_maps_typed_partial_rejoin_failure_with_exact_context(
     assert caught.value.code is ErrorCode.MANIA_PARTIAL_REJOIN_INVALID
     assert caught.value.context == PARTIAL_REJOIN_CONTEXT
     assert caught.value.context is not PARTIAL_REJOIN_CONTEXT
+
+
+def test_generator_maps_typed_required_gameplay_failure_with_exact_reason(
+    config, tmp_path
+):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_REQUIRED_GAMEPLAY_FAILED",
+                "context": REQUIRED_GAMEPLAY_FAILURE_CONTEXT,
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.MANIA_REQUIRED_GAMEPLAY_FAILED
+    assert caught.value.context == REQUIRED_GAMEPLAY_FAILURE_CONTEXT
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {**REQUIRED_GAMEPLAY_FAILURE_CONTEXT, "reason": "TOKEN_BUDGET_EXHAUSTED"},
+        {**REQUIRED_GAMEPLAY_FAILURE_CONTEXT, "extra": 1},
+        {**REQUIRED_GAMEPLAY_FAILURE_CONTEXT, "version": True},
+        {**REQUIRED_GAMEPLAY_FAILURE_CONTEXT, "generatedTokenIndex": -1},
+        {**REQUIRED_GAMEPLAY_FAILURE_CONTEXT, "message": ""},
+    ],
+)
+def test_generator_rejects_malformed_required_gameplay_failure_context(
+    config, tmp_path, context
+):
+    generator = MapperatorinatorGenerator(
+        config=config,
+        run=_terminal_run(
+            {
+                "version": 1,
+                "status": "FAILURE",
+                "code": "MANIA_REQUIRED_GAMEPLAY_FAILED",
+                "context": context,
+            }
+        ),
+        verify_patch=lambda _home: None,
+    )
+
+    with pytest.raises(WorkerError) as caught:
+        generator.generate_map(_request(), tmp_path / "work")
+
+    assert caught.value.code is ErrorCode.INFERENCE_PROTOCOL_FAILED
 
 
 def test_generator_carries_the_generated_source_window_of_a_rejoin_failure(

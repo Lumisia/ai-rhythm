@@ -28,7 +28,11 @@ from chart_worker.generation.diagnostic_fallback import (
     DiagnosticFallbackIdentity,
     export_diagnostic_fallback,
 )
+from chart_worker.generation.difficulty_family_compiler import (
+    DifficultyFamilyCompilerDecision,
+)
 from chart_worker.generation.fake import FakeGenerator
+from chart_worker.generation.family_selection import MAX_CONFIRMED_INTRO_DELAY_BEATS
 from chart_worker.generation.generation_control import (
     MAX_CRASH_ATTEMPTS,
     MAX_TOTAL_ATTEMPTS,
@@ -83,7 +87,9 @@ from chart_worker.stages.types import (
     SongTimingAuthority,
 )
 from chart_worker.validation.difficulty_selector import DifficultySelectionComparison
+from chart_worker.validation.family_evidence_v3 import SongSelectionEvidenceV3
 from chart_worker.validation.final_difficulty_family import (
+    CURRENT_DIFFICULTY_FAMILY_CALIBRATION_STATE,
     DifficultyFamilyEntry,
     observe_final_difficulty_family,
 )
@@ -104,15 +110,19 @@ from chart_worker.validation.publication_policy import (
     decide_publication,
 )
 from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateAction, GateAxis
+from chart_worker.validation.safe_family_assignment import (
+    MAX_SAFE_SUBSTITUTES_PER_KEY,
+    SAFE_FAMILY_ASSIGNMENT_VERSION,
+    SafeFamilyAssignmentDecision,
+)
 from chart_worker.validation.song_family_selector import SongSelectionComparison
+from chart_worker.validation.song_family_selector_v3 import ShadowV3ProposalEvaluation
 from chart_worker.validation.timing_authority import validate_timing_identity
 from chart_worker.validation.timing_family_review import TimingFamilyReview
 from chart_worker.validation.timing_review import TimingAuthorityAction
 
 GeneratorName = Literal["fake", "mapperatorinator"]
-_PLAYTEST_ONLY_PROVENANCES = frozenset(
-    {"COVERAGE_REPAIR", "RAW_UNVERIFIED", "SAFE_FALLBACK"}
-)
+_PLAYTEST_ONLY_PROVENANCES = frozenset({"COVERAGE_REPAIR", "RAW_UNVERIFIED", "SAFE_FALLBACK"})
 PrepareStage = Callable[[Path, Path, WorkerConfig], PreparedAudio]
 AnalysisStage = Callable[[Path], OnsetAnalysis]
 TimingStage = Callable[
@@ -147,6 +157,15 @@ def _prepare_stage(source: Path, run_dir: Path, config: WorkerConfig) -> Prepare
     return replace(
         prepared,
         difficulty_selector_mode=config.difficulty_selector_mode,
+        difficulty_shadow_challenger_enabled=(
+            config.difficulty_shadow_challenger_enabled
+        ),
+        difficulty_family_compiler_shadow_enabled=(
+            config.difficulty_family_compiler_shadow_enabled
+        ),
+        difficulty_family_resolution_enabled=(
+            config.difficulty_family_resolution_enabled
+        ),
         boundary_policy_mode=config.boundary_policy_mode,
         beat_this_enabled=config.beat_this_enabled,
         beat_this_checkpoint=config.beat_this_checkpoint,
@@ -484,22 +503,33 @@ def _coverage_summary(variant: GeneratedVariant) -> CoverageSummary:
     attack_gaps = tuple(
         gap
         for gap in variant.acceptance.timing.coverage_gaps
-        if gap.opportunity is None
-        or gap.opportunity.kind.value == "ATTACK_REQUIRED"
+        if gap.opportunity is not None
+        and gap.opportunity.kind.value == "ATTACK_REQUIRED"
     )
     return CoverageSummary(
         first_note_time_ms=variant.acceptance.timing.first_note_time_ms,
         max_gap_ms=variant.acceptance.timing.max_gap_ms,
         attack_required_gap_count=len(attack_gaps),
-        attack_required_gap_total_ms=sum(
-            gap.end_ms - gap.start_ms for gap in attack_gaps
-        ),
+        attack_required_gap_total_ms=sum(gap.end_ms - gap.start_ms for gap in attack_gaps),
         repaired_gap_count=variant.coverage_repair_gap_count,
     )
 
 
+def _variant_is_playtest_only(variant: GeneratedVariant) -> bool:
+    return (
+        not getattr(variant, "production_eligible", True)
+        or variant.provenance in _PLAYTEST_ONLY_PROVENANCES
+        or getattr(variant, "family_assignment_kind", "ORIGINAL") != "ORIGINAL"
+        or getattr(variant, "family_resolution_state", "RESOLVED") != "RESOLVED"
+    )
+
+
 def _playability_tier(variant: GeneratedVariant) -> str:
-    if variant.provenance not in _PLAYTEST_ONLY_PROVENANCES:
+    if (
+        variant.provenance not in _PLAYTEST_ONLY_PROVENANCES
+        and variant.acceptance.action is not GateAction.RETRY_MAP
+        and variant.family_assignment_kind == "ORIGINAL"
+    ):
         return "MODEL_PLAYABLE"
     if variant.provenance == "RAW_UNVERIFIED":
         return "DIAGNOSTIC_ONLY"
@@ -576,6 +606,7 @@ def _require_difficulty_order_reports(
                 for variant in generated
                 if variant.key_mode == key_mode
             ),
+            calibration_state=CURRENT_DIFFICULTY_FAMILY_CALIBRATION_STATE,
         ).to_report()
         reports[f"{key_mode}K"] = report
 
@@ -606,6 +637,12 @@ def _generation_report(
     boundary_publication_assessment: BoundaryPublicationAssessment,
     difficulty_selection_shadows: tuple[DifficultySelectionComparison, ...] = (),
     song_selection_shadow: SongSelectionComparison | None = None,
+    song_selection_evidence_v3: SongSelectionEvidenceV3 | None = None,
+    song_selection_shadow_v3: ShadowV3ProposalEvaluation | None = None,
+    safe_family_assignments: tuple[SafeFamilyAssignmentDecision, ...] = (),
+    difficulty_family_compiler_shadow: tuple[
+        DifficultyFamilyCompilerDecision, ...
+    ] = (),
     intro_start_contract: IntroStartContract | None = None,
     intro_contract_review: IntroContractReview | None = None,
     intro_phrase_family_reviews: tuple[IntroPhraseFamilyReview, ...] = (),
@@ -626,7 +663,7 @@ def _generation_report(
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
         acceptance = variant.acceptance.to_report()
-        playtest_only = variant.provenance in _PLAYTEST_ONLY_PROVENANCES
+        playtest_only = _variant_is_playtest_only(variant)
         coverage_summary = _coverage_summary(variant)
         quality_profile = acceptance["qualityProfile"]
         resnap_diagnostics = variant.generated.resnap_diagnostics.to_report()
@@ -657,11 +694,13 @@ def _generation_report(
                 "candidateCount": variant.candidate_count,
                 "generationAttemptCount": variant.generation_attempt_count,
                 "provenance": variant.provenance,
+                "familyAssignmentKind": variant.family_assignment_kind,
+                "familyResolutionState": variant.family_resolution_state,
+                "familyResolutionReasons": list(variant.family_resolution_reasons),
+                "sourceDifficulty": variant.source_difficulty,
                 "recoveryReason": variant.recovery_reason,
                 "productionEligible": not playtest_only,
-                "distributionTier": (
-                    "PLAYTEST_ONLY" if playtest_only else "PRODUCTION_CANDIDATE"
-                ),
+                "distributionTier": ("PLAYTEST_ONLY" if playtest_only else "PRODUCTION_CANDIDATE"),
                 "playabilityTier": _playability_tier(variant),
                 "coverageSummary": coverage_summary.model_dump(by_alias=True),
                 "attemptErrors": list(variant.attempt_errors),
@@ -707,22 +746,27 @@ def _generation_report(
         or (outro_family_review is not None and outro_family_review.status == "REVIEW")
     )
     has_playtest_fallback = any(
-        variant.provenance in _PLAYTEST_ONLY_PROVENANCES
-        for variant in generated
+        _variant_is_playtest_only(variant) for variant in generated
     )
     has_order_retry = any(
-        variant.difficulty_order is not None
-        and variant.difficulty_order.status == "RETRY"
+        variant.difficulty_order is not None and variant.difficulty_order.status == "RETRY"
         for variant in generated
     )
+    difficulty_review_required = any(
+        bool(report["finalFamilyObservation"]["requiresReview"])
+        for report in difficulty_order_reports.values()
+    )
     # timingReviewRequired 는 진단 플래그로 남긴다 (배치 실측상 잦고,
-    # 사람 판정과 자주 어긋난다). 곡 상태를 낮추는 것은 실제 계약 위반
-    # 두 가지뿐이다: 조합 누락(PARTIAL), 품질 축 우회 발행(REVIEW).
+    # 사람 판정과 자주 어긋난다). 곡 상태를 낮추는 것은 조합 누락,
+    # 품질 축 우회 발행, 또는 두 독립 난이도 지표 중 하나라도 남긴
+    # 미해결 family 순서 증거다. 마지막 경우는 재생성을 뜻하지 않고
+    # false PASS만 막는다.
     if missing:
         status = "PARTIAL"
     elif (
         has_playtest_fallback
         or has_order_retry
+        or difficulty_review_required
         or (intro_contract_review is not None and intro_contract_review.status == "REVIEW")
         or any(review.should_block_publication for review in intro_phrase_family_reviews)
         or any(review.status == "OUTLIER" for review in timing_family_reviews)
@@ -738,6 +782,7 @@ def _generation_report(
             timing_review_required
             or has_playtest_fallback
             or has_order_retry
+            or difficulty_review_required
             or bool(missing)
         ),
     )
@@ -752,6 +797,7 @@ def _generation_report(
         "qualityGateVersion": QUALITY_GATE_VERSION,
         "publishable": publication_decision.decision == "ALLOW_PRODUCTION",
         "status": status,
+        "difficultyReviewRequired": difficulty_review_required,
         "outcomeStatusV2": outcome_status_v2.to_report(),
         "strictBlockers": list(strict_blockers),
         "publicationDecision": publication_decision.to_report(),
@@ -804,15 +850,55 @@ def _generation_report(
         "songSelectionShadow": (
             song_selection_shadow.to_report() if song_selection_shadow is not None else None
         ),
+        "songSelectionEvidenceV3": (
+            song_selection_evidence_v3.to_report()
+            if song_selection_evidence_v3 is not None
+            else None
+        ),
+        "songSelectionEvidenceV3Sha256": (
+            song_selection_evidence_v3.stable_sha256()
+            if song_selection_evidence_v3 is not None
+            else None
+        ),
+        "songSelectionShadowV3": (
+            song_selection_shadow_v3.to_report() if song_selection_shadow_v3 is not None else None
+        ),
+        "safeFamilyAssignments": [
+            decision.to_report() for decision in safe_family_assignments
+        ],
+        "difficultyFamilyCompilerShadow": [
+            decision.to_report()
+            for decision in difficulty_family_compiler_shadow
+            if decision.publication_mode == "SHADOW"
+        ],
+        "difficultyFamilyResolution": [
+            decision.to_report()
+            for decision in difficulty_family_compiler_shadow
+            if decision.publication_mode == "ENFORCED"
+        ],
+        "safeFamilyAssignmentPolicy": {
+            "version": SAFE_FAMILY_ASSIGNMENT_VERSION,
+            "payloadUniqueness": "HARD_PUBLICATION_INVARIANT",
+            "familyFeasibility": "HARD_BEFORE_RANKING",
+            "relativeDifficultyMode": "RELABEL_UNIQUE_THEN_BOUNDED_RESOLUTION",
+            "resolutionOrder": [
+                "EXISTING_UNIQUE_RELABEL",
+                "DETERMINISTIC_FAMILY_COMPILER",
+                "ONE_CALL_TARGETED_GENERATION",
+                "COHERENT_CANONICAL_FAMILY_FALLBACK",
+                "FAIL_CLOSED",
+            ],
+            "maxConfirmedIntroDelayBeats": MAX_CONFIRMED_INTRO_DELAY_BEATS,
+            "maxSafeSubstitutesPerKey": MAX_SAFE_SUBSTITUTES_PER_KEY,
+            "additionalModelCallsMax": 1,
+        },
         "introStartContract": (
             intro_start_contract.to_report() if intro_start_contract is not None else None
         ),
         "introContractReview": (
             intro_contract_review.to_report() if intro_contract_review is not None else None
         ),
-        "introPhraseFamilyReviews": [
-            review.to_report() for review in intro_phrase_family_reviews
-        ],
+        "introPhraseFamilyReviews": [review.to_report() for review in intro_phrase_family_reviews],
         "timingFamilyReviews": [review.to_report() for review in timing_family_reviews],
         "outroFamilyReview": (
             outro_family_review.to_report() if outro_family_review is not None else None
@@ -990,6 +1076,7 @@ def _export_diagnostic_raw_fallbacks(
             hold_state_mode=config.mapperatorinator_hold_state_mode,
         )
         for candidate in candidates:
+
             def validate_osu(text: str, *, _candidate=candidate) -> None:
                 beatmap = parse_osu_mania(text)
                 generated = GeneratedChart(
@@ -1065,10 +1152,7 @@ def _require_publishable_acceptance(generated: tuple[GeneratedVariant, ...]) -> 
                 GateAxis.SONG_BOUNDS,
             )
         )
-        if (
-            variant.provenance in _PLAYTEST_ONLY_PROVENANCES
-            and hard_safe
-        ):
+        if _variant_is_playtest_only(variant) and hard_safe:
             continue
         rejected.append(
             {
@@ -1122,15 +1206,9 @@ def _run_pipeline(
     )
     boundary_publication_assessment = assess_boundary_publication(
         policy_state=(
-            boundary_evaluation.policy_state
-            if boundary_evaluation is not None
-            else None
+            boundary_evaluation.policy_state if boundary_evaluation is not None else None
         ),
-        confidence=(
-            boundary_evaluation.confidence
-            if boundary_evaluation is not None
-            else None
-        ),
+        confidence=(boundary_evaluation.confidence if boundary_evaluation is not None else None),
     )
 
     generator = dependencies.select_generator(options.generator, dependencies.config)
@@ -1148,10 +1226,14 @@ def _run_pipeline(
     try:
         authority = dependencies.timing(prepared, onsets, run_dir, generator, options.seed)
     except WorkerError as error:
-        if error.code not in {
-            ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-            ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
-        } and error.code not in _REPORTABLE_INFERENCE_FAILURES:
+        if (
+            error.code
+            not in {
+                ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+            }
+            and error.code not in _REPORTABLE_INFERENCE_FAILURES
+        ):
             raise
         elapsed["timing"] = _elapsed_ms(started)
         _write_generation_report(
@@ -1257,10 +1339,14 @@ def _run_pipeline(
                     epoch + 1,
                 )
             except WorkerError as error:
-                if error.code not in {
-                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-                    ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
-                } and error.code not in _REPORTABLE_INFERENCE_FAILURES:
+                if (
+                    error.code
+                    not in {
+                        ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                        ErrorCode.CHART_TIMING_CANDIDATE_FAILED,
+                    }
+                    and error.code not in _REPORTABLE_INFERENCE_FAILURES
+                ):
                     raise
                 elapsed["timing"] += _elapsed_ms(started)
                 elapsed["generation"] = generation_elapsed_ms
@@ -1286,11 +1372,15 @@ def _run_pipeline(
             _require_canonical_audio_hash(prepared)
             continue
         except WorkerError as error:
-            if error.code not in {
-                ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
-                ErrorCode.CHART_CANDIDATES_EXHAUSTED,
-                ErrorCode.CHART_VALIDATION_FAILED,
-            } and error.code not in _REPORTABLE_INFERENCE_FAILURES:
+            if (
+                error.code
+                not in {
+                    ErrorCode.CHART_TIMING_REVIEW_REQUIRED,
+                    ErrorCode.CHART_CANDIDATES_EXHAUSTED,
+                    ErrorCode.CHART_VALIDATION_FAILED,
+                }
+                and error.code not in _REPORTABLE_INFERENCE_FAILURES
+            ):
                 raise
             generation_elapsed_ms += _elapsed_ms(started)
             authority_epochs.append(
@@ -1400,6 +1490,12 @@ def _run_pipeline(
         boundary_publication_assessment,
         difficulty_selection_shadows=outcome.difficulty_selection_shadows,
         song_selection_shadow=outcome.song_selection_shadow,
+        song_selection_evidence_v3=outcome.song_selection_evidence_v3,
+        song_selection_shadow_v3=outcome.song_selection_shadow_v3,
+        safe_family_assignments=outcome.safe_family_assignments,
+        difficulty_family_compiler_shadow=(
+            outcome.difficulty_family_compiler_shadow
+        ),
         intro_start_contract=outcome.intro_start_contract,
         intro_contract_review=outcome.intro_contract_review,
         intro_phrase_family_reviews=outcome.intro_phrase_family_reviews,
@@ -1407,17 +1503,14 @@ def _run_pipeline(
         outro_family_review=outcome.outro_family_review,
         additional_inference_calls=outcome.additional_inference_calls,
         additional_inference_work_ms=outcome.additional_inference_work_ms,
-        additional_inference_work_limit_ms=(
-            outcome.additional_inference_work_limit_ms
-        ),
+        additional_inference_work_limit_ms=(outcome.additional_inference_work_limit_ms),
         missing=outcome.missing,
         music_bounds={
             "audioDurationMs": prepared.normalized.duration_ms,
             "musicEndMs": (
                 (
                     prepared.normalized.duration_ms
-                    if boundary_evaluation.effective_source
-                    == "FULL_DURATION_BASELINE"
+                    if boundary_evaluation.effective_source == "FULL_DURATION_BASELINE"
                     else boundary_evaluation.provisional_decision.selected_music_end_ms
                 )
                 if boundary_evaluation is not None
@@ -1427,14 +1520,10 @@ def _run_pipeline(
                 outro_observation.to_report() if outro_observation is not None else None
             ),
             "outroEvidenceProfile": (
-                outro_evidence_profile.to_report()
-                if outro_evidence_profile is not None
-                else None
+                outro_evidence_profile.to_report() if outro_evidence_profile is not None else None
             ),
             "terminalSilenceObservation": (
-                onsets.terminal_silence.to_report()
-                if onsets.terminal_silence is not None
-                else None
+                onsets.terminal_silence.to_report() if onsets.terminal_silence is not None else None
             ),
             "outroPolicyDecision": (
                 boundary_evaluation.provisional_decision.to_report()
@@ -1442,9 +1531,7 @@ def _run_pipeline(
                 else None
             ),
             "boundaryPolicyEvaluation": (
-                boundary_evaluation.to_report()
-                if boundary_evaluation is not None
-                else None
+                boundary_evaluation.to_report() if boundary_evaluation is not None else None
             ),
             "songBoundaryContract": (
                 boundary_evaluation.effective_contract.to_report()
@@ -1475,13 +1562,14 @@ def _run_pipeline(
                 key_mode=result.document.key_mode,
                 difficulty=result.document.difficulty,
                 provenance=variant.provenance,
-                production_eligible=(
-                    variant.provenance
-                    not in _PLAYTEST_ONLY_PROVENANCES
-                ),
+                family_assignment_kind=variant.family_assignment_kind,
+                family_resolution_state=variant.family_resolution_state,
+                family_resolution_reasons=list(variant.family_resolution_reasons),
+                source_difficulty=variant.source_difficulty,
+                production_eligible=(not _variant_is_playtest_only(variant)),
                 distribution_tier=(
                     "PLAYTEST_ONLY"
-                    if variant.provenance in _PLAYTEST_ONLY_PROVENANCES
+                    if _variant_is_playtest_only(variant)
                     else "PRODUCTION_CANDIDATE"
                 ),
                 playability_tier=_playability_tier(variant),

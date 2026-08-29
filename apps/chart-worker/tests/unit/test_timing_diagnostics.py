@@ -235,6 +235,10 @@ def test_marks_long_gap_with_active_onsets_for_review():
             "activeOnsetCount": 20,
             "activeFrameRatio": 1.0,
             "position": "POST_FIRST",
+            "rowSpanStartMs": 0,
+            "rowSpanDurationMs": 30_838,
+            "unoccupiedStartMs": 0,
+            "unoccupiedDurationMs": 30_838,
         }
     ]
 
@@ -287,7 +291,7 @@ def test_reports_hold_covered_low_attack_gap_as_sustain_opportunity():
     assert gap.to_report()["opportunity"]["holdOccupancyRatio"] == 1.0
 
 
-def test_reports_hold_covered_strong_attack_gap_as_attack_required():
+def test_reports_fully_hold_covered_strong_attacks_as_attack_required():
     analysis = _coverage_analysis(
         {time_ms: 0.9 for time_ms in range(5_000, 21_000, 1_000)}
     )
@@ -307,9 +311,52 @@ def test_reports_hold_covered_strong_attack_gap_as_attack_required():
     gap = next(gap for gap in result.coverage_gaps if gap.start_ms == 4_000)
     assert gap.opportunity is not None
     assert gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
+    assert gap.opportunity.actionable is True
+    assert gap.opportunity.attack_evidence_scope == "GLOBAL"
+    assert gap.unoccupied_start_ms == 30_000
+    assert gap.unoccupied_duration_ms == 0
 
 
-def test_reports_local_gap_evidence_without_changing_the_existing_verdict():
+def test_hold_tail_uses_unoccupied_span_and_keeps_uncertain_evidence_non_actionable():
+    analysis = _coverage_analysis(
+        {
+            184_500: 0.4,
+            185_500: 0.4,
+            187_000: 0.4,
+            188_000: 0.4,
+        },
+        duration_ms=190_000,
+    )
+    result = diagnose_chart_timing(
+        [
+            NoteEvent(181_316, 0, kind="HOLD", duration_ms=2_681),
+            NoteEvent(183_997, 1, kind="HOLD", duration_ms=2_560),
+            tap(188_880),
+        ],
+        analysis.onset_ms,
+        duration_ms=190_000,
+        coverage_end_ms=188_880,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+        activity=analysis.activity,
+        onset_analysis=analysis,
+        difficulty="EASY",
+    )
+
+    assert result.coverage_gaps == ()
+    gap = next(
+        gap
+        for gap in result.uncertain_coverage_gaps
+        if gap.row_span_start_ms == 183_997
+    )
+    assert gap.unoccupied_start_ms == 186_557
+    assert gap.end_ms == 188_880
+    assert gap.unoccupied_duration_ms == 2_323
+    assert gap.to_report()["rowSpanDurationMs"] == 4_883
+    assert gap.to_report()["unoccupiedDurationMs"] == 2_323
+
+
+def test_locally_corroborated_gap_is_made_actionable_only_at_the_source_classifier():
+    """Catch diagnostics discarding a source-authorized local phrase."""
     strengths = {
         **{time_ms: 0.9 for time_ms in range(1_000, 11_000, 500)},
         21_000: 0.9,
@@ -355,7 +402,9 @@ def test_reports_local_gap_evidence_without_changing_the_existing_verdict():
         if gap.start_ms == 20_000 and gap.end_ms == 28_000
     )
     assert gap.opportunity is not None
-    assert gap.opportunity.kind is CoverageKind.INSUFFICIENT_EVIDENCE
+    assert gap.opportunity.kind is CoverageKind.ATTACK_REQUIRED
+    assert gap.opportunity.actionable is True
+    assert gap.opportunity.attack_evidence_scope == "LOCAL_CORROBORATED"
     assert gap.to_report()["localAudioEvidence"] == {
         "version": "coverage-jury-local-evidence-v1",
         "startMs": 20_000,
@@ -449,6 +498,8 @@ def test_serializes_stable_camel_case_report_fields():
         "maxGapMs": 1000,
         "coverageGaps": [],
         "quietCoverageGaps": [],
+        "uncertainCoverageGaps": [],
+        "maxRowSpanGapMs": 1000,
         "overall": {
             "rowCount": 8,
             "precision20": 1.0,

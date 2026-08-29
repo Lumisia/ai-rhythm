@@ -197,6 +197,57 @@ def test_high_confidence_terminal_silence_rejects_a_hold_releasing_deep_in_silen
     assert _decision(result, "SONG_BOUNDS").reasons == ("HOLD_END_AFTER_RELEASE",)
 
 
+def test_terminal_cut_accepts_upstream_ten_ms_hold_serialization_tolerance():
+    terminal = import_module("chart_worker.analysis.terminal_silence")
+    activity = AudioActivity(
+        frame_ms=100.0,
+        rms_db=np.array([-10.0] * 201 + [-80.0] * 100),
+        floor_db=-60.0,
+        active_onset_ms=tuple(range(500, 20_001, 500)),
+    )
+    observation = terminal.TerminalSilenceObservation(
+        version="terminal-silence-observation-v1",
+        duration_ms=30_000,
+        frame_ms=100,
+        channel_count=2,
+        candidates=tuple(
+            terminal.TerminalThresholdCandidate(
+                rms_db=rms_db,
+                peak_db=peak_db,
+                suffix_start_ms=20_000,
+                suffix_duration_ms=10_000,
+            )
+            for rms_db, peak_db in terminal.DEFAULT_THRESHOLDS_DB
+        ),
+        candidate_spread_ms=0,
+        last_onset_ms=20_000,
+    )
+    analysis = replace(
+        _analysis(activity.active_onset_ms, activity=activity),
+        terminal_silence=observation,
+    )
+    chart = GeneratedChart(
+        notes=[NoteEvent(19_000, 0, kind="HOLD", duration_ms=1_010)],
+        key_mode=4,
+        osu_text="",
+        generator_name="terminal-hold-tolerance-fixture",
+        seed=0,
+        bpm_events=(OsuBpmEvent(0, 120.0),),
+    )
+
+    result = _gate().evaluate_chart_candidate(
+        chart,
+        _authority(),
+        analysis,
+        requested_key_mode=4,
+        requested_difficulty="EASY",
+        duration_ms=30_000,
+        boundary_policy_mode="HIGH_CONFIDENCE_ENFORCED",
+    )
+
+    assert _decision(result, "SONG_BOUNDS").action is _gate().GateAction.PASS
+
+
 def test_acceptance_uses_every_local_bpm_segment_for_hold_beats():
     events = (OsuBpmEvent(0, 120.0), OsuBpmEvent(1_000, 240.0))
     chart = GeneratedChart(
@@ -239,16 +290,18 @@ def test_structural_retry_is_not_hidden_by_profile_construction():
     assert result.to_report()["qualityProfile"] is None
 
 
-def test_active_leading_coverage_gap_retries_the_map():
+def test_onsets_without_activity_evidence_review_instead_of_retrying():
     result = _evaluate(
         _chart((30_000,)),
         tuple(range(1_000, 21_000, 1_000)) + (30_000,),
         duration_ms=40_000,
     )
 
-    assert result.action is _gate().GateAction.RETRY_MAP
-    assert _decision(result, "COVERAGE").action is _gate().GateAction.RETRY_MAP
-    assert _decision(result, "COVERAGE").reasons == ("ACTIVE_LEADING_GAP",)
+    assert result.action is _gate().GateAction.REVIEW
+    assert _decision(result, "COVERAGE").action is _gate().GateAction.REVIEW
+    assert _decision(result, "COVERAGE").reasons == (
+        "UNCERTAIN_COVERAGE_EVIDENCE_LEADING_GAP",
+    )
 
 
 def test_quality_gate_uses_musical_coverage_horizon_for_trailing_gap():
@@ -310,8 +363,18 @@ def test_song_bounds_reject_hold_end_beyond_completion_horizon():
 @pytest.mark.parametrize(
     ("rows", "onsets", "duration_ms", "reason"),
     [
-        ((0, 20_000, 40_000), tuple(range(21_000, 40_000, 1_000)), 60_000, "ACTIVE_MIDDLE_GAP"),
-        ((0, 10_000), tuple(range(11_000, 31_000, 1_000)), 40_000, "ACTIVE_TRAILING_GAP"),
+        (
+            (0, 20_000, 40_000),
+            tuple(range(21_000, 40_000, 1_000)),
+            60_000,
+            "UNCERTAIN_COVERAGE_EVIDENCE_MIDDLE_GAP",
+        ),
+        (
+            (0, 10_000),
+            tuple(range(11_000, 31_000, 1_000)),
+            40_000,
+            "UNCERTAIN_COVERAGE_EVIDENCE_TRAILING_GAP",
+        ),
     ],
 )
 def test_active_gap_positions_have_stable_reasons(rows, onsets, duration_ms, reason):
@@ -571,10 +634,10 @@ def test_sustain_representable_gap_requires_review_not_full_map_retry():
 
     decision = _decision(result, "COVERAGE")
     assert decision.action is _gate().GateAction.REVIEW
-    assert "SUSTAIN_REPRESENTABLE_POST_FIRST_GAP" in decision.reasons
+    assert "SUSTAIN_COVERED_POST_FIRST_GAP" in decision.reasons
 
 
-def test_repeated_strong_attacks_under_hold_still_retry_map():
+def test_repeated_strong_attacks_under_a_fully_occupying_hold_retry_map():
     onsets = tuple(range(5_000, 21_000, 1_000))
     analysis = _analysis(
         onsets,
@@ -764,6 +827,69 @@ def test_axes_remain_independent_and_retry_beats_review_and_pass():
     }
     assert review.action is _gate().GateAction.REVIEW
     assert passed.action is _gate().GateAction.PASS
+
+
+def test_candidate_disposition_separates_hard_reject_from_repairable_quality():
+    structural = _evaluate(
+        _chart((1_000,), lane=4),
+        (1_000,),
+        duration_ms=2_000,
+    )
+    coverage = _evaluate(
+        _chart((30_000,)),
+        tuple(range(1_000, 21_000, 1_000)) + (30_000,),
+        duration_ms=40_000,
+    )
+
+    assert structural.disposition is _gate().CandidateDisposition.HARD_REJECT
+    assert structural.repair_eligible is False
+    assert coverage.disposition is _gate().CandidateDisposition.REVIEW
+    assert coverage.repair_eligible is False
+    assert coverage.repair_axes == ()
+
+
+def test_quality_defect_without_a_supported_repair_axis_is_preserved_as_unresolved():
+    result = _evaluate(
+        _chart(tuple(range(1_000, 9_000, 1_000))),
+        tuple(range(1_000, 9_000, 1_000)),
+        duration_ms=15_000,
+    )
+    decisions = tuple(
+        replace(
+            decision,
+            action=_gate().GateAction.RETRY_MAP,
+            reasons=("PATTERN_DENSITY_OUT_OF_RANGE",),
+        )
+        if decision.axis is _gate().GateAxis.PATTERN
+        else decision
+        for decision in result.decisions
+    )
+    pattern_retry = replace(
+        result,
+        action=_gate().GateAction.RETRY_MAP,
+        decisions=decisions,
+    )
+
+    assert pattern_retry.disposition is _gate().CandidateDisposition.QUALITY_DEFECT
+    assert pattern_retry.repair_eligible is False
+    assert pattern_retry.repair_axes == ()
+    report = pattern_retry.to_report()
+    assert report["candidateDisposition"] == "QUALITY_DEFECT"
+    assert report["repairEligible"] is False
+    assert report["repairAxes"] == []
+
+
+def test_candidate_disposition_keeps_review_and_admit_distinct():
+    review = _evaluate(_chart((500,)), (), duration_ms=1_000)
+    passed = _evaluate(
+        _chart(tuple(range(1_000, 9_000, 1_000))),
+        tuple(range(1_000, 9_000, 1_000)),
+        duration_ms=15_000,
+    )
+
+    assert review.disposition is _gate().CandidateDisposition.REVIEW
+    assert passed.disposition is _gate().CandidateDisposition.ADMIT
+    assert passed.to_report()["candidateDisposition"] == "ADMIT"
 
 
 def test_invalid_difficulty_is_rejected_before_evaluation():

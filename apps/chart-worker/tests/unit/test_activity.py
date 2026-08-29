@@ -347,11 +347,14 @@ def test_high_confidence_terminal_consensus_is_the_only_new_enforced_boundary():
 
     assert evaluation.effective_source == "TERMINAL_SILENCE_CONSENSUS"
     assert evaluation.effective_contract.last_attack_ms == 25_000
-    assert evaluation.effective_contract.max_note_start_ms == 25_070
+    assert evaluation.effective_contract.max_note_start_ms == 25_000
     assert evaluation.effective_contract.release_end_ms == 25_000
-    assert evaluation.effective_contract.generation_end_ms == 30_000
+    assert evaluation.effective_contract.generation_end_ms == 25_000
     assert evaluation.policy_state == "PROVISIONAL"
+    # Detector confidence is distinct from policy calibration confidence.
     assert evaluation.confidence == "UNKNOWN"
+    assert evaluation.to_report()["terminalConsensusConfidence"] == "HIGH"
+    assert evaluation.to_report()["terminalConsensusBoundaryMs"] == 25_000
 
 
 def test_high_confidence_mode_keeps_full_duration_without_consensus():
@@ -371,6 +374,9 @@ def test_high_confidence_mode_keeps_full_duration_without_consensus():
 
     assert evaluation.effective_source == "FULL_DURATION_BASELINE"
     assert evaluation.effective_contract.max_note_start_ms == 30_000
+    assert evaluation.confidence == "UNKNOWN"
+    assert evaluation.to_report()["terminalConsensusConfidence"] is None
+    assert evaluation.to_report()["terminalConsensusBoundaryMs"] is None
 
 
 def test_boundary_report_separates_policy_state_confidence_and_enforcement():

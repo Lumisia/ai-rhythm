@@ -192,6 +192,69 @@ def test_v2_chart_ref_requires_playtest_tier_for_safe_fallback():
         )
 
 
+@pytest.mark.parametrize("family_state", ("NARROW_REVIEW", "UNRESOLVED"))
+def test_v2_chart_ref_keeps_non_resolved_family_out_of_production(family_state):
+    """Removing the family-state guard must not publish unresolved evidence."""
+
+    summary = CoverageSummary(
+        first_note_time_ms=250,
+        max_gap_ms=2_000,
+        attack_required_gap_count=0,
+        attack_required_gap_total_ms=0,
+        repaired_gap_count=0,
+    )
+    chart = RunChartRefV2(
+        key_mode=4,
+        difficulty="HARD",
+        path="charts/4k-hard.chart.json",
+        sha256=SHA,
+        family_resolution_state=family_state,
+        family_resolution_reasons=["FAMILY_ORDER_NOT_PROVEN"],
+        production_eligible=False,
+        distribution_tier="PLAYTEST_ONLY",
+        playability_tier="MODEL_PLAYABLE",
+        coverage_summary=summary,
+    )
+
+    assert chart.family_resolution_state == family_state
+    assert chart.production_eligible is False
+    with pytest.raises(ValidationError, match="unresolved family must be playtest-only"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="HARD",
+            path="charts/4k-hard.chart.json",
+            sha256=SHA,
+            family_resolution_state=family_state,
+            family_resolution_reasons=["FAMILY_ORDER_NOT_PROVEN"],
+            production_eligible=True,
+            distribution_tier="PRODUCTION_CANDIDATE",
+        )
+
+
+def test_v2_chart_ref_requires_canonical_family_resolution_reasons():
+    with pytest.raises(ValidationError, match="requires reason codes"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="HARD",
+            path="charts/4k-hard.chart.json",
+            sha256=SHA,
+            family_resolution_state="UNRESOLVED",
+            production_eligible=False,
+            distribution_tier="PLAYTEST_ONLY",
+        )
+    with pytest.raises(ValidationError, match="sorted and unique"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="HARD",
+            path="charts/4k-hard.chart.json",
+            sha256=SHA,
+            family_resolution_state="UNRESOLVED",
+            family_resolution_reasons=["Z_REASON", "A_REASON", "Z_REASON"],
+            production_eligible=False,
+            distribution_tier="PLAYTEST_ONLY",
+        )
+
+
 def test_v2_chart_ref_carries_honest_coverage_repair_playability():
     summary = CoverageSummary(
         first_note_time_ms=250,
@@ -239,6 +302,58 @@ def test_v2_chart_ref_requires_summary_when_new_playability_tier_is_present():
             production_eligible=False,
             distribution_tier="PLAYTEST_ONLY",
             playability_tier="RECOVERY_PLAYABLE",
+        )
+
+
+def test_v2_chart_ref_marks_cross_difficulty_assignment_as_playtest_only():
+    summary = CoverageSummary(
+        first_note_time_ms=250,
+        max_gap_ms=2_000,
+        attack_required_gap_count=0,
+        attack_required_gap_total_ms=0,
+        repaired_gap_count=0,
+    )
+    reassigned = RunChartRefV2(
+        key_mode=4,
+        difficulty="EXPERT",
+        path="charts/4k-expert.chart.json",
+        sha256=SHA,
+        provenance="PRIMARY",
+        family_assignment_kind="REASSIGNED",
+        source_difficulty="HARD",
+        production_eligible=False,
+        distribution_tier="PLAYTEST_ONLY",
+        playability_tier="RECOVERY_PLAYABLE",
+        coverage_summary=summary,
+    )
+
+    assert reassigned.family_assignment_kind == "REASSIGNED"
+    assert reassigned.source_difficulty == "HARD"
+    with pytest.raises(ValidationError, match="family assignment"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="EXPERT",
+            path="charts/4k-expert.chart.json",
+            sha256=SHA,
+            provenance="PRIMARY",
+            family_assignment_kind="EMERGENCY_DUPLICATE",
+            source_difficulty="HARD",
+            production_eligible=True,
+            distribution_tier="PRODUCTION_CANDIDATE",
+        )
+
+
+def test_v2_chart_ref_requires_source_difficulty_for_adapted_assignment():
+    with pytest.raises(ValidationError, match="source difficulty"):
+        RunChartRefV2(
+            key_mode=4,
+            difficulty="EXPERT",
+            path="charts/4k-expert.chart.json",
+            sha256=SHA,
+            provenance="PRIMARY",
+            family_assignment_kind="REASSIGNED",
+            production_eligible=False,
+            distribution_tier="PLAYTEST_ONLY",
         )
 
 

@@ -8,6 +8,14 @@ from typing import Literal
 from chart_worker.analysis.intro_anchor import GRID_SUPPORT_WINDOW_MS
 from chart_worker.analysis.song_context import SongAnalysisContext
 from chart_worker.schema.note import Chart, NoteEvent
+from chart_worker.validation.intro_region_contract import (
+    IntroRegionContract,
+    build_intro_region_contract,
+    review_intro_region_candidate,
+)
+
+INTRO_START_CONTRACT_V2 = "intro-start-contract-v2"
+INTRO_START_CONTRACT_V3 = "intro-start-contract-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,13 +40,14 @@ class IntroCandidateView:
 
 @dataclass(frozen=True, slots=True)
 class IntroStartContract:
-    version: Literal["intro-start-contract-v2"]
+    version: Literal["intro-start-contract-v2", "intro-start-contract-v3"]
     canonical_first_row_ms: int | None
     candidate_support_count: int
     raw_supported: bool
     audio_supported: bool
     grid_distance_ms: int | None
     candidates: tuple[IntroCandidateView, ...]
+    intro_region: IntroRegionContract | None = None
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -49,6 +58,11 @@ class IntroStartContract:
             "audioSupported": self.audio_supported,
             "gridDistanceMs": self.grid_distance_ms,
             "candidates": [candidate.to_report() for candidate in self.candidates],
+            "introRegion": (
+                self.intro_region.to_report()
+                if self.intro_region is not None
+                else None
+            ),
         }
 
 
@@ -58,6 +72,7 @@ class IntroContractReview:
     mismatches: tuple[tuple[int, str, int | None], ...]
     corrected_count: int = 0
     correction_reasons: tuple[str, ...] = ()
+    exact_mismatches: tuple[tuple[int, str, int | None], ...] = ()
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -72,6 +87,14 @@ class IntroContractReview:
             ],
             "correctedCount": self.corrected_count,
             "correctionReasons": list(self.correction_reasons),
+            "exactMismatches": [
+                {
+                    "keyMode": key_mode,
+                    "difficulty": difficulty,
+                    "firstRowMs": first_row_ms,
+                }
+                for key_mode, difficulty, first_row_ms in self.exact_mismatches
+            ],
         }
 
 
@@ -119,6 +142,7 @@ def build_intro_start_contract(
     candidates: tuple[IntroCandidateView, ...],
 ) -> IntroStartContract:
     """Choose one evidence-backed timestamp without changing any chart."""
+    intro_region = build_intro_region_contract(song_context)
     proposal_times = {
         candidate.first_row_ms
         for candidate in candidates
@@ -129,13 +153,14 @@ def build_intro_start_contract(
         proposal_times.add(anchor.anchor_grid_ms)
     if not proposal_times:
         return IntroStartContract(
-            version="intro-start-contract-v2",
+            version=INTRO_START_CONTRACT_V3,
             canonical_first_row_ms=None,
             candidate_support_count=0,
             raw_supported=False,
             audio_supported=False,
             grid_distance_ms=None,
             candidates=candidates,
+            intro_region=intro_region,
         )
 
     def proposal_evidence(time_ms: int) -> tuple[int, int, int]:
@@ -186,13 +211,14 @@ def build_intro_start_contract(
         for candidate in candidates
     )
     return IntroStartContract(
-        version="intro-start-contract-v2",
+        version=INTRO_START_CONTRACT_V3,
         canonical_first_row_ms=canonical,
         candidate_support_count=support_count,
         raw_supported=raw_supported,
         audio_supported=audio_rank > 0,
         grid_distance_ms=grid_distance,
         candidates=candidates,
+        intro_region=intro_region,
     )
 
 
@@ -204,16 +230,33 @@ def validate_exact_first_row(
     correction_reasons: tuple[str, ...] = (),
 ) -> IntroContractReview:
     canonical = contract.canonical_first_row_ms
-    mismatches = tuple(
+    exact_mismatches = tuple(
         (candidate.key_mode, candidate.difficulty, candidate.first_row_ms)
         for candidate in selected
         if canonical is None or candidate.first_row_ms != canonical
     )
+    if (
+        contract.version == INTRO_START_CONTRACT_V3
+        and contract.intro_region is not None
+        and contract.intro_region.status == "CONFIRMED"
+    ):
+        mismatches = tuple(
+            (candidate.key_mode, candidate.difficulty, candidate.first_row_ms)
+            for candidate in selected
+            if review_intro_region_candidate(
+                contract.intro_region,
+                first_row_ms=candidate.first_row_ms,
+            ).status
+            == "DEFECT"
+        )
+    else:
+        mismatches = exact_mismatches
     return IntroContractReview(
         status="REVIEW" if mismatches else "PASS",
         mismatches=mismatches,
         corrected_count=corrected_count,
         correction_reasons=correction_reasons,
+        exact_mismatches=exact_mismatches,
     )
 
 

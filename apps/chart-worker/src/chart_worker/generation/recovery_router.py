@@ -59,17 +59,29 @@ class RecoveryPlan:
     deferred: tuple[RecoveryRequest, ...]
     available_generation_ms: int
     selected_generation_ms: int
+    available_calls: int
 
     @property
     def remaining_generation_ms(self) -> int:
         return self.available_generation_ms - self.selected_generation_ms
 
+    @property
+    def selected_calls(self) -> int:
+        return len(self.selected)
+
+    @property
+    def remaining_calls(self) -> int:
+        return self.available_calls - self.selected_calls
+
     def to_report(self) -> dict[str, object]:
         return {
-            "policyVersion": "RECOVERY_WORK_BUDGET_V2",
+            "policyVersion": "RECOVERY_WORK_AND_CALL_BUDGET_V3",
             "availableGenerationMs": self.available_generation_ms,
             "selectedGenerationMs": self.selected_generation_ms,
             "remainingGenerationMs": self.remaining_generation_ms,
+            "availableCalls": self.available_calls,
+            "selectedCalls": self.selected_calls,
+            "remainingCalls": self.remaining_calls,
             "selectedRequestIds": [request.request_id for request in self.selected],
             "deferredRequestIds": [request.request_id for request in self.deferred],
             "requests": [
@@ -78,7 +90,11 @@ class RecoveryPlan:
                     "decision": (
                         "SELECTED"
                         if request in self.selected
-                        else "DEFERRED_WORK_BUDGET"
+                        else (
+                            "DEFERRED_CALL_BUDGET"
+                            if self.remaining_calls == 0
+                            else "DEFERRED_WORK_BUDGET"
+                        )
                     ),
                 }
                 for request in (*self.selected, *self.deferred)
@@ -90,6 +106,7 @@ _KIND_ORDER = {
     RecoveryKind.PARTIAL_REMAP: 0,
     RecoveryKind.INTRO: 1,
     RecoveryKind.TIMING_FAMILY: 2,
+    RecoveryKind.DIFFICULTY_SHADOW: 3,
 }
 
 
@@ -108,11 +125,16 @@ def plan_recoveries(
     requests: tuple[RecoveryRequest, ...],
     *,
     available_generation_ms: int,
+    available_calls: int,
 ) -> RecoveryPlan:
     """Choose recovery work independently of discovery or iteration order."""
 
     if available_generation_ms < 0:
         raise ValueError("available_generation_ms must be non-negative")
+    if type(available_calls) is not int:
+        raise TypeError("available_calls must be an exact integer")
+    if available_calls < 0:
+        raise ValueError("available_calls must be non-negative")
     request_ids = [request.request_id for request in requests]
     if len(request_ids) != len(set(request_ids)):
         raise ValueError("duplicate recovery request id")
@@ -121,11 +143,17 @@ def plan_recoveries(
     selected: list[RecoveryRequest] = []
     deferred: list[RecoveryRequest] = []
     remaining = available_generation_ms
+    remaining_calls = available_calls
     higher_priority_blocked = False
     for request in ranked:
-        if not higher_priority_blocked and request.estimated_generation_ms <= remaining:
+        if (
+            not higher_priority_blocked
+            and remaining_calls > 0
+            and request.estimated_generation_ms <= remaining
+        ):
             selected.append(request)
             remaining -= request.estimated_generation_ms
+            remaining_calls -= 1
         else:
             deferred.append(request)
             # Requests are sorted by priority and then increasing cost.  Once
@@ -137,6 +165,7 @@ def plan_recoveries(
         deferred=tuple(deferred),
         available_generation_ms=available_generation_ms,
         selected_generation_ms=available_generation_ms - remaining,
+        available_calls=available_calls,
     )
 
 
@@ -173,6 +202,27 @@ def intro_phrase_recovery_request(
     )
 
 
+def intro_region_recovery_request(
+    *,
+    key_mode: int,
+    difficulty: str,
+    window_ms: int,
+) -> RecoveryRequest:
+    """Request one bounded repair for an audio-confirmed late chart start."""
+
+    if type(window_ms) is not int or window_ms <= 0:
+        raise ValueError("window_ms must be a positive exact integer")
+    return RecoveryRequest(
+        request_id=f"intro:{key_mode}k:{difficulty}",
+        kind=RecoveryKind.INTRO,
+        key_mode=key_mode,
+        difficulty=difficulty,
+        priority=RecoveryPriority.COMPLETENESS_BLOCKING,
+        estimated_generation_ms=window_ms,
+        reason="CONFIRMED_INTRO_REGION_DEFECT",
+    )
+
+
 def timing_family_recovery_request(
     *,
     key_mode: int,
@@ -187,4 +237,23 @@ def timing_family_recovery_request(
         priority=RecoveryPriority.QUALITY_BLOCKING,
         estimated_generation_ms=song_duration_ms,
         reason="CORROBORATED_TIMING_FAMILY_OUTLIER",
+    )
+
+
+def difficulty_shadow_recovery_request(
+    *,
+    key_mode: int,
+    difficulty: str,
+    window_ms: int,
+) -> RecoveryRequest:
+    if type(window_ms) is not int or window_ms <= 0:
+        raise ValueError("window_ms must be a positive exact integer")
+    return RecoveryRequest(
+        request_id=f"difficulty-shadow:{key_mode}k:{difficulty}",
+        kind=RecoveryKind.DIFFICULTY_SHADOW,
+        key_mode=key_mode,
+        difficulty=difficulty,
+        priority=RecoveryPriority.ADVISORY,
+        estimated_generation_ms=window_ms,
+        reason="STRONG_FALLBACK_INVERSION_WITH_LEADING_NEAR_SOLUTION",
     )

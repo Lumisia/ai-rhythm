@@ -15,8 +15,12 @@ from chart_worker.validation.timing_review import TimingAuthorityReview
 
 if TYPE_CHECKING:
     from chart_worker.generation.diagnostic_fallback import DiagnosticRawCandidate
+    from chart_worker.generation.difficulty_family_compiler import (
+        DifficultyFamilyCompilerDecision,
+    )
     from chart_worker.validation.difficulty_order import DifficultyOrderReview
     from chart_worker.validation.difficulty_selector import DifficultySelectionComparison
+    from chart_worker.validation.family_evidence_v3 import SongSelectionEvidenceV3
     from chart_worker.validation.intro_phrase_family import IntroPhraseFamilyReview
     from chart_worker.validation.intro_start_contract import (
         IntroContractReview,
@@ -26,7 +30,13 @@ if TYPE_CHECKING:
     from chart_worker.validation.outro_family_review import OutroFamilyReview
     from chart_worker.validation.quality_gate import ChartAcceptance
     from chart_worker.validation.recovery_preflight import RecoveryPreflight
+    from chart_worker.validation.safe_family_assignment import (
+        SafeFamilyAssignmentDecision,
+    )
     from chart_worker.validation.song_family_selector import SongSelectionComparison
+    from chart_worker.validation.song_family_selector_v3 import (
+        ShadowV3ProposalEvaluation,
+    )
     from chart_worker.validation.timing_candidate_selector import TimingCandidateSelection
     from chart_worker.validation.timing_family_review import TimingFamilyReview
     from chart_worker.validation.timing_integrity import TimingIntegrityAssessment
@@ -40,6 +50,16 @@ GenerationProvenance = Literal[
     "COVERAGE_REPAIR",
     "RAW_UNVERIFIED",
     "SAFE_FALLBACK",
+]
+FamilyAssignmentKind = Literal[
+    "ORIGINAL",
+    "REASSIGNED",
+    "EMERGENCY_DUPLICATE",
+]
+FamilyResolutionState = Literal[
+    "RESOLVED",
+    "NARROW_REVIEW",
+    "UNRESOLVED",
 ]
 """Playtest provenance contract.
 
@@ -55,6 +75,9 @@ PLAYTEST_ONLY/REVIEW.
 class PreparedAudio:
     normalized: NormalizedAudio
     difficulty_selector_mode: Literal["CURRENT", "SHADOW_V2", "V2"] = "SHADOW_V2"
+    difficulty_shadow_challenger_enabled: bool = False
+    difficulty_family_compiler_shadow_enabled: bool = False
+    difficulty_family_resolution_enabled: bool = False
     boundary_policy_mode: Literal[
         "SHADOW",
         "EXPERIMENTAL_ENFORCED",
@@ -103,8 +126,13 @@ class GeneratedVariant:
     selected_seed: int | None = None
     difficulty_order: "DifficultyOrderReview | None" = None
     provenance: GenerationProvenance = "PRIMARY"
+    family_assignment_kind: FamilyAssignmentKind = "ORIGINAL"
+    source_difficulty: str | None = None
     recovery_reason: str | None = None
     coverage_repair_gap_count: int = 0
+    production_eligible: bool = True
+    family_resolution_state: FamilyResolutionState = "RESOLVED"
+    family_resolution_reasons: tuple[str, ...] = ()
     """Why this is not PRIMARY, including any playtest-only fallback policy."""
 
 
@@ -140,6 +168,12 @@ class GenerationOutcome:
     missing: tuple[MissingVariant, ...] = ()
     difficulty_selection_shadows: tuple["DifficultySelectionComparison", ...] = ()
     song_selection_shadow: "SongSelectionComparison | None" = None
+    song_selection_evidence_v3: "SongSelectionEvidenceV3 | None" = None
+    song_selection_shadow_v3: "ShadowV3ProposalEvaluation | None" = None
+    safe_family_assignments: tuple["SafeFamilyAssignmentDecision", ...] = ()
+    difficulty_family_compiler_shadow: tuple[
+        "DifficultyFamilyCompilerDecision", ...
+    ] = ()
     intro_start_contract: "IntroStartContract | None" = None
     intro_contract_review: "IntroContractReview | None" = None
     intro_phrase_family_reviews: tuple["IntroPhraseFamilyReview", ...] = ()

@@ -63,49 +63,79 @@ def test_required_patch_manifest_includes_hold_state_grammar():
         "canonical-sidecar-v32-final-serialization",
         "mania-terminal-budget-v33-reserve-eos",
         "mania-group-fragment-v34-explicit-failure",
+        "required-gameplay-interval-v35-origin-accounting",
+        "required-gameplay-enforcement-v36-shadow-fsm",
+        "intro-evidence-v37-region-class",
     ]
     assert all(path.is_file() for _, path in REQUIRED_PATCHES)
     assert (
-        mapperatorinator_patch.MANIA_GROUP_FRAGMENT_V34_PATCH_PATH
+        mapperatorinator_patch.INTRO_EVIDENCE_V37_PATCH_PATH
         == REQUIRED_PATCHES[-1][1]
     )
-    assert REQUIRED_PATCHES[-2][0] == (
+    assert (
+        mapperatorinator_patch.REQUIRED_GAMEPLAY_ENFORCEMENT_V36_PATCH_PATH
+        == REQUIRED_PATCHES[-2][1]
+    )
+    assert (
+        mapperatorinator_patch.REQUIRED_GAMEPLAY_INTERVAL_V35_PATCH_PATH
+        == REQUIRED_PATCHES[-3][1]
+    )
+    assert REQUIRED_PATCHES[-4][0] == (
+        "mania-group-fragment-v34-explicit-failure"
+    )
+    assert (
+        mapperatorinator_patch.MANIA_GROUP_FRAGMENT_V34_PATCH_PATH
+        == REQUIRED_PATCHES[-4][1]
+    )
+    assert REQUIRED_PATCHES[-5][0] == (
         "mania-terminal-budget-v33-reserve-eos"
     )
     assert (
         mapperatorinator_patch.MANIA_TERMINAL_BUDGET_V33_PATCH_PATH
-        == REQUIRED_PATCHES[-2][1]
-    )
-    assert REQUIRED_PATCHES[-3][0] == (
-        "canonical-sidecar-v32-final-serialization"
+        == REQUIRED_PATCHES[-5][1]
     )
     assert (
-        mapperatorinator_patch.CANONICAL_SIDECAR_V32_PATCH_PATH
-        == REQUIRED_PATCHES[-3][1]
+        mapperatorinator_patch.LEGACY_V36_REQUIRED_PATCHES
+        == REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V35_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V36_REQUIRED_PATCHES[:-1]
+    )
+    assert (
+        mapperatorinator_patch.LEGACY_V34_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V35_REQUIRED_PATCHES[:-1]
     )
     assert (
         mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
-        == REQUIRED_PATCHES[:-1]
+        == mapperatorinator_patch.LEGACY_V34_REQUIRED_PATCHES[:-1]
     )
     assert (
         mapperatorinator_patch.LEGACY_V32_REQUIRED_PATCHES
         == mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES[:-1]
     )
-    assert REQUIRED_PATCHES[-4][0] == (
+    assert REQUIRED_PATCHES[-6][0] == (
+        "canonical-sidecar-v32-final-serialization"
+    )
+    assert (
+        mapperatorinator_patch.CANONICAL_SIDECAR_V32_PATCH_PATH
+        == REQUIRED_PATCHES[-6][1]
+    )
+    assert REQUIRED_PATCHES[-7][0] == (
         "resnap-lane-order-v31-integer-milliseconds"
     )
     assert (
         mapperatorinator_patch.LEGACY_V31_REQUIRED_PATCHES
         == mapperatorinator_patch.LEGACY_V32_REQUIRED_PATCHES[:-1]
     )
-    assert REQUIRED_PATCHES[-5][0] == (
+    assert REQUIRED_PATCHES[-8][0] == (
         "generation-telemetry-v30-hash-bound-evidence"
     )
     assert (
         mapperatorinator_patch.LEGACY_V30_REQUIRED_PATCHES
         == mapperatorinator_patch.LEGACY_V31_REQUIRED_PATCHES[:-1]
     )
-    assert REQUIRED_PATCHES[-6][0] == (
+    assert REQUIRED_PATCHES[-9][0] == (
         "mania-decoder-termination-v29-hard-cap-eos"
     )
     assert (
@@ -214,19 +244,19 @@ def test_required_patch_manifest_includes_hold_state_grammar():
     )
     assert (
         mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[0]
-        == mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V36_REQUIRED_PATCHES
     )
     assert (
         mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[1]
-        == mapperatorinator_patch.LEGACY_V32_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V35_REQUIRED_PATCHES
     )
     assert (
         mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[2]
-        == mapperatorinator_patch.LEGACY_V31_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V34_REQUIRED_PATCHES
     )
     assert (
         mapperatorinator_patch.LEGACY_REQUIRED_PATCH_SETS[3]
-        == mapperatorinator_patch.LEGACY_V30_REQUIRED_PATCHES
+        == mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
     )
 
 
@@ -297,7 +327,7 @@ def _path_snapshot(home: Path, paths: set[str]) -> dict[str, tuple[str, str, str
     return snapshot
 
 
-def test_v34_patch_chain_round_trips_from_pinned_local_upstream(
+def test_v37_patch_chain_round_trips_from_pinned_local_upstream(
     monkeypatch: pytest.MonkeyPatch,
 ):
     source_value = os.environ.get("MAPPERATORINATOR_INTEGRATION_SOURCE")
@@ -360,13 +390,13 @@ def test_v34_patch_chain_round_trips_from_pinned_local_upstream(
         "TemporaryDirectory",
         accessible_temporary_directory,
     )
-    legacy_v33 = mapperatorinator_patch.LEGACY_V33_REQUIRED_PATCHES
-    v34_patch = REQUIRED_PATCHES[-1][1]
+    legacy_v36 = mapperatorinator_patch.LEGACY_V36_REQUIRED_PATCHES
+    v37_patch = REQUIRED_PATCHES[-1][1]
     all_paths = _patch_paths(REQUIRED_PATCHES)
-    v34_paths = _patch_paths((REQUIRED_PATCHES[-1],))
-    earlier_only_paths = all_paths - v34_paths
+    v37_paths = _patch_paths((REQUIRED_PATCHES[-1],))
+    earlier_only_paths = all_paths - v37_paths
 
-    full_home = _clone_pinned_upstream(source, integration_root / "full-v34")
+    full_home = _clone_pinned_upstream(source, integration_root / "full-v37")
     assert (full_home / ".git" / "objects").resolve() != (
         source / ".git" / "objects"
     ).resolve()
@@ -384,30 +414,30 @@ def test_v34_patch_chain_round_trips_from_pinned_local_upstream(
     assert _path_snapshot(full_home, all_paths) == full_snapshot
     assert _git(full_home, "status", "--porcelain=v1").stdout == first_status
 
-    v33_home = _clone_pinned_upstream(source, integration_root / "exact-v33")
+    v36_home = _clone_pinned_upstream(source, integration_root / "exact-v36")
     apply_required_mapperatorinator_patches(
-        v33_home,
-        patches=legacy_v33,
+        v36_home,
+        patches=legacy_v36,
     )
-    v33_snapshot = _path_snapshot(v33_home, all_paths)
+    v36_snapshot = _path_snapshot(v36_home, all_paths)
 
-    reverse = _git(full_home, "apply", "--reverse", str(v34_patch))
+    reverse = _git(full_home, "apply", "--reverse", str(v37_patch))
     assert reverse.returncode == 0
     reversed_snapshot = _path_snapshot(full_home, all_paths)
-    assert reversed_snapshot == v33_snapshot
+    assert reversed_snapshot == v36_snapshot
     assert {
         path: reversed_snapshot[path] for path in earlier_only_paths
     } == {
         path: full_snapshot[path] for path in earlier_only_paths
     }
 
-    reapply = _git(full_home, "apply", str(v34_patch))
+    reapply = _git(full_home, "apply", str(v37_patch))
     assert reapply.returncode == 0
     assert _path_snapshot(full_home, all_paths) == full_snapshot
 
-    apply_required_mapperatorinator_patches(v33_home)
-    assert required_patch_statuses(v33_home) == expected_statuses
-    assert _path_snapshot(v33_home, all_paths) == full_snapshot
+    apply_required_mapperatorinator_patches(v36_home)
+    assert required_patch_statuses(v36_home) == expected_statuses
+    assert _path_snapshot(v36_home, all_paths) == full_snapshot
 
 
 def _git(home: Path, *args: str) -> subprocess.CompletedProcess[str]:

@@ -34,6 +34,7 @@ class ErrorCode(StrEnum):
     # Mapperatorinator 도메인·프로토콜
     MANIA_TAIL_REPAIR_EXHAUSTED = "MANIA_TAIL_REPAIR_EXHAUSTED"
     MANIA_PARTIAL_REJOIN_INVALID = "MANIA_PARTIAL_REJOIN_INVALID"
+    MANIA_REQUIRED_GAMEPLAY_FAILED = "MANIA_REQUIRED_GAMEPLAY_FAILED"
     INFERENCE_PROTOCOL_FAILED = "INFERENCE_PROTOCOL_FAILED"
     INFERENCE_START_FAILED = "INFERENCE_START_FAILED"
     INFERENCE_COMPLETION_UNKNOWN = "INFERENCE_COMPLETION_UNKNOWN"
@@ -90,6 +91,9 @@ _DISPOSITION: dict[ErrorCode, Disposition] = {
     # PARTIAL_REMAP 은 변형당 한 번만 청구된다. 참조 자체가 깨졌으면 같은 참조로
     # 다시 이어붙여도 결과가 같고, 이어붙이기가 실패했어도 다시 청구할 예산이 없다.
     ErrorCode.MANIA_PARTIAL_REJOIN_INVALID: Disposition.FINAL,
+    # 한 번의 bounded research partial 호출이 명시적 interval 계약을 만족하지
+    # 못했다. 호출자는 원 후보를 보존하며 동일 호출을 자동 반복하지 않는다.
+    ErrorCode.MANIA_REQUIRED_GAMEPLAY_FAILED: Disposition.FINAL,
     # 구조화 결과가 깨지면 실행 완료 여부나 실패 종류를 신뢰할 수 없다.
     ErrorCode.INFERENCE_PROTOCOL_FAILED: Disposition.FINAL_ALERT,
     # Before ACCEPTED no model execution is known to have started. Existing bounded retry

@@ -56,6 +56,51 @@ def _expand_across_holds(
         start_ms, end_ms = expanded_start, expanded_end
 
 
+def expand_partial_remap_window(
+    notes: Chart,
+    *,
+    start_ms: int,
+    end_ms: int,
+    duration_ms: int,
+) -> PartialRemapWindow | None:
+    """Expand a requested interval across HOLDs, or decline a near-full remap."""
+
+    if type(duration_ms) is not int or duration_ms <= 0:
+        raise ValueError("duration_ms must be a positive exact integer")
+    if type(start_ms) is not int or type(end_ms) is not int:
+        raise ValueError("partial remap bounds must be exact integers")
+    if start_ms < 0 or start_ms >= end_ms or end_ms > duration_ms:
+        raise ValueError("partial remap bounds must satisfy 0 <= start < end <= duration")
+
+    start_ms, end_ms = _expand_across_holds(
+        notes,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        duration_ms=duration_ms,
+    )
+    if (end_ms - start_ms) / duration_ms > MAX_REPAIR_FRACTION:
+        return None
+    return PartialRemapWindow(start_ms=start_ms, end_ms=end_ms)
+
+
+def partial_suffix_signature(
+    notes: Chart,
+    *,
+    end_ms: int,
+) -> tuple[tuple[int, int, str, int | None], ...]:
+    """Return the normalized semantic identity strictly after a partial window."""
+
+    if type(end_ms) is not int or end_ms < 0:
+        raise ValueError("end_ms must be a non-negative exact integer")
+    return tuple(
+        sorted(
+            (note.time_ms, note.lane, note.kind, note.duration_ms)
+            for note in notes
+            if note.time_ms > end_ms
+        )
+    )
+
+
 def build_partial_remap_window(
     notes: Chart,
     coverage_gaps: tuple[TimingCoverageGap, ...],
@@ -73,12 +118,9 @@ def build_partial_remap_window(
     gap_end_ms = max(gap.end_ms for gap in coverage_gaps)
     start_ms = max(0, gap_start_ms - _margin_ms(gap_start_ms, bpm_events))
     end_ms = min(duration_ms, gap_end_ms + _margin_ms(gap_end_ms, bpm_events))
-    start_ms, end_ms = _expand_across_holds(
+    return expand_partial_remap_window(
         notes,
         start_ms=start_ms,
         end_ms=end_ms,
         duration_ms=duration_ms,
     )
-    if (end_ms - start_ms) / duration_ms > MAX_REPAIR_FRACTION:
-        return None
-    return PartialRemapWindow(start_ms=start_ms, end_ms=end_ms)

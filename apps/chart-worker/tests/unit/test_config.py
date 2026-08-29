@@ -122,6 +122,36 @@ def test_unknown_difficulty_selector_mode_is_rejected():
         WorkerConfig(difficulty_selector_mode="AUTO")
 
 
+def test_difficulty_shadow_challenger_is_default_off_and_explicitly_opt_in(
+    monkeypatch,
+):
+    monkeypatch.delenv("DIFFICULTY_SHADOW_CHALLENGER_ENABLED", raising=False)
+    assert load_config().difficulty_shadow_challenger_enabled is False
+    assert WorkerConfig(
+        difficulty_shadow_challenger_enabled=True
+    ).difficulty_shadow_challenger_enabled is True
+
+
+def test_difficulty_family_compiler_shadow_is_default_off_and_explicitly_opt_in(
+    monkeypatch,
+):
+    monkeypatch.delenv("DIFFICULTY_FAMILY_COMPILER_SHADOW_ENABLED", raising=False)
+    assert load_config().difficulty_family_compiler_shadow_enabled is False
+    assert WorkerConfig(
+        difficulty_family_compiler_shadow_enabled=True
+    ).difficulty_family_compiler_shadow_enabled is True
+
+
+def test_unique_difficulty_family_resolution_is_default_on_and_can_be_disabled(
+    monkeypatch,
+):
+    monkeypatch.delenv("DIFFICULTY_FAMILY_RESOLUTION_ENABLED", raising=False)
+    assert load_config().difficulty_family_resolution_enabled is True
+    assert WorkerConfig(
+        difficulty_family_resolution_enabled=False
+    ).difficulty_family_resolution_enabled is False
+
+
 def test_boundary_policy_defaults_to_high_confidence_enforcement(monkeypatch):
     monkeypatch.delenv("BOUNDARY_POLICY_MODE", raising=False)
 

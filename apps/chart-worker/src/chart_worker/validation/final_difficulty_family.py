@@ -5,11 +5,30 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
-FINAL_DIFFICULTY_FAMILY_OBSERVATION_VERSION = "final-difficulty-family-observation-v1"
+FINAL_DIFFICULTY_FAMILY_OBSERVATION_VERSION = "final-difficulty-family-observation-v2"
+CalibrationState: TypeAlias = Literal[
+    "UNAVAILABLE",
+    "PILOT_ONLY",
+    "REPORT_ONLY_VALIDATED",
+    "ACTIVATION_ELIGIBLE",
+    "ENFORCED",
+]
+CalibrationContractStatus: TypeAlias = Literal["UNCALIBRATED", "CALIBRATED"]
+CALIBRATION_STATES: tuple[CalibrationState, ...] = (
+    "UNAVAILABLE",
+    "PILOT_ONLY",
+    "REPORT_ONLY_VALIDATED",
+    "ACTIVATION_ELIGIBLE",
+    "ENFORCED",
+)
+# The frozen evidence is a single-rater enriched pilot.  It supports screening
+# research, but it is neither an independent production holdout nor an active
+# calibration model.  Callers must pass this state explicitly.
+CURRENT_DIFFICULTY_FAMILY_CALIBRATION_STATE: Literal["PILOT_ONLY"] = "PILOT_ONLY"
 _RECOVERY_PROVENANCES = frozenset(
     {
         "PARTIAL_REMAP",
@@ -54,10 +73,10 @@ class DifficultyFamilyEntry:
 
 @dataclass(frozen=True, slots=True)
 class FinalDifficultyFamilyObservation:
-    version: Literal["final-difficulty-family-observation-v1"]
+    version: Literal["final-difficulty-family-observation-v2"]
     key_mode: int
-    calibration_state: Literal["UNAVAILABLE"]
-    contract_status: Literal["UNCALIBRATED"]
+    calibration_state: CalibrationState
+    contract_status: CalibrationContractStatus
     provisional_concern: Literal[
         "NONE",
         "INCOMPLETE_EVIDENCE",
@@ -72,12 +91,36 @@ class FinalDifficultyFamilyObservation:
     ordering_score_inversions: tuple[tuple[str, str], ...]
     recovery_difficulties: tuple[str, ...]
 
+    @property
+    def requires_review(self) -> bool:
+        """Whether relative-order evidence is unresolved.
+
+        This does not claim calibrated player tiers.  It only prevents an
+        observed inversion, metric disagreement, or incomplete family from
+        being reported as a clean quality PASS.
+        """
+
+        return self.provisional_concern != "NONE"
+
+    @property
+    def resolution_status(self) -> Literal["NO_OBSERVED_CONCERN", "UNRESOLVED"]:
+        """Describe observation status without implying calibrated correctness."""
+
+        return "UNRESOLVED" if self.requires_review else "NO_OBSERVED_CONCERN"
+
+    @property
+    def production_calibration_enforced(self) -> bool:
+        """Whether an independently activated calibration contract is live."""
+
+        return self.calibration_state == "ENFORCED"
+
     def to_report(self) -> dict[str, object]:
         return {
             "version": self.version,
             "keyMode": self.key_mode,
             "calibrationState": self.calibration_state,
             "contractStatus": self.contract_status,
+            "productionCalibrationEnforced": self.production_calibration_enforced,
             "provisionalConcern": self.provisional_concern,
             "entries": [entry.to_report() for entry in self.entries],
             "missingDifficulties": list(self.missing_difficulties),
@@ -89,9 +132,12 @@ class FinalDifficultyFamilyObservation:
                 list(pair) for pair in self.ordering_score_inversions
             ],
             "recoveryDifficulties": list(self.recovery_difficulties),
-            "policyState": "OBSERVATION_ONLY",
+            "requiresReview": self.requires_review,
+            "resolutionStatus": self.resolution_status,
+            "policyState": "REPORTING_ENFORCED",
             "mutatesSelection": False,
             "mutatesCharts": False,
+            "mutatesQualityStatus": True,
         }
 
 
@@ -110,14 +156,18 @@ def _inversions(
 def observe_final_difficulty_family(
     key_mode: int,
     entries: tuple[DifficultyFamilyEntry, ...],
+    *,
+    calibration_state: CalibrationState,
 ) -> FinalDifficultyFamilyObservation:
-    """Compare within-key labels while keeping all scores explicitly uncalibrated."""
+    """Compare within-key labels under one caller-declared calibration state."""
     if type(key_mode) is not int or key_mode not in KEY_MODES:
         raise ValueError(f"unsupported key mode: {key_mode!r}")
     if type(entries) is not tuple or not entries:
         raise TypeError("entries must be a non-empty tuple")
     if any(not isinstance(entry, DifficultyFamilyEntry) for entry in entries):
         raise TypeError("entries must contain DifficultyFamilyEntry values")
+    if type(calibration_state) is not str or calibration_state not in CALIBRATION_STATES:
+        raise ValueError("calibration_state is unsupported")
     difficulties = tuple(entry.difficulty for entry in entries)
     if len(set(difficulties)) != len(difficulties):
         raise ValueError("difficulty entries must be unique")
@@ -151,8 +201,10 @@ def observe_final_difficulty_family(
     return FinalDifficultyFamilyObservation(
         version=FINAL_DIFFICULTY_FAMILY_OBSERVATION_VERSION,
         key_mode=key_mode,
-        calibration_state="UNAVAILABLE",
-        contract_status="UNCALIBRATED",
+        calibration_state=calibration_state,
+        contract_status=(
+            "CALIBRATED" if calibration_state == "ENFORCED" else "UNCALIBRATED"
+        ),
         provisional_concern=concern,
         entries=ordered,
         missing_difficulties=missing,
