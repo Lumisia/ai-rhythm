@@ -38,19 +38,20 @@ def _sha256(path: Path) -> str:
 
 
 def _manifest_evidence(song_dir: Path, *, report_sha256: str) -> tuple[str, str]:
-    manifest_path = next(
-        (
-            path
-            for path in (
-                song_dir / "playtest-run-v2.json",
-                song_dir / "playtest-run-v1.json",
-            )
-            if path.is_file()
-        ),
-        None,
-    )
-    if manifest_path is None:
+    manifest_paths = [
+        path
+        for path in (
+            song_dir / "playtest-run-v3.json",
+            song_dir / "playtest-run-v2.json",
+            song_dir / "playtest-run-v1.json",
+        )
+        if path.is_file()
+    ]
+    if not manifest_paths:
         raise ValueError(f"playtest manifest is missing: {song_dir}")
+    if len(manifest_paths) > 1:
+        raise ValueError(f"multiple playtest manifests found: {song_dir}")
+    manifest_path = manifest_paths[0]
 
     manifest = _load_json(manifest_path)
     generation_report = manifest.get("generationReport")

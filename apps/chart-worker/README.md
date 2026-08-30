@@ -116,18 +116,20 @@ PowerShell의 현재 프로세스에만 Mapperatorinator와 공유 FFmpeg 경로
 - `audio/game.flac`: 브라우저 재생용 정규화 음원
 - `audio/timing-reference.osu`: 12개 MAP이 공유하는 SHA-256 고정 timing 기준
 - `generation-report.json`: 성공 또는 보류 결과, 품질 프로필과 후보 선택 근거
-- `diagnostic-raw-fallback/<variant>/`: 정상 발행 후보가 없는 변형의 hard-safe Mapperatorinator 원본. `PLAYTEST_ONLY`, `productionEligible=false`이며 정상 export 입력이 아님
+- `diagnostic-raw-fallback/<variant>/`: 정상 발행 후보가 없는 변형의 hard-safe Mapperatorinator 원본. 별도 진단 manifest에서 `PLAYTEST_ONLY`로 격리하며 정상 export 입력이 아님
 - `benchmark-report.json`: 실행 요약과 읽기 전용 구조 경고
-- `playtest-run-v2.json`: 프론트엔드가 읽는 실행 폴더 manifest
+- `playtest-run-v3.json`: 프론트엔드가 읽는 신규 실행 폴더 manifest. 최종 production 권한은 run-level `publication.decision` 하나에만 있음
 
 성공한 `generation-report.json`은 `qualityGateVersion=quality-gate-v4-beat-aware-coverage`,
 `status=PASS`, timing authority의 tempo metrics·review와 채보별
 acceptance status·reason·축별 결정·note-grid 근거를 기록한다. 각 채보에는 선택 seed,
 실제 생성 횟수, 후보 수, 측정 난이도와 15초 구간별 HOLD·레인·반복 프로필을 남기고,
 키 모드별 `difficultyOrder`에는 네 라벨의 상대 난이도와 역전·동률 쌍을 남긴다.
-채보별 `REVIEW`가 있어도 실행 자체는 완료될 수 있지만, raw/safe fallback이 하나라도
-있으면 `distributionTier=PLAYTEST_ONLY`, `productionEligible=false`를 채보별로 남기고
-전체 publication decision도 production 허용으로 승격하지 않는다.
+채보별 `REVIEW`가 있어도 실행 자체는 완료될 수 있지만, raw/safe fallback이나
+미해결 family가 하나라도 있으면 전체 publication decision을 production 허용으로
+승격하지 않는다. V3 채보 참조는 provenance·family resolution·playability 같은
+진단 사실만 보존하며 채보별 production boolean이나 tier를 갖지 않는다. V2는 과거
+산출물 검수용 형식이며 신규 production 입력으로 신뢰하지 않는다.
 
 발행 여부는 boolean이 아니다. `PUBLICATION_POLICY_V2`가 `ALLOW_PRODUCTION` /
 `PLAYTEST_ONLY` / `REJECTED` 중 하나를 사유 코드와 함께 내고, 직교하는 `OutcomeStatus`가

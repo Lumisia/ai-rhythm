@@ -1,8 +1,13 @@
 # 로컬 채보 플레이테스터
 
-이 앱은 `playtest-run-v1.json`이 있는 chart-worker 실행 폴더를 브라우저 안에서
-읽어 수동 플레이하는 React/Phaser 도구다. 로컬 폴더의 파일을 서버로 업로드하지
-않는다.
+이 앱은 chart-worker의 `playtest-run-v1.json`, `playtest-run-v2.json` 또는
+`playtest-run-v3.json`이 정확히 하나 있는 실행 폴더를 브라우저 안에서 읽어 수동
+플레이하는 React/Phaser 도구다. 로컬 폴더의 파일을 서버로 업로드하지 않는다.
+
+V3만 신규 production 검증 대상이다. V3는 schema·보고서 SHA·상태 snapshot·전역
+publication을 독립 검증하고 `ALLOW_PRODUCTION`일 때만 production으로 연다. V2는
+내부 무결성을 검사한 뒤에도 과거 chart-level 권한을 신뢰하지 않고
+`LEGACY_V2_PLAYTEST_ONLY`로만 연다. V1은 `LEGACY_UNVERIFIED` playtest 전용이다.
 
 구형 프로토타입에서는 화면 구성, 중앙 메뉴 카드, 게임 HUD, 색과 진행 표시만
 이식했다. 현재 실행 폴더 검증, Web Audio 시계, 판정 엔진, 리뷰 마커와 키 입력은

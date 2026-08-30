@@ -63,6 +63,21 @@ def _latest_note_times(chart: dict[str, Any]) -> tuple[int, int]:
     return (max(starts, default=0), max(ends, default=0))
 
 
+def _run_manifest_path(song_root: Path) -> Path | None:
+    paths = [
+        path
+        for path in (
+            song_root / "playtest-run-v3.json",
+            song_root / "playtest-run-v2.json",
+            song_root / "playtest-run-v1.json",
+        )
+        if path.is_file()
+    ]
+    if len(paths) > 1:
+        raise ValueError(f"multiple playtest manifests found: {song_root}")
+    return paths[0] if paths else None
+
+
 def audit_batch(batch_state_path: Path) -> dict[str, Any]:
     batch_state = _read_json(batch_state_path)
     batch_root = batch_state_path.parent
@@ -73,8 +88,7 @@ def audit_batch(batch_state_path: Path) -> dict[str, Any]:
         if not isinstance(song, dict):
             continue
         song_root = _resolve_song_path(batch_root, str(song["outputPath"]))
-        run_paths = [song_root / "playtest-run-v2.json", song_root / "playtest-run-v1.json"]
-        run_path = next((path for path in run_paths if path.exists()), None)
+        run_path = _run_manifest_path(song_root)
         if run_path is None:
             results.append(
                 {

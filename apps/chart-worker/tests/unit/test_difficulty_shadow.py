@@ -12,6 +12,7 @@ from chart_worker.analysis.difficulty_shadow import (
     recalculate_batch,
 )
 from chart_worker.generation import mapperatorinator
+from chart_worker.hashing import sha256_file
 from chart_worker.schema.chart import (
     BpmEvent,
     ChartDocument,
@@ -111,6 +112,65 @@ def archived_batch(tmp_path: Path) -> Path:
     return batch_dir
 
 
+def _write_v3_manifest(batch_dir: Path) -> Path:
+    song_dir = batch_dir / "songs" / "01"
+    report_path = song_dir / "generation-report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    chart_refs = []
+    for chart in report["charts"]:
+        chart_path = song_dir / chart["chartPath"]
+        chart_refs.append(
+            {
+                "path": chart["chartPath"],
+                "sha256": sha256_file(chart_path),
+                "keyMode": chart["keyMode"],
+                "difficulty": chart["difficulty"],
+                "provenance": "PRIMARY",
+                "familyAssignmentKind": "ORIGINAL",
+                "sourceDifficulty": None,
+                "familyResolutionState": "RESOLVED",
+                "familyResolutionReasons": [],
+                "playabilityTier": None,
+                "coverageSummary": None,
+            }
+        )
+    manifest = {
+        "version": 3,
+        "runId": "33333333-3333-4333-8333-333333333333",
+        "title": "difficulty shadow fixture",
+        "generatedAt": "2026-08-30T00:00:00Z",
+        "workerVersion": "test",
+        "audio": {
+            "game": {"path": "audio/game.flac", "sha256": SHA},
+            "noDrums": None,
+            "keys": None,
+        },
+        "charts": chart_refs,
+        "missingCharts": [],
+        "keysoundManifestPath": None,
+        "generationReport": {
+            "path": "generation-report.json",
+            "sha256": sha256_file(report_path),
+        },
+        "outcome": {
+            "execution": "SUCCEEDED",
+            "completeness": "COMPLETE",
+            "quality": "PASS",
+            "failureCategory": "NONE",
+            "publishableStrict": True,
+        },
+        "strictBlockers": [],
+        "publication": {
+            "policyVersion": "PUBLICATION_POLICY_V2",
+            "decision": "ALLOW_PRODUCTION",
+            "reasonCodes": [],
+        },
+    }
+    manifest_path = song_dir / "playtest-run-v3.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
 def test_recalculation_never_constructs_a_generator(
     monkeypatch: pytest.MonkeyPatch,
     archived_batch: Path,
@@ -148,6 +208,41 @@ def test_recalculation_rejects_report_chart_identity_mismatch(
     report_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="ARCHIVE_INCONSISTENT"):
+        recalculate_batch(archived_batch, tmp_path / "shadow.json")
+
+
+def test_recalculation_uses_v3_manifest_chart_hashes(
+    archived_batch: Path,
+    tmp_path: Path,
+):
+    _write_v3_manifest(archived_batch)
+
+    report = recalculate_batch(archived_batch, tmp_path / "shadow.json")
+
+    assert report.chart_count == 12
+
+
+def test_recalculation_rejects_v3_manifest_chart_sha_mismatch(
+    archived_batch: Path,
+    tmp_path: Path,
+):
+    _write_v3_manifest(archived_batch)
+    chart_path = archived_batch / "songs" / "01" / "charts" / "4k-easy.chart.json"
+    chart_path.write_text(chart_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest SHA mismatch"):
+        recalculate_batch(archived_batch, tmp_path / "shadow.json")
+
+
+def test_recalculation_rejects_multiple_manifest_versions(
+    archived_batch: Path,
+    tmp_path: Path,
+):
+    _write_v3_manifest(archived_batch)
+    song_dir = archived_batch / "songs" / "01"
+    (song_dir / "playtest-run-v1.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="multiple playtest manifests"):
         recalculate_batch(archived_batch, tmp_path / "shadow.json")
 
 

@@ -35,13 +35,15 @@ librosa 분석은 검수 근거일 뿐 채보를 수정하지 않는다.
 
 정상 발행 후보가 없는 변형에 기존 hard-safe Mapperatorinator 원본이 있으면
 `diagnostic-raw-fallback/`에 `PLAYTEST_ONLY`로 격리할 수 있다. 이 출력은
-`productionEligible=false`이며 정상 성공률이나 packager 입력에 포함하지 않는다.
+별도 진단 manifest의 run-level 결정으로 격리하며 정상 성공률이나 packager 입력에
+포함하지 않는다. 채보별 production 권한처럼 읽힐 boolean은 기록하지 않는다.
 
 현재 chart-worker의 정식 플레이테스트 경로는 admitted 모델 후보가 없을 때도
 hard invariant를 통과한 `RAW_UNVERIFIED`를 우선 사용하고, 그것도 없으면 canonical
 timing/onset에서 `SAFE_FALLBACK`을 결정론적으로 만든다. 두 경우 모두 12개 슬롯을
-플레이할 수 있게 내보내되 `PLAYTEST_ONLY`, `productionEligible=false`를 manifest에
-명시한다. 구조가 깨진 모델 출력을 그대로 사용자에게 주는 정책은 아니다.
+플레이할 수 있게 내보내되 V3 manifest의 전역 publication을 `PLAYTEST_ONLY`로
+명시한다. 채보에는 provenance와 검증 사실만 남고 최종 배포 권한은 없다. 구조가
+깨진 모델 출력을 그대로 사용자에게 주는 정책은 아니다.
 
 ### 난이도 descriptor
 

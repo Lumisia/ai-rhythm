@@ -75,10 +75,15 @@ def _write_batch_fixture(tmp_path: Path, *, manifest_version: int) -> dict[str, 
             "audio": {"game": {"path": "audio/game.flac", "sha256": audio_sha}},
         }
     else:
-        manifest_path = song_dir / "playtest-run-v2.json"
+        manifest_path = song_dir / f"playtest-run-v{manifest_version}.json"
         manifest = {
-            "version": 2,
-            "audio": {"asset": {"path": "audio/game.flac", "sha256": audio_sha}},
+            "version": manifest_version,
+            "audio": {
+                ("asset" if manifest_version == 2 else "game"): {
+                    "path": "audio/game.flac",
+                    "sha256": audio_sha,
+                }
+            },
             "generationReport": {
                 "path": "generation-report.json",
                 "sha256": _sha256(report_path),
@@ -137,6 +142,24 @@ def test_audit_reads_v2_canonical_audio_identity(tmp_path: Path):
     row = next(item for item in audit["rows"] if item["keyMode"] == 4)
 
     assert row["audioSha256"] == fixture["audioSha"]
+
+
+def test_audit_reads_v3_manifest_and_report_binding(tmp_path: Path):
+    fixture = _write_batch_fixture(tmp_path, manifest_version=3)
+
+    audit = _load_audit_module().audit_batch(tmp_path)
+    row = next(item for item in audit["rows"] if item["keyMode"] == 4)
+
+    assert row["audioSha256"] == fixture["audioSha"]
+    assert row["playtestManifestSha256"] == _sha256(fixture["manifestPath"])
+
+
+def test_audit_rejects_multiple_manifest_versions(tmp_path: Path):
+    fixture = _write_batch_fixture(tmp_path, manifest_version=3)
+    _write_json(fixture["songDir"] / "playtest-run-v2.json", {"version": 2})
+
+    with pytest.raises(ValueError, match="multiple playtest manifests"):
+        _load_audit_module().audit_batch(tmp_path)
 
 
 def test_audit_rejects_v2_manifest_bound_to_a_different_report(tmp_path: Path):

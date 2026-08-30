@@ -21,7 +21,11 @@ from chart_worker.generation.osu_parser import OsuBpmEvent
 from chart_worker.hashing import sha256_file
 from chart_worker.schema.chart import CamelModel, ChartDocument
 from chart_worker.schema.note import NoteEvent
-from chart_worker.schema.playtest_run import PlaytestRunManifest
+from chart_worker.schema.playtest_run import (
+    PlaytestRunManifest,
+    PlaytestRunManifestV2,
+    PlaytestRunManifestV3,
+)
 from chart_worker.schema.types import DIFFICULTIES, Difficulty
 
 DIAGNOSTIC_AXES: tuple[tuple[str, str], ...] = (
@@ -315,14 +319,23 @@ def _safe_chart_path(song_dir: Path, relative: object) -> Path:
 
 
 def _manifest_refs(song_dir: Path) -> dict[str, tuple[int, str, str]]:
-    manifest_path = song_dir / "playtest-run-v1.json"
-    if not manifest_path.exists():
+    candidates = (
+        (song_dir / "playtest-run-v3.json", PlaytestRunManifestV3),
+        (song_dir / "playtest-run-v2.json", PlaytestRunManifestV2),
+        (song_dir / "playtest-run-v1.json", PlaytestRunManifest),
+    )
+    existing = [(path, model) for path, model in candidates if path.is_file()]
+    if not existing:
         return {}
+    if len(existing) != 1:
+        names = ", ".join(path.name for path, _model in existing)
+        raise _archive_error(f"multiple playtest manifests: {names}")
+    manifest_path, manifest_model = existing[0]
     try:
-        manifest = PlaytestRunManifest.model_validate_json(
+        manifest = manifest_model.model_validate_json(
             manifest_path.read_text(encoding="utf-8")
         )
-    except (OSError, ValueError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         raise _archive_error(f"invalid playtest manifest: {manifest_path}") from error
     return {
         reference.path: (

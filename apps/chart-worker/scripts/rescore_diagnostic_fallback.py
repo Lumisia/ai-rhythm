@@ -32,6 +32,21 @@ RESCORE_REPORT_NAME = "coverage-v4-rescore-v3.json"
 DIAGNOSTIC_OUTPUT_ROOT = "diagnostic-raw-fallback-v3"
 
 
+def _diagnostic_manifest(
+    *,
+    exports: list[dict[str, object]],
+    failures: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "version": DIAGNOSTIC_FALLBACK_VERSION,
+        "decision": "PLAYTEST_ONLY",
+        "modelInvocations": 0,
+        "entries": exports,
+        "failures": failures,
+        "rescoreReport": RESCORE_REPORT_NAME,
+    }
+
+
 def _write_json_once_or_identical(path: Path, payload: dict[str, object]) -> None:
     encoded = (
         json.dumps(
@@ -330,15 +345,7 @@ def rescore_existing_run(run_dir: Path) -> dict[str, object]:
     _write_json_once_or_identical(run_dir / RESCORE_REPORT_NAME, result)
     _write_json_once_or_identical(
         run_dir / DIAGNOSTIC_OUTPUT_ROOT / "manifest-v1.json",
-        {
-            "version": DIAGNOSTIC_FALLBACK_VERSION,
-            "decision": "PLAYTEST_ONLY",
-            "productionEligible": False,
-            "modelInvocations": 0,
-            "entries": exports,
-            "failures": failures,
-            "rescoreReport": RESCORE_REPORT_NAME,
-        },
+        _diagnostic_manifest(exports=exports, failures=failures),
     )
     return result
 
