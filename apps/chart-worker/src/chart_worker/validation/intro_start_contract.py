@@ -16,6 +16,7 @@ from chart_worker.validation.intro_region_contract import (
 
 INTRO_START_CONTRACT_V2 = "intro-start-contract-v2"
 INTRO_START_CONTRACT_V3 = "intro-start-contract-v3"
+IntroStartResolution = Literal["RESOLVED", "AMBIGUOUS", "UNAVAILABLE"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +40,27 @@ class IntroCandidateView:
 
 
 @dataclass(frozen=True, slots=True)
+class IntroCandidateCluster:
+    first_row_ms: int
+    support_count: int
+    audio_support_count: int
+    candidates: tuple[IntroCandidateView, ...]
+
+    @property
+    def audio_supported(self) -> bool:
+        return self.audio_support_count > 0
+
+    def to_report(self) -> dict[str, object]:
+        return {
+            "firstRowMs": self.first_row_ms,
+            "supportCount": self.support_count,
+            "audioSupportCount": self.audio_support_count,
+            "audioSupported": self.audio_supported,
+            "candidates": [candidate.to_report() for candidate in self.candidates],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class IntroStartContract:
     version: Literal["intro-start-contract-v2", "intro-start-contract-v3"]
     canonical_first_row_ms: int | None
@@ -48,6 +70,8 @@ class IntroStartContract:
     grid_distance_ms: int | None
     candidates: tuple[IntroCandidateView, ...]
     intro_region: IntroRegionContract | None = None
+    resolution: IntroStartResolution = "RESOLVED"
+    conflict_clusters: tuple[IntroCandidateCluster, ...] = ()
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -58,6 +82,8 @@ class IntroStartContract:
             "audioSupported": self.audio_supported,
             "gridDistanceMs": self.grid_distance_ms,
             "candidates": [candidate.to_report() for candidate in self.candidates],
+            "resolution": self.resolution,
+            "conflictClusters": [cluster.to_report() for cluster in self.conflict_clusters],
             "introRegion": (
                 self.intro_region.to_report()
                 if self.intro_region is not None
@@ -73,6 +99,7 @@ class IntroContractReview:
     corrected_count: int = 0
     correction_reasons: tuple[str, ...] = ()
     exact_mismatches: tuple[tuple[int, str, int | None], ...] = ()
+    reasons: tuple[str, ...] = ()
 
     def to_report(self) -> dict[str, object]:
         return {
@@ -95,6 +122,7 @@ class IntroContractReview:
                 }
                 for key_mode, difficulty, first_row_ms in self.exact_mismatches
             ],
+            "reasons": list(self.reasons),
         }
 
 
@@ -137,6 +165,41 @@ def _grid_distance_ms(context: SongAnalysisContext, time_ms: int) -> int:
     return abs(time_ms - grid_ms)
 
 
+def _candidate_clusters(
+    candidates: tuple[IntroCandidateView, ...],
+) -> tuple[IntroCandidateCluster, ...]:
+    present = sorted(
+        (candidate for candidate in candidates if candidate.first_row_ms is not None),
+        key=lambda candidate: (
+            candidate.first_row_ms,
+            candidate.key_mode,
+            candidate.difficulty,
+            candidate.seed if candidate.seed is not None else -1,
+        ),
+    )
+    grouped: list[list[IntroCandidateView]] = []
+    for candidate in present:
+        first_row_ms = candidate.first_row_ms
+        assert first_row_ms is not None
+        if (
+            not grouped
+            or first_row_ms - (grouped[-1][0].first_row_ms or 0)
+            > GRID_SUPPORT_WINDOW_MS
+        ):
+            grouped.append([candidate])
+        else:
+            grouped[-1].append(candidate)
+    return tuple(
+        IntroCandidateCluster(
+            first_row_ms=group[0].first_row_ms or 0,
+            support_count=len(group),
+            audio_support_count=sum(candidate.audio_supported for candidate in group),
+            candidates=tuple(group),
+        )
+        for group in grouped
+    )
+
+
 def build_intro_start_contract(
     song_context: SongAnalysisContext,
     candidates: tuple[IntroCandidateView, ...],
@@ -161,7 +224,36 @@ def build_intro_start_contract(
             grid_distance_ms=None,
             candidates=candidates,
             intro_region=intro_region,
+            resolution="UNAVAILABLE",
         )
+
+    clusters = _candidate_clusters(candidates)
+    if intro_region.status == "UNKNOWN" and len(clusters) >= 2:
+        support_cluster = min(
+            clusters,
+            key=lambda cluster: (-cluster.support_count, cluster.first_row_ms),
+        )
+        audio_cluster = min(
+            clusters,
+            key=lambda cluster: (
+                -cluster.audio_support_count,
+                -cluster.support_count,
+                cluster.first_row_ms,
+            ),
+        )
+        if audio_cluster.audio_supported and audio_cluster != support_cluster:
+            return IntroStartContract(
+                version=INTRO_START_CONTRACT_V3,
+                canonical_first_row_ms=None,
+                candidate_support_count=0,
+                raw_supported=False,
+                audio_supported=False,
+                grid_distance_ms=None,
+                candidates=candidates,
+                intro_region=intro_region,
+                resolution="AMBIGUOUS",
+                conflict_clusters=clusters,
+            )
 
     def proposal_evidence(time_ms: int) -> tuple[int, int, int]:
         support = sum(
@@ -229,6 +321,15 @@ def validate_exact_first_row(
     corrected_count: int = 0,
     correction_reasons: tuple[str, ...] = (),
 ) -> IntroContractReview:
+    if contract.version == INTRO_START_CONTRACT_V3 and contract.resolution == "AMBIGUOUS":
+        return IntroContractReview(
+            status="REVIEW",
+            mismatches=(),
+            corrected_count=corrected_count,
+            correction_reasons=correction_reasons,
+            exact_mismatches=(),
+            reasons=("AMBIGUOUS_INTRO_START_EVIDENCE",),
+        )
     canonical = contract.canonical_first_row_ms
     exact_mismatches = tuple(
         (candidate.key_mode, candidate.difficulty, candidate.first_row_ms)

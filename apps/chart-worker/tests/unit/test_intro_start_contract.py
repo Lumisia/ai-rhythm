@@ -172,6 +172,51 @@ def test_audio_supported_time_before_first_timing_point_can_be_canonical():
     assert contract.audio_supported is True
 
 
+def test_unknown_audio_singleton_conflict_is_ambiguous():
+    song_context = replace(
+        context(first_timing_ms=0, onsets=(15_206,)),
+        duration_ms=30_000,
+        intro_anchor=IntroAnchorEvidence(
+            status="UNCERTAIN",
+            anchor_ms=15_206,
+            anchor_grid_ms=15_000,
+            grid_distance_ms=206,
+            aggregate_percentile_rank=0.99,
+            prominent_band_count=3,
+            pulse_continuation_matches=0,
+            pulse_continuation_opportunities=4,
+        ),
+    )
+    identities = tuple(
+        (key_mode, difficulty)
+        for key_mode in (4, 6, 7)
+        for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
+    )
+    candidates = tuple(
+        candidate(
+            key_mode,
+            difficulty,
+            15_206 if (key_mode, difficulty) == (7, "EASY") else 5,
+            seed=index,
+            audio_supported=(key_mode, difficulty) == (7, "EASY"),
+        )
+        for index, (key_mode, difficulty) in enumerate(identities)
+    )
+
+    contract = build_intro_start_contract(song_context, candidates)
+    review = validate_exact_first_row(contract, candidates)
+
+    assert contract.resolution == "AMBIGUOUS"
+    assert contract.canonical_first_row_ms is None
+    assert [cluster.support_count for cluster in contract.conflict_clusters] == [11, 1]
+    assert [cluster.audio_supported for cluster in contract.conflict_clusters] == [False, True]
+    assert review.status == "REVIEW"
+    assert review.mismatches == ()
+    assert review.exact_mismatches == ()
+    assert review.reasons == ("AMBIGUOUS_INTRO_START_EVIDENCE",)
+    assert review.correction_reasons == ()
+
+
 def test_confirmed_audio_anchor_outweighs_a_raw_first_row_majority():
     song_context = replace(
         context(first_timing_ms=500, onsets=(500,)),
