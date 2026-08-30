@@ -18,7 +18,7 @@ from chart_worker.pipeline import (
 from chart_worker.schema.chart import CamelModel, ChartDocument, Sha256
 from chart_worker.schema.playtest_run import (
     MissingChartRef,
-    PlaytestRunManifestV2,
+    PlaytestRunManifestV3,
     RunChartRef,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
@@ -73,7 +73,7 @@ def _load_generation_report(path: Path) -> dict[str, object]:
     return value
 
 
-def _warnings(manifest: PlaytestRunManifestV2, output_dir: Path) -> list[str]:
+def _warnings(manifest: PlaytestRunManifestV3, output_dir: Path) -> list[str]:
     documents = {
         (reference.key_mode, reference.difficulty): ChartDocument.model_validate_json(
             (output_dir / reference.path).read_text(encoding="utf-8")
@@ -136,7 +136,7 @@ def run_benchmark(
     dependencies: PipelineDependencies | None = None,
 ) -> BenchmarkResult:
     pipeline = run_pipeline(options, dependencies=dependencies)
-    manifest = PlaytestRunManifestV2.model_validate_json(
+    manifest = PlaytestRunManifestV3.model_validate_json(
         pipeline.manifest_path.read_text(encoding="utf-8")
     )
     generation_report_path = pipeline.output_dir / manifest.generation_report.path

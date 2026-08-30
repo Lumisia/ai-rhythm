@@ -6,7 +6,7 @@ import numpy as np
 
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
-from chart_worker.schema.playtest_run import PlaytestRunManifestV2
+from chart_worker.schema.playtest_run import PlaytestRunManifestV3
 from tests.support import contract_fixture_dependencies
 
 
@@ -38,7 +38,9 @@ def test_fake_pipeline_writes_twelve_hash_verified_charts(tmp_path: Path):
         dependencies=contract_fixture_dependencies(),
     )
 
-    manifest = PlaytestRunManifestV2.model_validate_json(
+    assert result.manifest_path == output_dir / "playtest-run-v3.json"
+    assert not (output_dir / "playtest-run-v2.json").exists()
+    manifest = PlaytestRunManifestV3.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     assert len(manifest.charts) == 12

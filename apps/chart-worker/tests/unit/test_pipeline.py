@@ -24,7 +24,7 @@ from chart_worker.generation.resnap_diagnostics import RESNAP_DIAGNOSTICS_VERSIO
 from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
-from chart_worker.schema.playtest_run import PlaytestRunManifestV2
+from chart_worker.schema.playtest_run import PlaytestRunManifestV3
 from chart_worker.stages.s2_timing import run_timing_generation
 from chart_worker.stages.timing_feedback import (
     MapTimingFailureSignature,
@@ -343,7 +343,7 @@ def test_map_unknown_after_timing_returns_twelve_safe_playtest_charts(
         ),
     )
 
-    manifest = PlaytestRunManifestV2.model_validate_json(
+    manifest = PlaytestRunManifestV3.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
@@ -356,8 +356,11 @@ def test_map_unknown_after_timing_returns_twelve_safe_playtest_charts(
         for difficulty in ("EASY", "NORMAL", "HARD", "EXPERT")
     }
     assert all(chart.provenance == "SAFE_FALLBACK" for chart in manifest.charts)
-    assert all(chart.production_eligible is False for chart in manifest.charts)
-    assert all(chart.distribution_tier == "PLAYTEST_ONLY" for chart in manifest.charts)
+    assert all(
+        "productionEligible" not in chart.model_dump(by_alias=True)
+        and "distributionTier" not in chart.model_dump(by_alias=True)
+        for chart in manifest.charts
+    )
     assert report["status"] == "REVIEW"
 
 
@@ -377,8 +380,9 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
         dependencies=fake_dependencies(),
     )
 
-    assert result.manifest_path == output_dir / "playtest-run-v2.json"
-    manifest = PlaytestRunManifestV2.model_validate_json(
+    assert result.manifest_path == output_dir / "playtest-run-v3.json"
+    assert not (output_dir / "playtest-run-v2.json").exists()
+    manifest = PlaytestRunManifestV3.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     assert len(manifest.charts) == 12
@@ -393,8 +397,13 @@ def test_direct_pipeline_writes_twelve_unmodified_charts(tmp_path: Path):
     assert manifest.audio.no_drums is None
     assert manifest.audio.keys is None
     assert manifest.keysound_manifest_path is None
-    assert all(chart.production_eligible for chart in manifest.charts)
-    assert all(chart.distribution_tier == "PRODUCTION_CANDIDATE" for chart in manifest.charts)
+    assert all(chart.provenance == "PRIMARY" for chart in manifest.charts)
+    assert all(chart.family_resolution_state == "RESOLVED" for chart in manifest.charts)
+    assert all(
+        "productionEligible" not in chart.model_dump(by_alias=True)
+        and "distributionTier" not in chart.model_dump(by_alias=True)
+        for chart in manifest.charts
+    )
     assert not (output_dir / "analysis").exists()
 
     report = json.loads((output_dir / "generation-report.json").read_text())
@@ -856,6 +865,7 @@ def test_withheld_generation_writes_failure_report_without_publishable_artifacts
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v2.json").exists()
+    assert not (output_dir / "playtest-run-v3.json").exists()
 
 
 def test_v2_only_difficulty_inversion_forces_review_instead_of_false_pass(
@@ -1032,6 +1042,7 @@ def test_pipeline_rejects_missing_difficulty_order_before_export(tmp_path: Path)
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v2.json").exists()
+    assert not (output_dir / "playtest-run-v3.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1120,6 +1131,7 @@ def test_timing_review_writes_pre_authority_failure_report_and_stops_pipeline(
     assert not (output_dir / "raw").exists()
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v2.json").exists()
+    assert not (output_dir / "playtest-run-v3.json").exists()
 
 
 def test_timing_candidates_exhausted_writes_attempt_evidence_before_reraising(
@@ -1180,6 +1192,7 @@ def test_timing_candidates_exhausted_writes_attempt_evidence_before_reraising(
     }
     assert report["timingAuthority"] is None
     assert not (output_dir / "playtest-run-v2.json").exists()
+    assert not (output_dir / "playtest-run-v3.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1274,6 +1287,7 @@ def test_pipeline_rejects_retry_map_variant_returned_by_generation_stage(
     assert export_calls == []
     assert not (output_dir / "charts").exists()
     assert not (output_dir / "playtest-run-v2.json").exists()
+    assert not (output_dir / "playtest-run-v3.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1342,20 +1356,20 @@ def test_pipeline_allows_hard_safe_fallback_only_as_playtest_output(
     assert len(report["charts"]) == 12
     assert report["charts"][0]["provenance"] == provenance
     assert report["charts"][0]["acceptanceStatus"] == "RETRY_MAP"
-    assert report["charts"][0]["productionEligible"] is False
-    assert report["charts"][0]["distributionTier"] == "PLAYTEST_ONLY"
+    assert "productionEligible" not in report["charts"][0]
+    assert "distributionTier" not in report["charts"][0]
     assert report["status"] == "REVIEW"
     assert report["publishable"] is False
     assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
-    manifest = PlaytestRunManifestV2.model_validate_json(
-        (output_dir / "playtest-run-v2.json").read_text()
+    manifest = PlaytestRunManifestV3.model_validate_json(
+        (output_dir / "playtest-run-v3.json").read_text()
     )
     chart = next(
         item for item in manifest.charts if (item.key_mode, item.difficulty) == (4, "EASY")
     )
     assert chart.provenance == provenance
-    assert chart.production_eligible is False
-    assert chart.distribution_tier == "PLAYTEST_ONLY"
+    assert "productionEligible" not in chart.model_dump(by_alias=True)
+    assert "distributionTier" not in chart.model_dump(by_alias=True)
 
 
 def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
@@ -1424,7 +1438,8 @@ def test_pipeline_publishes_review_variant_with_warning(tmp_path: Path):
     assert report["charts"][0]["acceptanceStatus"] == "REVIEW"
     assert "FIXTURE_REVIEW" in report["charts"][0]["acceptanceReasons"]
     assert export_calls == [output_dir]
-    assert (output_dir / "playtest-run-v2.json").is_file()
+    assert (output_dir / "playtest-run-v3.json").is_file()
+    assert not (output_dir / "playtest-run-v2.json").exists()
 
 
 def test_generation_report_uses_recorded_acceptance_timing(tmp_path: Path):
@@ -1616,15 +1631,15 @@ def test_generation_report_records_raw_unverified_provenance(tmp_path: Path):
     first = report["charts"][0]
     assert first["provenance"] == "RAW_UNVERIFIED"
     assert first["recoveryReason"] == "QUALITY_GATE_REJECTED"
-    assert first["productionEligible"] is False
-    assert first["distributionTier"] == "PLAYTEST_ONLY"
+    assert "productionEligible" not in first
+    assert "distributionTier" not in first
     assert "recoveryPlan" not in first
     # raw 출력이 섞이면 곡을 PASS 로 올리지 않는다.
     assert report["status"] == "REVIEW"
     assert report["publishable"] is False
     assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
-    manifest = PlaytestRunManifestV2.model_validate_json(
-        (tmp_path / "run" / "playtest-run-v2.json").read_text(encoding="utf-8")
+    manifest = PlaytestRunManifestV3.model_validate_json(
+        (tmp_path / "run" / "playtest-run-v3.json").read_text(encoding="utf-8")
     )
     assert manifest.charts[0].playability_tier == "DIAGNOSTIC_ONLY"
     assert manifest.charts[0].coverage_summary is not None
@@ -1665,13 +1680,13 @@ def test_manifest_marks_coverage_repair_as_recovery_playable(tmp_path: Path):
         dependencies=replace(dependencies, generation=generation),
     )
 
-    manifest = PlaytestRunManifestV2.model_validate_json(
+    manifest = PlaytestRunManifestV3.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     first = manifest.charts[0]
     assert first.provenance == "COVERAGE_REPAIR"
-    assert first.production_eligible is False
-    assert first.distribution_tier == "PLAYTEST_ONLY"
+    assert "productionEligible" not in first.model_dump(by_alias=True)
+    assert "distributionTier" not in first.model_dump(by_alias=True)
     assert first.playability_tier == "RECOVERY_PLAYABLE"
     assert first.coverage_summary is not None
     assert first.coverage_summary.repaired_gap_count == 2
@@ -1729,7 +1744,7 @@ def test_manifest_does_not_call_a_still_rejected_coverage_repair_playable(
         dependencies=replace(dependencies, generation=generation),
     )
 
-    manifest = PlaytestRunManifestV2.model_validate_json(
+    manifest = PlaytestRunManifestV3.model_validate_json(
         result.manifest_path.read_text(encoding="utf-8")
     )
     assert manifest.charts[0].playability_tier == "DIAGNOSTIC_ONLY"
@@ -2154,16 +2169,18 @@ def test_hard_safe_quality_rejection_enters_normal_playtest_as_diagnostic_only(
         if chart["keyMode"] == 4 and chart["difficulty"] == "EASY"
     )
     assert fallback["provenance"] == "RAW_UNVERIFIED"
-    assert fallback["productionEligible"] is False
+    assert "productionEligible" not in fallback
+    assert "distributionTier" not in fallback
     assert fallback["playabilityTier"] == "DIAGNOSTIC_ONLY"
     assert fallback["familyResolutionState"] == "UNRESOLVED"
     assert fallback["familyResolutionReasons"] == [
         "QUALITY_REJECTED_HARD_SAFE_PLAYTEST_RETURN"
     ]
     assert report["diagnosticRawFallbacks"][0]["path"].endswith("/map.osu")
-    assert report["diagnosticRawFallbacks"][0]["productionEligible"] is False
+    assert "productionEligible" not in report["diagnosticRawFallbacks"][0]
     manifest = json.loads((diagnostic_path.parent / "manifest-v1.json").read_text(encoding="utf-8"))
     assert manifest["decision"] == "PLAYTEST_ONLY"
+    assert "productionEligible" not in manifest
     assert manifest["identity"]["patchSetId"] == CONSTRAINT_PATCH_ID
 
 

@@ -63,11 +63,11 @@ from chart_worker.schema.playtest_run import (
     CoverageSummary,
     MissingChartRef,
     OutcomeStatusSnapshot,
-    PlaytestRunManifestV2,
+    PlaytestRunManifestV3,
     PublicationDecisionSnapshot,
     ReportFileRef,
     RunAudioRefs,
-    RunChartRefV2,
+    RunChartRefV3,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 from chart_worker.stages.authority_epoch import AuthorityEpochRecord
@@ -663,7 +663,6 @@ def _generation_report(
     for variant, result in zip(generated, exported, strict=True):
         notes = variant.generated.notes
         acceptance = variant.acceptance.to_report()
-        playtest_only = _variant_is_playtest_only(variant)
         coverage_summary = _coverage_summary(variant)
         quality_profile = acceptance["qualityProfile"]
         resnap_diagnostics = variant.generated.resnap_diagnostics.to_report()
@@ -699,8 +698,6 @@ def _generation_report(
                 "familyResolutionReasons": list(variant.family_resolution_reasons),
                 "sourceDifficulty": variant.source_difficulty,
                 "recoveryReason": variant.recovery_reason,
-                "productionEligible": not playtest_only,
-                "distributionTier": ("PLAYTEST_ONLY" if playtest_only else "PRODUCTION_CANDIDATE"),
                 "playabilityTier": _playability_tier(variant),
                 "coverageSummary": coverage_summary.model_dump(by_alias=True),
                 "attemptErrors": list(variant.attempt_errors),
@@ -913,7 +910,6 @@ def _generation_report(
             {
                 **entry.to_report(relative_to=run_dir),
                 "decision": "PLAYTEST_ONLY",
-                "productionEligible": False,
             }
             for entry in diagnostic_fallbacks
         ],
@@ -1121,7 +1117,6 @@ def _export_diagnostic_raw_fallbacks(
         {
             "version": DIAGNOSTIC_FALLBACK_VERSION,
             "decision": "PLAYTEST_ONLY",
-            "productionEligible": False,
             "entries": [entry.to_report(relative_to=run_dir) for entry in exports],
             "failures": failures,
         },
@@ -1129,7 +1124,7 @@ def _export_diagnostic_raw_fallbacks(
     return tuple(exports), tuple(failures), manifest_path
 
 
-def _write_playtest_manifest(path: Path, manifest: PlaytestRunManifestV2) -> None:
+def _write_playtest_manifest(path: Path, manifest: PlaytestRunManifestV3) -> None:
     temporary = path.with_suffix(f"{path.suffix}.tmp")
     temporary.write_text(
         manifest.model_dump_json(by_alias=True, indent=2) + "\n",
@@ -1544,8 +1539,8 @@ def _run_pipeline(
         diagnostic_fallback_manifest=diagnostic_manifest,
     )
     _write_generation_report(report_path, generation_report)
-    manifest = PlaytestRunManifestV2(
-        version=2,
+    manifest = PlaytestRunManifestV3(
+        version=3,
         run_id=run_id,
         title=options.title,
         generated_at=dependencies.now(),
@@ -1557,7 +1552,7 @@ def _run_pipeline(
             )
         ),
         charts=[
-            RunChartRefV2(
+            RunChartRefV3(
                 path=_relative(result.path, run_dir),
                 sha256=result.sha256,
                 key_mode=result.document.key_mode,
@@ -1567,12 +1562,6 @@ def _run_pipeline(
                 family_resolution_state=variant.family_resolution_state,
                 family_resolution_reasons=list(variant.family_resolution_reasons),
                 source_difficulty=variant.source_difficulty,
-                production_eligible=(not _variant_is_playtest_only(variant)),
-                distribution_tier=(
-                    "PLAYTEST_ONLY"
-                    if _variant_is_playtest_only(variant)
-                    else "PRODUCTION_CANDIDATE"
-                ),
                 playability_tier=_playability_tier(variant),
                 coverage_summary=_coverage_summary(variant),
             )
@@ -1596,7 +1585,7 @@ def _run_pipeline(
             generation_report["publicationDecision"]
         ),
     )
-    manifest_path = run_dir / "playtest-run-v2.json"
+    manifest_path = run_dir / "playtest-run-v3.json"
     _write_playtest_manifest(manifest_path, manifest)
     return PipelineResult(
         run_id=run_id,

@@ -303,7 +303,6 @@ def export_diagnostic_fallback(
     manifest = {
         "version": DIAGNOSTIC_FALLBACK_VERSION,
         "decision": "PLAYTEST_ONLY",
-        "productionEligible": False,
         "keyMode": candidate.key_mode,
         "difficulty": candidate.difficulty,
         "seed": candidate.seed,

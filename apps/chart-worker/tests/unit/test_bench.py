@@ -46,6 +46,8 @@ def test_benchmark_writes_shared_timing_generation_report_for_all_charts(
     generation = json.loads((output_dir / "generation-report.json").read_text())
     assert generation["strategy"] == "MAPPERATORINATOR_SHARED_TIMING"
     assert all(chart["attemptCount"] == 1 for chart in generation["charts"])
+    assert (output_dir / "playtest-run-v3.json").is_file()
+    assert not (output_dir / "playtest-run-v2.json").exists()
 
 
 def test_model_call_count_prefers_actual_hydra_invocation_directories(tmp_path: Path):
@@ -74,7 +76,7 @@ def test_benchmark_rejects_a_generation_report_without_shared_timing_strategy(
         payload = json.loads(path.read_text())
         payload["strategy"] = "HYBRID"
         path.write_text(json.dumps(payload), encoding="utf-8")
-        manifest_path = output_dir / "playtest-run-v2.json"
+        manifest_path = output_dir / "playtest-run-v3.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["generationReport"]["sha256"] = sha256_file(path)
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -154,8 +156,8 @@ def test_benchmark_exports_hard_safe_raw_output_as_playtest_only(
     assert len(generation["charts"]) == 12
     assert all(
         chart["provenance"] == "RAW_UNVERIFIED"
-        and chart["productionEligible"] is False
-        and chart["distributionTier"] == "PLAYTEST_ONLY"
+        and "productionEligible" not in chart
+        and "distributionTier" not in chart
         for chart in generation["charts"]
     )
     assert result.report.status == "REVIEW"

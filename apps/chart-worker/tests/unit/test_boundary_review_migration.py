@@ -145,6 +145,7 @@ def test_migrate_builds_hardlinks_and_only_v2_manifest(tmp_path: Path) -> None:
     migrated = target / "songs" / "01"
     assert summary.song_count == 1
     assert (migrated / "playtest-run-v2.json").is_file()
+    assert not (migrated / "playtest-run-v3.json").exists()
     assert not (migrated / "playtest-run-v1.json").exists()
     assert os.path.samefile(
         migrated / "audio" / "game.flac",

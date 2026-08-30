@@ -160,7 +160,7 @@ def test_export_is_playtest_only_atomic_and_idempotent(tmp_path: Path):
     assert first.path == run_dir / "diagnostic-raw-fallback" / "4k-easy" / "map.osu"
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     assert manifest["decision"] == "PLAYTEST_ONLY"
-    assert manifest["productionEligible"] is False
+    assert "productionEligible" not in manifest
     assert manifest["sourceWorkdir"] == "raw/work/attempt-1"
     assert manifest["osuSha256"] == first.sha256
     assert manifest["identity"]["holdStateMode"] == "incremental"

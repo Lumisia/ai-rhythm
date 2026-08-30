@@ -401,7 +401,6 @@ def assemble_publication(
                             "reason": "UNRESOLVED_FAMILY_HARD_SAFE_PLAYTEST_RETURN",
                             "selectedSeed": selected_candidate.seed,
                             "selectedAttempt": selected_candidate.attempt,
-                            "productionEligible": False,
                         }
                     )
                     continue
@@ -436,7 +435,6 @@ def assemble_publication(
                         "reason": "QUALITY_REJECTED_HARD_SAFE_PLAYTEST_RETURN",
                         "selectedSeed": selected_candidate.seed,
                         "selectedAttempt": selected_candidate.attempt,
-                        "productionEligible": False,
                     }
                 )
             if raw_unverified_targets or unresolved_safe_targets:
