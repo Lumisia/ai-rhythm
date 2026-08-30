@@ -130,11 +130,11 @@ type StrictManifest = PlaytestRunManifestV2 | PlaytestRunManifestV3;
 
 function validateV3ChartFacts(manifest: PlaytestRunManifestV3): void {
   for (const chart of manifest.charts) {
-    const provenance = chart.provenance ?? "PRIMARY";
-    const familyAssignmentKind = chart.familyAssignmentKind ?? "ORIGINAL";
-    const sourceDifficulty = chart.sourceDifficulty ?? null;
-    const familyResolutionState = chart.familyResolutionState ?? "RESOLVED";
-    const familyResolutionReasons = chart.familyResolutionReasons ?? [];
+    const provenance = chart.provenance;
+    const familyAssignmentKind = chart.familyAssignmentKind;
+    const sourceDifficulty = chart.sourceDifficulty;
+    const familyResolutionState = chart.familyResolutionState;
+    const familyResolutionReasons = chart.familyResolutionReasons;
     const canonicalReasons = [...new Set(familyResolutionReasons)].sort();
     const familyAdapted = familyAssignmentKind !== "ORIGINAL";
     const familyUnresolved = familyResolutionState !== "RESOLVED";

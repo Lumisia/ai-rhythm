@@ -93,8 +93,11 @@ def _charts_v3() -> list[RunChartRefV3]:
             sha256=SHA,
             provenance="PRIMARY",
             family_assignment_kind="ORIGINAL",
+            source_difficulty=None,
             family_resolution_state="RESOLVED",
             family_resolution_reasons=[],
+            playability_tier=None,
+            coverage_summary=None,
         )
         for key_mode in KEY_MODES
         for difficulty in DIFFICULTIES
@@ -512,6 +515,26 @@ def test_v3_chart_ref_contains_facts_without_chart_level_publication_authority()
     assert "distributionTier" not in payload
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "provenance",
+        "familyAssignmentKind",
+        "sourceDifficulty",
+        "familyResolutionState",
+        "familyResolutionReasons",
+        "playabilityTier",
+        "coverageSummary",
+    ),
+)
+def test_v3_chart_ref_rejects_missing_explicit_trust_fact(field):
+    payload = _charts_v3()[0].model_dump(by_alias=True)
+    payload.pop(field)
+
+    with pytest.raises(ValidationError, match=field):
+        RunChartRefV3.model_validate(payload)
+
+
 @pytest.mark.parametrize("field", ("version", "missingCharts", "strictBlockers"))
 def test_v3_manifest_rejects_missing_explicit_contract_fields(field):
     payload = json.loads(_manifest_v3().model_dump_json(by_alias=True))
@@ -619,5 +642,15 @@ def test_committed_playtest_v3_schema_matches_the_python_contract():
     assert committed == generated
     assert {"version", "missingCharts", "strictBlockers"} <= set(generated["required"])
     chart_properties = generated["$defs"]["RunChartRefV3"]["properties"]
+    chart_required = set(generated["$defs"]["RunChartRefV3"]["required"])
+    assert {
+        "provenance",
+        "familyAssignmentKind",
+        "sourceDifficulty",
+        "familyResolutionState",
+        "familyResolutionReasons",
+        "playabilityTier",
+        "coverageSummary",
+    } <= chart_required
     assert "productionEligible" not in chart_properties
     assert "distributionTier" not in chart_properties

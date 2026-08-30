@@ -288,7 +288,6 @@
           "type": "string"
         },
         "provenance": {
-          "default": "PRIMARY",
           "enum": [
             "PRIMARY",
             "RETRY",
@@ -303,7 +302,6 @@
           "type": "string"
         },
         "familyAssignmentKind": {
-          "default": "ORIGINAL",
           "enum": [
             "ORIGINAL",
             "REASSIGNED",
@@ -327,11 +325,9 @@
               "type": "null"
             }
           ],
-          "default": null,
           "title": "Sourcedifficulty"
         },
         "familyResolutionState": {
-          "default": "RESOLVED",
           "enum": [
             "RESOLVED",
             "NARROW_REVIEW",
@@ -361,7 +357,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "title": "Playabilitytier"
         },
         "coverageSummary": {
@@ -372,15 +367,21 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         }
       },
       "required": [
         "path",
         "sha256",
         "keyMode",
-        "difficulty"
+        "difficulty",
+        "provenance",
+        "familyAssignmentKind",
+        "sourceDifficulty",
+        "familyResolutionState",
+        "familyResolutionReasons",
+        "playabilityTier",
+        "coverageSummary"
       ],
       "title": "RunChartRefV3",
       "type": "object"

@@ -137,7 +137,15 @@ export interface RunChartRef extends RunChartRefBase {
 }
 
 /** V3 exposes diagnostic facts only; publication authority lives at run level. */
-export interface RunChartRefV3 extends RunChartRefBase {}
+export interface RunChartRefV3 extends RunChartRefBase {
+  provenance: GenerationProvenance;
+  familyAssignmentKind: FamilyAssignmentKind;
+  sourceDifficulty: Difficulty | null;
+  familyResolutionState: FamilyResolutionState;
+  familyResolutionReasons: string[];
+  playabilityTier: PlayabilityTier | null;
+  coverageSummary: CoverageSummary | null;
+}
 
 /** A combination the worker could not publish in this run. */
 export interface MissingChartRef {

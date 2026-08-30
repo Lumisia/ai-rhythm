@@ -176,25 +176,25 @@ class RunChartRefV3(RunChartRef):
         "COVERAGE_REPAIR",
         "RAW_UNVERIFIED",
         "SAFE_FALLBACK",
-    ] = "PRIMARY"
+    ]
     family_assignment_kind: Literal[
         "ORIGINAL",
         "REASSIGNED",
         "EMERGENCY_DUPLICATE",
-    ] = "ORIGINAL"
-    source_difficulty: Difficulty | None = None
+    ]
+    source_difficulty: Difficulty | None
     family_resolution_state: Literal[
         "RESOLVED",
         "NARROW_REVIEW",
         "UNRESOLVED",
-    ] = "RESOLVED"
-    family_resolution_reasons: list[str] = Field(default_factory=list)
+    ]
+    family_resolution_reasons: list[str]
     playability_tier: Literal[
         "MODEL_PLAYABLE",
         "RECOVERY_PLAYABLE",
         "DIAGNOSTIC_ONLY",
-    ] | None = None
-    coverage_summary: CoverageSummary | None = None
+    ] | None
+    coverage_summary: CoverageSummary | None
 
     @model_validator(mode="after")
     def _check_trust_facts(self) -> Self:

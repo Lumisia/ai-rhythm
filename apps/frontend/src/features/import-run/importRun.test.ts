@@ -45,6 +45,14 @@ interface RunOptions {
   uncalibratedBoundary?: boolean;
   varyFirstChartDuration?: boolean;
   v3ChartAuthorityFields?: boolean;
+  omittedV3ChartTrustField?:
+    | "provenance"
+    | "familyAssignmentKind"
+    | "sourceDifficulty"
+    | "familyResolutionState"
+    | "familyResolutionReasons"
+    | "playabilityTier"
+    | "coverageSummary";
   v3UnsafeTrust?:
     | "REASSIGNED"
     | "UNRESOLVED"
@@ -234,6 +242,9 @@ function makeRunFiles(options: RunOptions = {}): File[] {
         }
       : ref,
   );
+  if (options.omittedV3ChartTrustField) {
+    delete v3ChartRefs[0][options.omittedV3ChartTrustField];
+  }
 
   const audio: PlaytestRunManifest["audio"] = {
     game: { path: "audio/game.flac", sha256: gameSha },
@@ -471,6 +482,20 @@ describe("importRun", () => {
       ).rejects.toThrow(/schema validation.*required/i);
     },
   );
+
+  it.each([
+    "provenance",
+    "familyAssignmentKind",
+    "sourceDifficulty",
+    "familyResolutionState",
+    "familyResolutionReasons",
+    "playabilityTier",
+    "coverageSummary",
+  ] as const)("rejects a v3 run whose explicit chart trust fact %s is absent", async (field) => {
+    await expect(
+      importRun(makeRunFiles({ omittedV3ChartTrustField: field }), "PRODUCTION"),
+    ).rejects.toThrow(/schema validation.*required/i);
+  });
 
   it.each(["version", "missingCharts", "strictBlockers"] as const)(
     "still rejects a v2 run whose required %s field is absent before legacy policy",

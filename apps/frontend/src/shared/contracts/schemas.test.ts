@@ -164,4 +164,20 @@ describe("playtest-run-v3 contract", () => {
       expect(() => validatePlaytestRunV3(document)).toThrow(/additional properties/i);
     },
   );
+
+  it.each([
+    "provenance",
+    "familyAssignmentKind",
+    "sourceDifficulty",
+    "familyResolutionState",
+    "familyResolutionReasons",
+    "playabilityTier",
+    "coverageSummary",
+  ])("rejects an omitted explicit chart trust fact %s", (field) => {
+    const document = validPlaytestRunV3();
+    const charts = document.charts as Array<Record<string, unknown>>;
+    delete charts[0][field];
+
+    expect(() => validatePlaytestRunV3(document)).toThrow(/required/i);
+  });
 });
