@@ -280,6 +280,7 @@ def _write_v2_song(
         strict_blockers=_STRICT_BLOCKERS,
     )
     manifest_v2 = PlaytestRunManifestV2(
+        version=2,
         run_id=source.manifest.run_id,
         title=source.manifest.title,
         generated_at=source.manifest.generated_at,

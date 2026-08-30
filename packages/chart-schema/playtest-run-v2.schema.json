@@ -404,7 +404,6 @@
   "properties": {
     "version": {
       "const": 2,
-      "default": 2,
       "title": "Version",
       "type": "integer"
     },
@@ -477,14 +476,17 @@
     }
   },
   "required": [
+    "version",
     "runId",
     "title",
     "generatedAt",
     "workerVersion",
     "audio",
     "charts",
+    "missingCharts",
     "generationReport",
     "outcome",
+    "strictBlockers",
     "publication"
   ],
   "title": "PlaytestRunManifestV2",

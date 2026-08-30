@@ -1545,6 +1545,7 @@ def _run_pipeline(
     )
     _write_generation_report(report_path, generation_report)
     manifest = PlaytestRunManifestV2(
+        version=2,
         run_id=run_id,
         title=options.title,
         generated_at=dependencies.now(),

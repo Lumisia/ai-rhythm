@@ -15,6 +15,7 @@ describe("derivePublication", () => {
         },
         12,
         12,
+        [],
       ),
     ).toEqual({
       policyVersion: "PUBLICATION_POLICY_V2",
@@ -56,6 +57,7 @@ describe("derivePublication", () => {
         },
         12,
         12,
+        [],
       ).reasonCodes,
     ).toEqual(["QUALITY_REVIEW_REQUIRED", "STRICT_OUTCOME_FALSE"]);
 
@@ -70,6 +72,7 @@ describe("derivePublication", () => {
         },
         11,
         12,
+        [],
       ).reasonCodes,
     ).toEqual(["INCOMPLETE_CHART_SET", "STRICT_OUTCOME_FALSE"]);
   });
@@ -86,6 +89,7 @@ describe("derivePublication", () => {
         },
         11,
         12,
+        [],
       ),
     ).toThrow(/completeness/i);
 
@@ -100,6 +104,7 @@ describe("derivePublication", () => {
         },
         12,
         12,
+        [],
       ),
     ).toThrow(/publishableStrict/);
   });
@@ -116,6 +121,7 @@ describe("derivePublication", () => {
         },
         12,
         12,
+        [],
       ),
     ).toThrow(/failureCategory/);
 
@@ -130,6 +136,7 @@ describe("derivePublication", () => {
         },
         0,
         12,
+        [],
       ),
     ).toThrow(/failureCategory/);
   });

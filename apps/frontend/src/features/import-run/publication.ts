@@ -29,7 +29,7 @@ export function derivePublication(
   outcome: OutcomeStatusSnapshot,
   publishedSlots: number,
   expectedSlots: number,
-  strictBlockers: readonly PublicationStrictBlocker[] = [],
+  strictBlockers: readonly PublicationStrictBlocker[],
 ): PublicationDecisionSnapshot {
   const actualCompleteness = completenessForSlots(publishedSlots, expectedSlots);
   if (outcome.completeness !== actualCompleteness) {

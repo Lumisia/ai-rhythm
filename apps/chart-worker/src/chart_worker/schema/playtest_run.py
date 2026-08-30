@@ -265,18 +265,18 @@ class PublicationDecisionSnapshot(CamelModel):
 
 
 class PlaytestRunManifestV2(CamelModel):
-    version: Literal[2] = 2
+    version: Literal[2]
     run_id: UUID
     title: str = Field(min_length=1)
     generated_at: datetime
     worker_version: str = Field(min_length=1)
     audio: RunAudioRefs
     charts: list[RunChartRefV2] = Field(min_length=1)
-    missing_charts: list[MissingChartRef] = Field(default_factory=list)
+    missing_charts: list[MissingChartRef]
     keysound_manifest_path: SafeRelativePath | None = None
     generation_report: ReportFileRef
     outcome: OutcomeStatusSnapshot
-    strict_blockers: list[PublicationStrictBlocker] = Field(default_factory=list)
+    strict_blockers: list[PublicationStrictBlocker]
     publication: PublicationDecisionSnapshot
 
     @field_validator("charts", mode="before")

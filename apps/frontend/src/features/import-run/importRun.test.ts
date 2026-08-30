@@ -32,6 +32,7 @@ interface RunOptions {
   manifestPublicationMissingReason?: boolean;
   manifestVersion?: 1 | 2;
   missingReport?: boolean;
+  omittedV2Fields?: Array<"version" | "missingCharts" | "strictBlockers">;
   omitFirstChart?: boolean;
   partial?: boolean;
   reportOutcomeMismatch?: boolean;
@@ -304,7 +305,9 @@ function makeRunFiles(options: RunOptions = {}): File[] {
         ? reportPublication.decision !== "ALLOW_PRODUCTION"
         : reportPublication.decision === "ALLOW_PRODUCTION",
       outcomeStatusV2: reportOutcome,
-      strictBlockers: reportStrictBlockers,
+      ...(options.omittedV2Fields?.includes("strictBlockers")
+        ? {}
+        : { strictBlockers: reportStrictBlockers }),
       publicationDecision: reportPublication,
       ...(options.withBoundaryEvidence
         ? {
@@ -343,21 +346,25 @@ function makeRunFiles(options: RunOptions = {}): File[] {
       makeFile(
         "playtest-run-v2.json",
         JSON.stringify({
-          version: 2,
+          ...(options.omittedV2Fields?.includes("version") ? {} : { version: 2 }),
           runId: legacyManifest.runId,
           title: legacyManifest.title,
           generatedAt: legacyManifest.generatedAt,
           workerVersion: legacyManifest.workerVersion,
           audio,
           charts: chartRefs,
-          missingCharts: legacyManifest.missingCharts ?? [],
+          ...(options.omittedV2Fields?.includes("missingCharts")
+            ? {}
+            : { missingCharts: legacyManifest.missingCharts ?? [] }),
           keysoundManifestPath,
           generationReport: {
             path: "generation-report.json",
             sha256: digest(reportBody),
           },
           outcome,
-          strictBlockers,
+          ...(options.omittedV2Fields?.includes("strictBlockers")
+            ? {}
+            : { strictBlockers }),
           publication,
         }),
       ),
@@ -390,6 +397,15 @@ describe("importRun", () => {
       Array.from(encoder.encode("fLaC")),
     );
   });
+
+  it.each(["version", "missingCharts", "strictBlockers"] as const)(
+    "rejects a v2 production run whose required %s field is absent",
+    async (field) => {
+      await expect(
+        importRun(makeRunFiles({ omittedV2Fields: [field] }), "PRODUCTION"),
+      ).rejects.toThrow(/schema validation.*required/i);
+    },
+  );
 
   it("accepts chart-level recovery provenance and coverage evidence", async () => {
     const imported = await importRun(

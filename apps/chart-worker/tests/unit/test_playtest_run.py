@@ -53,12 +53,14 @@ def _manifest(**overrides) -> PlaytestRunManifest:
 
 def _manifest_v2(**overrides) -> PlaytestRunManifestV2:
     values = {
+        "version": 2,
         "run_id": UUID(int=2),
         "title": "fixture",
         "generated_at": datetime(2026, 8, 10, tzinfo=UTC),
         "worker_version": "test-build",
         "audio": RunAudioRefs(game=AudioFileRef(path="audio/game.flac", sha256=SHA)),
         "charts": _charts(),
+        "missing_charts": [],
         "generation_report": ReportFileRef(
             path="generation-report.json",
             sha256=SHA,
@@ -70,6 +72,7 @@ def _manifest_v2(**overrides) -> PlaytestRunManifestV2:
             failure_category="NONE",
             publishable_strict=True,
         ),
+        "strict_blockers": [],
         "publication": PublicationDecisionSnapshot(
             policy_version="PUBLICATION_POLICY_V2",
             decision="ALLOW_PRODUCTION",
@@ -165,6 +168,17 @@ def test_v2_manifest_json_binds_report_and_round_trips():
     assert '"generationReport"' in payload
     assert '"publishableStrict":true' in payload
     assert PlaytestRunManifestV2.model_validate_json(payload) == manifest
+
+
+@pytest.mark.parametrize("field", ("version", "missingCharts", "strictBlockers"))
+def test_v2_manifest_rejects_missing_explicit_contract_fields(field):
+    """Removing a V2 safety field must not silently activate a model default."""
+
+    payload = json.loads(_manifest_v2().model_dump_json(by_alias=True))
+    payload.pop(field)
+
+    with pytest.raises(ValidationError, match=field):
+        PlaytestRunManifestV2.model_validate(payload)
 
 
 def test_v2_chart_ref_requires_playtest_tier_for_safe_fallback():
