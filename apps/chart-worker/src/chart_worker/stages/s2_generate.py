@@ -1855,10 +1855,10 @@ def _selected_candidates(
             DifficultyOrderReview | None,
         ]
     ],
-) -> tuple[_Candidate, ...]:
+) -> tuple[tuple[int, str, _Candidate], ...]:
     return tuple(
-        candidate
-        for _states, assignment, _review in selections
+        (states[difficulty].key_mode, difficulty, candidate)
+        for states, assignment, _review in selections
         for difficulty in DIFFICULTIES
         if (candidate := assignment[difficulty]) is not None
     )
@@ -2374,7 +2374,13 @@ def run_generation(
     )
     final_intro_candidates = _selected_candidates(selections)
     final_intro_views = tuple(
-        _intro_view(candidate, song_context) for candidate in final_intro_candidates
+        _intro_view(
+            candidate,
+            key_mode=key_mode,
+            difficulty=difficulty,
+            song_context=song_context,
+        )
+        for key_mode, difficulty, candidate in final_intro_candidates
     )
     intro_start_contract = build_intro_start_contract(
         song_context,
@@ -2765,7 +2771,13 @@ def run_generation(
     # published assignment, not the pre-selector assignment.
     final_intro_candidates = _selected_candidates(selections)
     final_intro_views = tuple(
-        _intro_view(candidate, song_context) for candidate in final_intro_candidates
+        _intro_view(
+            candidate,
+            key_mode=key_mode,
+            difficulty=difficulty,
+            song_context=song_context,
+        )
+        for key_mode, difficulty, candidate in final_intro_candidates
     )
     intro_start_contract = build_intro_start_contract(
         song_context,

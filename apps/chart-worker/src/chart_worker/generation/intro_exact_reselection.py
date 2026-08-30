@@ -29,10 +29,12 @@ Selection = tuple[
 ]
 
 
-def _selected_candidates(selections: list[Selection]) -> tuple[Candidate, ...]:
+def _selected_candidates(
+    selections: list[Selection],
+) -> tuple[tuple[int, str, Candidate], ...]:
     return tuple(
-        candidate
-        for _states, assignment, _review in selections
+        (states[difficulty].key_mode, difficulty, candidate)
+        for states, assignment, _review in selections
         for difficulty in DIFFICULTIES
         if (candidate := assignment[difficulty]) is not None
     )
@@ -91,7 +93,15 @@ def apply_intro_start_contract(
     initial = _selected_candidates(selections)
     contract = build_intro_start_contract(
         song_context,
-        tuple(intro_candidate_view(candidate, song_context) for candidate in initial),
+        tuple(
+            intro_candidate_view(
+                candidate,
+                key_mode=key_mode,
+                difficulty=difficulty,
+                song_context=song_context,
+            )
+            for key_mode, difficulty, candidate in initial
+        ),
     )
     canonical_ms = contract.canonical_first_row_ms
     correction_reasons: list[str] = []
@@ -148,8 +158,13 @@ def apply_intro_start_contract(
     review = validate_exact_first_row(
         contract,
         tuple(
-            intro_candidate_view(candidate, song_context)
-            for candidate in final_candidates
+            intro_candidate_view(
+                candidate,
+                key_mode=key_mode,
+                difficulty=difficulty,
+                song_context=song_context,
+            )
+            for key_mode, difficulty, candidate in final_candidates
         ),
         corrected_count=corrected_count,
         correction_reasons=tuple(correction_reasons),

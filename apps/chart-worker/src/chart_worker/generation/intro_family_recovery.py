@@ -206,6 +206,9 @@ def intro_recovery_targets(
 
 def intro_candidate_view(
     candidate: Candidate,
+    *,
+    key_mode: int,
+    difficulty: str,
     song_context: SongAnalysisContext,
 ) -> IntroCandidateView:
     first = first_row_ms(candidate)
@@ -222,8 +225,8 @@ def intro_candidate_view(
     ):
         audio_supported = True
     return IntroCandidateView(
-        key_mode=candidate.request.key_mode,
-        difficulty=candidate.request.difficulty,
+        key_mode=key_mode,
+        difficulty=difficulty,
         first_row_ms=first,
         seed=candidate.seed,
         raw_supported=first is not None,
@@ -255,7 +258,12 @@ def intro_phrase_view(
         if first is not None and second is not None
         else None
     )
-    intro = intro_candidate_view(candidate, song_context)
+    intro = intro_candidate_view(
+        candidate,
+        key_mode=key_mode,
+        difficulty=difficulty,
+        song_context=song_context,
+    )
     return IntroPhraseChartView(
         key_mode=key_mode,
         difficulty=difficulty,

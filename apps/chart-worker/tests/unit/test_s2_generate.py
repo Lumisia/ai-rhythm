@@ -12,6 +12,7 @@ from chart_worker.analysis.coverage_jury import LocalAudioGapEvidence
 from chart_worker.analysis.coverage_opportunity import CoverageKind, CoverageOpportunity
 from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.song_context import SongAnalysisContext
 from chart_worker.analysis.terminal_silence import (
     TerminalSilenceObservation,
     TerminalThresholdCandidate,
@@ -44,7 +45,10 @@ from chart_worker.generation.generation_control import (
     RecoveryKind,
 )
 from chart_worker.generation.intro_exact_reselection import try_exact_intro_candidate
-from chart_worker.generation.intro_family_recovery import intro_phrase_pair_review
+from chart_worker.generation.intro_family_recovery import (
+    intro_candidate_view,
+    intro_phrase_pair_review,
+)
 from chart_worker.generation.mapperatorinator import GeneratedChart
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
 from chart_worker.generation.osu_writer import timing_to_osu_mania
@@ -1307,6 +1311,31 @@ class RecordingGenerator:
             seed=request.seed,
             bpm_events=(OsuBpmEvent(0, 120.0),),
         )
+
+
+def test_intro_contract_reports_reassigned_candidate_as_target_slot(tmp_path: Path):
+    prepared = _prepared(tmp_path)
+    authority = _authority(prepared, tmp_path)
+    song_context = SongAnalysisContext.build(
+        authority,
+        _analysis(),
+        duration_ms=prepared.normalized.duration_ms,
+    )
+    source = SimpleNamespace(
+        request=SimpleNamespace(key_mode=4, difficulty="EASY"),
+        generated=SimpleNamespace(notes=[NoteEvent(500, 0)]),
+        seed=7,
+    )
+
+    view = intro_candidate_view(
+        source,
+        key_mode=4,
+        difficulty="EXPERT",
+        song_context=song_context,
+    )
+
+    assert (view.key_mode, view.difficulty, view.first_row_ms) == (4, "EXPERT", 500)
+    assert source.request.difficulty == "EASY"
 
 
 @pytest.mark.parametrize(
