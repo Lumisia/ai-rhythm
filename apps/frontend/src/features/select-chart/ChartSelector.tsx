@@ -42,6 +42,7 @@ export function ChartSelector({
   const publicationLabel = {
     PRODUCTION_VERIFIED: "RUN VERIFIED",
     PLAYTEST_ONLY: "PLAYTEST ONLY",
+    LEGACY_V2_PLAYTEST_ONLY: "V2 LEGACY · PLAYTEST ONLY",
     LEGACY_UNVERIFIED: "LEGACY UNVERIFIED",
   }[run.publicationState];
   return (

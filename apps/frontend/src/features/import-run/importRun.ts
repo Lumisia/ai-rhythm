@@ -7,9 +7,10 @@ import type {
   KeysoundManifest,
   PlaytestRunManifest,
   PlaytestRunManifestV2,
+  PlaytestRunManifestV3,
   PublicationReasonCode,
   ReportFileRef,
-  RunChartRef,
+  RunChartRefBase,
 } from "../../game/core/types";
 import {
   extractBoundaryEvidence,
@@ -20,6 +21,7 @@ import {
   validateKeysoundManifest,
   validatePlaytestRunV1,
   validatePlaytestRunV2,
+  validatePlaytestRunV3,
 } from "../../shared/contracts/schemas";
 import type { AssetSource } from "../../shared/local-files/AssetSource";
 import {
@@ -31,6 +33,7 @@ import { derivePublication } from "./publication";
 
 const RUN_MANIFEST_V1_PATH = "playtest-run-v1.json";
 const RUN_MANIFEST_V2_PATH = "playtest-run-v2.json";
+const RUN_MANIFEST_V3_PATH = "playtest-run-v3.json";
 const keyModes: KeyMode[] = [4, 6, 7];
 const difficulties: Difficulty[] = ["EASY", "NORMAL", "HARD", "EXPERT"];
 
@@ -38,11 +41,15 @@ export type ImportMode = "PRODUCTION" | "PLAYTEST";
 export type PublicationState =
   | "PRODUCTION_VERIFIED"
   | "PLAYTEST_ONLY"
+  | "LEGACY_V2_PLAYTEST_ONLY"
   | "LEGACY_UNVERIFIED";
-export type ImportPublicationReason = PublicationReasonCode | "LEGACY_MANIFEST_UNVERIFIED";
+export type ImportPublicationReason =
+  | PublicationReasonCode
+  | "LEGACY_V2_CHART_AUTHORITY_UNVERIFIED"
+  | "LEGACY_MANIFEST_UNVERIFIED";
 
 export interface ImportedChart {
-  ref: RunChartRef;
+  ref: RunChartRefBase;
   document: ChartDocument;
   bytes: ArrayBuffer;
 }
@@ -119,9 +126,78 @@ async function readVerifiedAsset(source: AssetSource, ref: AudioFileRef): Promis
   return bytes;
 }
 
-async function validateV2Publication(
+type StrictManifest = PlaytestRunManifestV2 | PlaytestRunManifestV3;
+
+function validateV3ChartFacts(manifest: PlaytestRunManifestV3): void {
+  for (const chart of manifest.charts) {
+    const provenance = chart.provenance ?? "PRIMARY";
+    const familyAssignmentKind = chart.familyAssignmentKind ?? "ORIGINAL";
+    const sourceDifficulty = chart.sourceDifficulty ?? null;
+    const familyResolutionState = chart.familyResolutionState ?? "RESOLVED";
+    const familyResolutionReasons = chart.familyResolutionReasons ?? [];
+    const canonicalReasons = [...new Set(familyResolutionReasons)].sort();
+    const familyAdapted = familyAssignmentKind !== "ORIGINAL";
+    const familyUnresolved = familyResolutionState !== "RESOLVED";
+    const provenanceFallback = [
+      "COVERAGE_REPAIR",
+      "RAW_UNVERIFIED",
+      "SAFE_FALLBACK",
+    ].includes(provenance);
+    const invalid =
+      (familyAdapted && sourceDifficulty === null) ||
+      (!familyAdapted &&
+        sourceDifficulty !== null &&
+        sourceDifficulty !== chart.difficulty) ||
+      (familyUnresolved && familyResolutionReasons.length === 0) ||
+      (!familyUnresolved && familyResolutionReasons.length > 0) ||
+      !valuesAgree(familyResolutionReasons, canonicalReasons) ||
+      ((chart.playabilityTier == null) !== (chart.coverageSummary == null)) ||
+      (chart.playabilityTier != null &&
+        !provenanceFallback &&
+        !familyAdapted &&
+        chart.playabilityTier !== "MODEL_PLAYABLE") ||
+      (provenance === "RAW_UNVERIFIED" &&
+        chart.playabilityTier != null &&
+        chart.playabilityTier !== "DIAGNOSTIC_ONLY") ||
+      ((provenance === "COVERAGE_REPAIR" ||
+        provenance === "SAFE_FALLBACK" ||
+        familyAdapted) &&
+        chart.playabilityTier === "MODEL_PLAYABLE");
+    if (invalid) {
+      throw new Error(
+        `v3 chart trust facts are inconsistent for ${chart.keyMode}K ${chart.difficulty}`,
+      );
+    }
+  }
+}
+
+function validateV3ProductionTrust(manifest: PlaytestRunManifestV3): void {
+  if (manifest.publication.decision !== "ALLOW_PRODUCTION") return;
+
+  const unsafeChart = manifest.charts.find((chart) => {
+    const provenance = chart.provenance ?? "PRIMARY";
+    const familyAssignmentKind = chart.familyAssignmentKind ?? "ORIGINAL";
+    const familyResolutionState = chart.familyResolutionState ?? "RESOLVED";
+    const familyResolutionReasons = chart.familyResolutionReasons ?? [];
+    return (
+      ["COVERAGE_REPAIR", "RAW_UNVERIFIED", "SAFE_FALLBACK"].includes(provenance) ||
+      familyAssignmentKind !== "ORIGINAL" ||
+      familyResolutionState !== "RESOLVED" ||
+      familyResolutionReasons.length > 0 ||
+      (chart.playabilityTier != null &&
+        chart.playabilityTier !== "MODEL_PLAYABLE")
+    );
+  });
+  if (unsafeChart) {
+    throw new Error(
+      `ALLOW_PRODUCTION disagrees with chart trust facts for ${unsafeChart.keyMode}K ${unsafeChart.difficulty}`,
+    );
+  }
+}
+
+async function validateStrictPublication(
   source: AssetSource,
-  manifest: PlaytestRunManifestV2,
+  manifest: StrictManifest,
   mode: ImportMode,
 ): Promise<LoadedManifest> {
   const expectedPublication = derivePublication(
@@ -144,13 +220,17 @@ async function validateV2Publication(
     throw new Error(`${reportPath} must contain a JSON object`);
   }
   if (!valuesAgree(report.outcomeStatusV2, manifest.outcome)) {
-    throw new Error("generation report outcome disagrees with the v2 manifest snapshot");
+    throw new Error(`generation report outcome disagrees with the v${manifest.version} manifest snapshot`);
   }
   if (!valuesAgree(report.publicationDecision, manifest.publication)) {
-    throw new Error("generation report publication decision disagrees with the v2 manifest snapshot");
+    throw new Error(
+      `generation report publication decision disagrees with the v${manifest.version} manifest snapshot`,
+    );
   }
   if (!valuesAgree(report.strictBlockers, manifest.strictBlockers)) {
-    throw new Error("generation report strict blockers disagree with the v2 manifest snapshot");
+    throw new Error(
+      `generation report strict blockers disagree with the v${manifest.version} manifest snapshot`,
+    );
   }
   const productionAllowed = manifest.publication.decision === "ALLOW_PRODUCTION";
   if (report.publishable !== productionAllowed) {
@@ -160,6 +240,23 @@ async function validateV2Publication(
   if (manifest.publication.decision === "REJECTED") {
     throw new Error("rejected publication decisions cannot be imported for gameplay");
   }
+  if (manifest.version === 2) {
+    if (mode === "PRODUCTION") {
+      throw new Error("v2 run manifests are legacy PLAYTEST-only inputs");
+    }
+    return {
+      manifest,
+      publicationState: "LEGACY_V2_PLAYTEST_ONLY",
+      publicationReasons: [
+        ...manifest.publication.reasonCodes,
+        "LEGACY_V2_CHART_AUTHORITY_UNVERIFIED",
+      ],
+      generationReportDocument: report,
+    };
+  }
+
+  validateV3ChartFacts(manifest);
+  validateV3ProductionTrust(manifest);
   if (mode === "PRODUCTION" && manifest.publication.decision !== "ALLOW_PRODUCTION") {
     throw new Error(
       `production import rejected publication decision ${manifest.publication.decision}`,
@@ -180,11 +277,22 @@ async function validateV2Publication(
 async function loadManifest(source: AssetSource, mode: ImportMode): Promise<LoadedManifest> {
   const hasV1 = source.has(RUN_MANIFEST_V1_PATH);
   const hasV2 = source.has(RUN_MANIFEST_V2_PATH);
-  if (hasV1 && hasV2) {
-    throw new Error("selected directory contains both v1 and v2 run manifests");
+  const hasV3 = source.has(RUN_MANIFEST_V3_PATH);
+  const manifestCount = Number(hasV1) + Number(hasV2) + Number(hasV3);
+  if (manifestCount > 1) {
+    throw new Error("selected directory contains multiple run manifests");
   }
-  if (!hasV1 && !hasV2) {
+  if (manifestCount === 0) {
     throw new Error("selected directory does not contain a run manifest");
+  }
+
+  if (hasV3) {
+    const document = parseJson(
+      await source.readText(RUN_MANIFEST_V3_PATH),
+      RUN_MANIFEST_V3_PATH,
+    );
+    validatePlaytestRunV3(document, RUN_MANIFEST_V3_PATH);
+    return validateStrictPublication(source, document, mode);
   }
 
   if (hasV2) {
@@ -193,7 +301,7 @@ async function loadManifest(source: AssetSource, mode: ImportMode): Promise<Load
       RUN_MANIFEST_V2_PATH,
     );
     validatePlaytestRunV2(document, RUN_MANIFEST_V2_PATH);
-    return validateV2Publication(source, document, mode);
+    return validateStrictPublication(source, document, mode);
   }
 
   const document = parseJson(
@@ -298,7 +406,7 @@ function validateChartSet(manifest: PlaytestRunManifest): void {
 
 function validateChartIdentity(
   chart: ChartDocument,
-  ref: RunChartRef,
+  ref: RunChartRefBase,
   manifest: PlaytestRunManifest,
   commonSongVersionId: string | null,
   commonGameAudioAssetId: string | null,

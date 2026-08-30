@@ -1,7 +1,60 @@
 import { describe, expect, it } from "vitest";
 
 import type { BoundaryLabelV1, BoundaryLabelV2 } from "../../game/core/types";
-import { validateBoundaryLabel, validateBoundaryLabelV2 } from "./schemas";
+import {
+  validateBoundaryLabel,
+  validateBoundaryLabelV2,
+  validatePlaytestRunV3,
+} from "./schemas";
+
+function validPlaytestRunV3(): Record<string, unknown> {
+  return {
+    version: 3,
+    runId: "30000000-0000-4000-8000-000000000001",
+    title: "v3 fixture",
+    generatedAt: "2026-08-30T00:00:00Z",
+    workerVersion: "fixture",
+    audio: {
+      game: { path: "audio/game.flac", sha256: "a".repeat(64) },
+      noDrums: null,
+      keys: null,
+    },
+    charts: [4, 6, 7].flatMap((keyMode) =>
+      ["EASY", "NORMAL", "HARD", "EXPERT"].map((difficulty) => ({
+        path: `charts/${keyMode}k-${difficulty.toLowerCase()}.chart.json`,
+        sha256: "b".repeat(64),
+        keyMode,
+        difficulty,
+        provenance: "PRIMARY",
+        familyAssignmentKind: "ORIGINAL",
+        sourceDifficulty: null,
+        familyResolutionState: "RESOLVED",
+        familyResolutionReasons: [],
+        playabilityTier: null,
+        coverageSummary: null,
+      })),
+    ),
+    missingCharts: [],
+    keysoundManifestPath: null,
+    generationReport: {
+      path: "generation-report.json",
+      sha256: "c".repeat(64),
+    },
+    outcome: {
+      execution: "SUCCEEDED",
+      completeness: "COMPLETE",
+      quality: "PASS",
+      failureCategory: "NONE",
+      publishableStrict: true,
+    },
+    strictBlockers: [],
+    publication: {
+      policyVersion: "PUBLICATION_POLICY_V2",
+      decision: "ALLOW_PRODUCTION",
+      reasonCodes: [],
+    },
+  };
+}
 
 function validBoundaryLabel(): BoundaryLabelV1 {
   return {
@@ -94,4 +147,21 @@ describe("boundary-label-v2 contract", () => {
   it("does not accept a v1 document as v2", () => {
     expect(() => validateBoundaryLabelV2(validBoundaryLabel())).toThrow(/version/i);
   });
+});
+
+describe("playtest-run-v3 contract", () => {
+  it("accepts factual chart trust fields without chart-level authority", () => {
+    expect(() => validatePlaytestRunV3(validPlaytestRunV3())).not.toThrow();
+  });
+
+  it.each(["productionEligible", "distributionTier"])(
+    "rejects removed chart authority field %s",
+    (field) => {
+      const document = validPlaytestRunV3();
+      const charts = document.charts as Array<Record<string, unknown>>;
+      charts[0][field] = field === "productionEligible" ? true : "PRODUCTION_CANDIDATE";
+
+      expect(() => validatePlaytestRunV3(document)).toThrow(/additional properties/i);
+    },
+  );
 });

@@ -27,12 +27,12 @@ interface RunOptions {
   badChartHash?: boolean;
   chartPath?: string;
   duplicateCombination?: boolean;
-  includeBothManifests?: boolean;
+  additionalManifestVersions?: Array<1 | 2 | 3>;
   invalidChartSchema?: boolean;
   manifestPublicationMissingReason?: boolean;
-  manifestVersion?: 1 | 2;
+  manifestVersion?: 1 | 2 | 3;
   missingReport?: boolean;
-  omittedV2Fields?: Array<"version" | "missingCharts" | "strictBlockers">;
+  omittedContractFields?: Array<"version" | "missingCharts" | "strictBlockers">;
   omitFirstChart?: boolean;
   partial?: boolean;
   reportOutcomeMismatch?: boolean;
@@ -44,6 +44,13 @@ interface RunOptions {
   tamperReportHash?: boolean;
   uncalibratedBoundary?: boolean;
   varyFirstChartDuration?: boolean;
+  v3ChartAuthorityFields?: boolean;
+  v3UnsafeTrust?:
+    | "REASSIGNED"
+    | "UNRESOLVED"
+    | "NON_MODEL_PLAYABILITY"
+    | "SOURCE_MISMATCH"
+    | "UNPAIRED_PLAYABILITY";
   withBoundaryEvidence?: boolean;
   withKeysounds?: boolean;
 }
@@ -123,6 +130,11 @@ function makeChart(index: number, keyMode: KeyMode, difficulty: Difficulty, audi
 }
 
 function makeRunFiles(options: RunOptions = {}): File[] {
+  const manifestVersion = options.manifestVersion ?? 3;
+  const manifestVersions = new Set<1 | 2 | 3>([
+    manifestVersion,
+    ...(options.additionalManifestVersions ?? []),
+  ]);
   const gameAudio = new Uint8Array([0x66, 0x4c, 0x61, 0x43, 1, 2, 3]);
   const gameSha = digest(gameAudio);
   const chartFiles: File[] = [];
@@ -146,11 +158,16 @@ function makeRunFiles(options: RunOptions = {}): File[] {
           sha256: digest(body),
           keyMode,
           difficulty,
+          provenance: "PRIMARY",
+          familyAssignmentKind: "ORIGINAL",
+          sourceDifficulty: null,
+          familyResolutionState: "RESOLVED",
+          familyResolutionReasons: [],
+          playabilityTier: null,
+          coverageSummary: null,
           ...(options.recoveryTrust && index === 0
             ? {
                 provenance: "COVERAGE_REPAIR" as const,
-                productionEligible: false,
-                distributionTier: "PLAYTEST_ONLY" as const,
                 playabilityTier: "RECOVERY_PLAYABLE" as const,
                 coverageSummary: {
                   firstNoteTimeMs: 500,
@@ -173,6 +190,50 @@ function makeRunFiles(options: RunOptions = {}): File[] {
   if (options.duplicateCombination) {
     chartRefs[1] = { ...chartRefs[1], keyMode: chartRefs[0].keyMode, difficulty: chartRefs[0].difficulty };
   }
+  if (options.v3UnsafeTrust === "REASSIGNED") {
+    chartRefs[0].familyAssignmentKind = "REASSIGNED";
+    chartRefs[0].sourceDifficulty = "NORMAL";
+  } else if (options.v3UnsafeTrust === "UNRESOLVED") {
+    chartRefs[0].familyResolutionState = "UNRESOLVED";
+    chartRefs[0].familyResolutionReasons = ["FAMILY_ORDER_NOT_PROVEN"];
+  } else if (options.v3UnsafeTrust === "NON_MODEL_PLAYABILITY") {
+    chartRefs[0].playabilityTier = "RECOVERY_PLAYABLE";
+    chartRefs[0].coverageSummary = {
+      firstNoteTimeMs: 500,
+      maxGapMs: 1_000,
+      attackRequiredGapCount: 0,
+      attackRequiredGapTotalMs: 0,
+      repairedGapCount: 1,
+    };
+  } else if (options.v3UnsafeTrust === "SOURCE_MISMATCH") {
+    chartRefs[0].sourceDifficulty = "NORMAL";
+  } else if (options.v3UnsafeTrust === "UNPAIRED_PLAYABILITY") {
+    chartRefs[0].playabilityTier = "MODEL_PLAYABLE";
+  }
+
+  const legacyChartRefs = chartRefs.map(({ path, sha256, keyMode, difficulty }) => ({
+    path,
+    sha256,
+    keyMode,
+    difficulty,
+  }));
+  const v2ChartRefs = chartRefs.map((ref) => ({
+    ...ref,
+    productionEligible: ref.provenance !== "COVERAGE_REPAIR",
+    distributionTier:
+      ref.provenance === "COVERAGE_REPAIR"
+        ? ("PLAYTEST_ONLY" as const)
+        : ("PRODUCTION_CANDIDATE" as const),
+  }));
+  const v3ChartRefs = chartRefs.map((ref, chartIndex) =>
+    options.v3ChartAuthorityFields && chartIndex === 0
+      ? {
+          ...ref,
+          productionEligible: true,
+          distributionTier: "PRODUCTION_CANDIDATE",
+        }
+      : ref,
+  );
 
   const audio: PlaytestRunManifest["audio"] = {
     game: { path: "audio/game.flac", sha256: gameSha },
@@ -212,7 +273,7 @@ function makeRunFiles(options: RunOptions = {}): File[] {
     generatedAt: "2026-08-02T00:00:00Z",
     workerVersion: "0.1.0",
     audio,
-    charts: chartRefs,
+    charts: legacyChartRefs,
     ...(options.partial
       ? { missingCharts: [{ keyMode: 4, difficulty: "EASY", reason: "FIXTURE_MISSING" }] }
       : {}),
@@ -220,11 +281,11 @@ function makeRunFiles(options: RunOptions = {}): File[] {
     generationReportPath: "generation-report.json",
   };
 
-  if (options.manifestVersion === 1 || options.includeBothManifests) {
+  if (manifestVersions.has(1)) {
     files.push(makeFile("playtest-run-v1.json", JSON.stringify(legacyManifest)));
   }
 
-  if (options.manifestVersion !== 1 || options.includeBothManifests) {
+  if (manifestVersions.has(2) || manifestVersions.has(3)) {
     const outcome: OutcomeStatusSnapshot = options.partial
       ? {
           execution: "SUCCEEDED",
@@ -305,7 +366,7 @@ function makeRunFiles(options: RunOptions = {}): File[] {
         ? reportPublication.decision !== "ALLOW_PRODUCTION"
         : reportPublication.decision === "ALLOW_PRODUCTION",
       outcomeStatusV2: reportOutcome,
-      ...(options.omittedV2Fields?.includes("strictBlockers")
+      ...(options.omittedContractFields?.includes("strictBlockers")
         ? {}
         : { strictBlockers: reportStrictBlockers }),
       publicationDecision: reportPublication,
@@ -342,18 +403,20 @@ function makeRunFiles(options: RunOptions = {}): File[] {
     if (!options.missingReport) {
       files.push(makeFile("generation-report.json", reportFileBody));
     }
-    files.push(
-      makeFile(
-        "playtest-run-v2.json",
-        JSON.stringify({
-          ...(options.omittedV2Fields?.includes("version") ? {} : { version: 2 }),
+    for (const version of [2, 3] as const) {
+      if (!manifestVersions.has(version)) continue;
+      files.push(
+        makeFile(
+          `playtest-run-v${version}.json`,
+          JSON.stringify({
+          ...(options.omittedContractFields?.includes("version") ? {} : { version }),
           runId: legacyManifest.runId,
           title: legacyManifest.title,
           generatedAt: legacyManifest.generatedAt,
           workerVersion: legacyManifest.workerVersion,
           audio,
-          charts: chartRefs,
-          ...(options.omittedV2Fields?.includes("missingCharts")
+          charts: version === 2 ? v2ChartRefs : v3ChartRefs,
+          ...(options.omittedContractFields?.includes("missingCharts")
             ? {}
             : { missingCharts: legacyManifest.missingCharts ?? [] }),
           keysoundManifestPath,
@@ -362,20 +425,22 @@ function makeRunFiles(options: RunOptions = {}): File[] {
             sha256: digest(reportBody),
           },
           outcome,
-          ...(options.omittedV2Fields?.includes("strictBlockers")
+          ...(options.omittedContractFields?.includes("strictBlockers")
             ? {}
             : { strictBlockers }),
           publication,
-        }),
-      ),
-    );
+          }),
+        ),
+      );
+    }
   }
   return files;
 }
 
 describe("importRun", () => {
-  it("imports a valid v2 run in production mode", async () => {
+  it("imports a valid v3 run in production mode", async () => {
     const imported = await importRun(makeRunFiles(), "PRODUCTION");
+    expect(imported.manifest.version).toBe(3);
     expect(imported.manifest.charts).toHaveLength(12);
     expect(imported.charts).toHaveLength(12);
     expect(imported.publicationState).toBe("PRODUCTION_VERIFIED");
@@ -399,20 +464,36 @@ describe("importRun", () => {
   });
 
   it.each(["version", "missingCharts", "strictBlockers"] as const)(
-    "rejects a v2 production run whose required %s field is absent",
+    "rejects a v3 production run whose required %s field is absent",
     async (field) => {
       await expect(
-        importRun(makeRunFiles({ omittedV2Fields: [field] }), "PRODUCTION"),
+        importRun(makeRunFiles({ omittedContractFields: [field] }), "PRODUCTION"),
       ).rejects.toThrow(/schema validation.*required/i);
     },
   );
 
-  it("accepts chart-level recovery provenance and coverage evidence", async () => {
+  it.each(["version", "missingCharts", "strictBlockers"] as const)(
+    "still rejects a v2 run whose required %s field is absent before legacy policy",
+    async (field) => {
+      await expect(
+        importRun(
+          makeRunFiles({ manifestVersion: 2, omittedContractFields: [field] }),
+          "PRODUCTION",
+        ),
+      ).rejects.toThrow(/schema validation.*required/i);
+    },
+  );
+
+  it("preserves v2 chart-level recovery fields only as legacy playtest evidence", async () => {
     const imported = await importRun(
-      makeRunFiles({ recoveryTrust: true, review: true }),
+      makeRunFiles({ manifestVersion: 2, recoveryTrust: true, review: true }),
       "PLAYTEST",
     );
 
+    expect(imported.publicationState).toBe("LEGACY_V2_PLAYTEST_ONLY");
+    expect(imported.publicationReasons).toContain(
+      "LEGACY_V2_CHART_AUTHORITY_UNVERIFIED",
+    );
     expect(imported.charts[0].ref).toMatchObject({
       provenance: "COVERAGE_REPAIR",
       productionEligible: false,
@@ -428,7 +509,26 @@ describe("importRun", () => {
     });
   });
 
-  it("projects verified v2 boundary evidence without making it a human verdict", async () => {
+  it.each([
+    { recoveryTrust: true },
+    { v3UnsafeTrust: "REASSIGNED" as const },
+    { v3UnsafeTrust: "UNRESOLVED" as const },
+    { v3UnsafeTrust: "NON_MODEL_PLAYABILITY" as const },
+    { v3UnsafeTrust: "SOURCE_MISMATCH" as const },
+    { v3UnsafeTrust: "UNPAIRED_PLAYABILITY" as const },
+  ])("rejects v3 ALLOW_PRODUCTION with unsafe chart facts: %o", async (options) => {
+    await expect(importRun(makeRunFiles(options), "PRODUCTION")).rejects.toThrow(
+      /chart trust facts/i,
+    );
+  });
+
+  it("rejects removed chart authority fields from a v3 manifest", async () => {
+    await expect(
+      importRun(makeRunFiles({ v3ChartAuthorityFields: true }), "PRODUCTION"),
+    ).rejects.toThrow(/schema validation.*additional properties/i);
+  });
+
+  it("projects verified v3 boundary evidence without making it a human verdict", async () => {
     const imported = await importRun(
       makeRunFiles({ withBoundaryEvidence: true }),
       "PRODUCTION",
@@ -445,7 +545,7 @@ describe("importRun", () => {
     });
   });
 
-  it("keeps v2 human labeling available when automatic boundary evidence is absent", async () => {
+  it("keeps v3 human labeling available when automatic boundary evidence is absent", async () => {
     const imported = await importRun(makeRunFiles(), "PRODUCTION");
 
     expect(imported.boundaryLabelContext.available).toBe(true);
@@ -494,18 +594,31 @@ describe("importRun", () => {
   });
 
   it("rejects a missing run manifest", async () => {
-    const files = makeRunFiles().filter((file) => file.name !== "playtest-run-v2.json");
+    const files = makeRunFiles().filter((file) => file.name !== "playtest-run-v3.json");
     await expect(importRun(files, "PLAYTEST")).rejects.toThrow(/run manifest/i);
   });
 
   it.each([{ review: true }, { partial: true }])(
-    "rejects playtest-only v2 outcomes in production mode: %o",
+    "rejects playtest-only v3 outcomes in production mode: %o",
     async (options) => {
       await expect(importRun(makeRunFiles(options), "PRODUCTION")).rejects.toThrow(
         /production.*PLAYTEST_ONLY/i,
       );
     },
   );
+
+  it("keeps a valid v2 ALLOW_PRODUCTION snapshot out of production", async () => {
+    const files = makeRunFiles({ manifestVersion: 2 });
+
+    await expect(importRun(files, "PRODUCTION")).rejects.toThrow(
+      /v2.*PLAYTEST/i,
+    );
+    const imported = await importRun(files, "PLAYTEST");
+    expect(imported.publicationState).toBe("LEGACY_V2_PLAYTEST_ONLY");
+    expect(imported.publicationReasons).toEqual([
+      "LEGACY_V2_CHART_AUTHORITY_UNVERIFIED",
+    ]);
+  });
 
   it("imports a review outcome only in playtest mode with explicit reasons", async () => {
     const imported = await importRun(makeRunFiles({ review: true }), "PLAYTEST");
@@ -525,9 +638,18 @@ describe("importRun", () => {
     expect(imported.boundaryLabelContext.available).toBe(true);
   });
 
-  it("rejects a v2 generation report hash mismatch in playtest mode", async () => {
+  it("rejects a v3 generation report hash mismatch in playtest mode", async () => {
     await expect(
       importRun(makeRunFiles({ tamperReportHash: true }), "PLAYTEST"),
+    ).rejects.toThrow(/SHA-256.*generation-report/i);
+  });
+
+  it("checks v2 report integrity before rejecting a production import", async () => {
+    await expect(
+      importRun(
+        makeRunFiles({ manifestVersion: 2, tamperReportHash: true }),
+        "PRODUCTION",
+      ),
     ).rejects.toThrow(/SHA-256.*generation-report/i);
   });
 
@@ -579,13 +701,16 @@ describe("importRun", () => {
     expect(imported.publicationState).toBe("LEGACY_UNVERIFIED");
   });
 
-  it("rejects ambiguous directories containing both manifest versions", async () => {
+  it("rejects ambiguous directories containing v1, v2, and v3 manifests", async () => {
     await expect(
-      importRun(makeRunFiles({ includeBothManifests: true }), "PLAYTEST"),
-    ).rejects.toThrow(/both.*manifest/i);
+      importRun(
+        makeRunFiles({ additionalManifestVersions: [1, 2] }),
+        "PLAYTEST",
+      ),
+    ).rejects.toThrow(/multiple.*manifest/i);
   });
 
-  it("rejects a v2 run whose generation report is absent", async () => {
+  it("rejects a v3 run whose generation report is absent", async () => {
     await expect(
       importRun(makeRunFiles({ missingReport: true }), "PLAYTEST"),
     ).rejects.toThrow(/missing file.*generation-report/i);

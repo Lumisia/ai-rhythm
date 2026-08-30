@@ -118,7 +118,7 @@ export interface CoverageSummary {
   repairedGapCount: number;
 }
 
-export interface RunChartRef extends AudioFileRef {
+export interface RunChartRefBase extends AudioFileRef {
   keyMode: KeyMode;
   difficulty: Difficulty;
   provenance?: GenerationProvenance;
@@ -126,11 +126,18 @@ export interface RunChartRef extends AudioFileRef {
   familyResolutionState?: FamilyResolutionState;
   familyResolutionReasons?: string[];
   sourceDifficulty?: Difficulty | null;
+  playabilityTier?: PlayabilityTier | null;
+  coverageSummary?: CoverageSummary | null;
+}
+
+/** Historical V1/V2 shape. These fields are never V3 production authority. */
+export interface RunChartRef extends RunChartRefBase {
   productionEligible?: boolean;
   distributionTier?: "PRODUCTION_CANDIDATE" | "PLAYTEST_ONLY";
-  playabilityTier?: PlayabilityTier;
-  coverageSummary?: CoverageSummary;
 }
+
+/** V3 exposes diagnostic facts only; publication authority lives at run level. */
+export interface RunChartRefV3 extends RunChartRefBase {}
 
 /** A combination the worker could not publish in this run. */
 export interface MissingChartRef {
@@ -180,7 +187,7 @@ export interface KeysoundManifest {
   drumOnsets: number[];
 }
 
-interface PlaytestRunManifestBase {
+interface PlaytestRunManifestBase<TChart extends RunChartRefBase> {
   runId: string;
   title: string;
   generatedAt: string;
@@ -190,20 +197,20 @@ interface PlaytestRunManifestBase {
     noDrums: AudioFileRef | null;
     keys: AudioFileRef | null;
   };
-  charts: RunChartRef[];
+  charts: TChart[];
   /** Absent on runs written before partial publishing existed. */
   missingCharts?: MissingChartRef[];
   keysoundManifestPath: string | null;
 }
 
-export interface PlaytestRunManifestV1 extends PlaytestRunManifestBase {
+export interface PlaytestRunManifestV1 extends PlaytestRunManifestBase<RunChartRef> {
   version: 1;
   generationReportPath: string;
 }
 
 export interface ReportFileRef extends AudioFileRef {}
 
-export interface PlaytestRunManifestV2 extends PlaytestRunManifestBase {
+export interface PlaytestRunManifestV2 extends PlaytestRunManifestBase<RunChartRef> {
   version: 2;
   missingCharts: MissingChartRef[];
   generationReport: ReportFileRef;
@@ -212,7 +219,19 @@ export interface PlaytestRunManifestV2 extends PlaytestRunManifestBase {
   publication: PublicationDecisionSnapshot;
 }
 
-export type PlaytestRunManifest = PlaytestRunManifestV1 | PlaytestRunManifestV2;
+export interface PlaytestRunManifestV3 extends PlaytestRunManifestBase<RunChartRefV3> {
+  version: 3;
+  missingCharts: MissingChartRef[];
+  generationReport: ReportFileRef;
+  outcome: OutcomeStatusSnapshot;
+  strictBlockers: PublicationStrictBlocker[];
+  publication: PublicationDecisionSnapshot;
+}
+
+export type PlaytestRunManifest =
+  | PlaytestRunManifestV1
+  | PlaytestRunManifestV2
+  | PlaytestRunManifestV3;
 
 export type BoundaryPolicyState =
   | "EXPERIMENTAL"
