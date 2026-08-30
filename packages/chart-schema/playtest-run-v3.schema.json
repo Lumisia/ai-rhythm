@@ -1,0 +1,480 @@
+{
+  "$defs": {
+    "AudioFileRef": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "AudioFileRef",
+      "type": "object"
+    },
+    "CoverageSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "firstNoteTimeMs": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Firstnotetimems"
+        },
+        "maxGapMs": {
+          "minimum": 0,
+          "title": "Maxgapms",
+          "type": "integer"
+        },
+        "attackRequiredGapCount": {
+          "minimum": 0,
+          "title": "Attackrequiredgapcount",
+          "type": "integer"
+        },
+        "attackRequiredGapTotalMs": {
+          "minimum": 0,
+          "title": "Attackrequiredgaptotalms",
+          "type": "integer"
+        },
+        "repairedGapCount": {
+          "minimum": 0,
+          "title": "Repairedgapcount",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "firstNoteTimeMs",
+        "maxGapMs",
+        "attackRequiredGapCount",
+        "attackRequiredGapTotalMs",
+        "repairedGapCount"
+      ],
+      "title": "CoverageSummary",
+      "type": "object"
+    },
+    "MissingChartRef": {
+      "additionalProperties": false,
+      "description": "이번 실행에서 발행하지 못한 조합. 프론트가 목록에서 빠지는 근거다.",
+      "properties": {
+        "keyMode": {
+          "enum": [
+            4,
+            6,
+            7
+          ],
+          "title": "Keymode",
+          "type": "integer"
+        },
+        "difficulty": {
+          "enum": [
+            "EASY",
+            "NORMAL",
+            "HARD",
+            "EXPERT"
+          ],
+          "title": "Difficulty",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "keyMode",
+        "difficulty",
+        "reason"
+      ],
+      "title": "MissingChartRef",
+      "type": "object"
+    },
+    "OutcomeStatusSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "execution": {
+          "enum": [
+            "SUCCEEDED",
+            "FAILED"
+          ],
+          "title": "Execution",
+          "type": "string"
+        },
+        "completeness": {
+          "enum": [
+            "COMPLETE",
+            "PARTIAL",
+            "EMPTY"
+          ],
+          "title": "Completeness",
+          "type": "string"
+        },
+        "quality": {
+          "enum": [
+            "PASS",
+            "REVIEW",
+            "REJECTED",
+            "UNKNOWN"
+          ],
+          "title": "Quality",
+          "type": "string"
+        },
+        "failureCategory": {
+          "enum": [
+            "NONE",
+            "INFRA",
+            "GENERATION",
+            "VALIDATION",
+            "POLICY"
+          ],
+          "title": "Failurecategory",
+          "type": "string"
+        },
+        "publishableStrict": {
+          "title": "Publishablestrict",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "execution",
+        "completeness",
+        "quality",
+        "failureCategory",
+        "publishableStrict"
+      ],
+      "title": "OutcomeStatusSnapshot",
+      "type": "object"
+    },
+    "PublicationDecisionSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "policyVersion": {
+          "const": "PUBLICATION_POLICY_V2",
+          "default": "PUBLICATION_POLICY_V2",
+          "title": "Policyversion",
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "ALLOW_PRODUCTION",
+            "PLAYTEST_ONLY",
+            "REJECTED"
+          ],
+          "title": "Decision",
+          "type": "string"
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "BOUNDARY_POLICY_UNCALIBRATED",
+              "EXECUTION_FAILED",
+              "INCOMPLETE_CHART_SET",
+              "QUALITY_REVIEW_REQUIRED",
+              "QUALITY_REJECTED",
+              "QUALITY_UNKNOWN",
+              "STRICT_OUTCOME_FALSE"
+            ],
+            "type": "string"
+          },
+          "title": "Reasoncodes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "decision",
+        "reasonCodes"
+      ],
+      "title": "PublicationDecisionSnapshot",
+      "type": "object"
+    },
+    "ReportFileRef": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "title": "ReportFileRef",
+      "type": "object"
+    },
+    "RunAudioRefs": {
+      "additionalProperties": false,
+      "properties": {
+        "game": {
+          "$ref": "#/$defs/AudioFileRef"
+        },
+        "noDrums": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioFileRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "keys": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AudioFileRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "game"
+      ],
+      "title": "RunAudioRefs",
+      "type": "object"
+    },
+    "RunChartRefV3": {
+      "additionalProperties": false,
+      "description": "A chart reference containing diagnostic facts, never publication authority.",
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "keyMode": {
+          "enum": [
+            4,
+            6,
+            7
+          ],
+          "title": "Keymode",
+          "type": "integer"
+        },
+        "difficulty": {
+          "enum": [
+            "EASY",
+            "NORMAL",
+            "HARD",
+            "EXPERT"
+          ],
+          "title": "Difficulty",
+          "type": "string"
+        },
+        "provenance": {
+          "default": "PRIMARY",
+          "enum": [
+            "PRIMARY",
+            "RETRY",
+            "PARTIAL_REMAP",
+            "INTRO_RECOVERY",
+            "INTRO_ALIGNED",
+            "COVERAGE_REPAIR",
+            "RAW_UNVERIFIED",
+            "SAFE_FALLBACK"
+          ],
+          "title": "Provenance",
+          "type": "string"
+        },
+        "familyAssignmentKind": {
+          "default": "ORIGINAL",
+          "enum": [
+            "ORIGINAL",
+            "REASSIGNED",
+            "EMERGENCY_DUPLICATE"
+          ],
+          "title": "Familyassignmentkind",
+          "type": "string"
+        },
+        "sourceDifficulty": {
+          "anyOf": [
+            {
+              "enum": [
+                "EASY",
+                "NORMAL",
+                "HARD",
+                "EXPERT"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sourcedifficulty"
+        },
+        "familyResolutionState": {
+          "default": "RESOLVED",
+          "enum": [
+            "RESOLVED",
+            "NARROW_REVIEW",
+            "UNRESOLVED"
+          ],
+          "title": "Familyresolutionstate",
+          "type": "string"
+        },
+        "familyResolutionReasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Familyresolutionreasons",
+          "type": "array"
+        },
+        "playabilityTier": {
+          "anyOf": [
+            {
+              "enum": [
+                "MODEL_PLAYABLE",
+                "RECOVERY_PLAYABLE",
+                "DIAGNOSTIC_ONLY"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Playabilitytier"
+        },
+        "coverageSummary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CoverageSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "keyMode",
+        "difficulty"
+      ],
+      "title": "RunChartRefV3",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 3,
+      "title": "Version",
+      "type": "integer"
+    },
+    "runId": {
+      "format": "uuid",
+      "title": "Runid",
+      "type": "string"
+    },
+    "title": {
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    },
+    "generatedAt": {
+      "format": "date-time",
+      "title": "Generatedat",
+      "type": "string"
+    },
+    "workerVersion": {
+      "minLength": 1,
+      "title": "Workerversion",
+      "type": "string"
+    },
+    "audio": {
+      "$ref": "#/$defs/RunAudioRefs"
+    },
+    "charts": {
+      "items": {
+        "$ref": "#/$defs/RunChartRefV3"
+      },
+      "minItems": 1,
+      "title": "Charts",
+      "type": "array"
+    },
+    "missingCharts": {
+      "items": {
+        "$ref": "#/$defs/MissingChartRef"
+      },
+      "title": "Missingcharts",
+      "type": "array"
+    },
+    "keysoundManifestPath": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Keysoundmanifestpath"
+    },
+    "generationReport": {
+      "$ref": "#/$defs/ReportFileRef"
+    },
+    "outcome": {
+      "$ref": "#/$defs/OutcomeStatusSnapshot"
+    },
+    "strictBlockers": {
+      "items": {
+        "const": "BOUNDARY_POLICY_UNCALIBRATED",
+        "type": "string"
+      },
+      "title": "Strictblockers",
+      "type": "array"
+    },
+    "publication": {
+      "$ref": "#/$defs/PublicationDecisionSnapshot"
+    }
+  },
+  "required": [
+    "version",
+    "runId",
+    "title",
+    "generatedAt",
+    "workerVersion",
+    "audio",
+    "charts",
+    "missingCharts",
+    "generationReport",
+    "outcome",
+    "strictBlockers",
+    "publication"
+  ],
+  "title": "PlaytestRunManifestV3",
+  "type": "object"
+}

@@ -164,6 +164,88 @@ class RunChartRefV2(RunChartRef):
         return self
 
 
+class RunChartRefV3(RunChartRef):
+    """A chart reference containing diagnostic facts, never publication authority."""
+
+    provenance: Literal[
+        "PRIMARY",
+        "RETRY",
+        "PARTIAL_REMAP",
+        "INTRO_RECOVERY",
+        "INTRO_ALIGNED",
+        "COVERAGE_REPAIR",
+        "RAW_UNVERIFIED",
+        "SAFE_FALLBACK",
+    ] = "PRIMARY"
+    family_assignment_kind: Literal[
+        "ORIGINAL",
+        "REASSIGNED",
+        "EMERGENCY_DUPLICATE",
+    ] = "ORIGINAL"
+    source_difficulty: Difficulty | None = None
+    family_resolution_state: Literal[
+        "RESOLVED",
+        "NARROW_REVIEW",
+        "UNRESOLVED",
+    ] = "RESOLVED"
+    family_resolution_reasons: list[str] = Field(default_factory=list)
+    playability_tier: Literal[
+        "MODEL_PLAYABLE",
+        "RECOVERY_PLAYABLE",
+        "DIAGNOSTIC_ONLY",
+    ] | None = None
+    coverage_summary: CoverageSummary | None = None
+
+    @model_validator(mode="after")
+    def _check_trust_facts(self) -> Self:
+        family_adapted = self.family_assignment_kind != "ORIGINAL"
+        if family_adapted and self.source_difficulty is None:
+            raise ValueError("adapted family assignment requires source difficulty")
+        if (
+            self.family_assignment_kind == "ORIGINAL"
+            and self.source_difficulty is not None
+            and self.source_difficulty != self.difficulty
+        ):
+            raise ValueError("original family assignment source difficulty must match target")
+
+        family_unresolved = self.family_resolution_state != "RESOLVED"
+        if family_unresolved and not self.family_resolution_reasons:
+            raise ValueError("unresolved family state requires reason codes")
+        if not family_unresolved and self.family_resolution_reasons:
+            raise ValueError("resolved family state cannot carry unresolved reasons")
+        if self.family_resolution_reasons != sorted(
+            set(self.family_resolution_reasons)
+        ):
+            raise ValueError("family resolution reasons must be sorted and unique")
+
+        if (self.playability_tier is None) != (self.coverage_summary is None):
+            raise ValueError(
+                "playability tier and coverage summary must be present together"
+            )
+        if self.playability_tier is None:
+            return self
+
+        provenance_fallback = self.provenance in {
+            "COVERAGE_REPAIR",
+            "RAW_UNVERIFIED",
+            "SAFE_FALLBACK",
+        }
+        if not provenance_fallback and not family_adapted and (
+            self.playability_tier != "MODEL_PLAYABLE"
+        ):
+            raise ValueError("model-backed provenance must be MODEL_PLAYABLE")
+        if self.provenance == "RAW_UNVERIFIED" and (
+            self.playability_tier != "DIAGNOSTIC_ONLY"
+        ):
+            raise ValueError("RAW_UNVERIFIED must be DIAGNOSTIC_ONLY")
+        if (
+            self.provenance in {"COVERAGE_REPAIR", "SAFE_FALLBACK"}
+            or family_adapted
+        ) and self.playability_tier == "MODEL_PLAYABLE":
+            raise ValueError("recovery provenance or family assignment cannot be MODEL_PLAYABLE")
+        return self
+
+
 class MissingChartRef(CamelModel):
     """이번 실행에서 발행하지 못한 조합. 프론트가 목록에서 빠지는 근거다."""
 
@@ -311,4 +393,58 @@ class PlaytestRunManifestV2(CamelModel):
         )
         if self.publication.model_dump(by_alias=True) != expected.to_report():
             raise ValueError("publication decision disagrees with run outcome")
+        return self
+
+
+class PlaytestRunManifestV3(CamelModel):
+    version: Literal[3]
+    run_id: UUID
+    title: str = Field(min_length=1)
+    generated_at: datetime
+    worker_version: str = Field(min_length=1)
+    audio: RunAudioRefs
+    charts: list[RunChartRefV3] = Field(min_length=1)
+    missing_charts: list[MissingChartRef]
+    keysound_manifest_path: SafeRelativePath | None = None
+    generation_report: ReportFileRef
+    outcome: OutcomeStatusSnapshot
+    strict_blockers: list[PublicationStrictBlocker]
+    publication: PublicationDecisionSnapshot
+
+    @model_validator(mode="after")
+    def _check_run(self) -> Self:
+        _validate_run_fields(
+            charts=self.charts,
+            missing_charts=self.missing_charts,
+            audio=self.audio,
+            keysound_manifest_path=self.keysound_manifest_path,
+        )
+        if self.strict_blockers != sorted(set(self.strict_blockers)):
+            raise ValueError("publication strict blockers must be sorted and unique")
+        expected = decide_publication(
+            outcome=self.outcome.to_domain(),
+            published_slots=len(self.charts),
+            expected_slots=len(KEY_MODES) * len(DIFFICULTIES),
+            strict_blockers=tuple(self.strict_blockers),
+        )
+        if self.publication.model_dump(by_alias=True) != expected.to_report():
+            raise ValueError("publication decision disagrees with run outcome")
+        if self.publication.decision == "ALLOW_PRODUCTION":
+            unsafe = [
+                chart
+                for chart in self.charts
+                if chart.provenance
+                in {"COVERAGE_REPAIR", "RAW_UNVERIFIED", "SAFE_FALLBACK"}
+                or chart.family_assignment_kind != "ORIGINAL"
+                or chart.family_resolution_state != "RESOLVED"
+                or bool(chart.family_resolution_reasons)
+                or (
+                    chart.playability_tier is not None
+                    and chart.playability_tier != "MODEL_PLAYABLE"
+                )
+            ]
+            if unsafe:
+                raise ValueError(
+                    "ALLOW_PRODUCTION requires every chart to have production-safe trust facts"
+                )
         return self

@@ -14,11 +14,13 @@ from chart_worker.schema.playtest_run import (
     OutcomeStatusSnapshot,
     PlaytestRunManifest,
     PlaytestRunManifestV2,
+    PlaytestRunManifestV3,
     PublicationDecisionSnapshot,
     ReportFileRef,
     RunAudioRefs,
     RunChartRef,
     RunChartRefV2,
+    RunChartRefV3,
 )
 from chart_worker.schema.types import DIFFICULTIES, KEY_MODES
 
@@ -80,6 +82,54 @@ def _manifest_v2(**overrides) -> PlaytestRunManifestV2:
         ),
     }
     return PlaytestRunManifestV2(**(values | overrides))
+
+
+def _charts_v3() -> list[RunChartRefV3]:
+    return [
+        RunChartRefV3(
+            key_mode=key_mode,
+            difficulty=difficulty,
+            path=f"charts/{key_mode}k-{difficulty.lower()}.chart.json",
+            sha256=SHA,
+            provenance="PRIMARY",
+            family_assignment_kind="ORIGINAL",
+            family_resolution_state="RESOLVED",
+            family_resolution_reasons=[],
+        )
+        for key_mode in KEY_MODES
+        for difficulty in DIFFICULTIES
+    ]
+
+
+def _manifest_v3(**overrides) -> PlaytestRunManifestV3:
+    values = {
+        "version": 3,
+        "run_id": UUID(int=3),
+        "title": "v3 fixture",
+        "generated_at": datetime(2026, 8, 30, tzinfo=UTC),
+        "worker_version": "test-build",
+        "audio": RunAudioRefs(game=AudioFileRef(path="audio/game.flac", sha256=SHA)),
+        "charts": _charts_v3(),
+        "missing_charts": [],
+        "generation_report": ReportFileRef(
+            path="generation-report.json",
+            sha256=SHA,
+        ),
+        "outcome": OutcomeStatusSnapshot(
+            execution="SUCCEEDED",
+            completeness="COMPLETE",
+            quality="PASS",
+            failure_category="NONE",
+            publishable_strict=True,
+        ),
+        "strict_blockers": [],
+        "publication": PublicationDecisionSnapshot(
+            policy_version="PUBLICATION_POLICY_V2",
+            decision="ALLOW_PRODUCTION",
+            reason_codes=[],
+        ),
+    }
+    return PlaytestRunManifestV3(**(values | overrides))
 
 
 @pytest.mark.parametrize(
@@ -442,7 +492,87 @@ def test_v2_manifest_rejects_invalid_report_sha256():
         ReportFileRef(path="generation-report.json", sha256="not-a-sha")
 
 
-def test_export_schemas_writes_six_parseable_contracts(tmp_path: Path):
+def test_v3_chart_ref_contains_facts_without_chart_level_publication_authority():
+    payload = _charts_v3()[0].model_dump(by_alias=True)
+
+    assert payload == {
+        "path": "charts/4k-easy.chart.json",
+        "sha256": SHA,
+        "keyMode": 4,
+        "difficulty": "EASY",
+        "provenance": "PRIMARY",
+        "familyAssignmentKind": "ORIGINAL",
+        "sourceDifficulty": None,
+        "familyResolutionState": "RESOLVED",
+        "familyResolutionReasons": [],
+        "playabilityTier": None,
+        "coverageSummary": None,
+    }
+    assert "productionEligible" not in payload
+    assert "distributionTier" not in payload
+
+
+@pytest.mark.parametrize("field", ("version", "missingCharts", "strictBlockers"))
+def test_v3_manifest_rejects_missing_explicit_contract_fields(field):
+    payload = json.loads(_manifest_v3().model_dump_json(by_alias=True))
+    payload.pop(field)
+
+    with pytest.raises(ValidationError, match=field):
+        PlaytestRunManifestV3.model_validate(payload)
+
+
+@pytest.mark.parametrize("unsafe_kind", ("fallback", "unresolved"))
+def test_v3_manifest_rejects_allow_production_with_unsafe_chart(unsafe_kind):
+    charts = _charts_v3()
+    chart_payload = charts[0].model_dump()
+    if unsafe_kind == "fallback":
+        chart_payload["provenance"] = "SAFE_FALLBACK"
+    else:
+        chart_payload["family_resolution_state"] = "UNRESOLVED"
+        chart_payload["family_resolution_reasons"] = ["FAMILY_ORDER_NOT_PROVEN"]
+    charts[0] = RunChartRefV3.model_validate(chart_payload)
+
+    with pytest.raises(ValidationError, match="ALLOW_PRODUCTION"):
+        _manifest_v3(charts=charts)
+
+
+def test_v3_manifest_allows_diagnostic_chart_for_matching_playtest_decision():
+    charts = _charts_v3()
+    chart_payload = charts[0].model_dump()
+    chart_payload["provenance"] = "SAFE_FALLBACK"
+    charts[0] = RunChartRefV3.model_validate(chart_payload)
+    outcome = OutcomeStatusSnapshot(
+        execution="SUCCEEDED",
+        completeness="COMPLETE",
+        quality="REVIEW",
+        failure_category="NONE",
+        publishable_strict=False,
+    )
+    publication = PublicationDecisionSnapshot(
+        policy_version="PUBLICATION_POLICY_V2",
+        decision="PLAYTEST_ONLY",
+        reason_codes=["QUALITY_REVIEW_REQUIRED", "STRICT_OUTCOME_FALSE"],
+    )
+
+    manifest = _manifest_v3(
+        charts=charts,
+        outcome=outcome,
+        publication=publication,
+    )
+
+    assert manifest.publication.decision == "PLAYTEST_ONLY"
+
+
+def test_v3_manifest_rejects_removed_chart_authority_fields():
+    payload = json.loads(_manifest_v3().model_dump_json(by_alias=True))
+    payload["charts"][0]["productionEligible"] = True
+    payload["charts"][0]["distributionTier"] = "PRODUCTION_CANDIDATE"
+
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        PlaytestRunManifestV3.model_validate(payload)
+
+
+def test_export_schemas_writes_seven_parseable_contracts(tmp_path: Path):
     paths = export_schemas(tmp_path)
     assert {path.name for path in paths} == {
         "boundary-label-v1.schema.json",
@@ -451,6 +581,7 @@ def test_export_schemas_writes_six_parseable_contracts(tmp_path: Path):
         "keysound-manifest-v1.schema.json",
         "playtest-run-v1.schema.json",
         "playtest-run-v2.schema.json",
+        "playtest-run-v3.schema.json",
     }
     schemas = {path.name: json.loads(path.read_text(encoding="utf-8")) for path in paths}
     assert "timeMs" in schemas["chart-v1.schema.json"]["$defs"]["ChartNote"]["properties"]
@@ -475,3 +606,18 @@ def test_committed_playtest_v2_schema_matches_the_python_contract():
     )
 
     assert committed == schemas()["playtest-run-v2.schema.json"]
+
+
+def test_committed_playtest_v3_schema_matches_the_python_contract():
+    project_root = Path(__file__).resolve().parents[4]
+    committed = json.loads(
+        (project_root / "packages/chart-schema/playtest-run-v3.schema.json")
+        .read_text(encoding="utf-8")
+    )
+
+    generated = schemas()["playtest-run-v3.schema.json"]
+    assert committed == generated
+    assert {"version", "missingCharts", "strictBlockers"} <= set(generated["required"])
+    chart_properties = generated["$defs"]["RunChartRefV3"]["properties"]
+    assert "productionEligible" not in chart_properties
+    assert "distributionTier" not in chart_properties
