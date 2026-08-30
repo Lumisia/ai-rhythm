@@ -181,11 +181,8 @@ def _candidate_clusters(
     for candidate in present:
         first_row_ms = candidate.first_row_ms
         assert first_row_ms is not None
-        if (
-            not grouped
-            or first_row_ms - (grouped[-1][0].first_row_ms or 0)
-            > GRID_SUPPORT_WINDOW_MS
-        ):
+        previous_ms = grouped[-1][-1].first_row_ms if grouped else None
+        if previous_ms is None or first_row_ms - previous_ms > GRID_SUPPORT_WINDOW_MS:
             grouped.append([candidate])
         else:
             grouped[-1].append(candidate)

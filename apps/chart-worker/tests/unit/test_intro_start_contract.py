@@ -217,6 +217,33 @@ def test_unknown_audio_singleton_conflict_is_ambiguous():
     assert review.correction_reasons == ()
 
 
+def test_unknown_intro_clusters_use_transitive_neighbor_distance():
+    song_context = replace(
+        context(first_timing_ms=0, onsets=(120,)),
+        intro_anchor=IntroAnchorEvidence(
+            status="UNCERTAIN",
+            anchor_ms=120,
+            anchor_grid_ms=0,
+            grid_distance_ms=120,
+            aggregate_percentile_rank=0.99,
+            prominent_band_count=3,
+            pulse_continuation_matches=0,
+            pulse_continuation_opportunities=4,
+        ),
+    )
+    candidates = (
+        candidate(4, "EASY", 0, audio_supported=False),
+        candidate(6, "EASY", 60, audio_supported=False),
+        candidate(7, "EASY", 120, audio_supported=True),
+    )
+
+    contract = build_intro_start_contract(song_context, candidates)
+
+    assert contract.resolution == "RESOLVED"
+    assert contract.canonical_first_row_ms == 60
+    assert contract.conflict_clusters == ()
+
+
 def test_confirmed_audio_anchor_outweighs_a_raw_first_row_majority():
     song_context = replace(
         context(first_timing_ms=500, onsets=(500,)),
