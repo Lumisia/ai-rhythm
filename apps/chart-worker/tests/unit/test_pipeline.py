@@ -25,12 +25,17 @@ from chart_worker.hashing import sha256_file
 from chart_worker.pipeline import PipelineOptions, run_pipeline
 from chart_worker.schema.chart import ChartDocument
 from chart_worker.schema.playtest_run import PlaytestRunManifestV3
-from chart_worker.stages.s2_timing import run_timing_generation
+from chart_worker.stages.s2_timing import (
+    IntroPrefixTimingRecoveryOutcome,
+    IntroTimingAddressability,
+    run_timing_generation,
+)
 from chart_worker.stages.timing_feedback import (
     MapTimingFailureSignature,
     RetryTimingSignal,
 )
 from chart_worker.stages.types import MissingVariant
+from chart_worker.validation.intro_region_contract import IntroRegionContract
 from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.quality_gate import QUALITY_GATE_VERSION, GateAction, GateAxis
 from chart_worker.validation.timing_review import (
@@ -2419,6 +2424,300 @@ def _retry_timing_signal(authority_sha256: str) -> RetryTimingSignal:
             for seed in (7, 19)
         )
     )
+
+
+def _intro_timing_addressability(authority, status: str) -> IntroTimingAddressability:
+    region = IntroRegionContract(
+        version="intro-region-contract-v1",
+        status="CONFIRMED",
+        allowed_first_row_ms=(0, 4_320),
+        leading_silence_end_ms=None,
+        anchor_ms=250,
+        anchor_grid_ms=250,
+        supported_pulse_ms=tuple(range(250, 4_251, 250)),
+        quantization_tolerance_ms=70,
+        reasons=("TEST_CONFIRMED_INTRO",),
+    )
+    return IntroTimingAddressability(
+        status=status,
+        reason=f"TEST_{status}",
+        authority_sha256=authority.sha256,
+        authority_mode=authority.mode,
+        authority_seed=authority.seed,
+        first_event_time_ms=authority.bpm_events[0].time_ms,
+        allowed_first_row_ms=region.allowed_first_row_ms,
+        intro_region=region,
+    )
+
+
+def _intro_prefix_outcome(
+    original,
+    *,
+    status: str,
+    final=None,
+) -> IntroPrefixTimingRecoveryOutcome:
+    selected = final if final is not None else original
+    attempted = status != "NOT_TRIGGERED"
+    return IntroPrefixTimingRecoveryOutcome(
+        status=status,
+        reason=f"TEST_{status}",
+        authority=selected,
+        original_authority_sha256=original.sha256,
+        original_addressability=_intro_timing_addressability(original, "UNADDRESSED"),
+        retry_addressability=(
+            _intro_timing_addressability(selected, "ADDRESSED")
+            if status == "SELECTED"
+            else None
+        ),
+        attempted=attempted,
+        authority_epoch=2 if status == "SELECTED" else 1,
+        workdir=("timing/work/intro-prefix-recovery/attempt-1" if attempted else None),
+        seed_derivation=("original-plus-1-v1" if attempted else None),
+        retry_seed=8 if attempted else None,
+        error=(
+            {"code": "CHART_GENERATION_FAILED", "message": "known failure"}
+            if status == "FAILED"
+            else None
+        ),
+    )
+
+
+def test_intro_prefix_timing_recovery_finishes_before_any_map_generation(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    call_order: list[str] = []
+    recovered_authorities = []
+    generation_epochs: list[int] = []
+
+    def timing(prepared, analysis, run_dir, generator, seed):
+        call_order.append("timing")
+        return dependencies.timing(prepared, analysis, run_dir, generator, seed)
+
+    def intro_timing_recovery(prepared, authority, analysis, run_dir, generator, seed):
+        del prepared, analysis, generator, seed
+        call_order.append("intro-prefix-recovery")
+        recovered_path = run_dir / "timing" / "intro-recovered-reference.osu"
+        recovered_path.parent.mkdir(parents=True, exist_ok=True)
+        recovered_path.write_bytes(authority.reference_path.read_bytes() + b"\n")
+        recovered = replace(
+            authority,
+            reference_path=recovered_path,
+            sha256=sha256_file(recovered_path),
+            mode="SUPER_TIMING",
+            generator_name="intro-prefix-recovery-fixture",
+        )
+        recovered_authorities.append(recovered)
+        return _intro_prefix_outcome(authority, status="SELECTED", final=recovered)
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        call_order.append("generation")
+        generation_epochs.append(authority_epoch)
+        assert authority is recovered_authorities[0]
+        outcome = dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+        assert all(
+            variant.timing_authority_sha256 == authority.sha256
+            for variant in outcome.variants
+        )
+        return outcome
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(
+            dependencies,
+            timing=timing,
+            intro_timing_recovery=intro_timing_recovery,
+            generation=generation,
+        ),
+    )
+
+    assert call_order == ["timing", "intro-prefix-recovery", "generation"]
+    assert generation_epochs == [2]
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["introPrefixTimingRecovery"]["status"] == "SELECTED"
+    assert (
+        report["introPrefixTimingRecovery"]["originalAuthoritySha256"]
+        != report["timingAuthoritySha256"]
+    )
+    assert report["selectedAuthorityEpoch"] == 2
+
+
+def test_known_intro_prefix_recovery_failure_keeps_epoch_one_and_playtest_only(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    originals = []
+    generation_epochs: list[int] = []
+
+    def intro_timing_recovery(prepared, authority, analysis, run_dir, generator, seed):
+        del prepared, analysis, run_dir, generator, seed
+        originals.append(authority)
+        return _intro_prefix_outcome(authority, status="FAILED")
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        assert authority is originals[0]
+        generation_epochs.append(authority_epoch)
+        return dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+
+    run_pipeline(
+        PipelineOptions(
+            source=source,
+            output_dir=tmp_path / "run",
+            title="fixture",
+            generator="fake",
+            seed=7,
+        ),
+        dependencies=replace(
+            dependencies,
+            intro_timing_recovery=intro_timing_recovery,
+            generation=generation,
+        ),
+    )
+
+    assert generation_epochs == [1]
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["introPrefixTimingRecovery"]["status"] == "FAILED"
+    assert report["introPrefixTimingRecovery"]["workdir"] == (
+        "timing/work/intro-prefix-recovery/attempt-1"
+    )
+    assert report["status"] == "REVIEW"
+    assert report["publicationDecision"]["decision"] == "PLAYTEST_ONLY"
+
+
+def test_unknown_intro_prefix_completion_stops_before_map_generation(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    generation_calls = []
+    failure = WorkerError(
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+        "terminal state unavailable",
+    )
+
+    def intro_timing_recovery(prepared, authority, analysis, run_dir, generator, seed):
+        del prepared, analysis, run_dir, generator, seed
+        snapshot = _intro_prefix_outcome(authority, status="FAILED").to_report()
+        failure.context["introPrefixTimingRecovery"] = snapshot
+        raise failure
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        generation_calls.append(authority_epoch)
+        return dependencies.generation(
+            prepared,
+            authority,
+            analysis,
+            run_dir,
+            generator,
+            seed,
+            authority_epoch,
+        )
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(
+                dependencies,
+                intro_timing_recovery=intro_timing_recovery,
+                generation=generation,
+            ),
+        )
+
+    assert captured.value is failure
+    assert generation_calls == []
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["failureStage"] == "TIMING"
+    assert report["introPrefixTimingRecovery"]["status"] == "FAILED"
+    assert report["introPrefixTimingRecovery"]["seedDerivation"] == (
+        "original-plus-1-v1"
+    )
+    assert report["timingAuthoritySha256"] is not None
+
+
+def test_selected_intro_prefix_epoch_does_not_create_a_third_authority(
+    tmp_path: Path,
+):
+    source = tmp_path / "fixture.wav"
+    source.write_bytes(b"source")
+    dependencies = fake_dependencies()
+    super_calls: list[int] = []
+    generation_epochs: list[int] = []
+
+    def intro_timing_recovery(prepared, authority, analysis, run_dir, generator, seed):
+        del prepared, analysis, run_dir, generator, seed
+        recovered = replace(
+            authority,
+            mode="SUPER_TIMING",
+            generator_name="intro-prefix-recovery-fixture",
+        )
+        return _intro_prefix_outcome(authority, status="SELECTED", final=recovered)
+
+    def generation(prepared, authority, analysis, run_dir, generator, seed, authority_epoch):
+        del prepared, analysis, run_dir, generator, seed
+        generation_epochs.append(authority_epoch)
+        raise _retry_timing_signal(authority.sha256)
+
+    def super_timing(prepared, analysis, run_dir, generator, seed, authority_epoch=2):
+        del prepared, analysis, run_dir, generator, authority_epoch
+        super_calls.append(seed)
+        raise AssertionError("a selected epoch-2 recovery must not create epoch 3")
+
+    with pytest.raises(WorkerError) as captured:
+        run_pipeline(
+            PipelineOptions(
+                source=source,
+                output_dir=tmp_path / "run",
+                title="fixture",
+                generator="fake",
+                seed=7,
+            ),
+            dependencies=replace(
+                dependencies,
+                intro_timing_recovery=intro_timing_recovery,
+                generation=generation,
+                super_timing=super_timing,
+            ),
+        )
+
+    assert captured.value.code is ErrorCode.CHART_CANDIDATES_EXHAUSTED
+    assert generation_epochs == [2]
+    assert super_calls == []
+    report = json.loads((tmp_path / "run" / "generation-report.json").read_text())
+    assert report["introPrefixTimingRecovery"]["status"] == "SELECTED"
+    assert [candidate["epoch"] for candidate in report["timingCandidates"]] == [2]
 
 
 def test_map_timing_feedback_replaces_authority_and_regenerates_all_variants(

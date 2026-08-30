@@ -79,6 +79,7 @@ IntroPrefixTimingRecoveryStatus = Literal[
     "FAILED",
 ]
 INTRO_PREFIX_TIMING_RECOVERY_SEED_OFFSET = 1
+INTRO_PREFIX_TIMING_RECOVERY_SEED_DERIVATION = "original-plus-1-v1"
 _UNSAFE_TO_CONTINUE_AFTER_PREFIX_RECOVERY = frozenset(
     {
         ErrorCode.INFERENCE_PROTOCOL_FAILED,
@@ -93,6 +94,8 @@ class IntroTimingAddressability:
     status: IntroTimingAddressabilityStatus
     reason: str
     authority_sha256: str
+    authority_mode: str
+    authority_seed: int | None
     first_event_time_ms: int
     allowed_first_row_ms: tuple[int, int] | None
     intro_region: IntroRegionContract
@@ -102,6 +105,8 @@ class IntroTimingAddressability:
             "status": self.status,
             "reason": self.reason,
             "authoritySha256": self.authority_sha256,
+            "authorityMode": self.authority_mode,
+            "authoritySeed": self.authority_seed,
             "firstEventTimeMs": self.first_event_time_ms,
             "allowedFirstRowMs": (
                 list(self.allowed_first_row_ms)
@@ -109,6 +114,7 @@ class IntroTimingAddressability:
                 else None
             ),
             "introRegion": self.intro_region.to_report(),
+            "introRegionSha256": self.intro_region.stable_sha256(),
         }
 
 
@@ -122,6 +128,8 @@ class IntroPrefixTimingRecoveryOutcome:
     retry_addressability: IntroTimingAddressability | None
     attempted: bool
     authority_epoch: int
+    workdir: str | None
+    seed_derivation: str | None
     retry_seed: int | None = None
     attempt_report: dict[str, object] | None = None
     error: dict[str, object] | None = None
@@ -135,6 +143,8 @@ class IntroPrefixTimingRecoveryOutcome:
             "authorityEpoch": self.authority_epoch,
             "originalAuthoritySha256": self.original_authority_sha256,
             "finalAuthoritySha256": self.authority.sha256,
+            "workdir": self.workdir,
+            "seedDerivation": self.seed_derivation,
             "retrySeed": self.retry_seed,
             "originalAddressability": self.original_addressability.to_report(),
             "retryAddressability": (
@@ -171,6 +181,8 @@ def review_intro_timing_addressability(
             status="NOT_APPLICABLE",
             reason="CONFIRMED_INTRO_REGION_UNAVAILABLE",
             authority_sha256=authority.sha256,
+            authority_mode=authority.mode,
+            authority_seed=authority.seed,
             first_event_time_ms=first_event_time_ms,
             allowed_first_row_ms=None,
             intro_region=region,
@@ -180,6 +192,8 @@ def review_intro_timing_addressability(
             status="ADDRESSED",
             reason="TIMING_EVENT_ADDRESSES_CONFIRMED_INTRO_REGION",
             authority_sha256=authority.sha256,
+            authority_mode=authority.mode,
+            authority_seed=authority.seed,
             first_event_time_ms=first_event_time_ms,
             allowed_first_row_ms=allowed,
             intro_region=region,
@@ -188,6 +202,8 @@ def review_intro_timing_addressability(
         status="UNADDRESSED",
         reason="FIRST_TIMING_EVENT_AFTER_CONFIRMED_INTRO_REGION",
         authority_sha256=authority.sha256,
+        authority_mode=authority.mode,
+        authority_seed=authority.seed,
         first_event_time_ms=first_event_time_ms,
         allowed_first_row_ms=allowed,
         intro_region=region,
@@ -589,10 +605,13 @@ def run_intro_prefix_timing_recovery(
             retry_addressability=None,
             attempted=False,
             authority_epoch=1,
+            workdir=None,
+            seed_derivation=None,
         )
 
     retry_seed = seed + INTRO_PREFIX_TIMING_RECOVERY_SEED_OFFSET
     workdir = run_dir / "timing" / "work" / "intro-prefix-recovery" / "attempt-1"
+    workdir_report = workdir.relative_to(run_dir).as_posix()
     staging_reference = (
         run_dir / "timing" / "intro-prefix-recovery" / "candidate-reference.osu"
     )
@@ -638,6 +657,8 @@ def run_intro_prefix_timing_recovery(
             retry_addressability=None,
             attempted=True,
             authority_epoch=1,
+            workdir=workdir_report,
+            seed_derivation=INTRO_PREFIX_TIMING_RECOVERY_SEED_DERIVATION,
             retry_seed=retry_seed,
             error=error_report,
         )
@@ -655,6 +676,8 @@ def run_intro_prefix_timing_recovery(
             retry_addressability=None,
             attempted=True,
             authority_epoch=1,
+            workdir=workdir_report,
+            seed_derivation=INTRO_PREFIX_TIMING_RECOVERY_SEED_DERIVATION,
             retry_seed=retry_seed,
             error={
                 "type": type(error).__name__,
@@ -684,6 +707,8 @@ def run_intro_prefix_timing_recovery(
             retry_addressability=retry_addressability,
             attempted=True,
             authority_epoch=2,
+            workdir=workdir_report,
+            seed_derivation=INTRO_PREFIX_TIMING_RECOVERY_SEED_DERIVATION,
             retry_seed=retry_seed,
             attempt_report=attempt_report,
         )
@@ -697,6 +722,8 @@ def run_intro_prefix_timing_recovery(
         retry_addressability=retry_addressability,
         attempted=True,
         authority_epoch=1,
+        workdir=workdir_report,
+        seed_derivation=INTRO_PREFIX_TIMING_RECOVERY_SEED_DERIVATION,
         retry_seed=retry_seed,
         attempt_report=attempt_report,
     )

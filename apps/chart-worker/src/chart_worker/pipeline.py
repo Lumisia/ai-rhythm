@@ -75,7 +75,11 @@ from chart_worker.stages.s1_prepare import run_prepare
 from chart_worker.stages.s2_generate import (
     run_generation,
 )
-from chart_worker.stages.s2_timing import run_timing_generation
+from chart_worker.stages.s2_timing import (
+    IntroPrefixTimingRecoveryOutcome,
+    run_intro_prefix_timing_recovery,
+    run_timing_generation,
+)
 from chart_worker.stages.s3_export import run_export
 from chart_worker.stages.timing_feedback import RetryTimingSignal
 from chart_worker.stages.types import (
@@ -131,6 +135,10 @@ TimingStage = Callable[
 SuperTimingStage = Callable[
     [PreparedAudio, OnsetAnalysis, Path, ChartGenerator, int, int],
     SongTimingAuthority,
+]
+IntroTimingRecoveryStage = Callable[
+    [PreparedAudio, SongTimingAuthority, OnsetAnalysis, Path, ChartGenerator, int],
+    IntroPrefixTimingRecoveryOutcome,
 ]
 GenerationStage = Callable[
     [PreparedAudio, SongTimingAuthority, OnsetAnalysis, Path, ChartGenerator, int, int],
@@ -227,6 +235,24 @@ def _super_timing_stage(
         seed=seed,
         force_super=True,
         authority_epoch=authority_epoch,
+    )
+
+
+def _intro_timing_recovery_stage(
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    analysis: OnsetAnalysis,
+    run_dir: Path,
+    generator: ChartGenerator,
+    seed: int,
+) -> IntroPrefixTimingRecoveryOutcome:
+    return run_intro_prefix_timing_recovery(
+        prepared,
+        authority,
+        analysis,
+        run_dir,
+        generator=generator,
+        seed=seed,
     )
 
 
@@ -354,6 +380,7 @@ class PipelineDependencies:
     bind_inference_session: BindInferenceSession = _bind_inference_session
     attached_inference_session: InferenceSession | None = None
     timing: TimingStage = _timing_stage
+    intro_timing_recovery: IntroTimingRecoveryStage = _intro_timing_recovery_stage
     super_timing: SuperTimingStage = _super_timing_stage
     generation: GenerationStage = _generation_stage
     export: ExportStage = _export_stage
@@ -635,6 +662,7 @@ def _generation_report(
     map_timing_escalations: list[dict[str, object]],
     selected_authority_epoch: int,
     boundary_publication_assessment: BoundaryPublicationAssessment,
+    intro_timing_recovery: IntroPrefixTimingRecoveryOutcome,
     difficulty_selection_shadows: tuple[DifficultySelectionComparison, ...] = (),
     song_selection_shadow: SongSelectionComparison | None = None,
     song_selection_evidence_v3: SongSelectionEvidenceV3 | None = None,
@@ -736,6 +764,7 @@ def _generation_report(
         )
     timing_review_required = (
         (authority.review is not None and authority.review.action is TimingAuthorityAction.REVIEW)
+        or intro_timing_recovery.status in {"UNRESOLVED", "FAILED"}
         or any(chart["acceptanceStatus"] != "PASS" for chart in charts)
         or (intro_contract_review is not None and intro_contract_review.status == "REVIEW")
         or any(review.should_block_publication for review in intro_phrase_family_reviews)
@@ -764,6 +793,7 @@ def _generation_report(
         has_playtest_fallback
         or has_order_retry
         or difficulty_review_required
+        or intro_timing_recovery.status in {"UNRESOLVED", "FAILED"}
         or (intro_contract_review is not None and intro_contract_review.status == "REVIEW")
         or any(review.should_block_publication for review in intro_phrase_family_reviews)
         or any(review.status == "OUTLIER" for review in timing_family_reviews)
@@ -813,6 +843,7 @@ def _generation_report(
             map_timing_escalations,
             selected_authority_epoch,
         ),
+        "introPrefixTimingRecovery": intro_timing_recovery.to_report(),
         "resnapCollisions": resnap_collisions,
         "noteMutationEnabled": (
             intro_contract_review is not None and intro_contract_review.corrected_count > 0
@@ -940,6 +971,7 @@ def _failure_generation_report(
     failure_stage: str | None = None,
     authority_epochs: list[AuthorityEpochRecord] | None = None,
     map_timing_escalations: list[dict[str, object]] | None = None,
+    intro_prefix_timing_recovery: dict[str, object] | None = None,
 ) -> dict[str, object]:
     strict_blockers = boundary_publication_assessment.strict_blockers
     status = {
@@ -1001,6 +1033,7 @@ def _failure_generation_report(
             map_timing_escalations or [],
             None,
         ),
+        "introPrefixTimingRecovery": intro_prefix_timing_recovery,
         "resnapCollisions": [],
         "canonicalAudioSha256": prepared.normalized.sha256,
         "elapsedMsByStage": elapsed,
@@ -1250,13 +1283,53 @@ def _run_pipeline(
     _require_canonical_audio_hash(prepared)
     elapsed["timing"] = _elapsed_ms(started)
 
+    original_authority = authority
+    started = perf_counter_ns()
+    try:
+        intro_timing_recovery = dependencies.intro_timing_recovery(
+            prepared,
+            authority,
+            onsets,
+            run_dir,
+            generator,
+            options.seed,
+        )
+    except WorkerError as error:
+        if error.code not in _REPORTABLE_INFERENCE_FAILURES:
+            raise
+        elapsed["timing"] += _elapsed_ms(started)
+        recovery_snapshot = error.context.get("introPrefixTimingRecovery")
+        _write_generation_report(
+            run_dir / "generation-report.json",
+            _failure_generation_report(
+                options,
+                dependencies.config,
+                run_id,
+                elapsed,
+                run_dir,
+                prepared,
+                original_authority,
+                error,
+                boundary_publication_assessment,
+                failure_stage="TIMING",
+                intro_prefix_timing_recovery=(
+                    recovery_snapshot if isinstance(recovery_snapshot, dict) else None
+                ),
+            ),
+        )
+        raise
+    elapsed["timing"] += _elapsed_ms(started)
+    authority = intro_timing_recovery.authority
+    generation_start_epoch = intro_timing_recovery.authority_epoch
+    _require_canonical_audio_hash(prepared)
+
     authority_epochs: list[AuthorityEpochRecord] = []
     map_timing_escalations: list[dict[str, object]] = []
     generation_elapsed_ms = 0
     selected_authority_epoch: int | None = None
 
     outcome: GenerationOutcome | None = None
-    for epoch in (1, 2):
+    for epoch in range(generation_start_epoch, 3):
         started = perf_counter_ns()
         try:
             outcome = dependencies.generation(
@@ -1310,6 +1383,7 @@ def _run_pipeline(
                         failure_stage="GENERATION",
                         authority_epochs=authority_epochs,
                         map_timing_escalations=map_timing_escalations,
+                        intro_prefix_timing_recovery=intro_timing_recovery.to_report(),
                     ),
                 )
                 raise error from signal
@@ -1360,6 +1434,7 @@ def _run_pipeline(
                         failure_stage="TIMING",
                         authority_epochs=authority_epochs,
                         map_timing_escalations=map_timing_escalations,
+                        intro_prefix_timing_recovery=intro_timing_recovery.to_report(),
                     ),
                 )
                 raise
@@ -1402,6 +1477,7 @@ def _run_pipeline(
                     failure_stage="GENERATION",
                     authority_epochs=authority_epochs,
                     map_timing_escalations=map_timing_escalations,
+                    intro_prefix_timing_recovery=intro_timing_recovery.to_report(),
                 ),
             )
             raise
@@ -1483,6 +1559,7 @@ def _run_pipeline(
         map_timing_escalations,
         selected_authority_epoch,
         boundary_publication_assessment,
+        intro_timing_recovery,
         difficulty_selection_shadows=outcome.difficulty_selection_shadows,
         song_selection_shadow=outcome.song_selection_shadow,
         song_selection_evidence_v3=outcome.song_selection_evidence_v3,

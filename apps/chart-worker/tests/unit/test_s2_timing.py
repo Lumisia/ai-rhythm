@@ -201,6 +201,15 @@ def test_intro_prefix_timing_recovery_promotes_only_an_addressed_full_song_candi
     assert outcome.authority.reference_path.read_bytes() != original_bytes
     assert outcome.retry_addressability is not None
     assert outcome.retry_addressability.status == "ADDRESSED"
+    report = outcome.to_report()
+    assert report["workdir"] == "timing/work/intro-prefix-recovery/attempt-1"
+    assert report["seedDerivation"] == "original-plus-1-v1"
+    assert report["originalAddressability"]["authorityMode"] == "STANDARD"
+    assert report["originalAddressability"]["authoritySeed"] == original.seed
+    assert report["originalAddressability"]["introRegionSha256"] == (
+        outcome.original_addressability.intro_region.stable_sha256()
+    )
+    assert report["retryAddressability"]["authorityMode"] == "SUPER_TIMING"
 
 
 def test_intro_prefix_timing_recovery_does_not_call_model_when_already_addressed(
