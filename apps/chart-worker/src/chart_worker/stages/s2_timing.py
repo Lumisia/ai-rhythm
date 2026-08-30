@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter_ns
+from typing import Literal
 
 from chart_worker.analysis.beat import BeatGrid, bpm_events_of
 from chart_worker.analysis.beat_corroboration import measure_beat_corroboration
@@ -14,6 +15,7 @@ from chart_worker.analysis.grid_alignment import (
 )
 from chart_worker.analysis.local_timing import measure_local_timing
 from chart_worker.analysis.onset import OnsetAnalysis
+from chart_worker.analysis.song_context import SongAnalysisContext
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import ChartGenerator, GeneratedTiming
 from chart_worker.generation.osu_parser import OsuBpmEvent, parse_osu_file
@@ -21,6 +23,10 @@ from chart_worker.generation.osu_writer import timing_to_osu_mania
 from chart_worker.generation.params import TimingGenerationRequest
 from chart_worker.hashing import sha256_file
 from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
+from chart_worker.validation.intro_region_contract import (
+    IntroRegionContract,
+    build_intro_region_contract,
+)
 from chart_worker.validation.leading_timing_coverage import (
     LeadingTimingCoverage,
     review_leading_timing_coverage,
@@ -61,6 +67,131 @@ _SUPER_TIMING_REVIEW_REASONS = frozenset(
 )
 
 BeatAnalyzer = Callable[[Path], BeatGrid]
+IntroTimingAddressabilityStatus = Literal[
+    "NOT_APPLICABLE",
+    "ADDRESSED",
+    "UNADDRESSED",
+]
+IntroPrefixTimingRecoveryStatus = Literal[
+    "NOT_TRIGGERED",
+    "SELECTED",
+    "UNRESOLVED",
+    "FAILED",
+]
+INTRO_PREFIX_TIMING_RECOVERY_SEED_OFFSET = 1
+_UNSAFE_TO_CONTINUE_AFTER_PREFIX_RECOVERY = frozenset(
+    {
+        ErrorCode.INFERENCE_PROTOCOL_FAILED,
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+        ErrorCode.INFERENCE_INVOCATION_CONFLICT,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class IntroTimingAddressability:
+    status: IntroTimingAddressabilityStatus
+    reason: str
+    authority_sha256: str
+    first_event_time_ms: int
+    allowed_first_row_ms: tuple[int, int] | None
+    intro_region: IntroRegionContract
+
+    def to_report(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "authoritySha256": self.authority_sha256,
+            "firstEventTimeMs": self.first_event_time_ms,
+            "allowedFirstRowMs": (
+                list(self.allowed_first_row_ms)
+                if self.allowed_first_row_ms is not None
+                else None
+            ),
+            "introRegion": self.intro_region.to_report(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class IntroPrefixTimingRecoveryOutcome:
+    status: IntroPrefixTimingRecoveryStatus
+    reason: str
+    authority: SongTimingAuthority
+    original_authority_sha256: str
+    original_addressability: IntroTimingAddressability
+    retry_addressability: IntroTimingAddressability | None
+    attempted: bool
+    authority_epoch: int
+    retry_seed: int | None = None
+    attempt_report: dict[str, object] | None = None
+    error: dict[str, object] | None = None
+
+    def to_report(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "attempted": self.attempted,
+            "authorityChangedBeforeMapGeneration": self.status == "SELECTED",
+            "authorityEpoch": self.authority_epoch,
+            "originalAuthoritySha256": self.original_authority_sha256,
+            "finalAuthoritySha256": self.authority.sha256,
+            "retrySeed": self.retry_seed,
+            "originalAddressability": self.original_addressability.to_report(),
+            "retryAddressability": (
+                self.retry_addressability.to_report()
+                if self.retry_addressability is not None
+                else None
+            ),
+            "attempt": self.attempt_report,
+            "error": self.error,
+        }
+
+
+def review_intro_timing_addressability(
+    authority: SongTimingAuthority,
+    analysis: OnsetAnalysis,
+    *,
+    duration_ms: int,
+) -> IntroTimingAddressability:
+    context = SongAnalysisContext.build(
+        authority,
+        analysis,
+        duration_ms=duration_ms,
+        intro_anchor=(
+            authority.leading_coverage.intro_anchor
+            if authority.leading_coverage is not None
+            else None
+        ),
+    )
+    region = build_intro_region_contract(context)
+    first_event_time_ms = authority.bpm_events[0].time_ms
+    allowed = region.allowed_first_row_ms
+    if region.status != "CONFIRMED" or allowed is None:
+        return IntroTimingAddressability(
+            status="NOT_APPLICABLE",
+            reason="CONFIRMED_INTRO_REGION_UNAVAILABLE",
+            authority_sha256=authority.sha256,
+            first_event_time_ms=first_event_time_ms,
+            allowed_first_row_ms=None,
+            intro_region=region,
+        )
+    if first_event_time_ms <= allowed[1]:
+        return IntroTimingAddressability(
+            status="ADDRESSED",
+            reason="TIMING_EVENT_ADDRESSES_CONFIRMED_INTRO_REGION",
+            authority_sha256=authority.sha256,
+            first_event_time_ms=first_event_time_ms,
+            allowed_first_row_ms=allowed,
+            intro_region=region,
+        )
+    return IntroTimingAddressability(
+        status="UNADDRESSED",
+        reason="FIRST_TIMING_EVENT_AFTER_CONFIRMED_INTRO_REGION",
+        authority_sha256=authority.sha256,
+        first_event_time_ms=first_event_time_ms,
+        allowed_first_row_ms=allowed,
+        intro_region=region,
+    )
 
 
 def _should_try_super_timing(review: TimingAuthorityReview) -> bool:
@@ -120,20 +251,29 @@ def _promote(generated: GeneratedTiming, prepared: PreparedAudio, reference_path
     reference_path.parent.mkdir(parents=True, exist_ok=True)
     candidate_path = reference_path.with_name(f"{reference_path.stem}-candidate.osu")
     try:
-        candidate_path.write_text(
-            timing_to_osu_mania(
-                generated.bpm_events,
-                audio_filename=prepared.normalized.path.name,
-                title=prepared.normalized.path.stem,
-            ),
-            encoding="utf-8",
-        )
-        validate_timing_identity(parse_osu_file(candidate_path).bpm_events, generated.bpm_events)
+        _write_validated_timing_reference(generated, prepared, candidate_path)
         candidate_path.replace(reference_path)
     except TimingAuthorityValidationError:
         candidate_path.unlink(missing_ok=True)
         reference_path.unlink(missing_ok=True)
         raise
+
+
+def _write_validated_timing_reference(
+    generated: GeneratedTiming,
+    prepared: PreparedAudio,
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        timing_to_osu_mania(
+            generated.bpm_events,
+            audio_filename=prepared.normalized.path.name,
+            title=prepared.normalized.path.stem,
+        ),
+        encoding="utf-8",
+    )
+    validate_timing_identity(parse_osu_file(path).bpm_events, generated.bpm_events)
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,6 +552,153 @@ def _to_authority(
         recovery_preflight=selected.recovery_preflight,
         candidate_selection=selection,
         timing_integrity=selected.integrity,
+    )
+
+
+def _worker_error_report(error: WorkerError) -> dict[str, object]:
+    return {
+        "code": error.code.value,
+        "message": str(error),
+        "context": dict(error.context),
+    }
+
+
+def run_intro_prefix_timing_recovery(
+    prepared: PreparedAudio,
+    authority: SongTimingAuthority,
+    analysis: OnsetAnalysis,
+    run_dir: Path,
+    *,
+    generator: ChartGenerator,
+    seed: int,
+) -> IntroPrefixTimingRecoveryOutcome:
+    """Try one staged full-song timing candidate before any MAP generation."""
+
+    original_addressability = review_intro_timing_addressability(
+        authority,
+        analysis,
+        duration_ms=prepared.normalized.duration_ms,
+    )
+    if original_addressability.status != "UNADDRESSED":
+        return IntroPrefixTimingRecoveryOutcome(
+            status="NOT_TRIGGERED",
+            reason="INTRO_TIMING_RECOVERY_NOT_REQUIRED",
+            authority=authority,
+            original_authority_sha256=authority.sha256,
+            original_addressability=original_addressability,
+            retry_addressability=None,
+            attempted=False,
+            authority_epoch=1,
+        )
+
+    retry_seed = seed + INTRO_PREFIX_TIMING_RECOVERY_SEED_OFFSET
+    workdir = run_dir / "timing" / "work" / "intro-prefix-recovery" / "attempt-1"
+    staging_reference = (
+        run_dir / "timing" / "intro-prefix-recovery" / "candidate-reference.osu"
+    )
+    request = TimingGenerationRequest(
+        audio_path=prepared.normalized.path,
+        duration_ms=prepared.normalized.duration_ms,
+        seed=retry_seed,
+        super_timing=True,
+    )
+    try:
+        generated = generator.generate_timing(request, workdir)
+        evaluated, attempt_report, hard_rejected = _evaluate_timing_candidate(
+            generated,
+            attempt_count=1,
+            prepared=prepared,
+            analysis=analysis,
+            reference_path=staging_reference,
+            authority_epoch=2,
+            workdir=workdir,
+            run_dir=run_dir,
+        )
+        _write_validated_timing_reference(generated, prepared, staging_reference)
+        selection = select_timing_candidate((evaluated.evidence,))
+        retry_authority = _to_authority(
+            evaluated,
+            selection,
+            prepared=prepared,
+            reference_path=staging_reference,
+        )
+        retry_addressability = review_intro_timing_addressability(
+            retry_authority,
+            analysis,
+            duration_ms=prepared.normalized.duration_ms,
+        )
+    except WorkerError as error:
+        error_report = _worker_error_report(error)
+        outcome = IntroPrefixTimingRecoveryOutcome(
+            status="FAILED",
+            reason="INTRO_PREFIX_TIMING_INFERENCE_FAILED",
+            authority=authority,
+            original_authority_sha256=authority.sha256,
+            original_addressability=original_addressability,
+            retry_addressability=None,
+            attempted=True,
+            authority_epoch=1,
+            retry_seed=retry_seed,
+            error=error_report,
+        )
+        if error.code in _UNSAFE_TO_CONTINUE_AFTER_PREFIX_RECOVERY:
+            error.context["introPrefixTimingRecovery"] = outcome.to_report()
+            raise
+        return outcome
+    except TimingAuthorityValidationError as error:
+        return IntroPrefixTimingRecoveryOutcome(
+            status="UNRESOLVED",
+            reason="INTRO_PREFIX_TIMING_CANDIDATE_INVALID",
+            authority=authority,
+            original_authority_sha256=authority.sha256,
+            original_addressability=original_addressability,
+            retry_addressability=None,
+            attempted=True,
+            authority_epoch=1,
+            retry_seed=retry_seed,
+            error={
+                "type": type(error).__name__,
+                "message": str(error),
+            },
+        )
+
+    if generated.mode != "SUPER_TIMING":
+        reason = "INTRO_PREFIX_TIMING_MODE_MISMATCH"
+    elif hard_rejected:
+        reason = "INTRO_PREFIX_TIMING_HARD_REJECTED"
+    elif retry_addressability.status != "ADDRESSED":
+        reason = "INTRO_PREFIX_TIMING_STILL_UNADDRESSED"
+    else:
+        staging_reference.replace(authority.reference_path)
+        selected_authority = replace(
+            retry_authority,
+            reference_path=authority.reference_path,
+            sha256=sha256_file(authority.reference_path),
+        )
+        return IntroPrefixTimingRecoveryOutcome(
+            status="SELECTED",
+            reason="INTRO_PREFIX_TIMING_CANDIDATE_SELECTED",
+            authority=selected_authority,
+            original_authority_sha256=authority.sha256,
+            original_addressability=original_addressability,
+            retry_addressability=retry_addressability,
+            attempted=True,
+            authority_epoch=2,
+            retry_seed=retry_seed,
+            attempt_report=attempt_report,
+        )
+
+    return IntroPrefixTimingRecoveryOutcome(
+        status="UNRESOLVED",
+        reason=reason,
+        authority=authority,
+        original_authority_sha256=authority.sha256,
+        original_addressability=original_addressability,
+        retry_addressability=retry_addressability,
+        attempted=True,
+        authority_epoch=1,
+        retry_seed=retry_seed,
+        attempt_report=attempt_report,
     )
 
 

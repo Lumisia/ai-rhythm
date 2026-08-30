@@ -6,15 +6,22 @@ import pytest
 
 from chart_worker.analysis.activity import AudioActivity
 from chart_worker.analysis.beat import BeatGrid
+from chart_worker.analysis.intro_anchor import IntroAnchorEvidence
 from chart_worker.analysis.onset import OnsetAnalysis
 from chart_worker.audio.normalize import NormalizedAudio
 from chart_worker.errors import ErrorCode, WorkerError
 from chart_worker.generation.mapperatorinator import GeneratedTiming
 from chart_worker.generation.osu_parser import OsuBpmEvent
+from chart_worker.generation.osu_writer import timing_to_osu_mania
 from chart_worker.hashing import sha256_file
 from chart_worker.stages import s2_timing
-from chart_worker.stages.s2_timing import run_timing_generation
-from chart_worker.stages.types import PreparedAudio
+from chart_worker.stages.s2_timing import (
+    review_intro_timing_addressability,
+    run_intro_prefix_timing_recovery,
+    run_timing_generation,
+)
+from chart_worker.stages.types import PreparedAudio, SongTimingAuthority
+from chart_worker.validation.leading_timing_coverage import LeadingTimingCoverage
 from chart_worker.validation.timing_authority import TimingAuthorityValidationError
 from chart_worker.validation.timing_integrity import (
     TimingIntegrityAssessment,
@@ -53,6 +60,60 @@ def _prepared_sha(tmp_path: Path) -> str:
     return sha256_file(tmp_path / "audio" / "game.flac")
 
 
+def _intro_authority(
+    prepared: PreparedAudio,
+    tmp_path: Path,
+    *,
+    first_event_time_ms: int,
+    anchor_status: str = "CONFIRMED",
+) -> SongTimingAuthority:
+    bpm_events = (OsuBpmEvent(first_event_time_ms, 120.0),)
+    reference_path = tmp_path / "audio" / "timing-reference.osu"
+    reference_path.write_text(
+        timing_to_osu_mania(
+            bpm_events,
+            audio_filename=prepared.normalized.path.name,
+            title="fixture",
+        ),
+        encoding="utf-8",
+    )
+    intro_anchor = IntroAnchorEvidence(
+        status=anchor_status,
+        anchor_ms=250,
+        anchor_grid_ms=250,
+        grid_distance_ms=0,
+        aggregate_percentile_rank=0.99,
+        prominent_band_count=3,
+        pulse_continuation_matches=4,
+        pulse_continuation_opportunities=4,
+        supported_pulse_ms=tuple(range(250, 4_251, 250)),
+    )
+    return SongTimingAuthority(
+        reference_path=reference_path,
+        sha256=sha256_file(reference_path),
+        audio_sha256=prepared.normalized.sha256,
+        bpm_events=bpm_events,
+        generator_name="intro-authority-fixture",
+        seed=17,
+        mode="STANDARD",
+        attempt_count=1,
+        review=TimingAuthorityReview(
+            TimingAuthorityAction.REVIEW,
+            ("CONFIRMED_INTRO_ANCHOR_BEFORE_FIRST_EVENT",),
+        ),
+        leading_coverage=LeadingTimingCoverage(
+            action=TimingAuthorityAction.REVIEW,
+            reasons=("CONFIRMED_INTRO_ANCHOR_BEFORE_FIRST_EVENT",),
+            first_event_time_ms=first_event_time_ms,
+            leading_duration_ms=first_event_time_ms,
+            onset_count=17,
+            active_onset_count=17,
+            active_frame_ratio=1.0,
+            intro_anchor=intro_anchor,
+        ),
+    )
+
+
 class RecordingGenerator:
     def __init__(self) -> None:
         self.timing_calls = []
@@ -69,6 +130,221 @@ class RecordingGenerator:
             seed=request.seed,
             mode="SUPER_TIMING" if request.super_timing else "STANDARD",
         )
+
+
+@pytest.mark.parametrize(
+    ("anchor_status", "first_event_time_ms", "expected_status"),
+    [
+        ("UNCERTAIN", 6_937, "NOT_APPLICABLE"),
+        ("CONFIRMED", 0, "ADDRESSED"),
+        ("CONFIRMED", 6_937, "UNADDRESSED"),
+    ],
+)
+def test_intro_timing_addressability_uses_confirmed_region_and_explicit_event_coverage(
+    tmp_path: Path,
+    anchor_status: str,
+    first_event_time_ms: int,
+    expected_status: str,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    authority = _intro_authority(
+        prepared,
+        tmp_path,
+        first_event_time_ms=first_event_time_ms,
+        anchor_status=anchor_status,
+    )
+
+    observation = review_intro_timing_addressability(
+        authority,
+        _active_analysis(20_000),
+        duration_ms=20_000,
+    )
+
+    assert observation.status == expected_status
+    assert observation.first_event_time_ms == first_event_time_ms
+    if anchor_status == "CONFIRMED":
+        assert observation.allowed_first_row_ms == (180, 4_320)
+    else:
+        assert observation.allowed_first_row_ms is None
+
+
+def test_intro_prefix_timing_recovery_promotes_only_an_addressed_full_song_candidate(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    original = _intro_authority(
+        prepared,
+        tmp_path,
+        first_event_time_ms=6_937,
+    )
+    original_bytes = original.reference_path.read_bytes()
+    generator = RecordingGenerator()
+
+    outcome = run_intro_prefix_timing_recovery(
+        prepared,
+        original,
+        _active_analysis(20_000),
+        tmp_path,
+        generator=generator,
+        seed=7,
+    )
+
+    assert outcome.status == "SELECTED"
+    assert outcome.attempted is True
+    assert outcome.authority_epoch == 2
+    assert len(generator.timing_calls) == 1
+    assert generator.timing_calls[0].super_timing is True
+    assert generator.timing_calls[0].seed != 7
+    assert outcome.original_authority_sha256 == original.sha256
+    assert outcome.authority.sha256 != original.sha256
+    assert sha256_file(outcome.authority.reference_path) == outcome.authority.sha256
+    assert outcome.authority.reference_path.read_bytes() != original_bytes
+    assert outcome.retry_addressability is not None
+    assert outcome.retry_addressability.status == "ADDRESSED"
+
+
+def test_intro_prefix_timing_recovery_does_not_call_model_when_already_addressed(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    original = _intro_authority(
+        prepared,
+        tmp_path,
+        first_event_time_ms=0,
+    )
+
+    class UnexpectedGenerator(RecordingGenerator):
+        def generate_timing(self, request, workdir):
+            raise AssertionError("timing recovery must not run for an addressed intro")
+
+    outcome = run_intro_prefix_timing_recovery(
+        prepared,
+        original,
+        _active_analysis(20_000),
+        tmp_path,
+        generator=UnexpectedGenerator(),
+        seed=7,
+    )
+
+    assert outcome.status == "NOT_TRIGGERED"
+    assert outcome.attempted is False
+    assert outcome.authority is original
+    assert outcome.authority_epoch == 1
+    assert outcome.original_addressability.status == "ADDRESSED"
+
+
+def test_intro_prefix_timing_recovery_keeps_original_when_retry_is_unaddressed(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    original = _intro_authority(
+        prepared,
+        tmp_path,
+        first_event_time_ms=6_937,
+    )
+    original_bytes = original.reference_path.read_bytes()
+
+    class StillLateGenerator(RecordingGenerator):
+        def generate_timing(self, request, workdir):
+            generated = super().generate_timing(request, workdir)
+            return replace(
+                generated,
+                bpm_events=(OsuBpmEvent(6_937, 120.0),),
+            )
+
+    generator = StillLateGenerator()
+    outcome = run_intro_prefix_timing_recovery(
+        prepared,
+        original,
+        _active_analysis(20_000),
+        tmp_path,
+        generator=generator,
+        seed=7,
+    )
+
+    assert outcome.status == "UNRESOLVED"
+    assert outcome.authority is original
+    assert outcome.authority_epoch == 1
+    assert len(generator.timing_calls) == 1
+    assert original.reference_path.read_bytes() == original_bytes
+    assert sha256_file(original.reference_path) == original.sha256
+    assert outcome.retry_addressability is not None
+    assert outcome.retry_addressability.status == "UNADDRESSED"
+
+
+def test_intro_prefix_timing_recovery_keeps_original_after_known_failure(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    original = _intro_authority(
+        prepared,
+        tmp_path,
+        first_event_time_ms=6_937,
+    )
+    original_bytes = original.reference_path.read_bytes()
+    failure = WorkerError(ErrorCode.CHART_GENERATION_FAILED, "known timing failure")
+
+    class FailingGenerator(RecordingGenerator):
+        def generate_timing(self, request, workdir):
+            self.timing_calls.append(request)
+            self.timing_workdirs.append(workdir)
+            raise failure
+
+    generator = FailingGenerator()
+    outcome = run_intro_prefix_timing_recovery(
+        prepared,
+        original,
+        _active_analysis(20_000),
+        tmp_path,
+        generator=generator,
+        seed=7,
+    )
+
+    assert outcome.status == "FAILED"
+    assert outcome.authority is original
+    assert outcome.authority_epoch == 1
+    assert outcome.error is not None
+    assert outcome.error["code"] == "CHART_GENERATION_FAILED"
+    assert original.reference_path.read_bytes() == original_bytes
+    assert sha256_file(original.reference_path) == original.sha256
+
+
+def test_intro_prefix_timing_recovery_propagates_unknown_completion_without_mutation(
+    tmp_path: Path,
+):
+    prepared = _prepared(tmp_path, duration_ms=20_000)
+    original = _intro_authority(
+        prepared,
+        tmp_path,
+        first_event_time_ms=6_937,
+    )
+    original_bytes = original.reference_path.read_bytes()
+    failure = WorkerError(
+        ErrorCode.INFERENCE_COMPLETION_UNKNOWN,
+        "terminal state unavailable",
+    )
+
+    class UnknownCompletionGenerator(RecordingGenerator):
+        def generate_timing(self, request, workdir):
+            self.timing_calls.append(request)
+            self.timing_workdirs.append(workdir)
+            raise failure
+
+    with pytest.raises(WorkerError) as captured:
+        run_intro_prefix_timing_recovery(
+            prepared,
+            original,
+            _active_analysis(20_000),
+            tmp_path,
+            generator=UnknownCompletionGenerator(),
+            seed=7,
+        )
+
+    assert captured.value is failure
+    assert captured.value.context["introPrefixTimingRecovery"]["status"] == "FAILED"
+    assert captured.value.context["introPrefixTimingRecovery"]["attempted"] is True
+    assert original.reference_path.read_bytes() == original_bytes
+    assert sha256_file(original.reference_path) == original.sha256
 
 
 class InvalidThenSuperGenerator(RecordingGenerator):
