@@ -224,6 +224,42 @@ describe("ChartSelector publication status", () => {
     expect(screen.getByText("RUN VERIFIED / 12 CHARTS")).toBeVisible();
   });
 
+  it("explains that v2 chart authority is legacy playtest evidence only", () => {
+    render(
+      <ChartSelector
+        run={importedRun(
+          "LEGACY_V2_PLAYTEST_ONLY",
+          ["LEGACY_V2_CHART_AUTHORITY_UNVERIFIED"],
+          12,
+        )}
+        onBoundaryReview={vi.fn()}
+        onReset={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("V2 LEGACY · PLAYTEST ONLY / 12 CHARTS")).toBeVisible();
+    expect(
+      screen.getByText(/V2의 차트별 배포 권한을 신뢰하지 않습니다/),
+    ).toBeVisible();
+    expect(screen.getByRole("status", { name: /publication status/i })).toHaveTextContent(
+      "LEGACY_V2_CHART_AUTHORITY_UNVERIFIED",
+    );
+  });
+
+  it("does not show the v2 legacy warning on a verified v3 run", () => {
+    render(
+      <ChartSelector
+        run={importedRun("PRODUCTION_VERIFIED", [], 12)}
+        onBoundaryReview={vi.fn()}
+        onReset={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText(/V2의 차트별 배포 권한/)).not.toBeInTheDocument();
+  });
+
   it("explains why legacy runs cannot create a bound song-end label", () => {
     render(
       <ChartSelector

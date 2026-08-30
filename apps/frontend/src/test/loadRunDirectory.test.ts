@@ -79,13 +79,33 @@ describe("loadRunDirectory", () => {
     ]);
   });
 
-  it("rejects ambiguous v1 and v2 manifests", () => {
+  it("loads a v3 manifest and its SHA-bound generation report", () => {
+    const root = createRoot();
+    writeFileSync(
+      join(root, "playtest-run-v3.json"),
+      JSON.stringify({
+        ...commonManifest(),
+        generationReport: { path: "generation-report.json" },
+      }),
+    );
+
+    const paths = loadRunDirectory(root).map((file) => file.webkitRelativePath);
+
+    expect(paths).toEqual([
+      "playtest-run/playtest-run-v3.json",
+      "playtest-run/generation-report.json",
+      "playtest-run/audio/game.bin",
+    ]);
+  });
+
+  it("rejects ambiguous v1, v2, and v3 manifests independent of order", () => {
     const root = createRoot();
     writeFileSync(join(root, "playtest-run-v1.json"), "{}");
     writeFileSync(join(root, "playtest-run-v2.json"), "{}");
+    writeFileSync(join(root, "playtest-run-v3.json"), "{}");
 
     expect(() => loadRunDirectory(root)).toThrow(
-      "expected exactly one run manifest, found 2",
+      "expected exactly one run manifest, found 3",
     );
   });
 });

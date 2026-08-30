@@ -17,7 +17,11 @@ interface ManifestPaths {
   generationReport?: ManifestFileRef;
 }
 
-const manifestNames = ["playtest-run-v1.json", "playtest-run-v2.json"] as const;
+const manifestNames = [
+  "playtest-run-v1.json",
+  "playtest-run-v2.json",
+  "playtest-run-v3.json",
+] as const;
 
 function checkedPath(root: string, candidate: string): string {
   const normalized = candidate.replaceAll("\\", "/");
@@ -66,9 +70,9 @@ export function loadRunDirectory(root: string): File[] {
   const manifestPath = checkedPath(absoluteRoot, manifestName);
   const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as ManifestPaths;
   const generationReportPath =
-    manifestName === "playtest-run-v2.json"
-      ? manifest.generationReport?.path
-      : manifest.generationReportPath;
+    manifestName === "playtest-run-v1.json"
+      ? manifest.generationReportPath
+      : manifest.generationReport?.path;
   if (!generationReportPath) {
     throw new Error(`${manifestName} does not reference a generation report`);
   }

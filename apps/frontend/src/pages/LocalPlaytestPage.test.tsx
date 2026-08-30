@@ -180,7 +180,7 @@ describe("LocalPlaytestPage", () => {
     render(<LocalPlaytestPage importer={async () => importedRun(true)} />);
     await user.upload(
       screen.getByLabelText("실행 폴더"),
-      new File(["manifest"], "playtest-run-v2.json"),
+      new File(["manifest"], "playtest-run-v3.json"),
     );
 
     await user.click(await screen.findByRole("button", { name: "곡 끝 검토" }));

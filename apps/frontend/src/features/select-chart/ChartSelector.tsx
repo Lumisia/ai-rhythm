@@ -1,4 +1,8 @@
-import type { ImportedChart, ImportedRun } from "../import-run/importRun";
+import type {
+  ImportPublicationReason,
+  ImportedChart,
+  ImportedRun,
+} from "../import-run/importRun";
 
 interface ChartSelectorProps {
   run: ImportedRun;
@@ -32,6 +36,13 @@ function seconds(ms: number): string {
   return `${(ms / 1_000).toFixed(1)}초`;
 }
 
+function publicationReasonText(reason: ImportPublicationReason): string {
+  if (reason === "LEGACY_V2_CHART_AUTHORITY_UNVERIFIED") {
+    return `${reason} — V2의 차트별 배포 권한을 신뢰하지 않습니다. 이 실행은 플레이테스트 전용입니다.`;
+  }
+  return reason;
+}
+
 export function ChartSelector({
   run,
   lastReviews = {},
@@ -59,7 +70,7 @@ export function ChartSelector({
               data-state={run.publicationState}
               role="status"
             >
-              {run.publicationReasons.join(" · ")}
+              {run.publicationReasons.map(publicationReasonText).join(" · ")}
             </p>
           ) : null}
         </div>
